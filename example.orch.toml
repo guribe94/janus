@@ -1,0 +1,81 @@
+# Example orch.toml. Put it in the project root; `orch` finds it from any subdirectory. Paths are relative to this file.
+[project]
+name = "myproject"
+beads = "."              # directory holding .beads/ (units, instructions, rules)
+state = ".orch"          # HANDOFF.md, history.md and orch's bookkeeping
+cycle_min = 15           # a check/ack cycle is overdue after this
+deadline_min = 30        # an unacknowledged problem blocks Stop after this
+silent_min = 30          # an agent with no board post for this long is silent
+reset_tokens = 150000    # context size at which the watcher asks for notes, then /clear
+unreachable_min = 20
+
+[paths]
+board = "bin/board.sh"   # message board script (post/read/summary/rule/close)
+gate_log = "out/gates.log"   # lines: 'YYYY-MM-DD HH:MM:SS <name> EXIT_x=0 ... RESULT: PASS|FAIL'
+briefs = "briefs"        # <briefs>/<unit>.md
+out = "out"              # <out>/<unit>/REPORT.md
+worktrees = "worktrees"  # <worktrees>/<unit> is the unit's cwd when it exists
+
+[herdr]
+workspace = "myproject"  # herdr workspace label
+
+[orchestrator]           # what the watcher starts when the orchestrator pane is gone
+kind = "claude"          # a herdr agent kind
+args = []
+
+# Caps exist only when the owner sets them.
+# [caps]
+# total = 6
+# [caps.host]
+# server = 2
+
+# One table per machine. `local = true` is this machine; others are reached over ssh (BatchMode, 5 s timeout).
+[hosts.laptop]
+local = true
+ram_gb = 16
+cores = 10
+reserve_gb = 4           # memory kept free
+agent_gb = 1.5           # per agent
+job_gb = 3               # per pueue job
+min_disk_gb = 20
+
+[hosts.server]
+ssh = "me@server.lan"
+arch = "x86_64"          # aarch64 or x86_64: picks pueue's static binary
+ram_gb = 16
+cores = 8
+reserve_gb = 3
+agent_gb = 1.0
+job_gb = 3
+min_disk_gb = 20
+root = "/home/me/orch"   # synced worktrees, briefs and outputs live here
+bin = "/home/me/.local/bin"
+memory_max = "6G"        # systemd-run MemoryMax for each job on this Linux host
+# pueue_config = "/srv/tools/pueue/pueue.yml"   # when the host keeps pueue's files elsewhere
+
+[providers.claude_api]
+enabled = true
+cap_usd = 100
+ledger = "out/api-ledger.tsv"   # tsv: ts, unit, cost|running, budget, run id
+budget_per_unit = 15
+[providers.codex]
+enabled = true
+
+# kind "api" = headless launcher run as a pueue task; claude|codex|opencode = a herdr agent (tmux on remote hosts).
+[models.opus]
+provider = "claude_api"
+vendor = "anthropic"
+kind = "api"
+model = "opus"
+launcher = "bin/api-agent.sh"   # called: <unit> <brief> <cwd> <budget> <model>
+hosts = ["laptop"]
+[models.codex]
+provider = "codex"
+vendor = "openai"
+kind = "codex"
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[routing]                # ordered; first model whose provider is enabled and within budget
+critical = ["opus"]
+review = ["codex", "opus"]   # skips the implementer's vendor
+normal = ["codex"]
