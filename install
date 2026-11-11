@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Install orch: links, hooks, watcher, tools. `install --dry-run` prints every change and changes nothing.
-Usage: install [--dry-run] [--project DIR] [--no-hosts]   (DIR holds orch.toml; default: current directory or a parent)"""
+Usage: install [--dry-run] [--project DIR] [--no-hosts] [--hosts-only]   (DIR holds orch.toml; default: current directory or a parent)"""
 import argparse, json, os, shlex, subprocess, sys, time, tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent; HOME = Path.home()
-ap = argparse.ArgumentParser(); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--project"); ap.add_argument("--no-hosts", action="store_true")
+ap = argparse.ArgumentParser(); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--project"); ap.add_argument("--no-hosts", action="store_true"); ap.add_argument("--hosts-only", action="store_true")
 A = ap.parse_args(); DRY = A.dry_run
 EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch", "Stop": None}
 ORCH = HOME / ".local/bin/orch"
@@ -64,12 +64,12 @@ def host_tools(name, h):
     say(f"== {name} ({h['ssh']}, {arch}), no sudo ==")
     steps = [f"mkdir -p {bindir}"]
     for b in ("pueue", "pueued"):
-        steps.append(f"curl -fsSL -o {bindir}/{b} {base}/{b}-linux-{arch} && chmod +x {bindir}/{b}")
+        steps.append(f"curl -fsSL -o {bindir}/{b}.new {base}/{b}-{arch}-unknown-linux-musl && chmod +x {bindir}/{b}.new && mv -f {bindir}/{b}.new {bindir}/{b}")
     unit = SERVICE.format(bin=bindir, cfg=cflag)
     if shared:
         base_dir = "/srv/app-fleet/tools"
-        steps.append(f"mkdir -p {base_dir}/pueue/data {base_dir}/pueue/run")
-        if cfg: steps.append(f"printf 'shared:\\n  pueue_directory: {base_dir}/pueue/data\\n  runtime_directory: {base_dir}/pueue/run\\n' > {cfg}")
+        steps.append(f"mkdir -p {base_dir}/pueue.d/data {base_dir}/pueue.d/run")
+        if cfg: steps.append(f"printf 'shared:\\n  pueue_directory: {base_dir}/pueue.d/data\\n  runtime_directory: {base_dir}/pueue.d/run\\n' > {cfg}")
         steps.append(f"printf %s {shlex.quote(unit)} > {base_dir}/pueued.service")
         steps.append(f"systemctl --user link {base_dir}/pueued.service && systemctl --user enable --now pueued.service")
     else:
@@ -82,6 +82,9 @@ def main():
     p = Path(A.project or os.getcwd()).resolve()
     for d in [p, *p.parents]:
         if (d / "orch.toml").is_file(): root = d; break
+    if A.hosts_only:
+        for n, h in tomllib.loads((root / "orch.toml").read_text()).get("hosts", {}).items(): host_tools(n, h)
+        return
     say("== links ==")
     link("~/.claude/skills/orchestrating", HERE / "skill"); link("~/.codex/skills/orchestrating", HERE / "skill"); link(ORCH, HERE / "orch.py")
     say("== hooks ==")

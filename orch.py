@@ -126,7 +126,8 @@ echo "--pueue"; %(pueue)s status --json 2>/dev/null
 echo "--tmux"; tmux ls -F '#S' 2>/dev/null; true'''
 
 def pueue(h):
-    c = h.get("pueue_config"); return "pueue" + (f" -c {shlex.quote(c)}" if c else "")
+    c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
+    return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
 def probe(name, h):
     rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": h.get("root", "/"), "pueue": pueue(h)}, timeout=20)
@@ -428,15 +429,16 @@ def cmd_register(cfg, a):
         for lab, cmd in (("status", f"watch -n 60 orch status"), ("board", f"watch -n 60 {shlex.quote(str(cfg.p('board', 'bin/board.sh')))} summary"),
                          ("watcher", f"tail -f {shlex.quote(str(cfg.f('watch.log')))}")):
             if lab in have: continue
-            r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root), "--no-focus")
+            r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root))
             if r: herdr("pane", "run", r["root_pane"]["pane_id"], cmd)
 
 # ---------------------------------------------------------------- launch / stop / collect / close
-def pick_model(cfg, tier, kind, of_vendor):
+def pick_model(cfg, tier, kind, of_vendor, host=None):
     lst = cfg.route.get("review" if kind == "review" else tier, [])
     why = []
     for m in lst:
         c = cfg.models.get(m, {})
+        if host and host not in c.get("hosts", list(cfg.hosts)): why.append(f"{m}: not allowed on {host}"); continue
         if kind == "review" and of_vendor and c.get("vendor") == of_vendor: why.append(f"{m}: same vendor as implementer"); continue
         ok, w = model_ok(cfg, m)
         if ok: return m
@@ -456,7 +458,7 @@ def wait_shell(pane, unit):
 
 def new_tab(cfg, label, cwd):
     ws = ws_id(cfg, create=True) or ""
-    r = herdr("tab", "create", *(["--workspace", ws] if ws else []), "--label", label, "--cwd", str(cwd), "--no-focus")
+    r = herdr("tab", "create", *(["--workspace", ws] if ws else []), "--label", label, "--cwd", str(cwd))
     if not r: raise Err("herdr tab create failed")
     return r["root_pane"]["pane_id"], r["tab"].get("tab_id")
 
@@ -468,6 +470,27 @@ def wrap(h, cmd, unit_mem=None):
     mm = h.get("memory_max")
     return f"systemd-run --user --scope -q -p MemoryMax={mm} -- {cmd}" if mm and not h.get("local") else cmd
 
+def ledger(cfg, mc, run, state, amount, name):
+    with open(cfg.root / cfg.prov[mc["provider"]]["ledger"], "a") as f: f.write(f"{ts()}\t{name}\t{state}\t{amount}\t{run}\n")
+
+def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt):
+    """Headless claude as a pueue task on host h. The key goes over ssh stdin into a fifo that only that task reads: never a file or argv."""
+    root = h["root"]; fifo = f"{root}/run/{name}.key"; od = f"{root}/out/{name}"; q = shlex.quote
+    mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p MemoryMax={mm} -- " if mm else ""
+    script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nread -r K < {fifo}; export ANTHROPIC_API_KEY=$K; unset K\n"
+              f"export ORCH_ROLE=agent\ncd {q(rcwd)} || exit 1\nexec {sd}claude --bare -p --model {mc['api_id']} --max-budget-usd {budget} "
+              f"--output-format json --dangerously-skip-permissions {q(prompt)} < /dev/null > {od}/api.json 2> {od}/api.err\n")
+    if DRY: return X(h, f"mkfifo {fifo}; cat > {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {rcwd} --print-task-id -- sh {root}/run/{name}.sh; key | ssh cat > {fifo}")
+    rc, o, e = hrun(h, f"mkdir -p {root}/run {od} && rm -f {fifo} && mkfifo -m 600 {fifo} && cat > {root}/run/{name}.sh", inp=script)
+    if rc: return rc, o, e
+    rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {q(rcwd)} --print-task-id -- sh {root}/run/{name}.sh")
+    if rc: return rc, o, e
+    k = sh(["security", "find-generic-password", "-s", "orch-anthropic-api", "-w"])
+    if k[0] or not k[1].strip(): hrun(h, f"{pueue(h)} kill {o.strip()}; rm -f {fifo}"); return 1, "", "no key in keychain item orch-anthropic-api"
+    rc2, _, e2 = hrun(h, f"cat > {fifo}", inp=k[1].strip() + "\n", timeout=30)
+    if rc2: hrun(h, f"{pueue(h)} kill {o.strip()}; rm -f {fifo}"); return 1, "", "key delivery failed: " + e2.strip()[:80]
+    return 0, o, ""
+
 def cmd_launch(cfg, a):
     name = a.unit
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
@@ -476,7 +499,7 @@ def cmd_launch(cfg, a):
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
     of = next((u for u in units if u["name"] == (a.of or name)), None)
-    mname = a.model or pick_model(cfg, a.tier, a.kind, of.get("vendor") if of else None)
+    mname = a.model or pick_model(cfg, a.tier, a.kind, of.get("vendor") if of else None, a.host)
     mc = cfg.models[mname]
     hs = probe_all(cfg); hosts = [a.host] if a.host else [n for n in cfg.hosts if n in mc.get("hosts", list(cfg.hosts))]
     best, bn, notes = None, 0, []
@@ -505,13 +528,15 @@ def cmd_launch(cfg, a):
     u = {"host": hn, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now())}
     if mc["kind"] == "api":
-        if not local: raise Err("api models run on the local host only")
         budget = cfg.prov[mc["provider"]].get("budget_per_unit", 15)
-        cmd = shlex.join([str(cfg.root / mc["launcher"]), name, rbrief, rcwd, str(budget), mc["model"]])
         X(h, ensure_lanes(h))
-        rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {cmd}")
+        if local:
+            cmd = shlex.join([str(cfg.root / mc["launcher"]), name, rbrief, rcwd, str(budget), mc["model"]])
+            rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {cmd}")
+        else: rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt)
         if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
         u.update(via="pueue", task=int(o.strip() or 0))
+        if not local and not DRY: ledger(cfg, mc, f"{name}.{u['task']}", "running", budget, name)
     elif local:
         pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd) if not DRY else ("pane", "tab")
         if not DRY:
@@ -522,7 +547,7 @@ def cmd_launch(cfg, a):
             r = sh(["herdr", "agent", "start", name, "--kind", mc["kind"], "--pane", pane, "--timeout", "90000", "--", *mc.get("args", [])], timeout=100)
             if r[0]: raise Err("herdr agent start failed: " + r[2][:120])
             herdr("agent", "prompt", name, prompt)
-            u.update(via="herdr", pane=pane, tab=tab, pid=findkey(herdr("pane", "process-info", pane), "pid"))
+            u.update(via="herdr", pane=pane, tab=tab, pid=findkey(herdr("pane", "process-info", "--pane", pane), "pid"))
         else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
     else:
         cli = {"claude": "claude", "codex": "codex", "opencode": "opencode run"}[mc["kind"]]
@@ -576,6 +601,11 @@ def cmd_collect(cfg, a):
         cmd = ["rsync", "-a", "-e", rsh, *EXCL, src, dst]
         if DRY: say("+ " + shlex.join(cmd))
         elif sh(cmd, timeout=600)[0]: raise Err(f"collect from {u['host']} failed (unreachable?)")
+    mc = cfg.models.get(u.get("model"), {})
+    if not DRY and u.get("via") == "pueue" and mc.get("kind") == "api" and not u.get("spent"):
+        try: cost = json.loads((cfg.p("out", "out") / u["name"] / "api.json").read_text()).get("total_cost_usd")
+        except Exception: cost = None
+        if cost is not None: ledger(cfg, mc, f"{u['name']}.{u['task']}", f"{cost}", f"done rc=0", u["name"]); u["spent"] = cost; bd.save(u)
     if not DRY: bd.comment(u["id"], f"{ts()} collected from {u['host']}"); cfg.touch("changed")
     say("collected")
 
@@ -590,7 +620,7 @@ def cmd_close(cfg, a):
         if DRY: say(f"+ herdr pane close {u['pane']}")
         else: herdr("pane", "close", u["pane"])
     if not h.get("local"):
-        root = h["root"]; X(h, f"rm -rf {shlex.quote(root)}/worktrees/{u['name']} {shlex.quote(root)}/briefs/{u['name']}.md")
+        root = h["root"]; X(h, f"cd {shlex.quote(root)} && rm -rf worktrees/{u['name']} briefs/{u['name']}.md out/{u['name']} run/{u['name']}.* && rmdir worktrees briefs out run 2>/dev/null; true")
     if u.get("via") == "pueue": X(h, f"{pueue(h)} clean -g agents")
     X({"local": True}, f"{shlex.quote(str(cfg.p('board', 'bin/board.sh')))} close {u['name']}")
     if DRY: return

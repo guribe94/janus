@@ -1,0 +1,113 @@
+# orch.toml for example-project. Paths are relative to this file. No caps are set (owner: none unless he sets them).
+[project]
+name = "example-project"
+beads = "."              # directory holding .beads/
+state = ".orch"          # HANDOFF.md, history.md, session, acks
+cycle_min = 15           # a check/ack cycle is overdue after this
+deadline_min = 30        # an unacknowledged problem blocks Stop after this
+silent_min = 30
+reset_tokens = 150000    # watcher asks for notes, then /clear, past this context size
+unreachable_min = 20
+
+[paths]
+board = "bin/board.sh"
+board_dir = "board"
+gate_log = "out/handoff-results.log"
+briefs = "briefs"
+out = "out"
+worktrees = "worktrees"  # <worktrees>/<unit> is a unit's cwd when it exists
+
+[herdr]
+workspace = "example-project"
+
+[orchestrator]           # started by the watcher when the pane is gone
+kind = "codex"
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+# [caps]  total = 6   [caps.host] linux1 = 2     (only when the owner sets them)
+
+[hosts.mac]
+local = true
+ram_gb = 16
+cores = 10
+reserve_gb = 4
+agent_gb = 1.5
+job_gb = 3
+job_slots = 2
+min_disk_gb = 20
+
+[hosts.linux1]
+ssh = "user@linux1.lan"
+arch = "aarch64"
+ram_gb = 7.5
+cores = 4
+reserve_gb = 1.5
+agent_gb = 1.0
+job_gb = 2.5
+job_slots = 1
+min_disk_gb = 10
+root = "/home/user/orch"
+bin = "/home/user/.local/bin"
+memory_max = "3G"
+
+[hosts.linux2]           # shared home server: our files only under /srv/app-fleet
+ssh = "user@192.0.2.10"
+arch = "x86_64"
+ram_gb = 11
+cores = 4
+reserve_gb = 3
+agent_gb = 1.0
+job_gb = 3
+job_slots = 1
+min_disk_gb = 30
+root = "/srv/app-fleet/orch"
+bin = "/srv/app-fleet/tools"
+pueue_config = "/srv/app-fleet/tools/pueue/pueue.yml"
+memory_max = "4G"
+
+[providers.claude_sub]
+enabled = false
+[providers.claude_api]
+enabled = true
+cap_usd = 100
+ledger = "out/api-ledger-orch-key.tsv"
+budget_per_unit = 15
+[providers.codex]
+enabled = true
+[providers.opencode]
+enabled = true
+
+# kind: api (headless via launcher, a pueue task) or a herdr agent kind (claude|codex|opencode).
+# hosts: where the model may run (default all); remote hosts need the tool and login installed there.
+[models.fable]
+provider = "claude_api"
+vendor = "anthropic"
+kind = "api"
+model = "fable"
+launcher = "bin/fable-api.sh"
+hosts = ["mac"]
+[models.opus]
+provider = "claude_api"
+vendor = "anthropic"
+kind = "api"
+model = "opus"
+launcher = "bin/fable-api.sh"
+hosts = ["mac"]
+[models.deepseek]
+provider = "opencode"
+vendor = "deepseek"
+kind = "opencode"
+model = "openrouter/deepseek/deepseek-v4.1-flash"
+args = ["--standalone"]
+hosts = ["mac"]          # the key is sent over ssh stdin by bin/linux1-agent.sh today; not wired here
+[models.codex]
+provider = "codex"
+vendor = "openai"
+kind = "codex"
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+hosts = ["mac"]
+
+[routing]
+critical = ["fable", "opus"]
+review = ["codex", "fable", "opus", "deepseek"]   # filtered to a vendor other than the implementer's
+normal = ["deepseek", "codex"]
