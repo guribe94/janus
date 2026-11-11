@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.orch.watch</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>[ -f "$HOME/.config/orch/projects" ] || exit 0; while read -r p; do [ -d "$p" ] &amp;&amp; (cd "$p" &amp;&amp; "$HOME/.local/bin/orch" watch); done &lt; "$HOME/.config/orch/projects"</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StandardErrorPath</key><string>__HOME__/.config/orch/watch.err</string>
+</dict></plist>
