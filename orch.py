@@ -283,7 +283,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     ws = ws_id(cfg); names = {u["name"] for u in units}
     un = cfg.jget("hosts.json")
     ready = 0
-    try: ready = len(Beads(cfg).run("ready"))
+    try: ready = len([i for i in Beads(cfg).run("ready", "--label", "unit") if "orch-log" not in (i.get("labels") or [])])
     except Err: pass
     for n, p in hs.items():
         if not p["ok"]:
@@ -420,7 +420,8 @@ def cmd_ack(cfg, a):
 def cmd_register(cfg, a):
     sid = a.session or os.environ.get("ORCH_SESSION") or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")
     cfg.f("session").write_text(sid or f"pending:{int(now())}")
-    if os.environ.get("HERDR_PANE_ID"): cfg.f("pane").write_text(os.environ["HERDR_PANE_ID"])
+    pid = os.environ.get("HERDR_PANE_ID") or (herdr("pane", "current") or {}).get("pane", {}).get("pane_id")
+    if pid: cfg.f("pane").write_text(pid)
     cfg.touch("last_cycle"); cfg.touch("last_ack")
     say("registered " + (sid or "(pending: the next hook event from this session claims it)"))
     ws = ws_id(cfg, create=True)
@@ -528,7 +529,7 @@ def cmd_launch(cfg, a):
     u = {"host": hn, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now())}
     if mc["kind"] == "api":
-        budget = cfg.prov[mc["provider"]].get("budget_per_unit", 15)
+        budget = a.budget if a.budget is not None else cfg.prov[mc["provider"]].get("budget_per_unit", 15)
         X(h, ensure_lanes(h))
         if local:
             cmd = shlex.join([str(cfg.root / mc["launcher"]), name, rbrief, rcwd, str(budget), mc["model"]])
@@ -739,7 +740,7 @@ def main():
     add("check", A("--brief", action="store_true"), A("--escalate", action="store_true"))
     add("capacity"); add("status"); add("watch")
     add("launch", A("unit"), A("--kind", choices=["implement", "review", "audit"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
-        A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"), dry=True)
+        A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"), A("--of", help="unit whose implementer's vendor a review must avoid"), dry=True)
     add("stop", A("unit"), dry=True)
     add("collect", A("unit"), dry=True)
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
