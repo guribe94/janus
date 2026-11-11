@@ -115,8 +115,10 @@ class Beads:
 # ---------------------------------------------------------------- hosts: one probe per host
 PROBE = r'''PATH="$HOME/.local/bin:%(bin)s:$PATH"
 if [ "$(uname)" = Darwin ]; then
- ps=$(sysctl -n hw.pagesize); pg=$(vm_stat | awk '/Pages (free|inactive|speculative|purgeable)/{gsub(/\./,"",$NF);s+=$NF}END{print s}')
- echo "avail_mb=$((pg*ps/1048576))"; echo "load=$(sysctl -n vm.loadavg | awk '{print $2}')"; echo "os=mac"
+ mem=$(sysctl -n hw.memsize); fp=$(memory_pressure 2>/dev/null | awk '/free percentage/{gsub(/%%/,"",$NF);print int($NF)}')
+ if [ -n "$fp" ]; then mb=$((mem/1048576*fp/100)); else
+  mb=$(vm_stat | awk '/page size of/{ps=$(NF-1)} /^Pages (free|inactive|speculative):/{gsub(/\./,"",$NF);n+=$NF} END{print int(n*ps/1048576)}'); fi
+ echo "avail_mb=$mb"; echo "load=$(sysctl -n vm.loadavg | tr -d '{}' | awk '{print $1}')"; echo "os=mac"
 else
  echo "avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"; echo "load=$(cut -d' ' -f1 /proc/loadavg)"
  echo "psi=$(awk '/^some/{sub("avg10=","",$2);print $2}' /proc/pressure/memory 2>/dev/null)"; echo "os=linux"
@@ -156,15 +158,20 @@ def fl(x, d=0.0):
     try: return float(x)
     except Exception: return d
 
-def room(cfg, name, p, units):
+def margins(h, p, cleanup=False):
+    """Why the host is over its load, memory-pressure or disk margins (a cleanup unit ignores the disk floor)."""
+    why = []
+    if fl(p.get("load")) > h.get("cores", 4) * 1.5: why.append(f"load {p.get('load')} over {h.get('cores', 4) * 1.5:g}")
+    if p.get("psi") and fl(p["psi"]) >= 5: why.append(f"memory pressure {p['psi']}")
+    if not cleanup and p.get("disk_gb") and fl(p["disk_gb"]) < h.get("min_disk_gb", 10): why.append(f"disk {p['disk_gb']}G")
+    return why
+
+def room(cfg, name, p, units, cleanup=False):
     """(number of agents that fit now, why not). Measured live against the host's margins."""
     h = cfg.hosts[name]
     if not p["ok"]: return 0, "unreachable"
     avail = fl(p.get("avail_mb")) / 1024
-    why = []
-    if fl(p.get("load")) > h.get("cores", 4) * 1.5: why.append(f"load {p.get('load')} over {h.get('cores', 4) * 1.5:g}")
-    if p.get("psi") and fl(p["psi"]) >= 5: why.append(f"memory pressure {p['psi']}")
-    if p.get("disk_gb") and fl(p["disk_gb"]) < h.get("min_disk_gb", 10): why.append(f"disk {p['disk_gb']}G")
+    why = margins(h, p, cleanup)
     n = int((avail - h.get("reserve_gb", 2)) // h.get("agent_gb", 1.0))
     if n < 1: why.append(f"memory {avail:.1f}G free, reserve {h.get('reserve_gb', 2)}G")
     caps = cfg.caps
@@ -291,8 +298,9 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); units there: {', '.join(qd) or 'none'}"))
             continue
         r, why = room(cfg, n, p, units)
-        if r < 1 and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6:
-            F.append((f"margin:{n}", f"host {n} over its margins: {why}"))
+        mg = margins(cfg.hosts[n], p)
+        if mg or (r < 1 and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6):
+            F.append((f"margin:{n}", f"host {n} over its margins: {'; '.join(mg) or why}"))
         elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} but {ready} unit(s) are ready: orch launch"))
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
@@ -505,7 +513,7 @@ def cmd_launch(cfg, a):
     hs = probe_all(cfg); hosts = [a.host] if a.host else [n for n in cfg.hosts if n in mc.get("hosts", list(cfg.hosts))]
     best, bn, notes = None, 0, []
     for n in hosts:
-        r, why = room(cfg, n, hs[n], units)
+        r, why = room(cfg, n, hs[n], units, a.kind == "cleanup")
         if r < 1: notes.append(f"{n}: {why}")
         elif r > bn: best, bn = n, r
     if not best: raise Err("refused, no host has room (" + "; ".join(notes) + ")")
@@ -628,11 +636,36 @@ def cmd_close(cfg, a):
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
     say("closed")
 
+SECRETS = [re.compile(x.encode()) for x in ("sk" + "-ant-", "sk" + "-or-", "gh" + "p_", "xo" + "x", "BEGIN (\\w+ )?PRIV" + "ATE KEY")]
+
+def cmd_commit_state(cfg, a):
+    rc, o, e = sh(["git", "ls-files", "-m", "-o", "--exclude-standard", "-z"], cwd=cfg.root)
+    if rc: raise Err("git ls-files failed: " + e.strip()[:80])
+    paths = [x for x in o.split("\0") if x]
+    hit = []
+    for x in paths:
+        try: b = (cfg.root / x).read_bytes()
+        except OSError: continue
+        if any(r.search(b) for r in SECRETS): hit.append(x)
+    if hit: raise Err("refused, possible secrets in: " + ", ".join(hit))
+    if not paths: say("nothing to commit"); return
+    for cmd in (["git", "add", "-A"], ["git", "commit", "-m", a.message], ["git", "push"]):
+        if DRY: say("+ " + shlex.join(cmd)); continue
+        rc, o, e = sh(cmd, cwd=cfg.root, timeout=120)
+        if rc: raise Err(f"{shlex.join(cmd[:2])} failed: {(e or o).strip()[-200:]}")
+    say(f"committed {len(paths)} path(s)" + ("" if DRY else " and pushed"))
+
 # ---------------------------------------------------------------- hooks (Claude Code and Codex share one format)
+MUT = r"(\b(rm|mv|cp|kill|pkill|killall)\b|\bsed\s+(-\S*i|--in-place)|\bperl\s+-\S*i|\bgit\b[^;|&\n]*?\b(add|commit|push|reset|checkout)\b|(?<![0-9&>])>>?\s*(?!/dev/null)[\"']?[$/.\w])"
 DENY = [(r"\brm\s+(-\S*[rR]|--recursive)", "rm -r by hand"), (r"(^|[;&|(]\s*)(sudo\s+)?(kill|pkill|killall)\b", "kill by hand: use orch stop"),
         (r"\bsed\s+(-\S*i|--in-place)|\bperl\s+-\S*i", "in-place edit"), (r"sparse-checkout", "sparse-checkout"),
-        (r"\b(for|while)\b.*\bworktrees?\b|git worktree list.*\|\s*(xargs|while)", "loop over worktrees"),
+        (r"(?s)\b(for|while)\b.*\bworktrees?\b.*" + MUT + r"|git worktree list.*\|\s*(xargs|while)\b.*" + MUT, "loop that changes worktrees"),
         (r"\bssh\b.*\b(rm|kill|pkill|mv|reboot|shutdown|mkfs|dd|systemctl\s+(stop|restart)|git\s+(reset|clean|checkout))\b", "destructive ssh")]
+
+def strip_heredocs(c):
+    """Drop heredoc bodies written to a file under briefs/ or out/: their words are text, not commands."""
+    return re.sub(r"(?ms)^([^\n]*<<-?\s*['\"]?(\w+)['\"]?[^\n]*)\n.*?^\s*\2\s*$",
+                  lambda m: m.group(1) if re.search(r">>?\s*\S*\b(briefs|out)/", m.group(1)) else m.group(0), c)
 
 def out(o): print(json.dumps(o))
 
@@ -670,7 +703,7 @@ def cmd_hook(ev):
         ctx(ev, "\n\n".join(parts)[:30000])
     elif ev == "UserPromptSubmit":
         pr = (d.get("prompt") or "").strip()
-        if pr and not pr.startswith("read .orch/HANDOFF.md"):
+        if pr and not pr.startswith(("orch cycle:", WAKE, "You are the orchestrator. " + WAKE)) and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
             try:
                 i = Beads(cfg).create("instr: " + re.sub(r"\s+", " ", pr)[:70], "instruction", pr[:4000]); cfg.touch("changed")
                 ctx(ev, f"Filed as instruction {i}: close it as done, or make it a standing rule with bd remember.")
@@ -681,7 +714,8 @@ def cmd_hook(ev):
         if tool in ("Bash", "shell", "local_shell"):
             c = ti.get("command", ""); c = " ".join(c) if isinstance(c, list) else c
             if not re.match(r"\s*(orch|\S*board\.sh|bd|pueue|herdr)\b", c):
-                why = next((w for rx, w in DENY if re.search(rx, c)), None)
+                sc = strip_heredocs(c)
+                why = next((w for rx, w in DENY if re.search(rx, sc if w == "in-place edit" else c)), None)
         elif tool in ("Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"):
             fp = Path(ti.get("file_path") or ti.get("notebook_path") or "/x").resolve()
             ok = [cfg.state.resolve(), cfg.p("briefs", "briefs").resolve(), (root / "orch.toml").resolve()]
@@ -739,11 +773,12 @@ def main():
     A = lambda *n, **k: (n, k)
     add("check", A("--brief", action="store_true"), A("--escalate", action="store_true"))
     add("capacity"); add("status"); add("watch")
-    add("launch", A("unit"), A("--kind", choices=["implement", "review", "audit"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
+    add("launch", A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
         A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"), A("--of", help="unit whose implementer's vendor a review must avoid"), dry=True)
     add("stop", A("unit"), dry=True)
     add("collect", A("unit"), dry=True)
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
+    add("commit-state", A("-m", "--message", default="orch: state"), dry=True)
     add("ack", A("problem"), A("decision"))
     add("register", A("session", nargs="?"), dry=True)
     add("hook", A("event", choices=["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"]))
@@ -756,7 +791,7 @@ def main():
     root = find_root()
     if not root: print("orch: no orch.toml here or in a parent", file=sys.stderr); return 2
     cfg = Cfg(root)
-    try: globals()["cmd_" + a.cmd](cfg, a)
+    try: globals()["cmd_" + a.cmd.replace("-", "_")](cfg, a)
     except Err as e: print(f"orch: {e}", file=sys.stderr); return 1
     return 0
 
