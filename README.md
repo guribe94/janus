@@ -89,8 +89,13 @@ when the orchestrator pane is gone.
 
 **`[hosts.<name>]`**: one per machine. `local = true` for this one; others have `ssh`, `arch`, `root` (where synced
 worktrees, briefs and outputs live) and `bin`. Capacity figures: `ram_gb`, `cores`, `reserve_gb` (kept free),
-`agent_gb` (per agent), `job_gb` (per pueue job), `min_disk_gb`. Optional `memory_max` (systemd-run limit) and
-`pueue_config`.
+`agent_gb` (per agent), `job_gb` (per pueue job), `min_disk_gb`. Optional `memory_max` (systemd-run limit for remote
+API agents) and `pueue_config`. For `orch run` (section 7a): `services_gb` (measured memory the host's own services use;
+`ram_gb - services_gb` // `job_gb` sets the initial `jobs`/`gates` parallel limits), `gate_slots` (parallel `gates` tasks),
+`legacy`/`legacy_slots` (the old scripts' queue, `heavy` or `runsh`, shown by `orch check` while it drains),
+`runner = "podman"` with `fleet`/`image` (linux2: run in the build container), `worktrees`, `fleet_log`, `run_env` (shell run
+before the job: linux1 sources `build-env.sh`), and on the Mac `admit_check` (agent-capacity) and `legacy_lanes` (old
+`heavy.land` lock dirs the land lane waits for). Optional `[lanes.<lane>] age_min` overrides a lane's age limit.
 
 **`[caps]`** (optional, only when the owner wants them): `total = 6`, and `[caps.host] server = 2`. With no caps the limit
 is what each machine can safely hold.
@@ -130,7 +135,11 @@ $ orch check
 [idle:server] host server has room for 2 but 3 unit(s) are ready: orch launch
 ```
 Options: `--brief` (at most 8 lines), `--escalate` (only problems open longer than `deadline_min`).
-What it reports: unreachable hosts and what was on them; hosts over their margins; idle room with ready units; orphan
+What it reports: per host and lane (`gates`, `jobs`, `land`), queued work with free slots or a paused group ("STALLED"),
+queued or admission-waiting work while the host has room for another job ("IDLE"), a host with free slots in a lane while
+another host has a backlog there, lane jobs older than their class age limit (enqueue to now: gates 240, jobs 120, land 240
+min), and an old-script queue (linux2 `run.sh`, linux1 `heavy.sh`) with waiters while it runs fewer than `legacy_slots`;
+unreachable hosts and what was on them; hosts over their margins; idle room with ready units; orphan
 pueue jobs, tmux sessions (`orch-*`) and herdr agents that belong to no open unit; blocked, finished or silent units;
 disabled providers in use; caps exceeded; spend at a provider's cap; failed gates (last 12 hours) and the same test failing
 in two or more gates; uncommitted or unpushed git work; unclassified owner instructions; a stale handoff; the watcher not
@@ -175,7 +184,8 @@ closed
 ```
 
 **`orch commit-state [-m msg] [--dry-run]`**: scans the files git would add (modified and untracked, minus ignored) for
-secrets: Anthropic, OpenRouter, GitHub and Slack token prefixes and private-key headers. On a hit it refuses and lists
+secrets: Anthropic, OpenRouter, GitHub and Slack token prefixes followed by a realistic token length (20+ characters of
+`[A-Za-z0-9_-]` for `sk-` and `ghp_`, 10+ for `xox`), and private-key headers. A bare prefix mention passes. On a hit it refuses and lists
 the paths, never the values. Otherwise it runs `git add -A`, `git commit` and `git push`.
 
 **`orch ack <key> "<decision>"`**: acknowledges a problem for 4 hours and records the decision as a beads comment (on the
@@ -239,7 +249,8 @@ is 5 or more, or disk is under `min_disk_gb` (not for a `cleanup` unit). Caps re
 Work belongs to the machine's own queue, not to an ssh session:
 - **pueue** runs on each machine (launchd/brew on the Mac, a user systemd service on Linux hosts). API agents run as
   tasks in the `agents` group and keep running if ssh drops. `orch check` also adjusts the `jobs` group's parallel limit
-  from measured room (at least 1, at most `cores`).
+  from measured room (at least 1, at most `cores`), and the `agents` group's from (avail - reserve) / `agent_gb` plus running
+  agents, capped by `[caps]`.
 - **tmux** holds interactive remote agents (session `orch-<unit>`); the herdr tab only attaches to it with
   `ssh -t host tmux attach`, so a dropped view does not stop the agent.
 - **systemd-run** with `MemoryMax` (from `memory_max`) wraps remote API agent tasks, so the kernel stops one that outgrows
@@ -252,6 +263,46 @@ failed. When the host returns, `check` reports finished units and `orch collect 
 
 Remote API agents read the key from the macOS keychain item `orch-anthropic-api` and pass it over ssh stdin into a
 private fifo; it is never written to a file or command line. Remote API agents need `claude` on the host.
+
+## 7a. Build and test jobs: `orch run`, `orch gate`, `orch collect <host>:<task>`
+
+One way to run a build or test job on any machine: that machine's pueue, never an ssh connection.
+
+**`orch run --host <h> --lane gates|jobs|land [--unit <u>] --wt <worktree> [--subdir <d>] [--usb] [--priority N] [--no-wait] -- <cmd>`**
+- syncs the worktree to a Linux host as the old `linux-test.sh`/`linux2-test.sh` did: `rsync -rlpgoD --checksum --delete`
+  with no `-t` (a changed file gets the transfer time as its mtime, so cargo never reuses an artifact built from older
+  content), no `.git` or build output; linux2 first reflink-clones `/srv/app-fleet/base`. It checks that
+  `reviews/dispatch-evidence` arrived when the worktree has it.
+- writes the job as `<root>/runs/<jid>.sh` and queues it in the host's pueue group: `gates` (priority 10) or `jobs`; `land`
+  is the Mac's landing lane (parallel 1). Groups are created on first use (`jobs` and `gates` with one slot per job cap).
+- Linux admission is by measured room (board 2026-11-11 14:44): the job waits in its pueue task, one job at a time under
+  `runs/admit.lock`, until MemAvailable >= `job_gb + reserve_gb`, memory PSI some avg10 < 5, load1 < `cores` and disk >=
+  `min_disk_gb`; an admitted job keeps the lock 60 s more so its memory shows before the next is judged. The rule lives in
+  `<root>/runs/admit.sh`, rewritten on every `orch run` and re-read by waiting jobs every 15 s, so a rule change reaches jobs
+  already waiting. `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Mac
+  land: 5 GB internal-disk floor, agent-capacity's memory check, and no old `heavy.land` lane still running.
+- runs the job in `systemd-run --user --scope -p MemoryMax=<job_gb>`: on linux1 after `build-env.sh` (sccache,
+  `app_ARAVIS_TEST_ADDRS`, `TMPDIR`, scene cache) and `uv sync` of the processing venv; on linux2 in `run.sh`'s container
+  settings (`localhost/app-build:2`, `/srv/app-fleet` at `/f`, its caches, 2 CPUs, `--memory=<job_gb>`, nice 15 and idle
+  IO; `--usb` adds the D435 devices under `run.usb.lock`). `run.sh` itself is not used or changed.
+- waits with `pueue wait` (retrying through ssh drops), prints the log and exits with the job's exit code. One command
+  argument is shell text (like the old `"$*"`); several are quoted with `shlex.join`.
+- If the caller dies the job keeps running. Its log and exit code stay in `<root>/runs/<jid>.{log,rc}` on the host;
+  **`orch collect <host>:<task>`** copies them to `.orch/runs/`, prints the log and exits with the job's code (3 while it
+  is still queued or running).
+
+**`orch gate <name> [--host h] [--priority N] [--wait]`** queues `out/<name>/tests.sh` as a `gates` task on the Mac through
+`bin/run-handoff.sh`, so the host choice, the `LINUX_TEST_FULL` rule for `land-*`/`merge-*`, the `EXIT_` parsing and the
+RESULT line in `out/handoff-results.log` are exactly as before (`orch check` and `gate-check.sh` read them). Inside it,
+`ORCH_LANE=gates` puts the gate's Linux steps in the hosts' `gates` lanes. `--wait` prints the RESULT line, exit 0 on PASS.
+
+The fleet scripts are shims over these (example-project `gate-logs/orch-20261031/bin`):
+- `linux-test.sh <wt> "<cmd>"` and `linux2-test.sh`: same arguments and exit codes; the full-suite guard (only `land-*` and
+  `merge-*` gates may run whole suites, exit 2 otherwise), `--which`, `LINUX_TEST_HOST=auto` and the D435 rule (USB jobs go to
+  linux2) run first, then `orch run` (lane `jobs`, or `gates` inside `orch gate`). Station gates stay on linux1 by the
+  `export LINUX_TEST_HOST=linux1` pin in their `tests.sh` (out/api-linux-gates/REPORT.md), which `run-handoff.sh` honours.
+- `heavy.sh` with `HEAVY_LANE=land` runs `orch run --host mac --lane land`; other heavy.sh lanes are unchanged.
+- `handoff-queue.sh` workers turn each queue file into `orch gate <job> --priority 100-rank` (linux2 queue: `--host linux2`).
 
 ## 8. Troubleshooting
 
@@ -269,6 +320,8 @@ private fifo; it is never written to a file or command line. Remote API agents n
 | `beads unavailable: ...` | `bd` is missing or `[project] beads` has no `.beads/`; run `bd init` there |
 | `watcher com.orch.watch is not running: run install` | the launchd agent is not loaded |
 | `git has no upstream: set the bare repo on linux1 and push` | the project repo has no upstream branch (the text names linux1 from the original project) |
+| `orch: waiting for admission (orch jobs A MB + old jobs B MB + this C MB > D MB ...)` (in a job log) | the job's memory cap does not fit beside the running jobs yet; it starts by itself when one ends |
+| `orch collect`: `<host>:<id> is Running, not finished` (exit 3) | collect again later; the job is still on the host |
 | `orchestrator gone; no provider enabled` (in `.orch/watch.log`) | the watcher will not start a new orchestrator unless a provider is enabled |
 
 Logs: `.orch/watch.log` (watcher), `~/.config/orch/watch.err` (launchd stderr). Hooks that fail print to stderr and let

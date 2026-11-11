@@ -23,7 +23,8 @@ def find_root(start=None):
     p = Path(start or os.getcwd()).resolve()
     for d in [p, *p.parents]:
         if (d / "orch.toml").is_file(): return d
-    return None
+    r = os.environ.get("ORCH_ROOT")   # shims (linux-test.sh, heavy.sh) run from a worktree outside the orch root
+    return Path(r).resolve() if not start and r and (Path(r) / "orch.toml").is_file() else None
 
 class Cfg:
     def __init__(self, root):
@@ -124,15 +125,29 @@ else
  echo "psi=$(awk '/^some/{sub("avg10=","",$2);print $2}' /proc/pressure/memory 2>/dev/null)"; echo "os=linux"
 fi
 d="%(root)s"; [ -d "$d" ] || d=/; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
+%(extra)s
 echo "--pueue"; %(pueue)s status --json 2>/dev/null
 echo "--tmux"; tmux ls -F '#S' 2>/dev/null; true'''
+
+PROBE_LEGACY = {   # jobs of the old scripts: waiting and running, so a jammed old queue shows in orch check
+    "runsh": 'echo "legacy_wait=$(ls /srv/app-fleet/queue 2>/dev/null | wc -l)"; echo "legacy_run=$(podman ps -q --filter name=app-run- 2>/dev/null | wc -l)"',
+    "heavy": 'r=$(stat -c "%i %n" $HOME/app-fleet/heavy*.lock 2>/dev/null | awk \'$2 !~ /admit/ {print $1}\' | awk \'NR == FNR {l[$1]; next} $2 == "FLOCK" {split($6, f, ":"); if (f[3] in l) n++} END {print n+0}\' - /proc/locks); '
+             'a=$(pgrep -fc "^/bin/bash $HOME/app-fleet/bin/heavy.sh"); echo "legacy_run=$r"; echo "legacy_wait=$((a > r ? a - r : 0))"',
+}
+
+def probe_extra(h):
+    """Running orch jobs still waiting in their admission (per lane), and the old scripts' queue."""
+    rd = "$HOME/.orch-none" if h.get("local") else f"{h.get('root', '/tmp')}/runs"
+    w = (f'g=0; j=0; for f in {rd}/*.gwait {rd}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
+         f'case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; done; echo "wait_gates=$g"; echo "wait_jobs=$j"')
+    return w + "\n" + PROBE_LEGACY.get(h.get("legacy", ""), "")
 
 def pueue(h):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
     return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
 def probe(name, h):
-    rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": h.get("root", "/"), "pueue": pueue(h)}, timeout=20)
+    rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": h.get("root", "/"), "pueue": pueue(h), "extra": probe_extra(h)}, timeout=20)
     if rc: return {"name": name, "ok": False, "err": (e or o).strip().splitlines()[-1][:80] if (e or o).strip() else f"rc {rc}"}
     head, _, rest = o.partition("--pueue\n"); pj, _, tm = rest.partition("--tmux\n")
     p = {"name": name, "ok": True, "tmux": tm.split()}
@@ -304,7 +319,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} but {ready} unit(s) are ready: orch launch"))
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
-            if k in ("Running", "Queued") and t.get("label") not in names:
+            if k in ("Running", "Queued") and t.get("label") not in names and not (t.get("group") in LANES and ":" in (t.get("label") or "")):
                 F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({t.get('label') or t.get('command', '')[:40]}) has no open unit"))
         for s in p.get("tmux", []):
             if s.startswith("orch-") and s[5:] not in names: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit"))
@@ -335,6 +350,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         k = sum(1 for u in units if u.get("host") == n)
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
     F += gate_findings(cfg)
+    F += lane_findings(cfg, hs)
     rc, o, e = sh(["git", "status", "--porcelain"], cwd=cfg.root)
     if rc == 0:
         if o.strip(): F.append(("git:dirty", f"{len(o.splitlines())} uncommitted path(s) in {cfg.root.name}"))
@@ -352,14 +368,22 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     return F
 
 def tune_pueue(cfg, hs, units):
-    """Set each reachable host's job-lane parallel limit from measured room (kept at least 1)."""
+    """Set each reachable host's jobs and agents parallel limits from measured room (kept at least 1). jobs: running jobs plus
+    (avail - reserve) / job_gb, capped by cores (each job still passes its own measured admission). agents: running agents plus (avail - reserve) /
+    agent_gb, capped by the owner's caps (caps.host, and caps.total minus the agents on other hosts)."""
+    caps = cfg.caps
     for n, p in hs.items():
         t = p.get("pueue")
         if not p["ok"] or not t: continue
-        h = cfg.hosts[n]; g = (t.get("groups") or {}).get("jobs")
-        running = sum(1 for x in (t.get("tasks") or {}).values() if x.get("group") == "jobs" and "Running" in str(x.get("status")))
-        want = max(1, min(h.get("cores", 4), running + int((fl(p.get("avail_mb")) / 1024 - h.get("reserve_gb", 2)) // h.get("job_gb", 2))))
-        if g and g.get("parallel_tasks") != want: hrun(h, f"{pueue(h)} parallel -g jobs {want}")
+        h = cfg.hosts[n]; groups = t.get("groups") or {}; free = fl(p.get("avail_mb")) / 1024 - h.get("reserve_gb", 2)
+        run = lambda grp: sum(1 for x in (t.get("tasks") or {}).values() if x.get("group") == grp and "Running" in str(x.get("status")))
+        want = {"jobs": min(h.get("cores", 4), run("jobs") + int(free // h.get("job_gb", 2))),
+                "agents": run("agents") + int(free // h.get("agent_gb", 1.0))}
+        if caps.get("host", {}).get(n) is not None: want["agents"] = min(want["agents"], caps["host"][n])
+        if caps.get("total") is not None: want["agents"] = min(want["agents"], caps["total"] - sum(1 for u in units if u.get("host") != n))
+        for grp, w in want.items():
+            w = max(1, w); g = groups.get(grp)
+            if g and g.get("parallel_tasks") != w: hrun(h, f"{pueue(h)} parallel -g {grp} {w}")
 
 def live_state(cfg, hs, units, F):
     L = ["## Live state (" + ts() + ")", "Hosts:"] + ["- " + cap_line(cfg, n, p, units) for n, p in hs.items()]
@@ -470,10 +494,6 @@ def new_tab(cfg, label, cwd):
     r = herdr("tab", "create", *(["--workspace", ws] if ws else []), "--label", label, "--cwd", str(cwd))
     if not r: raise Err("herdr tab create failed")
     return r["root_pane"]["pane_id"], r["tab"].get("tab_id")
-
-def ensure_lanes(h):
-    p = pueue(h)
-    return f"{p} group add agents >/dev/null 2>&1; {p} group add jobs >/dev/null 2>&1; true"
 
 def wrap(h, cmd, unit_mem=None):
     mm = h.get("memory_max")
@@ -603,6 +623,7 @@ def cmd_stop(cfg, a):
     bd.comment(u["id"], f"{ts()} stopped"); cfg.touch("changed"); say("stopped")
 
 def cmd_collect(cfg, a):
+    if ":" in a.unit: return collect_job(cfg, a.unit)
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]
     if h.get("local"): say("local unit: nothing to collect"); return
     root = h["root"]; rsh = " ".join(SSH)
@@ -636,7 +657,262 @@ def cmd_close(cfg, a):
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
     say("closed")
 
-SECRETS = [re.compile(x.encode()) for x in ("sk" + "-ant-", "sk" + "-or-", "gh" + "p_", "xo" + "x", "BEGIN (\\w+ )?PRIV" + "ATE KEY")]
+# ---------------------------------------------------------------- run / gate: build and test jobs in each host's own pueue
+# A job belongs to the host's pueue daemon, never to the ssh connection that queued it: if the caller dies the job keeps running,
+# and its log and exit code stay under <root>/runs/<jid>.{log,rc} on that host for `orch collect <host>:<task>`.
+LANES = ("gates", "jobs", "land")
+AGE_MIN = {"gates": 240, "jobs": 120, "land": 240}   # class age limits (minutes from enqueue); orch.toml [lanes.<lane>] age_min overrides
+LSSH = [*SSH, "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
+
+def lane_age(cfg, lane): return cfg.c.get("lanes", {}).get(lane, {}).get("age_min", AGE_MIN.get(lane, 120))
+
+def slots(h):
+    """Job caps that fit on the host: (RAM minus measured service use) // job_gb, at least 1."""
+    return max(1, int((h.get("ram_gb", 4) - h.get("services_gb", 0)) // h.get("job_gb", 2)))
+
+def ensure_lanes(h):
+    p = pueue(h); n = slots(h)
+    g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1} if h.get("local") else {})
+    return "; ".join(f"{p} group add -p {k} {g_} >/dev/null 2>&1" for g_, k in g.items()) + "; true"
+
+def runs_dir(cfg, h): return str(cfg.f("runs")) if h.get("local") else f"{h['root']}/runs"
+
+ADMIT_LIB = r'''# orch admission (written by orch run on every call; each waiting job re-reads it every 15 s, so a rule change reaches
+# jobs already waiting). Admit while measured MemAvailable >= job_gb + reserve_gb, memory PSI some avg10 < 5, load1 < cores and
+# disk >= min_disk_gb (board 2026-11-11 14:44: measured room, not reservations; MemoryMax per job is only the runaway guard).
+admit_ok() {
+  avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+  psi=$(awk '/^some/{sub("avg10=","",$2); print int($2)}' /proc/pressure/memory 2>/dev/null); psi=${psi:-0}
+  load=$(cut -d. -f1 /proc/loadavg)
+  d=$(df -Pk $RD | awk 'NR==2{print int($4/1048576)}')
+  why="MemAvailable ${avail} MB (need ${need_mb}), PSI ${psi}, load ${load} (cores ${cores}), disk ${d} GB (floor ${mindisk})"
+  [ "$avail" -ge "$need_mb" ] && [ "$psi" -lt 5 ] && [ "$load" -lt "$cores" ] && [ "$d" -ge "$mindisk" ]
+}
+'''
+
+ADMIT_LINUX = r'''# Admission: one job at a time under admit.lock, by the rule in runs/admit.sh (re-read each poll). An admitted job keeps the lock
+# for 60 s after its scope exists, so its memory shows in MemAvailable before the next job is judged. A jobs-lane job yields
+# while a gates-lane job waits.
+need_mb=%(need)d cores=%(cores)d lane=%(lane)s mindisk=%(disk)d
+AS=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice
+gates_waiting() { for f in $RD/*.gwait; do [ -e "$f" ] && kill -0 "$(cat $f)" 2>/dev/null && return 0; done; return 1; }
+W=$R.wait; [ $lane = gates ] && W=$R.gwait; echo $$ > $W
+exec 7>>$RD/admit.lock
+while :; do
+  if [ $lane = gates ] || ! gates_waiting; then
+    flock 7
+    . $RD/admit.sh
+    admit_ok && break
+    [ "$said" = "$why" ] || { echo "orch: waiting for admission: $why"; said=$why; }
+    flock -u 7
+  fi
+  sleep 15
+done
+rm -f $W
+echo "orch: admitted: $why"
+started() { for i in $(seq 20); do [ -d $AS/orch-%(jid)s.scope ] && break; kill -0 $1 2>/dev/null || break; sleep 1; done
+  sleep 60 </dev/null >/dev/null 2>&1 & exec 7>&-; }
+'''
+
+def job_script(cfg, hn, h, a, name, cmd, jid):
+    """The bash script pueue runs on the host. Output is tee'd to <runs>/<jid>.log, the exit code written to <jid>.rc."""
+    q = shlex.quote; rd = runs_dir(cfg, h); sub = a.subdir or "."
+    head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={q(rd)}; R=$RD/{jid}\n"
+    if h.get("local"):
+        adm = ""
+        if a.lane == "land":   # Mac landing lane: the 5 GB internal-disk floor and agent-capacity's memory check, as heavy.sh's land lanes had
+            ck = h.get("admit_check", ""); base = h.get("legacy_lanes", "")
+            adm = (f"said=\nwhile :; do d=$(/bin/df -g /Users | awk 'NR==2{{print $4}}'); busy=\n"
+                   f"  for s in {base}; do o=$(cat $s/pid 2>/dev/null); [ -n \"$o\" ] && kill -0 $o 2>/dev/null && busy=$s; done\n"
+                   f"  [ \"$d\" -ge {h.get('min_disk_gb', 5)} ] && {{ [ -z {q(ck)} ] || app_FAKE_FREE_DISK_GB=99 sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
+                   f"  [ \"$said\" ] || {{ echo \"orch: land lane waiting (disk ${{d}} GB, floor {h.get('min_disk_gb', 5)}; old lane busy: ${{busy:-none}})\"; said=1; }}; sleep 15; done\n")
+        body = f"{adm}cd {q(str(Path(a.wt).resolve()))} && cd {q(sub)} || exit $?\nnice -n 10 bash -c {q(cmd)}\n"
+    else:
+        cap = int(h.get("job_gb", 2) * 1024)
+        adm = ADMIT_LINUX % {"need": int((h.get("job_gb", 2) + h.get("reserve_gb", 2)) * 1024), "cores": h.get("cores", 4),
+                             "lane": a.lane, "disk": h.get("min_disk_gb", 10), "jid": jid}
+        scope = f"systemd-run --user --scope -q --unit=orch-{jid} -p MemoryMax={cap}M --"
+        if h.get("runner") == "podman":   # linux2: run.sh's container settings, the job capped at job_gb (run.sh is not used)
+            F = h.get("fleet", "/srv/app-fleet"); inner = f"(cd processing && uv sync --locked -q) && cd {sub} && {cmd}"
+            hw = ("--device /dev/bus/usb --group-add keep-groups --mount type=tmpfs,destination=/run/app,tmpfs-mode=0700,chown=true " if a.usb else "")
+            body = (f"[ -d {F}/worktrees/{name} ] || {{ echo 'orch: no worktree {name} on {hn}'; exit 2; }}\nmkdir -p {F}/tmp/{name}\n"
+                    + (f"exec 8>{F}/run.usb.lock; flock 8\n" if a.usb else "") + adm +
+                    f"printf '%s orch-run start [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {F}/log/fleet.log\n"
+                    f"{scope} nice -n 15 ionice -c 3 podman run --rm --init --name orch-run-{jid} {hw}"
+                    f"--memory={cap}m --memory-swap={cap}m --cpus=2 --pids-limit=4096 --cpu-shares=256 --userns=keep-id --security-opt label=disable "
+                    f"--tmpfs /dev/shm:rw,exec,nosuid,nodev,size=2g -v {F}:/f -w /f/worktrees/{name} -e CARGO_HOME=/f/cache/cargo -e RUSTC_WRAPPER=sccache "
+                    f"-e SCCACHE_DIR=/f/cache/sccache -e SCCACHE_CACHE_SIZE=8G -e CARGO_BUILD_JOBS=2 -e UV_CACHE_DIR=/f/cache/uv -e npm_config_store_dir=/f/cache/pnpm "
+                    f"-e TMPDIR=/f/tmp/{name} -e app_SCENE_CACHE=/f/cache/scenes -e PATH=/f/cache/cargo/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin "
+                    f"{h.get('image', 'localhost/app-build:2')} bash -c {q(inner)} 7>&- &\npid=$!; started $pid; wait $pid; rc=$?\n"
+                    f"printf '%s orch-run end [%s] {jid} exit %s\\n' \"$(date '+%F %T')\" {name} $rc >> {F}/log/fleet.log\nexit $rc\n")
+        else:   # linux1: build-env.sh (sccache, app_ARAVIS_TEST_ADDRS, TMPDIR, scene cache) and the processing venv, as linux-test.sh did
+            wd = f"{h.get('worktrees', '$HOME/app-fleet/worktrees')}/{name}"
+            body = (f"{h.get('run_env', '')}\ncd {wd} && (cd processing && uv sync --locked -q) && cd {q(sub)} || exit $?\n" + adm +
+                    f"printf '%s orch-run [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {h.get('fleet_log', '/dev/null')}\n"
+                    f"{scope} nice -n 10 bash -c {q(cmd)} 7>&- &\npid=$!; started $pid; wait $pid\n")
+    return head + "main() {\n" + body + "}\nmain 2>&1 | tee -a $R.log\nrc=${PIPESTATUS[0]}; echo $rc > $R.rc; exit $rc\n"
+
+def sync_wt(cfg, hn, h, src, name):
+    """Sync a Mac worktree to the host as linux-test.sh / linux2-test.sh did: --checksum and no -t (failure class 45: a changed file
+    gets the transfer time as its mtime, so cargo never reuses an artifact built from older content), no .git or build output.
+    Nested folders named like build output (reviews/dispatch-evidence and its neighbours) are synced: excludes are anchored."""
+    ex = ["--exclude", "/target", "--exclude", "/processing/.venv", "--exclude", "/station/web/node_modules", "--exclude", ".git"]
+    if h.get("runner") == "podman":
+        F = h.get("fleet", "/srv/app-fleet"); dst = f"{F}/worktrees/{name}"
+        rc, o, e = hrun(h, f"[ -d {dst} ] || cp -a --reflink=always {F}/base {dst}", timeout=300)
+        if rc: raise Err(f"reflink clone on {hn} failed: {(e or o).strip()[-120:]}")
+    else:
+        dst = f"{h.get('worktrees', 'app-fleet/worktrees').replace('$HOME/', '')}/{name}"
+        ex = ["--exclude", "target", "--exclude", ".venv", "--exclude", "node_modules", "--exclude", ".git"]   # linux1: exactly linux-test.sh's set
+    cmd = ["rsync", "-rlpgoD", "--checksum", "--delete", "-e", " ".join(SSH), *ex, f"{src}/", f"{h['ssh']}:{dst}/"]
+    r = subprocess.run(cmd)
+    if r.returncode: raise Err(f"rsync to {hn} failed (exit {r.returncode})")
+    if (Path(src) / "reviews/dispatch-evidence").exists():
+        rc, *_ = hrun(h, f"test -e {dst}/reviews/dispatch-evidence")
+        if rc: raise Err(f"reviews/dispatch-evidence did not arrive on {hn} (class 63)")
+
+def task_status(h, tid):
+    rc, o, e = hrun(h, f"{pueue(h)} status --json", timeout=30)
+    if rc: return None
+    try: return (json.loads(o).get("tasks") or {}).get(str(tid))
+    except Exception: return None
+
+def task_rc(t):
+    s = (t or {}).get("status"); k = s if isinstance(s, str) else next(iter(s or {}), "")
+    if k != "Done": return None
+    r = s["Done"].get("result") if isinstance(s, dict) else None
+    if r == "Success": return 0
+    if isinstance(r, dict) and "Failed" in r: return int(r["Failed"])
+    return 137 if r == "Killed" else 1
+
+def finish_job(cfg, hn, h, tid, jid, quiet=False):
+    """Wait for the task (retrying through ssh drops), print its log, return its exit code."""
+    while True:
+        if h.get("local"): rc = subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {tid}"]).returncode
+        else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h)} wait -q {tid}"], stdin=subprocess.DEVNULL).returncode
+        t = task_status(h, tid)
+        if task_rc(t) is not None: break
+        print(f"orch: {hn} task {tid} not done yet (wait exit {rc}); retrying", file=sys.stderr); time.sleep(30 if rc == 255 or t is None else 5)
+    rd = runs_dir(cfg, h)
+    if not quiet:
+        if h.get("local"): subprocess.run(["cat", f"{rd}/{jid}.log"])
+        else: subprocess.run([*LSSH, h["ssh"], f"cat {rd}/{jid}.log"], stdin=subprocess.DEVNULL)
+    rc, o, e = hrun(h, f"cat {rd}/{jid}.rc 2>/dev/null")
+    try: return int(o.strip())
+    except ValueError: return task_rc(t)
+
+def cmd_run(cfg, a):
+    hn = a.host
+    if hn not in cfg.hosts: raise Err(f"unknown host {hn}")
+    h = cfg.hosts[hn]
+    if a.lane == "land" and not h.get("local"): raise Err("the land lane is the Mac's")
+    cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
+    if not cmd: raise Err("no command")
+    cmd = cmd[0] if len(cmd) == 1 else shlex.join(cmd)   # one argument is shell text, as linux-test.sh's "$*" was
+    src = str(Path(a.wt).resolve()); name = Path(src).name
+    if not Path(src).is_dir(): raise Err(f"worktree {src} not found")
+    unit = a.unit or os.environ.get("ORCH_UNIT")
+    jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
+    if DRY: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
+    if not h.get("local"): sync_wt(cfg, hn, h, src, name)
+    rd = runs_dir(cfg, h)
+    if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True)
+    rc, o, e = hrun(h, f"mkdir -p {rd} && cat > {rd}/{jid}.sh && {ensure_lanes(h)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
+    if not rc and not h.get("local"):
+        rc, o, e = hrun(h, f"cat > {rd}/.admit.sh.$$ && mv {rd}/.admit.sh.$$ {rd}/admit.sh", inp=ADMIT_LIB)
+    if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
+    label = unit or f"run:{name}"
+    rc, o, e = hrun(h, f"{pueue(h)} add -g {a.lane} -l {shlex.quote(label)} -w {rd} --print-task-id"
+                       + (f" -o {a.priority}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- bash {rd}/{jid}.sh")
+    if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
+    tid = o.strip()
+    print(f"orch: queued {hn}:{tid} ({a.lane}, {label}) job {jid}; collect with: orch collect {hn}:{tid}", file=sys.stderr)
+    if a.no_wait: say(f"{hn}:{tid}"); return
+    return finish_job(cfg, hn, h, tid, jid)
+
+def job_of(t):
+    m = re.search(r"/runs/([^/ ]+)\.sh", (t or {}).get("command", ""))
+    return m.group(1) if m else None
+
+def collect_job(cfg, ref):
+    hn, _, tid = ref.partition(":")
+    if hn not in cfg.hosts or not tid.isdigit(): raise Err("expected <host>:<task id>")
+    h = cfg.hosts[hn]; t = task_status(h, tid)
+    if t is None: raise Err(f"no task {tid} on {hn} (unreachable, or cleaned)")
+    jid = job_of(t); rc = task_rc(t)
+    if rc is None: say(f"{hn}:{tid} is {next(iter(t['status'])) if isinstance(t['status'], dict) else t['status']}, not finished"); return 3
+    local = cfg.f("runs"); local.mkdir(exist_ok=True)
+    if jid and not h.get("local"):
+        r = sh(["rsync", "-a", "-e", " ".join(SSH), f"{h['ssh']}:{runs_dir(cfg, h)}/{jid}.*", f"{local}/"], timeout=300)
+        if r[0]: raise Err(f"copy from {hn} failed: {r[2].strip()[-120:]}")
+    if jid and (local / f"{jid}.log").exists(): sys.stdout.write((local / f"{jid}.log").read_text())
+    try: rc = int((local / f"{jid}.rc").read_text().strip())
+    except Exception: pass
+    say(f"orch: {hn}:{tid} ({t.get('label')}) exit {rc}; files in {local}/{jid}.*")
+    return rc
+
+GATE_LINE = re.compile(r"^\S+ \S+ (\S+) .*RESULT: (\S+)")
+
+def cmd_gate(cfg, a):
+    """Run out/<name>/tests.sh as a gates-lane task on the Mac, through run-handoff.sh (same host choice, LINUX_TEST_FULL rule,
+    EXIT_ parsing and RESULT line in out/handoff-results.log, so orch check and the gate checker read it as before)."""
+    out = cfg.p("out", "out"); t = out / a.name / "tests.sh"
+    if not t.is_file(): raise Err(f"{t} not found")
+    h = cfg.hosts[next(n for n, x in cfg.hosts.items() if x.get("local"))]
+    env = {"ORCH_LANE": "gates", "ORCH_ROOT": str(cfg.root)} | ({"LINUX_TEST_HOST": a.host} if a.host else {})
+    pre = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+    rh = cfg.root / cfg.paths.get("run_handoff", "bin/run-handoff.sh")
+    X(h, ensure_lanes(h))
+    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l gate:{a.name} -w {shlex.quote(str(cfg.root))} --print-task-id -o {a.priority} -- {shlex.quote(str(rh))} {a.name}")
+    if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
+    if DRY: return
+    tid = o.strip(); say(f"queued gate {a.name} as mac:{tid}")
+    if not a.wait: return
+    subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {tid}"])
+    lines = [l for l in cfg.p("gate_log").read_text().splitlines() if (m := GATE_LINE.match(l)) and m.group(1) == a.name]
+    say(lines[-1] if lines else f"no RESULT line for {a.name}")
+    return 0 if lines and lines[-1].endswith("RESULT: PASS") else 1
+
+def lane_findings(cfg, hs):
+    """Per host and lane: queued work with free slots (stalled), queued work while the host has room (idle), a host with free
+    slots while another waits, and jobs over their class age limit."""
+    F, free, backlog = [], {}, {}
+    for n, p in hs.items():
+        t = p.get("pueue")
+        if not p["ok"] or not t: continue
+        h = cfg.hosts[n]; groups = t.get("groups") or {}; tasks = list((t.get("tasks") or {}).values())
+        for lane in LANES:
+            g = groups.get(lane)
+            if not g: continue
+            mine = [x for x in tasks if x.get("group") == lane]
+            st = lambda x: x["status"] if isinstance(x["status"], str) else next(iter(x["status"]))
+            q = [x for x in mine if st(x) == "Queued"]; r = [x for x in mine if st(x) == "Running"]; par = g.get("parallel_tasks", 1)
+            wt = int(p.get(f"wait_{lane}", 0) or 0)   # running tasks still waiting in orch's own admission
+            if q and (g.get("status") != "Running" or len(r) < par):
+                F.append((f"stalled:{n}:{lane}", f"{n} {lane} STALLED: {len(q)} queued, {len(r)} of {par} slots running, group {g.get('status')}"))
+            elif (q or wt) and len(r) - wt < slots(h) and (h.get("local") or fl(p.get("avail_mb")) / 1024 - h.get("reserve_gb", 2) >= h.get("job_gb", 2)):
+                F.append((f"idle:{n}:{lane}", f"{n} {lane} IDLE: {len(q)} queued, {wt} waiting for admission, {len(r) - wt} running, room for more"))
+            if q: backlog.setdefault(lane, []).append(n)
+            elif len(r) < par: free.setdefault(lane, []).append(n)
+            for x in mine:
+                s = x["status"]; info = s.get(st(x), {}) if isinstance(s, dict) else {}
+                try: since = time.mktime(time.strptime(info.get("enqueued_at", "")[:19], "%Y-%m-%dT%H:%M:%S"))
+                except ValueError: continue
+                if st(x) in ("Queued", "Running") and now() - since > lane_age(cfg, lane) * 60:
+                    F.append((f"age:{n}:{x['id']}", f"{n}:{x['id']} {lane} {x.get('label')} {st(x).lower()} {int((now() - since) / 60)} min, over the {lane_age(cfg, lane)} min limit"))
+        lg, lr = int(p.get("legacy_wait", 0) or 0), int(p.get("legacy_run", 0) or 0)
+        if lg and lr < h.get("legacy_slots", 3):
+            F.append((f"stalled:{n}:legacy", f"{n} old-script queue STALLED: {lg} waiting, {lr} of {h.get('legacy_slots', 3)} running (its own admission holds them)"))
+    for lane, ns in backlog.items():
+        for f in free.get(lane, []):
+            if cfg.hosts[f].get("local") == cfg.hosts[ns[0]].get("local") and not (lane == "land"):
+                F.append((f"idle:{f}:{lane}:vs", f"{f} has free {lane} slots while {', '.join(ns)} has a backlog"))
+    return F
+
+SECRETS = [re.compile(x.encode()) for x in ("sk" + "-ant-[A-Za-z0-9_-]{20,}", "sk" + "-or-[A-Za-z0-9_-]{20,}", "gh" + "p_[A-Za-z0-9_-]{20,}", "xo" + "x[A-Za-z0-9_-]{10,}",
+    # a real PEM block only: the dashed BEGIN line, then a base64 line (a mention of the words in prose is not a key)
+    "-----" + "BEGIN( [A-Z0-9]+)* PRIV" + "ATE KEY-----\\r?\\n[A-Za-z0-9+/=]{16,}\\r?$")]
+SECRETS[-1] = re.compile(SECRETS[-1].pattern, re.M)
 
 def cmd_commit_state(cfg, a):
     rc, o, e = sh(["git", "ls-files", "-m", "-o", "--exclude-standard", "-z"], cwd=cfg.root)
@@ -776,7 +1052,13 @@ def main():
     add("launch", A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
         A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"), A("--of", help="unit whose implementer's vendor a review must avoid"), dry=True)
     add("stop", A("unit"), dry=True)
-    add("collect", A("unit"), dry=True)
+    add("collect", A("unit", help="a unit, or <host>:<task id> for an orch run job"), dry=True)
+    add("run", A("--host", required=True), A("--lane", choices=LANES, default="jobs"), A("--unit"), A("--wt", required=True),
+        A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="D435 job (linux2)"),
+        A("--priority", type=int, default=0), A("--no-wait", action="store_true", help="queue, print <host>:<task>, return"),
+        A("command", nargs=argparse.REMAINDER), dry=True)
+    add("gate", A("name"), A("--host", help="LINUX_TEST_HOST for the whole gate"), A("--priority", type=int, default=10),
+        A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"), dry=True)
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
     add("commit-state", A("-m", "--message", default="orch: state"), dry=True)
     add("ack", A("problem"), A("decision"))
@@ -791,8 +1073,8 @@ def main():
     root = find_root()
     if not root: print("orch: no orch.toml here or in a parent", file=sys.stderr); return 2
     cfg = Cfg(root)
-    try: globals()["cmd_" + a.cmd.replace("-", "_")](cfg, a)
+    try: r = globals()["cmd_" + a.cmd.replace("-", "_")](cfg, a)
     except Err as e: print(f"orch: {e}", file=sys.stderr); return 1
-    return 0
+    return r if isinstance(r, int) else 0
 
 if __name__ == "__main__": sys.exit(main())
