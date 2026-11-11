@@ -143,12 +143,13 @@ laptop room=2 avail=9.4G load=2.10 psi=- disk=80G agents=1
 server room=0 avail=3.1G load=1.20 psi=0.00 disk=60G agents=2 FULL: memory 3.1G free, reserve 3G
 ```
 
-**`orch launch <unit> --kind implement|review|audit [--tier critical|normal] [--host h] [--model m] [--brief f] [--cwd d] [--budget usd] [--of unit] [--dry-run]`**
+**`orch launch <unit> --kind implement|review|audit|cleanup [--tier critical|normal] [--host h] [--model m] [--brief f] [--cwd d] [--budget usd] [--of unit] [--dry-run]`**
 ```
 $ orch launch parser --kind implement --tier normal
 launch parser: model=codex host=laptop cwd=/proj/worktrees/parser
 launched parser on laptop via herdr
 ```
+A `cleanup` unit frees disk, so `min_disk_gb` does not refuse it; every other limit (load, memory, caps) still applies.
 It picks the model from `[routing]`, the host with the most room (or `--host`), syncs the worktree and brief to a remote
 host with rsync, starts the agent, records the unit as a beads issue and posts to the board. It refuses with
 `orch: refused, no host has room (...)` when nothing fits. The unit name must match `[a-z][a-z0-9_-]{0,31}` and the brief
@@ -173,6 +174,10 @@ close parser
 closed
 ```
 
+**`orch commit-state [-m msg] [--dry-run]`**: scans the files git would add (modified and untracked, minus ignored) for
+secrets: Anthropic, OpenRouter, GitHub and Slack token prefixes and private-key headers. On a hit it refuses and lists
+the paths, never the values. Otherwise it runs `git add -A`, `git commit` and `git push`.
+
 **`orch ack <key> "<decision>"`**: acknowledges a problem for 4 hours and records the decision as a beads comment (on the
 unit's issue for `unit:<name>:...` keys, otherwise on an `orch: decisions` issue).
 ```
@@ -192,8 +197,8 @@ registered orchestrator session; agents started by `orch launch` run with `ORCH_
 | Event | Orchestrator | Why |
 |---|---|---|
 | SessionStart | injects HANDOFF.md, `bd prime` (standing rules), and the `orch check` output | a fresh or cleared session resumes without being re-told |
-| UserPromptSubmit | files the prompt as a beads issue labelled `instruction` (except the watcher's wake prompt) | nothing the owner says is lost; `check` lists it until closed or turned into a rule |
-| PreToolUse | denies shell commands matching: `rm -r`, `kill`/`pkill`/`killall`, `sed -i`/`perl -i`, `sparse-checkout`, `for`/`while` loops mentioning worktrees, `ssh` with a destructive command. Commands starting with `orch`, `bd`, `pueue`, `herdr` or `board.sh` pass. File edits are allowed only under the state dir, the briefs dir and `orch.toml`; `apply_patch` is always denied | the orchestrator orchestrates; changes go through `orch` or an agent |
+| UserPromptSubmit | files the prompt as a beads issue labelled `instruction` (except the scheduled `orch cycle:` prompt, the watcher's wake text, and background-task notifications containing `<task-notification>` or `[SYSTEM NOTIFICATION`) | nothing the owner says is lost; `check` lists it until closed or turned into a rule |
+| PreToolUse | denies shell commands matching: `rm -r`, `kill`/`pkill`/`killall`, `sed -i`/`perl -i`, `sparse-checkout`, `for`/`while` loops over worktrees that change things (`rm`, `mv`, `cp`, in-place `sed`/`perl`, `git add/commit/push/reset/checkout`, `kill`, or redirection into the target; read-only loops such as `du`, `ls`, `head`, `cat`, `rg`, `git status/log` pass), `ssh` with a destructive command. The `sed -i` rule ignores those words when they are only text in a heredoc written to a file under `briefs/` or `out/`. Commands starting with `orch`, `bd`, `pueue`, `herdr` or `board.sh` pass. File edits are allowed only under the state dir, the briefs dir and `orch.toml`; `apply_patch` is always denied | the orchestrator orchestrates; changes go through `orch` or an agent |
 | Stop | blocks going idle while a problem is unacknowledged past `deadline_min`, or the handoff notes are stale | keeps it working and the notes current. After 3 blocks in a row it lets go, so it cannot loop forever |
 
 Agents: their Stop is blocked until `REPORT.md` (path in `ORCH_REPORT`) has line 1 no longer `VERDICT: PENDING`, a final
@@ -229,7 +234,7 @@ Agents post their progress to it; the orchestrator reads `orch` output rather th
 
 Every host in `orch.toml` can run agents. `launch` picks the host with the most room. Room is measured live: free memory
 minus `reserve_gb`, divided by `agent_gb`; a host is full when load exceeds 1.5 x `cores`, memory pressure (`psi`, Linux)
-is 5 or more, or disk is under `min_disk_gb`. Caps reduce it further. An unreachable host has room 0.
+is 5 or more, or disk is under `min_disk_gb` (not for a `cleanup` unit). Caps reduce it further. `check` reports "host over its margins" for low disk or high load even when no units are ready. On macOS the probe reads available memory from `memory_pressure` (free percentage x `hw.memsize`, falling back to `vm_stat` free + inactive + speculative pages) and load from `sysctl -n vm.loadavg`. An unreachable host has room 0.
 
 Work belongs to the machine's own queue, not to an ssh session:
 - **pueue** runs on each machine (launchd/brew on the Mac, a user systemd service on Linux hosts). API agents run as
@@ -271,24 +276,15 @@ the action through.
 
 ## Known gaps
 
+`install` has now been run (links, hooks, launchd); the Codex `/hooks` trust step is still manual.
+
 Not yet verified (from the toolkit's own test report, `out/api-orch-toolkit2/REPORT.md`):
 - A remote API agent on linux1 (only linux2 ran it; same code path).
 - `watch`: waking, restarting the orchestrator, and the context reset.
 - A full herdr-backed agent via `orch launch`, and `orch stop` of a live remote task (`pueue kill` was only tried by hand
   on the Mac).
 - A Mac-local API launch under pueue through the launcher script.
-- The real `install` (links, hooks, launchd) was not run.
 - `orch close` on a remote unit with a real git worktree.
-
-Known open items:
-- **Notifications filed as instructions:** UserPromptSubmit files every prompt except the watcher's wake text, so an
-  automatic notification becomes an `instruction` issue that must be classified.
-- **Cleanup refused by the disk floor:** `launch` refuses a host below `min_disk_gb`, so an agent meant to free disk space
-  cannot be launched there.
-- **The loop rule blocks read-only loops:** any `for`/`while` command that mentions worktrees is denied, even a harmless read.
-- **`check` can miss a host under its floor when idle:** the "over its margins" problem is raised only for low memory (below
-  60% of `reserve_gb`); low disk or high load alone are not reported, and an idle host with room is not reported without
-  ready units.
 
 Described in `docs/PLAN.md` but not in the code: moving unstarted jobs to another host after `unreachable_min`
 (the setting is read but unused), pushing state to a bare repo, wrapping tmux or herdr agents in `MemoryMax` (only remote API
