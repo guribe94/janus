@@ -135,28 +135,29 @@ WAIT_RX = re.compile(r"^[\s*>-]*WAITING\b\**:?\s*(.*)$", re.M)
 
 JOBREF = re.compile(r"(?<![\w/.-])([A-Za-z0-9][\w.-]*):(\d+)\b")
 
+LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"   # what str.splitlines breaks a line at
+ID_LIST = re.compile(r"^\s*(?:[-*+>]|\d+[.)])?[\s,;&`*]*(?:(?:[A-Za-z0-9][\w.-]*:\d+|and)[\s,;&`*]*)+$")   # a line of job ids and nothing else
+
 def park_jobs(cfg, text):
     """(line index, jobs) of the report's last park line that names a job janus knows (a host in cfg.hosts): finding 1 -- the ONE
-    reader verdict and waiting_line_jobs share. The ids may sit on the park line itself or on the line(s) after it (WAIT_RX's
-    `\\s*` spans the line break), so a unit parked as `WAITING` with `here:9` on the next line is read the same either way.
+    reader verdict and waiting_line_jobs share. The ids sit on the park line itself; only when it names none are they read from
+    the line(s) after it (`WAITING` with `here:9` on the next line, `WAITING on jobs:` and a bullet or numbered LIST of ids: the
+    unit parks on all of them). Review F1 (budget-follow item 9): a following line counts only when it is a list of ids and
+    nothing else (ID_LIST), so prose that names a job (a result line `- here:3 exit 0: ...` under a park line) is never read as
+    a job to wait for. A blank line and a `Jobs:`-like header are skipped; any other line ends the list.
     Finding 5: a prose line, or a park line whose ids janus cannot read (`mac:9` for an unknown host, a bare `9`), is not a park.
-    Finding B residue 1: words after the park word (`WAITING on jobs:`) do not stop the reader -- the ids on the following lines
-    are read too. Finding B residue 2: a bullet/numbered LIST of ids parks on ALL of them. A blank line is skipped, a `Jobs:`-like
-    header is skipped, a `VERDICT:` line or a prose line ends the list. (None, []) when there is no such park line."""
+    (None, []) when there is no such park line."""
     out = (None, [])
     for m in WAIT_RX.finditer(text):
         jobs = [f"{h}:{t}" for h, t in JOBREF.findall(m.group(1)) if h in cfg.hosts]
-        # finding B residue 1: words after the park word (`WAITING on jobs:`) do not hide the ids on the following lines; read
-        # them. Finding B residue 2: a bullet/numbered LIST of ids parks on ALL of them, so keep collecting the following lines
-        # while each names a job (a blank line is skipped, a `Jobs:`-like header is skipped, a `VERDICT:` line or a prose line
-        # ends the list).
-        for line in text[m.end():].splitlines():
+        # WAIT_RX's `\s*` spans the line break: ids caught from the line AFTER the park word are the start of a list
+        gap = text[text.index("WAITING", m.start()) + 7:m.start(1)]; own = bool(jobs) and not any(c in gap for c in LINE_BREAKS)
+        for line in ([] if own else text[m.end():].splitlines()):
             st = line.strip()
             if not st: continue
             if st.startswith("VERDICT:"): break
-            found = [f"{h}:{t}" for h, t in JOBREF.findall(line) if h in cfg.hosts]
-            if found: jobs.extend(found); continue
-            if st.endswith(":"): continue               # a header like `Jobs:` before the list
+            if ID_LIST.match(line): jobs.extend(f"{h}:{t}" for h, t in JOBREF.findall(line) if h in cfg.hosts); continue
+            if st.endswith(":") and not JOBREF.search(line): continue   # a header like `Jobs:` before the list
             break
         # finding A: the line index is a splitlines index, exactly like verdict's `text.splitlines()` (a form feed, U+2028 or
         # \x1c-\x1e counts as a line break in splitlines but not in `count("\n")`, so the two indexes must use one model).

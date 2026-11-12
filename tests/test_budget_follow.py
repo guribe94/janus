@@ -360,4 +360,45 @@ class Item6Checkpoint(unittest.TestCase):
         self.assertIn(" 100", calls[0].splitlines()[-1])                  # only this run's messages (since its start)
         self.assertIn("ls -t", calls[0])                                  # a first run has no session id here yet: the tree's newest transcript
 
+class Item9ResumeFigures(unittest.TestCase):
+    """What a resumed unit is told it spent is what it spent; a result line under a park line is not a job to wait for."""
+    def setUp(self):
+        self.d, self.cfg = project(); self.pv = self.cfg.prov["api"]; self.mc = self.cfg.models["m"]
+        self.u = api_unit(self.d, state="done", run=janus.reserve_budget(self.cfg, self.mc, "u1", 4, "u1.1.100"), runs=["u1.1.100"])
+        (self.d / "out/u1").mkdir()
+
+    def test_the_resume_message_states_the_ended_runs_real_cost(self):
+        """Catches (review F10): the message a resumed unit reads was built while its ended run was still open in the ledger, so
+        the run counted at its budget: a unit that had spent $1.20 was told 'spent $4.00 of $4' and wrote 'budget used up'."""
+        m = janus.resume_message(self.cfg, {}, self.u, [])                # the run's json is not here: its cost is not known
+        self.assertNotIn("$4.00 of", m); self.assertIn("not known yet", m)
+        (self.d / "out/u1/api.json").write_text(json.dumps({"total_cost_usd": 1.2, "session_id": "S"}))
+        m = janus.resume_message(self.cfg, {}, self.u, [])
+        self.assertNotIn("$4.00 of", m); self.assertIn("used $1.20 of its $4", m)
+        with FakeHome(self.d): run_resume(self.cfg, self.u, m)            # and the run it starts is told the same figure
+        text = (self.d / "out/u1/resume-2.md").read_text()
+        self.assertNotIn("$4.00 of", text); self.assertEqual(text.count("used $1.20 of its $4"), 2)
+
+    REPORT = ("VERDICT: PENDING\nstep 2 done\nWAITING here:6 here:7\nStep 3 results (jobs finished):\n- here:6 exit 0: all green\n"
+              "- here:3 exit 0: run1..run10=0\nStep 4: next I start the last build.\n")
+
+    def test_a_result_line_under_a_park_line_is_not_a_job_to_wait_for(self):
+        """Catches (review F1): every later line naming a job was read as part of the park list, so a result line (`- here:3
+        exit 0: ...`) under an old park line parked the unit on a job it never waited for."""
+        self.assertEqual(janus.park_jobs(self.cfg, self.REPORT)[1], ["here:6", "here:7"])
+        for text, want in (("WAITING\n- here:9\n- here:10\nresult of here:3: exit 0\n", ["here:9", "here:10"]),     # a list of ids still parks on all
+                           ("WAITING on jobs:\n1. `here:9`, here:10 and here:11\n", ["here:9", "here:10", "here:11"]),
+                           ("WAITING for nothing.\n\nJobs and exit codes:\n- here:9 exit 0\n", [])):
+            self.assertEqual(janus.park_jobs(self.cfg, text)[1], want, repr(text))
+
+    def test_a_capped_run_with_results_under_its_park_line_is_wrapped_up(self):
+        """Catches (review F1, the consequence): resumed for its jobs, the run wrote their results and ended at its budget cap;
+        the result lines read as a new park, so the unit was held 'parked' and the wrap-up run never came."""
+        (self.d / "out/u1/REPORT.md").write_text(self.REPORT); (self.d / "out/u1/api.json").write_text(json.dumps({"total_cost_usd": 4.0, "session_id": "S", "subtype": "error_max_budget_usd"}))
+        u = {**self.u, "handled_jobs": ["here:6", "here:7"]}; u.pop("state")
+        hs = {"here": {"ok": True, "res": [], "hist": [], "sched": [], "direct": [], "cap_pause": "", "cap_admit": "yes", "tmux": [],
+                       "pueue": {"tasks": {"5": {"status": {"Done": {"result": "Success"}}}}}}}
+        janus.unit_findings(self.cfg, hs, [u], {})
+        self.assertNotEqual(u.get("state"), "parked", u.get("_park")); self.assertTrue(janus.wrap_due(self.cfg, u))
+
 if __name__ == "__main__": unittest.main()
