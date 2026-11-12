@@ -372,7 +372,7 @@ Work belongs to the machine's own queue, not to an ssh session:
 During an outage `check` shows `host X unreachable since <time>` and the units there; their state is "unknown", not
 failed. When the host returns, `check` reports finished units and `orch collect <unit>` pulls the results back.
 
-Remote API agents read the key from the macOS keychain item `orch-anthropic-api` and pass it over ssh stdin into a
+Remote API agents get the key from the provider's secret store (`key_keychain` / `key_file`) over ssh stdin into a
 private fifo, which the task removes after reading; it is never written to a file or command line. No `pueue add` gets the
 caller's environment (see launch), so the key never reaches pueue's state file, even when an agent that holds it in its
 environment queues a job. Remote API agents need `claude` on the host.

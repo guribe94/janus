@@ -1460,7 +1460,7 @@ def landing_findings(cfg, units, hs=None):
     F = []
     for u in units:
         v = u.get("verdict") or ""
-        if u.get("state") not in ("done", "failed", "gone", "idle") or "DONE" not in v: continue
+        if u.get("state") not in ("done", "failed", "gone", "idle") or "DONE" not in v or u.get("kind", "implement") not in ld.get("kinds", ["implement"]): continue
         try: fin = report_path(cfg, u).stat().st_mtime
         except OSError: continue
         age = (now() - fin) / 60
