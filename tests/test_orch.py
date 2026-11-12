@@ -564,7 +564,7 @@ class Report(unittest.TestCase):
 class FalseFindings(unittest.TestCase):
     """item 7: findings that were false."""
     def test_localtest_skips_a_shim_whose_child_is_orch_run(self):
-        d, cfg = project(); cfg._viol = []
+        d, cfg = project()
         shim = " 10     1    10   0.0    01:00 sh -c run-tests.sh cargo test -p x\n"
         self.assertIn("localtest:10", [k for k, _ in orch.proc_findings(cfg, shim)])          # a build outside the lanes: flagged
         child = shim + " 11    10    10   0.0    00:59 python3 /x/orch.py run --host h --wt /w -- cargo test -p x\n"
@@ -904,7 +904,7 @@ class Tidy(unittest.TestCase):
 class Fixtures(unittest.TestCase):
     """fixes10 item 6: a live check skips the suite's process fixtures (marked by their root); the suite still sees them."""
     def test_marked_processes_are_skipped_live(self):
-        d, cfg = project(); cfg._viol = []
+        d, cfg = project()
         self.assertIn(orch.FIXTURE_MARK, str(d))                          # every fixture root carries the mark
         ps = (f"501 1 501 0.0 01:00 cargo test -p x --manifest-path {d}/Cargo.toml\n"
               "502 1 502 0.0 01:00 cargo test -p y --manifest-path /w/real/Cargo.toml\n")
