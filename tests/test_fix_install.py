@@ -1733,3 +1733,33 @@ class Item35BoardAnswer(unittest.TestCase):
         d, cfg = project(); (d / "bin").mkdir(); (d / "bin/board.sh").write_text("#!/bin/sh\ncase $1 in post) ;; *) echo help;; esac\n")
         self.assertEqual([k for k, _ in janus.board_findings(cfg, set())], [f"board:stale:{d / 'bin/board.sh'}"])
         (d / "bin/board.sh").unlink(); self.assertEqual(janus.board_findings(cfg, set()), [])
+
+
+class Item36ReusedJobId(unittest.TestCase):
+    """Item 36: pueue reuses task ids; a wrapper's record names a job by id AND job id, and only that job counts."""
+    def setUp(self):
+        self.d, self.cfg = project(); (self.d / ".janus/runs/wrap").mkdir(parents=True)
+        (self.d / ".janus/runs/wrap/place-1").write_text("here:72 old-job-1\n")   # the wrapper's own job, long gone
+        self.run = {"status": {"Running": {}}}
+
+    def test_a_reused_id_of_another_unit_of_the_same_project_is_not_an_orphan(self):
+        """Catches: task 72 recorded for an old job was reused for a live review agent of the SAME project; the reused-id guard only
+        skipped other projects' tasks, so check said 'the watcher cancels it' and the watcher would have killed the live agent."""
+        live = {**self.run, "label": "unit:review@t", "command": "bash /r/runs/review-1.sh"}
+        hs = {"here": {"ok": True, "pueue": {"tasks": {"72": live}}}}
+        self.assertEqual(janus.orphan_jobs(self.cfg, hs, [{"name": "review", "via": "pueue", "state": "working"}]), [])
+        mine = {**live, "command": "bash /r/runs/old-job-1.sh"}   # the recorded job itself, still running: its wrapper ended
+        hs["here"]["pueue"]["tasks"]["72"] = mine
+        self.assertEqual([r for r, _ in janus.orphan_jobs(self.cfg, hs, [{"name": "review", "via": "pueue", "state": "working"}])], ["here:72"])
+
+    def test_cancel_does_not_follow_a_reused_id(self):
+        """Catches: cancelling a wrapper also cancelled whatever job now holds an id the wrapper once recorded."""
+        label = lambda x: janus.tag(self.cfg, x)
+        (self.d / ".janus/runs/wrap/w-9").write_text("here:72 old-job-1\n")
+        tasks = {"5": {**self.run, "label": label("run:w"), "group": "jobs", "command": "bash /r/runs/w-9.sh"},
+                 "72": {**self.run, "label": label("unit:review"), "group": "jobs", "command": "bash /r/runs/review-1.sh"}}
+        real = janus.task_status; janus.task_status = lambda h, tid: tasks.get(str(tid))
+        self.cfg.run.dry = True
+        try: out = janus.cancel_job(self.cfg, "here:5")
+        finally: janus.task_status = real; self.cfg.run.dry = False
+        self.assertEqual(len(out), 1, out)

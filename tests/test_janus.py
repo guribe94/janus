@@ -801,7 +801,7 @@ class Park(unittest.TestCase):
         d, cfg = project(); run = lambda: {"status": {"Running": {}}}
         hs = {"here": {"ok": True, "pueue": {"tasks": {
             "1": {**run(), "label": "unit:closed@t"}, "2": {**run(), "label": "unit:api@t"}, "3": {**run(), "label": "unit:idle@t"},
-            "4": {**run(), "label": "unit:parked@t"}, "5": {**run(), "label": "run:x@t"}, "6": {"status": {"Done": {"result": "Success"}}, "label": "unit:closed@t"}}}}}
+            "4": {**run(), "label": "unit:parked@t"}, "5": {**run(), "label": "run:x@t", "command": "bash /r/runs/x-1.sh"}, "6": {"status": {"Done": {"result": "Success"}}, "label": "unit:closed@t"}}}}}
         units = [{"name": "api", "via": "pueue", "state": "done"}, {"name": "idle", "via": "herdr", "state": "idle"},
                  {"name": "parked", "via": "pueue", "state": "parked", "_park": ["here:4"]}]
         wd = d / ".janus/runs/wrap"; wd.mkdir(parents=True); (wd / "w-1").write_text("here:5 x-1\n")   # its wrapper is not running
