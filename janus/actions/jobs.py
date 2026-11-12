@@ -119,8 +119,8 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
             ck = h.get("admit_check", ""); base = h.get("legacy_lanes", ""); ce = h.get("admit_check_env", "")
             pre = (f"said=\nwhile :; do d=$(df -Pk {q(str(cfg.root))} | awk 'NR==2{{print int($4/1048576)}}'); busy=\n"
                    f"  for s in {base}; do o=$(cat $s/pid 2>/dev/null); [ -n \"$o\" ] && kill -0 $o 2>/dev/null && busy=$s; done\n"
-                   f"  [ \"$d\" -ge {h.get('min_disk_gb', 5)} ] && {{ [ -z {q(ck)} ] || {ce + ' ' if ce else ''}sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
-                   f"  [ \"$said\" ] || {{ echo \"janus: land lane waiting (disk ${{d}} GB, floor {h.get('min_disk_gb', 5)}; old lane busy: ${{busy:-none}})\"; said=1; }}; sleep 15; done\n")
+                   f"  [ \"$d\" -ge {capv(cfg, h, 'min_disk_gb')} ] && {{ [ -z {q(ck)} ] || {ce + ' ' if ce else ''}sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
+                   f"  [ \"$said\" ] || {{ echo \"janus: land lane waiting (disk ${{d}} GB, floor {capv(cfg, h, 'min_disk_gb')}; old lane busy: ${{busy:-none}})\"; said=1; }}; sleep 15; done\n")
         body = f"{pre}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n {nice} bash -c {q(cmd)}\n"
     else:
         cap = int(h.get("job_gb", 2) * 1024)

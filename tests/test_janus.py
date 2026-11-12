@@ -570,6 +570,25 @@ class Capacity(unittest.TestCase):
         hc = janus.host_cap(self.cfg, "b", dict(p, cap_pause="memory PSI avg10 30 over 10"), units[:1])
         self.assertFalse(janus.build_room(self.cfg, "b", hc)[0])
 
+class DiskFloor(unittest.TestCase):
+    def test_the_disk_floor_honours_the_host_value_over_capacity(self):
+        """Catches (item 20): the disk finding and the land lane used a fixed default instead of [hosts.<h>] min_disk_gb (host
+        value over [capacity], the per-host floor the config documents)."""
+        import argparse
+        d, cfg = project('\n[capacity]\nmin_disk_gb = 3\n')
+        h = cfg.hosts["here"]; p = {"ok": True, "disk_gb": "5", "load": "0"}
+        self.assertEqual(janus.capv(cfg, h, "min_disk_gb"), 3)                 # [capacity]
+        self.assertEqual(janus.margins(h, p, cfg=cfg), [])                     # 5 GB free is over the 3 GB floor
+        h["min_disk_gb"] = 7
+        self.assertEqual(janus.capv(cfg, h, "min_disk_gb"), 7)                 # the host value wins over [capacity]
+        self.assertTrue(any("disk" in w for w in janus.margins(h, p, cfg=cfg)), "the disk finding ignored the host floor")
+        h.pop("min_disk_gb")                                                   # the land lane falls back to [capacity] too
+        r = argparse.Namespace(host="here", lane="land", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
+        self.assertIn('"$d" -ge 3', js, "the land lane used a fixed disk floor, not [capacity] min_disk_gb")
+
+
 class Fill(unittest.TestCase):
     def test_fill_until_capacity_or_budget(self):
         d, cfg = project('\n[backlog]\nfile = "S.md"\n[routing]\nnormal = ["m"]\ncritical = ["m"]\n'

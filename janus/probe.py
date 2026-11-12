@@ -93,7 +93,7 @@ def margins(h, p, cleanup=False, cfg=None):
     why = []
     if p.get("cap_psi") and fl(p["cap_psi"]) > capv(cfg, h, "psi_pause"): why.append(f"memory pressure {p['cap_psi']}")
     elif not p.get("cap_psi") and p.get("psi") and fl(p["psi"]) >= 5: why.append(f"memory pressure {p['psi']}")
-    if not cleanup and p.get("disk_gb") and fl(p["disk_gb"]) < h.get("min_disk_gb", 10): why.append(f"disk {p['disk_gb']}G")
+    if not cleanup and p.get("disk_gb") and fl(p["disk_gb"]) < capv(cfg, h, "min_disk_gb"): why.append(f"disk {p['disk_gb']}G")
     return why
 
 def room(cfg, name, p, units, cleanup=False):
