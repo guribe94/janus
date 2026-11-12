@@ -154,6 +154,21 @@ class CpuScheduling(unittest.TestCase):
         self.h["_rd"] = str(self.rd / "not" / "yet"); (self.rd / "fresh.sh").write_text(janus.cap_lib(self.cfg, "b", self.h))
         out = subprocess.run(["bash", "-c", f"RD={self.rd}/not/yet; . {self.rd}/fresh.sh; cap_measure; echo $DF"], capture_output=True, text=True).stdout
         self.assertGreater(int(out.strip()), 0)
+    def test_job_setup_belongs_to_the_projects_trees_only(self):
+        """Catches (soak item 34): the host's job_setup (`cd processing && ...`) ran before the command in ANY tree, so every job in
+        a checkout of another repository exited 1 ('processing: No such file or directory') and the unit could run nothing."""
+        bin_ = self.d / "bin"; bin_.mkdir(); fake = bin_ / "systemd-run"   # no systemd on a Mac: run what follows `--`
+        fake.write_text('#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done; shift; exec "$@"\n'); fake.chmod(0o755)
+        a = type("A", (), {"lane": "jobs", "subdir": None, "wt": str(self.d), "usb": False, "broad": None})()
+        env = {k: v for k, v in os.environ.items() if k not in ("JANUS_CORES", "MAKEFLAGS", "CARGO_BUILD_JOBS", "RUST_TEST_THREADS")}
+        env.update(JANUS_POLL_S="1", PATH=f"{bin_}:{os.environ['PATH']}")
+        remote = dict(self.h, local=False, job_setup="cd processing && echo SETUP-RAN > ../setup.ran")
+        for i, (tree, has) in enumerate((("other", False), ("proj", True))):
+            wd = self.d / tree; (wd / "processing" if has else wd).mkdir(parents=True)
+            (self.rd / f"s-{i}.sh").write_text(janus.job_script(self.cfg, "b", remote, a, tree, "echo JOB-RAN", f"s-{i}", wd=str(wd)))
+            r = subprocess.run(["bash", str(self.rd / f"s-{i}.sh")], env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, f"{tree}: {r.stdout}{r.stderr}"); self.assertIn("JOB-RAN", r.stdout)
+            self.assertEqual((wd / "setup.ran").exists(), has, f"{tree}: the setup must run in the project's tree only")
     def test_a_job_records_the_shape_of_its_command(self):
         """Catches (item 32) the recording half: history carried only the class and the probe's reservation line nothing about
         the command, so a running job could only be compared with every job of its class (a 3-crate `cargo test` with a
