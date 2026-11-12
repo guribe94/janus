@@ -10,7 +10,8 @@ and never does the work by hand. Generic for any project, Claude Code and Codex,
 - **Check what exists, not events.** `orch check` reads the real state (beads, pueue, tmux, herdr, the board, gate logs,
   host probes, git, the spend ledger) and prints one line per problem, nothing when all is well. The model reads only those.
 - **Standard tools, thin glue.** beads (units, rules), pueue (queues), tmux/herdr (agents), ssh/rsync/git, systemd-run
-  (memory limits), launchd (watcher). `orch.py` is one standard-library file joining them; `board.sh` is a plain-file board.
+  (memory limits), launchd (watcher). The code is one standard-library package (`orchkit/`) behind one entry point
+  (`orch.py`); `board.sh` is a plain-file board.
 - **Capacity by reservations.** Each job and agent holds a reservation of cores and learned peak memory; a host admits work
   while the sums fit, pauses on pressure, never kills. Caps exist only when the owner sets them.
 - **Agents never pay to wait.** Builds and tests are submitted detached; the agent writes `WAITING <job ids>` and ends its
@@ -24,8 +25,9 @@ and never does the work by hand. Generic for any project, Claude Code and Codex,
 
 | Part | What it is |
 |---|---|
-| `orch.py` | the CLI: check, launch, stop, collect, close, park/resume, run/gate/cancel, land, fill, report, memory, peers, transcript, hooks, watch |
-| `board.sh` | the default message board: cards, directions, questions with ids, outboxes on other hosts merged by `sync` |
+| `orch.py` | the entry point: seven lines (`from orchkit.cli import main`); the command, its subcommands and the dispatch table are `orchkit/cli.py` |
+| `orchkit/` | the package: every subsystem, one module per seam (below); the installed release runs this, never the working tree |
+| `board.sh` | a thin shell shim over `orchkit/msgboard.py` (same path, same commands): cards, directions, questions with ids, outboxes on other hosts merged by `sync` |
 | `skill/SKILL.md` | the one-page role card both Claude Code and Codex load |
 | hooks | one handler (`orch hook <event>`) for SessionStart, UserPromptSubmit, PreToolUse, Stop, for the registered session only, plus an agent Stop check |
 | watcher | `orch watch` every few minutes (launchd): check, park/resume, orphans, board alerts, wake or restart the orchestrator |
@@ -35,27 +37,40 @@ and never does the work by hand. Generic for any project, Claude Code and Codex,
 
 The single stdlib file is split by seam into `orchkit/`, with `orch.py` kept as the entry point; `install`'s release copy
 (`PARTS`) includes the package, so the installed command runs the same code. Dependency direction is lower-to-higher and
-acyclic: a module never imports a higher one, and no module calls `say()` from another layer.
+acyclic: a module never imports a higher one, and a read-only command returns `(rc, lines)` for `cli.py` to print rather than
+calling `say()` across a layer.
 
-| Module | Holds | State |
-|---|---|---|
-| `orchkit/__init__.py` | `__version__` | moved |
-| `orchkit/context.py` | Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X, the registered-session process identity, pq/qp/fl/findkey, Locked, atomic_write, ORCH_SELF/FIXTURE_MARK/NUM, and DRY as one shared flag object (it re-exports ps_table/secs/herdr from `platform`) | moved |
-| `orchkit/platform.py` | the one OS/tool adapter (owner direction 2026-11-11): process listing (`ps`), the `ps` elapsed-time flavour, the terminal/pane tool (`herdr`), the secret store (macOS keychain), the service manager (launchd/systemd) | moved |
-| `orchkit/templates.py` | the nine shell/Python templates orch writes (PROBE, DIRECT_PROBE, CAP_LIB, ADMIT, STOP_GROUP, CLEAN_PUEUE, UNIT_PROCS, FINGERPRINT, CONDENSE) | moved |
-| `orchkit/beads.py` | `Beads` | moved |
-| `orchkit/cap.py` | CAP_DEFAULTS/capv/cap_nums, cap_lib, class_mb/class_secs, record_history, host_cap/next_free/build_room | moved |
-| `orchkit/probe.py` | probe/probe_all, probe_extra, pueue, margins/room/cap_line | moved |
-| `orchkit/ledger.py` | parse/read/spend/committed/append, reserve_budget/ledger_done, run_cost, settle_run, read_secret/model_ok | moved |
-| `orchkit/units.py` | unit_state, verdict, report_path, herdr_agents, ws_id | moved |
-| `orchkit/board.py` | board_script/dir/board, board_rows/board_questions/learned_posts, board_findings, board_files/board_alerts | moved |
-| `orchkit/findings/`, `orchkit/actions/`, `hooks.py`, `watch.py`, `setup.py`, `cli.py` | the rest of section 7 | not moved yet |
+| Module | Holds |
+|---|---|
+| `orchkit/__init__.py` | `__version__` |
+| `orchkit/context.py` | Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X, the registered-session process identity, pq/qp/fl/findkey, Locked, atomic_write, ORCH_SELF/FIXTURE_MARK/NUM, and `Run(dry, ro, all_units, rates)` — one invocation, carried as `cfg.run` (re-exports ps_table/secs/herdr from `platform`) |
+| `orchkit/platform.py` | the one OS/tool adapter (owner direction 2026-11-11): process listing (`ps`), the `ps` elapsed-time flavour, the terminal/pane tool (`herdr`), the secret store (macOS keychain), the service manager (launchd/systemd) |
+| `orchkit/templates.py` | the nine shell/Python templates orch writes (PROBE, DIRECT_PROBE, CAP_LIB, ADMIT, STOP_GROUP, CLEAN_PUEUE, UNIT_PROCS, FINGERPRINT, CONDENSE) |
+| `orchkit/beads.py` | `Beads`, and the unit-record codec (`UNIT_V`, `unit_record`, `migrate_unit`) |
+| `orchkit/cap.py` | CAP_DEFAULTS/capv/cap_nums, cap_lib, class_mb/class_secs, record_history, host_cap/next_free/build_room |
+| `orchkit/probe.py` | probe/probe_all, probe_extra, pueue, margins/room/cap_line |
+| `orchkit/ledger.py` | parse/read/spend/committed/append, reserve_budget/ledger_done, run_cost, settle_run, read_secret/model_ok |
+| `orchkit/units.py` | unit_state, verdict, report_path, herdr_agents, ws_id |
+| `orchkit/board.py` | board_script/dir/board, board_shipped, board_rows/board_questions/learned_posts, board_findings, board_files/board_alerts |
+| `orchkit/msgboard.py` | the board contract itself (run by `board.sh`): one card schema, one name validator, question ids, `summary`/`digest`/`sync` |
+| `orchkit/gates.py`, `budgets.py`, `backlog.py`, `memory.py`, `transcripts.py` | the query modules the actions and findings share (gate results and estimates, spend and the waste pause, checklist/beads backlog, the memory file, transcripts) |
+| `orchkit/findings/__init__.py` | the `Finding(key, text)` record and `FAMILIES`, the one registry of every legal finding family (doc, urgent, ack_ttl) |
+| `orchkit/findings/{hosts,units,work,memory}.py` | one function per finding family; `orchkit/check.py` runs `collect_findings` as the sequence of family calls |
+| `orchkit/actions/{jobs,launch,lifecycle,landing,backlog,swarm,tidy}.py` | one module per action group (run/gate/cancel, launch and prompts, stop/collect/close/park/resume, land, backlog/fill, memory/peers/report/index, tidy) |
+| `orchkit/hooks.py`, `watch.py`, `setup.py`, `cli.py` | the hook parser and handlers; the watcher; init/doctor/queue/register; the argparse table and dispatch (the only file with subcommand wiring) |
 
-The remaining grouping is **not itself acyclic**: measured on the code still in `orch.py`, the section graph has one
-17-section strongly connected component (check ↔ park/resume ↔ budgets ↔ launch ↔ run/gate ↔ thrash ↔ gate policy ↔
-backlog/landing ↔ report ↔ fill ↔ memory ↔ peers ↔ tidy ↔ briefs ↔ transcripts ↔ hooks). A move-only split of those groups
-therefore needs the item-2 seams first — the `Finding` registry, the `Run` object, and actions that return data instead of
-printing — or the modules call back into the `orch.py` shim. That state is recorded in `out/ds-refactor/REPORT.md`.
+### Seams (each removed a bug class)
+
+- **`Finding` registry** (`findings/__init__.py`): families are the spec; an unregistered key raises; the old URGENT /
+  NO_ACK / ACK_TTL prefix lists and `cfg._viol` are gone; `orch check --json` serialises the set.
+- **`Run` object** (`context.py`): one invocation (dry, read-only, units and rates read once) carried as `cfg.run`; the `DRY`
+  global and `cfg.ro`/`cfg._hs`/`cfg._rates`/`cfg._all_units`/`cfg._park` side-state are gone.
+- **Actions return data**: read-only commands return `(rc, lines)` and `cli.py` prints; commands that change the world keep
+  reporting progress as they go (a long rsync or merge must not go silent).
+- **Board contract in Python**: `orchkit/msgboard.py` is the one implementation; `board.sh` is a shim that execs it next to
+  itself, keeping the path every launcher names.
+- **Unit record v2**: `beads.py` holds the codec; every reader migrates on read (`v`, `runs`).
+
 
 ## Reuse audit (standard tool vs custom code, per subsystem)
 
@@ -74,8 +89,8 @@ new dependency; keep custom code only where no standard tool fits, with the reas
 | Transcripts and usage | Python stdlib (jsonl read, `cksum`) and a fixed price table | keep custom; no dependency added |
 | Sandboxing | `podman` (already supported for jobs: `runner = "podman"`) and `systemd-run` scopes | reuse podman for agents (the Tier-4 owner decision), not a new tool |
 | Notifications | `board.sh` (plain files) + herdr prompts + launchd/the systemd timer | used: no daemon, no new dependency |
-| The board | plain files plus a shell tool today; consolidating to Python in `orchkit/board.py` with `board.sh` a thin shim | moving to stdlib Python (board.sh stays a callable path, section 9) |
-| Test runner | Python stdlib `unittest` (`./check`, `tools/check_all.sh`) | used |
+| The board | plain files (cards, log, questions) with the semantics in `orchkit/msgboard.py` and `board.sh` a thin shim that execs it | used (stdlib Python; `board.sh` stays a callable path, section 9) |
+| Test runner | Python stdlib `unittest` (`./check` discovers every `tests/test_*.py`; `install` runs them against the release copy) | used |
 
 New dependencies added: **none**.
 
@@ -83,7 +98,7 @@ New dependencies added: **none**.
 `orchkit/platform.py`, so a second platform is a new function, not a new branch in the tool. `process listing`, `stat/date
 flavours`, `terminal/panes (herdr)`, `secrets (keychain)` and `the service manager (launchd/systemd)` are there now; `sh` is
 imported inside its functions so it stays below `context` (no import cycle), and `context` re-exports `ps_table`/`secs`/`herdr`
-so call sites are unchanged. Still to fold in during the split: `containers/scopes (podman, systemd-run)`, host discovery, the
+so call sites are unchanged. Still to fold in: `containers/scopes (podman, systemd-run)`, host discovery, the
 `PROBE` script's macOS/Linux branches, and `install`'s service-manager half.
 
 ## State (in the project, under `[project] state`, default `.orch/`)
