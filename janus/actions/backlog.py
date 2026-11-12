@@ -3,9 +3,9 @@ import argparse, re
 from janus.actions.launch import choose, cmd_launch, pick_model
 from janus.backlog import backlog_cfg, backlog_issues, backlog_items, item_actors, unit_items
 from janus.beads import Beads
-from janus.budgets import budget_for, waste_block
+from janus.budgets import budget_for, finish_reserve, waste_block
 from janus.context import Err, say, slug
-from janus.ledger import committed
+from janus.ledger import committed, reserved
 from janus.probe import probe_all
 from janus.units import all_units, herdr_agents, unit_state
 
@@ -82,7 +82,7 @@ def fill_plan(cfg, hs, units, limit=None):
     """(plan [(name, item, model, agent host, build host, budget, why)], stops [why the rest does not launch now]): candidates
     in priority order, each placed by choose() against the open units plus those planned before it, until the hosts'
     reservations or the provider budgets are used."""
-    plan, stops, virt, spent = [], [], [dict(u) for u in units], {}
+    plan, stops, virt, spent, keep = [], [], [dict(u) for u in units], {}, {}
     cands = fill_candidates(cfg, units)
     if not cands: return plan, ["no ready backlog item has an unlaunched brief (a brief is for an item when it has an ITEM: <id> line)"]
     for pr, order, item, f, name, kind, tier in cands:
@@ -90,14 +90,17 @@ def fill_plan(cfg, hs, units, limit=None):
         a = argparse.Namespace(unit=name, host=None, test_host=None, kind=kind, tier=tier)
         try: m = pick_model(cfg, tier, kind, None)
         except Err as e: stops.append(f"{name}: {e}"); continue
-        mc = cfg.models[m]; budget, bwhy = budget_for(cfg, mc, kind, tier) if mc.get("kind") == "api" else (None, "")
+        mc = cfg.models[m]; budget, bwhy = budget_for(cfg, mc, kind, tier) if mc.get("kind") == "api" else (None, ""); hold = budget
         pv = cfg.prov.get(mc.get("provider"), {})
         if budget is not None and "cap_usd" in pv:
-            left = pv["cap_usd"] - committed(cfg, pv) - spent.get(mc["provider"], 0)
-            if left < budget: stops.append(f"budget: {mc['provider']} has ${left:.2f} left, {name} needs ${budget:g}"); break
+            if mc["provider"] not in keep: keep[mc["provider"]] = finish_reserve(cfg, mc["provider"], units)   # item 4: the open units' reserve
+            k, need = keep[mc["provider"]]; left = pv["cap_usd"] - committed(cfg, pv) - spent.get(mc["provider"], 0) - k
+            hold = reserved(cfg, budget) if k else budget   # with a reserve the plan counts what launch will hold (budget and margin)
+            if left < hold:
+                stops.append(f"budget: {mc['provider']} has ${left:.2f} left" + (f" (${k:.2f} kept for {len(need)} open unit(s) to finish)" if k else "") + f", {name} needs ${budget:g}"); break
         try: hn, b, why = choose(cfg, a, f, mc, virt, hs)
         except Err as e: stops.append((name, str(e).removeprefix("refused, "))); continue
-        if budget is not None: spent[mc["provider"]] = spent.get(mc["provider"], 0) + budget
+        if budget is not None: spent[mc["provider"]] = spent.get(mc["provider"], 0) + hold
         plan.append((name, item, m, hn, b, budget, f"{why}; priority {pr}", kind, tier, f))
         virt.append({"name": name, "host": hn, "build": b, "state": "working", "item": item})
     if not stops: stops.append("every ready candidate is planned")

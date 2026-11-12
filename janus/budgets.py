@@ -4,13 +4,13 @@ Queries only: a unit's default budget, its spend so far (ledger, else its transc
 outcome, and whether launch and fill are paused by the waste rule."""
 import calendar, json, re, time
 from pathlib import Path
-from janus.context import hrun, now, sh
+from janus.context import Err, hrun, now, sh
 from janus.findings import live_acks
-from janus.ledger import RECONCILED, ledger_read
+from janus.ledger import RECONCILED, committed, ledger_read, reserved
 from janus.transcripts import remote_slug_sh, transcript_of
 from janus.usage import usage_scan
 import janus.usage as usage_mod
-from janus.units import all_units, api_out, report_text, unit_runs, verdict
+from janus.units import Beads, all_units, api_out, report_text, unit_runs, unit_spent, verdict
 
 # A unit's default budget is the median cost of the past finished runs of its kind and tier (ledger done rows joined to the
 # units that ran them), plus [budget] margin_pct; with fewer than min_runs runs, the provider's budget_per_unit. A running
@@ -25,7 +25,7 @@ from janus.units import all_units, api_out, report_text, unit_runs, verdict
 # 25 %) of the spend of the last recent_h hours: launch and fill are refused until the orchestrator acks waste-pause.
 
 BUDGET_DEFAULTS = {"margin_pct": 30, "min_runs": 3, "min_usd": 0.5, "max_usd": None, "warn_pct": 80, "report_stale_min": 10,
-                   "wrapup_usd": 0.5, "resume_min_usd": 0.1,
+                   "wrapup_usd": 0.5, "resume_min_usd": 0.1, "finish_reserve": True,
                    "token_weights": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.1}}
 
 def bset(cfg, k): return cfg.c.get("budget", {}).get(k, BUDGET_DEFAULTS[k])
@@ -159,6 +159,42 @@ def reload_usd(cfg, use):
 OUTCOMES = (("verdict", "finished with a verdict"), ("capped-partial", "capped, partial work"), ("capped-nothing", "capped, nothing written"),
             ("open", "open unit, no verdict yet"), ("no-verdict", "ended without a verdict"), ("unknown", "unknown (no done row)"),
             ("reconciled", "agent gone, no done row: reconciled, budget counted as the upper bound"))
+
+# The finish reserve (budget-follow item 4): an open unit that has not finished still needs the rest of its budget (a parked or
+# capped unit is resumed on it). New work is admitted against the cap MINUS that reserve, so the cap is never spent down by new
+# units while open ones can no longer finish; a plain resume draws on its own unit's reserve and is exempt. [budget]
+# finish_reserve = false turns it off.
+
+def unit_need(cfg, u):
+    """Dollars an open API unit still needs to finish: its budget minus what its runs used (a still-open run counts at its
+    budget, so a unit in its first run needs nothing more); 0 once it has a final verdict."""
+    if cfg.models.get(u.get("model"), {}).get("kind") != "api" or not u.get("budget") or verdict(cfg, u): return 0.0
+    return max(0.0, round(u["budget"] - unit_spent(cfg, u), 2))
+
+def finish_reserve(cfg, provider, units=None, but=()):
+    """(dollars, {unit: dollars}): what the provider's open units still need to finish, without the units named in but. Each
+    need is counted as the ledger will hold it when the unit is resumed (the rest of its budget plus the overshoot margin), so
+    every open unit can be resumed, all at once if need be."""
+    if not bset(cfg, "finish_reserve"): return 0.0, {}
+    if units is None:
+        try: units = Beads(cfg).units()
+        except Err: units = []
+    need = {u["name"]: n for u in units if u["name"] not in but and cfg.models.get(u.get("model"), {}).get("provider") == provider and (n := reserved(cfg, unit_need(cfg, u)))}
+    return round(sum(need.values()), 2), need
+
+def names_some(need, n=4):
+    L = sorted(need, key=lambda k: -need[k])
+    return ", ".join(f"{k} ${need[k]:.2f}" for k in L[:n]) + (f", {len(L) - n} more" if len(L) > n else "")
+
+def finish_refusal(cfg, mc, name, budget, units=None, but=()):
+    """Why a new $budget run of the provider is refused for the finish reserve (None: it fits, or no cap is set)."""
+    pv = cfg.prov.get(mc.get("provider"), {})
+    if not pv.get("cap_usd") or "ledger" not in pv or budget is None: return None
+    keep, need = finish_reserve(cfg, mc["provider"], units, (name, *but)); c = committed(cfg, pv); held = reserved(cfg, budget)
+    if not keep or c + keep + held <= pv["cap_usd"]: return None
+    return (f"refused: ${c:.2f} committed + ${keep:.2f} kept for {len(need)} open unit(s) to finish ({names_some(need)}) + ${held:.2f} (${budget:g} and its "
+            f"overshoot margin) would pass the ${pv['cap_usd']:g} cap of {mc['provider']}: let them finish or close one (janus close <unit>), or ask the "
+            f"owner to raise {mc['provider']}'s cap_usd")
 
 REPORT_DEFAULTS = {"every_h": 4, "at": [], "waste_pause": 25, "recent_h": 24}
 

@@ -5,7 +5,7 @@ import argparse, io, contextlib, json, os, re, subprocess, sys, time, unittest
 from pathlib import Path
 from unittest import mock
 
-from test_janus import janus, project
+from test_janus import host_probe, janus, project
 from janusload import JANUS_PY
 
 def ns(**k): return argparse.Namespace(**k)
@@ -208,5 +208,76 @@ class Item3RemoteSettle(unittest.TestCase):
              mock.patch.object(janus, "refuse_agent", lambda *a, **k: None):
             rc, out = said(janus.cmd_ledger, self.cfg, ns(action="reconcile", provider=None))
         self.assertAlmostEqual(janus.committed(self.cfg, self.pv), 0.6, msg=out)
+
+class FakeBeads:
+    """No beads database in a temp project: the open units are the list given."""
+    units_ = []
+    def __init__(self, cfg): pass
+    def units(self): return [dict(u) for u in FakeBeads.units_]
+    def create(self, title, *a): return title
+    def run(self, *a): raise janus.Err("no beads")
+    def save(self, u): pass
+    def comment(self, *a): pass
+
+class Item4FinishReserve(unittest.TestCase):
+    """New work is admitted against the cap MINUS what every open unit still needs to finish."""
+    def setUp(self):
+        self.d, self.cfg = project('\n[backlog]\nfile = "S.md"\n[routing]\nnormal = ["m"]\ncritical = ["m"]\n'); self.pv = self.cfg.prov["api"]; self.mc = self.cfg.models["m"]
+        self.units = []                                   # two open $4 units between runs: a used $1.00, b used $0.50
+        for n, c in (("a", 1.0), ("b", 0.5)):
+            run = janus.reserve_budget(self.cfg, self.mc, n, 4, f"{n}.1.100"); janus.ledger_done(self.cfg, self.pv, run, n, c, 0)
+            self.units.append(api_unit(self.d, n, run=run, runs=[run], state="parked"))
+        FakeBeads.units_ = self.units; self.real = janus.Beads; janus.Beads = FakeBeads
+    def tearDown(self): janus.Beads = self.real
+
+    def launch(self, name, budget):
+        (self.d / f"briefs/{name}.md").write_text(f"# Brief: {name}\n")
+        hs = {"here": {"name": "here", "ok": True, "avail_mb": "64000", "disk_gb": "100", "load": "0"}}
+        a = ns(unit=name, kind="implement", tier="normal", host="here", model="m", brief=None, cwd=str(self.d / "tree-c"), budget=budget, test_host=None,
+               allow_main=True, of=None, report=None, resume_of=None, item=None, probes=hs)
+        self.cfg.run.dry = True
+        try:
+            with mock.patch.object(janus, "herdr", lambda *a, **k: None), mock.patch.object(janus, "read_secret", lambda pv: ("K", "x")), \
+                 mock.patch.object(janus, "choose", lambda *a, **k: ("here", "here", "test")): return said(janus.cmd_launch, self.cfg, a)
+        finally: self.cfg.run.dry = False
+
+    def test_a_new_unit_is_refused_when_the_open_units_could_no_longer_finish(self):
+        """Catches (item 4): with $1.50 spent of a $10 cap a $3 unit was launched although the two open units still needed $6.50
+        of their budgets: the cap was then spent down by new work and no open unit could finish."""
+        with self.assertRaises(janus.Err) as e: self.launch("c", 3)       # 1.50 + 7.80 kept + 3.60 > 10
+        self.assertIn("$7.80 kept for 2 open unit(s) to finish", str(e.exception)); self.assertIn("ask the owner", str(e.exception))
+        self.launch("c", 0.5)                                             # 1.50 + 7.80 + 0.60 fits: launched as before
+        (self.d / "out/b").mkdir(); (self.d / "out/b/REPORT.md").write_text("VERDICT: DONE - exit 0\n")
+        self.launch("c", 3)                                               # b finished: it needs nothing more; 1.50 + 3.60 + 3.60 fits
+
+    def test_an_open_unit_resumes_on_what_is_kept_for_it(self):
+        """Catches (item 4): the reserve must never refuse the resume it is kept for."""
+        self.pv["cap_usd"] = 9.5                                          # 1.50 + 7.80 kept: no room for new work
+        with self.assertRaises(janus.Err): self.launch("c", 1)
+        with self.assertRaises(janus.Err) as e: run_resume(self.cfg, self.units[0], budget=3.5)   # a NEW budget would take b's money
+        self.assertIn("$4.20 kept for 1 open unit(s) to finish (b $4.20)", str(e.exception))
+        run_resume(self.cfg, self.units[0])                               # its own $3.00 is there
+        self.assertEqual(list(held(self.d, self.cfg).values()), [3.0])
+
+    def test_fill_plans_only_what_leaves_the_open_units_their_money(self):
+        """Catches (item 4): fill launched every ready unit the bare cap allowed and left nothing for the open units' resumes."""
+        (self.d / "S.md").write_text("| # | item | status |\n|---|---|---|\n| X1 | one | READY |\n| X2 | two | READY |\n| X3 | three | READY |\n")
+        for n, it in (("x1-a", "X1"), ("x2-a", "X2"), ("x3-a", "X3")): (self.d / f"briefs/{n}.md").write_text(f"# {n}\nITEM: {it}\n")
+        self.cfg.hosts["here"].update(ram_gb=64, cores=16); hs = {"here": host_probe(name="here")}
+        self.pv["cap_usd"] = 12; plan, stops = janus.fill_plan(self.cfg, hs, [])
+        self.assertEqual(len(plan), 3, stops)                             # no open unit: all three fit the cap
+        plan, stops = janus.fill_plan(self.cfg, hs, self.units)           # $2.70 is free after the $7.80 kept: two $1.20 holds fit, not three
+        self.assertEqual(len(plan), 2, stops); self.assertIn("$7.80 kept for 2 open unit(s) to finish", " ".join(map(str, stops)))
+
+    def test_a_finding_asks_the_owner_before_the_cap_is_reached(self):
+        """Catches (item 4): nothing was said until committed spend passed 80 % of the cap; by then the open units' remaining
+        budgets no longer fitted."""
+        F = dict(janus.reserve_findings(self.cfg, self.units))            # $1.50 committed is 15 % of the cap; $0.70 is free
+        self.assertIn("ask the owner", F.get("spend:api:reserve", ""), F)
+        self.pv["cap_usd"] = 9.0                                          # the open units need more than is left
+        self.assertIn("$0.30 short", dict(janus.reserve_findings(self.cfg, self.units)).get("spend:api:short", ""))
+        self.pv["cap_usd"] = 12
+        self.assertEqual(janus.reserve_findings(self.cfg, self.units), [])
+        for k in ("spend:api:reserve", "spend:api:short"): janus.finding(k, "x")   # both keys are of a registered family
 
 if __name__ == "__main__": unittest.main()

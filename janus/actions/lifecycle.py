@@ -7,7 +7,7 @@ from janus.actions.launch import api_remote, confirm_started, cwd_taken
 from janus.autopilot import forget, record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
-from janus.budgets import reload_usd, session_usage, bset
+from janus.budgets import bset, finish_refusal, reload_usd, session_usage
 from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
     sh, ts)
 from janus.ledger import keep_run_json, ledger_done, reserve_budget, run_cost, settle_run
@@ -304,6 +304,9 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
     if budget < floor:
         need = f", and a resume needs ${floor:.2f} (${reload:.2f} to load its {use['ctx']}-token context again)" if reload else " (under [budget] resume_min_usd)"
         raise Err(f"{name}: ${budget:.2f} budget {'given' if explicit else 'left'}{need}: resume it with janus resume {name} --budget <usd> (same tree), or janus launch --resume-of and a new budget")
+    # Item 4: a plain resume (and the wrap-up) draws on what is kept for this unit; a NEW budget must leave the other open units theirs.
+    why = finish_refusal(cfg, mc, name, budget) if explicit and not cfg.run.dry else None
+    if why: raise Err(why)
     k = len(unit_runs(u)) + 1; run = f"{name}.r{k}.{int(now())}"
     run = reserve_budget(cfg, mc, name, budget, run)
     local = h.get("local", False); old = u.get("task")

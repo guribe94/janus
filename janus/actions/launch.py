@@ -5,7 +5,7 @@ from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, in_container, job_script, runs_dir, task_rc, task_status, write_cap
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_script, board_shipped
-from janus.budgets import budget_for, transcript_cost, waste_block
+from janus.budgets import budget_for, finish_refusal, transcript_cost, waste_block
 from janus.cap import build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
 from janus.context import EXCL, Err, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, note_event, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
@@ -408,6 +408,8 @@ def cmd_launch(cfg, a):
     if mc["kind"] == "api":
         budget, bwhy = (a.budget, "--budget") if a.budget is not None else budget_for(cfg, mc, a.kind, a.tier)
         why_place += f"; budget ${budget:g} ({bwhy})"
+        why = finish_refusal(cfg, mc, name, budget, units, but=[x for x in (getattr(a, "resume_of", None),) if x])   # item 4: the open units' money stays theirs
+        if why: raise Err(why)
     say(f"launch {name}: model={mname} host={hn} builds on {build} ({why_place}) cwd={cwd}")
     btext = brief.read_text()
     if not local:   # every path the brief names must reach the agent there (refused before anything is recorded)
