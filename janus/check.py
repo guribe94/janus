@@ -12,6 +12,7 @@ from janus.decisions import decision_findings
 from janus.findings import ackable, finding, live_acks
 from janus.findings.hosts import (enforce, host_findings, lane_findings, orphan_job_findings, pane_findings, proc_findings,
     script_findings, thrash_findings, tidy_findings)
+from janus.findings.awareness import note_findings, related_findings   # imp-awareness: related:<a>:<b>, note:<agent>:<n>
 from janus.findings.memory import memory_findings, rule_findings
 from janus.findings.units import (budget_findings, cap_findings, card_findings, ledger_findings, peer_findings,
     report_findings, spend_findings, unit_findings)
@@ -37,9 +38,10 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     names = {u["name"] for u in units}
     for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no build position (host_cap)
     F += host_findings(cfg, hs, units, viol) + pane_findings(cfg, units, ag)
-    F += board_findings(cfg, names) + card_findings(cfg, names)
+    F += board_findings(cfg, names) + card_findings(cfg, names) + note_findings(cfg)
     UF, running = unit_findings(cfg, hs, units, ag); F += UF
     F += peer_findings(cfg, units, hs)   # peers.md, overlap:<a>:<b> (janus-swarm item 4)
+    F += related_findings(cfg, units, hs)   # related:<a>:<b> when two running units' work meets (imp-awareness)
     board_upkeep(cfg, units)
     F += orphan_job_findings(cfg, hs, units, {k for k, _ in F})
     cfg.jput("running.json", {"n": running})

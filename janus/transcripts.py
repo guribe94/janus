@@ -6,7 +6,7 @@ from pathlib import Path
 from janus.board import board_dir
 from janus.context import hrun, qp, sh
 from janus.templates import CONDENSE
-from janus.units import api_out
+from janus.units import all_units, api_out, report_path, unit_any
 
 # One condenser for Claude Code (jsonl under ~/.claude/projects) and Codex (rollout jsonl under ~/.codex/sessions) transcripts.
 # It runs where the transcript is: here, or on the agent's host as `python3 -` with this source on stdin (standard library only).
@@ -92,3 +92,47 @@ def transcript_where(cfg, u):
     esc = remote_slug(u)
     if not esc: return f"{u['host']}: janus transcript {u['name']} (its folder name depends on that host's $HOME)"
     return f"{u['host']}:~/.claude/projects/{esc}/" + (f"{sid}.jsonl" if sid else "(newest .jsonl)")
+
+
+def pointer_text(cfg, u, topic="", why=""):
+    """One line that makes an agent aware of another unit: what it is doing, its report path, and the exact command to read
+    its transcript by grep. The janus introduce direction and the brief's RELATED/predecessor pointers are this one text."""
+    name = u.get("name") or ""; h = cfg.hosts.get(u.get("host"), {})
+    what = (card_fields(cfg, name).get("step") or u.get("state") or "").strip() or "-"
+    rp = str(report_path(cfg, u)) if (h.get("local") or not u.get("host")) else f"{u['host']}:{h.get('root', '')}/out/{name}/REPORT.md"
+    cmd = f"janus transcript {name} --grep {shlex.quote(topic or name)}"
+    return (f"{why + '. ' if why else ''}{name} (host {u.get('host') or '-'}, {u.get('model') or '-'}, {u.get('state') or '-'}): "
+            f"{what[:90]}; its report {rp}; read its transcript: {cmd}")
+
+
+NAME_RX = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+
+
+def related_names(text):
+    """The unit names on a brief's RELATED: line (one line, comma or space separated); [] without one."""
+    m = re.search(r"^RELATED:\s*(.*)$", text or "", re.M)
+    return [n for n in re.split(r"[,\s]+", (m.group(1) if m else "").strip()) if NAME_RX.fullmatch(n)]
+
+
+def predecessor_name(cfg, name, resume_of=None):
+    """The unit a follow-up continues: --resume-of, else the unit whose name this one extends ('u21-finish' -> 'u21', the
+    longest such name among every unit ever recorded). None when there is none."""
+    if resume_of: return resume_of
+    names = set(all_units(cfg))
+    cands = [p for p in names if p != name and (name.startswith(p + "-") or name.startswith(p + "_"))]
+    return max(cands, key=len) if cands else None
+
+
+def related_pointers(cfg, name, brief_text="", pred=None):
+    """The 'Related units' block a brief gets: one pointer per RELATED: name and for the unit's predecessor (the same
+    pointers janus introduce posts as directions). '' when neither names a known unit."""
+    names = related_names(brief_text or "")
+    if pred: names = [pred, *[n for n in names if n != pred]]
+    L, seen = [], set()
+    for n in names:
+        if n == name or n in seen: continue
+        seen.add(n); u = unit_any(cfg, n)
+        if not u: continue
+        topic = name[len(pred) + 1:] if n == pred and pred and name.startswith(pred + "-") else n
+        L.append("- " + pointer_text(cfg, u, topic, f"your predecessor {n}" if n == pred else f"related unit {n}"))
+    return ("## Related units (janus)\n" + "\n".join(L)) if L else ""

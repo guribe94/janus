@@ -13,7 +13,7 @@ from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_run, cmd_thrash
 from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_scope, cmd_land
 from janus.actions.launch import cmd_api_run, cmd_launch
 from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd_park, cmd_resume, cmd_stop
-from janus.actions.swarm import cmd_forget, cmd_index, cmd_learned, cmd_ledger, cmd_memory, cmd_peers, cmd_remember, cmd_report, cmd_transcript
+from janus.actions.swarm import cmd_forget, cmd_index, cmd_introduce, cmd_learned, cmd_ledger, cmd_memory, cmd_peers, cmd_remember, cmd_report, cmd_transcript
 from janus.actions.tidy import cmd_tidy
 from janus.check import cmd_ack, cmd_capacity, cmd_check, cmd_status
 from janus.setup import cmd_doctor, cmd_init, cmd_queue, cmd_register, migrate
@@ -75,6 +75,8 @@ def main():
     for k in MEM_SECTIONS: g.add_argument(f"--{k}", action="store_true")
     add("forget", cmd_forget, A("text", help="the entry's number (janus memory), its subject, or its text"), dry=True)
     add("index", cmd_index, dry=True); add("peers", cmd_peers)
+    add("introduce", cmd_introduce, A("a"), A("b"), A("--why", required=True, help="why they should know each other (it goes to both)"),
+        A("--topic", help="the regex each reads in the other's transcript (default: a path named in --why)"), dry=True)
     add("transcript", cmd_transcript, A("unit"), A("--grep", help="only the lines matching this regex (case-insensitive)"), A("--tail", type=int, default=40, help="the last N lines (0: all)"))
     add("memory", cmd_memory, A("--keep", type=int, help="re-date entry N after review (it stays)"), dry=True)
     add("decide", cmd_decide, A("title"), A("--by", choices=["owner", "orchestrator"], required=True),
