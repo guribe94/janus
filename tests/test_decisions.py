@@ -185,6 +185,46 @@ class SessionStart(unittest.TestCase):
         self.assertIn("Decisions (read the record before deciding anything it touches)", out)
         self.assertIn("0001 Keys live in the keychain", out)
 
+    def test_the_instruction_comes_first_and_each_part_is_labelled_and_capped(self):
+        """F2: the one instruction is first (the model weights the start most), every part is labelled, and each is capped on its
+        own so a long handoff or bd prime cannot push it or a later part past the cut."""
+        import io, json, os
+        from contextlib import redirect_stdout
+        from unittest import mock
+        d, cfg = project()
+        janus.cmd_decide(cfg, ns("Keys live in the keychain"))
+        (d / ".janus/HANDOFF.md").write_text("<!-- LIVE:BEGIN -->\nlive\n<!-- LIVE:END -->\n## Orchestrator notes\nh\n" + "x" * 20000)
+        (d / ".janus/MEMORY.md").write_text("# Session memory\n\n## Facts\n- 2026-11-12 the cache lives in /var/c\n")
+        saved = (janus.session_root, janus.sh)
+        janus.session_root = lambda sid: d
+        janus.sh = lambda *a, **k: (0, "P" * 9000, "")
+        try:
+            with mock.patch.dict(os.environ, {"JANUS_ROLE": ""}), mock.patch("sys.stdin", io.StringIO(json.dumps({"session_id": "sid", "cwd": str(d)}))):
+                buf = io.StringIO()
+                with redirect_stdout(buf): janus.cmd_hook("SessionStart")
+            out = buf.getvalue()
+        finally: janus.session_root, janus.sh = saved
+        text = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(text.startswith("[janus] You are the orchestrator of t"))
+        for lab in ("## 1 HANDOFF.md", "## 2 MEMORY.md", "## 3 Decisions", "## 4 Owner rules (bd prime)"):
+            self.assertIn(lab, text)
+        self.assertIn("cut: read .janus/HANDOFF.md", text)     # the handoff was cut on its own
+        self.assertIn("cut: run bd prime", text)               # so was bd prime (it no longer reaches the cut as a whole)
+        self.assertIn("0001 Keys live in the keychain", text)  # a later part survived a long earlier one
+
+
+class Superseded(unittest.TestCase):
+    """F12: the injected decision list never shows a reversed decision as current. The failure caught: a model acting on a
+    decision its own replacement superseded."""
+    def test_a_superseded_decision_is_marked(self):
+        d, cfg = project()
+        janus.cmd_decide(cfg, ns("First choice"))
+        janus.cmd_decide(cfg, ns("Second choice", supersedes=1))
+        t = janus.session_text(cfg)
+        self.assertIn("0001 First choice (superseded by 0002)", t)
+        self.assertIn("0002 Second choice", t)
+        self.assertNotIn("0001 First choice\n", t)   # never as if current
+
 
 if __name__ == "__main__":
     unittest.main()

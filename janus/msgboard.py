@@ -27,7 +27,7 @@ Usage:
                                         the agent running this (its JANUS_UNIT).
   board.sh direct <agent|all> <text>    orchestrator to an agent (or every open card); answers that agent's open questions
   board.sh answer <question id> <text>  orchestrator: answer one question (a direction to its agent)
-  board.sh read <agent>                 the agent's directions
+  board.sh read <agent>                 the agent's new directions since its last read (newest first)
   board.sh questions                    open questions: <id> <agent> <asked> <text> (tab-separated)
   board.sh summary                      every open card grouped: needs answer, blocked, working, waiting, done; flags SILENT
                                         (> BOARD_SILENT_MIN, default 30 min, without a post) and GONE (process ended without done)
@@ -292,7 +292,8 @@ class Board:
             if field(c, "state") == "done": continue
             with Locked(self.p(".lock")): self.direct1(os.path.basename(c)[:-3], f"(to all) {x}", t, answer=False)
             n += 1
-        print(f'broadcast to {n} open card(s). If it is a standing instruction, also: janus remember --decision "{x}"')
+        print(f'broadcast to {n} open card(s). If it is a rule for you (how to run the project): bd remember "<rule>" --key <subject>. '
+              f'If agents must follow it: janus remember it (MEMORY.md heads every brief).')
 
     def cmd_answer(self, q="", *words):
         self.need_master("answer"); x = oneline(words)
@@ -301,8 +302,13 @@ class Board:
         with Locked(self.p(".lock")): self.direct1(field(self.p("questions", f"{q}.md"), "agent"), x, now(), only_q=q)
 
     def cmd_read(self, a="", *_):
-        okname(a); t = read(self.p("to", f"{a}.md"))
-        sys.stdout.write(t if t else f"(no directions for {a})\n")
+        okname(a); lines = [l for l in read(self.p("to", f"{a}.md")).splitlines() if l.strip()]
+        seen = self.p("to", f".seen-{a}"); last = read(seen).strip()
+        new = lines[:lines.index(last)] if last in lines else lines   # newest first: everything newer than the last line it saw
+        if not new: sys.stdout.write(f"(no new directions for {a})\n"); return
+        sys.stdout.write("\n".join(new) + "\n")
+        try: write(seen, new[0] + "\n")   # the newest line the agent has now seen (a read-only board copy: best effort)
+        except OSError: pass
 
     def cmd_questions(self, *_):
         for q in self.openq(): print("\t".join(q))
@@ -362,12 +368,12 @@ class Board:
         if h:
             r = next((x[2] for x in self.hosts() if x[0] == h), "")
             if r: p = f"{r}/bin/board.sh"
-        # No quote characters: launchers embed this in quoted prompts and remote command lines.
-        print(f"Message board: run {p} post {a} status <one line> when you start; {p} post {a} waiting <job ids> when you park on jobs; "
-              f"{p} post {a} blocked <what blocks you> or {p} post {a} question <your question> when stuck; {p} post {a} learned <a fact "
-              f"every agent should know, with its source> when you find one; {p} post {a} done <your VERDICT line> at the end. If another "
-              f"unit touches a file you change too, leave it a note on its card: {p} note <agent> <file>: <what>. Post only these state "
-              f"changes: your steps go in your report. Before each step run {p} read {a} and follow any new direction.")
+        # No quote characters: launchers embed this in quoted prompts and remote command lines. One copy, one path (F9, F10).
+        print(f"Board: B={p}. Post with $B post {a} <kind> <text>: status (start), waiting <job ids> (parked), blocked or question "
+              f"(stuck), learned <fact + source> (others should know), done <VERDICT line> (end). Only these; your steps go in your "
+              f"report. Before each step run $B read {a}: it prints the new directions; follow them. After a question: keep working on "
+              f"what does not depend on it; if nothing is left, read the board before each step; never sleep to wait. A file both units "
+              f"touch: $B note <unit> <file>: <what>.")
 
     def merge(self, lines, host):
         """Apply outbox lines (<date> <time> <agent> <kind>: <text>) in order; bad lines are skipped."""
@@ -411,7 +417,7 @@ class Board:
                 run([*SSH, ssh, f"rm -f {root}/board-outbox/{f}"])
             # Push the read-only copy and the board (board.sh and this file); lock, merge records, hosts and notify stay here.
             run([*SSH, ssh, f"mkdir -p {root}/bin {root}/board"])
-            ex = [x for e in (".lock", ".sync.lock", ".merged-*", ".master", ".notify", ".hosts", ".qseq", "*.tmp.*") for x in ("--exclude", e)]
+            ex = [x for e in (".lock", ".sync.lock", ".merged-*", ".master", ".notify", ".hosts", ".qseq", ".seen-*", "*.tmp.*") for x in ("--exclude", e)]
             rc, _ = run(["rsync", "-a", "--delete", "--chmod=Fa-w", *ex, "-e", RSYNC_SSH, self.bd + "/", f"{ssh}:{root}/board/"], timeout=300)
             if rc == 0: run([*SSH, ssh, f"find {root}/board -type f -perm -u+w -exec chmod a-w {{}} +"])
             run(["rsync", "-a", "-e", RSYNC_SSH, self.script, f"{ssh}:{root}/bin/board.sh"])

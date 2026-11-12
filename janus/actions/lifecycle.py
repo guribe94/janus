@@ -192,8 +192,10 @@ def cmd_close(cfg, a):
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); note_event(cfg, "close")
     say("closed")
 
-WRAPUP = ("Your budget is used up. Do no more work: write your report now ({report}): what is done, the state it is in, what is "
-          "left, the real exit codes of everything you ran, and the final line 'VERDICT: BLOCKED' (or DONE if it is done). Then stop.")
+WRAPUP = ("Your budget is spent; this short run is only for your report. Do not run, submit or wait for anything. Write {report} "
+          "now: what is done, its state, what is left, the real exit codes of everything you ran (say \"not run\" where none), then "
+          "the last line 'VERDICT: DONE' only if the brief's done-criteria are met, else 'VERDICT: BLOCKED'. Update report.json "
+          "beside it to match. Then stop.")
 
 def job_result(cfg, hs, ref, agent_host):
     """(exit code or None, log path the agent can read) of a finished job. A remote job's files are copied here first when
@@ -217,13 +219,15 @@ def job_result(cfg, hs, ref, agent_host):
     return rc, f"{hn}:{rd}/{jid}.log"
 
 def resume_message(cfg, hs, u, jobs):
-    L = [f"Your jobs finished (janus resumed you; you used ${unit_spent(cfg, u):.2f} of ${u.get('budget') or 0:g} so far):"]
+    s, b = unit_spent(cfg, u), u.get("budget") or 0
+    report = str(report_path(cfg, u)) if cfg.hosts[u["host"]].get("local") else f"{cfg.hosts[u['host']]['root']}/out/{u['name']}/REPORT.md"
+    L = [f"Your jobs finished (spent ${s:.2f} of ${b:g}):"]
     for j in jobs:
         rc, log = job_result(cfg, hs, j, u.get("host"))
         L.append(f"- {j}: exit {rc if rc is not None else 'unknown (the task is gone and left no exit code)'}; log {log}")
-    L.append("Read the logs you need, then continue the brief from where your report stands. Same rule as before: submit "
-             "builds and tests detached, write 'WAITING <job ids>' in the report and end your turn; keep the report current; "
-             "end with the VERDICT line and the real exit codes.")
+    L.append(f"Read only the logs you need, then continue the brief from where {report} stands. Same rules: submit builds and "
+             f"tests detached, write 'WAITING <job ids>' in the report and end your turn; finish with the VERDICT line and the "
+             f"real exit codes.")
     return "\n".join(L)
 
 def resume_unit(cfg, u, msg, wrapup=False):

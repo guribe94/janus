@@ -118,11 +118,14 @@ def write_index(cfg):
     return text
 
 def session_text(cfg):
-    """The titles only, for the SessionStart context and the brief header: the map of what is already settled."""
+    """The titles only, for the SessionStart context and the brief header: the map of what is already settled. A superseded
+    record is shown as such (never as current) and the list is capped to the newest 40 (F12)."""
     rows = sorted(decisions(cfg), key=lambda r: r["num"], reverse=True)
     if not rows: return ""
-    return ("Decisions (read the record before deciding anything it touches):\n"
-            + "\n".join(f"- {r['num']:04d} {r['title']}" for r in rows))
+    shown = rows[:40]
+    L = [f"- {r['num']:04d} {r['title']}" + (f" ({r['status']})" if r["status"] and r["status"] != "accepted" else "") for r in shown]
+    if len(rows) > len(shown): L.append(f"(+{len(rows) - len(shown)} older: janus decisions)")
+    return ("Decisions (read the record before deciding anything it touches):\n" + "\n".join(L))
 
 def link_instruction(cfg, iid):
     """An owner instruction's record of settlement: its beads id linked from the record and the 'decision' label on it."""

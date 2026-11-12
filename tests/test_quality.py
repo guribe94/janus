@@ -97,7 +97,9 @@ class QualityBlock(unittest.TestCase):
         self.assertIn("names the failure it catches", hd)
         self.assertIn("run only the tests your change can affect", hd)
         self.assertIn("report.json", hd)
-        self.assertIn("report.json", janus.agent_prompt(cfg, "u", "/b.md", "here"))
+        prompt = janus.agent_prompt(cfg, "u", "/b.md", "here")
+        self.assertNotIn("report.json", prompt)                 # the prompt keeps the report-current rule; the header keeps report.json (F11)
+        self.assertIn("Read /b.md (absolute path)", prompt)     # the brief path is absolute, so a worktree cwd cannot lose it (F11)
 
 
 class TestSignal(unittest.TestCase):
