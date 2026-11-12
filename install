@@ -1,47 +1,117 @@
 #!/usr/bin/env python3
-"""Install orch: links, hooks, watcher, tools. `install --dry-run` prints every change and changes nothing.
-Usage: install [--dry-run] [--project DIR] [--no-hosts] [--hosts-only] [--pin-only]   (DIR holds orch.toml; default: current directory or a parent)"""
+"""Install orch: a tested release, links, hooks, watcher, tools. `install --dry-run` prints every change and changes nothing.
+Usage: install [--dry-run] [--project DIR] [--no-hosts] [--hosts-only] [--release-only] [--rollback] [--skip-tests]
+  (DIR holds orch.toml; default: current directory or a parent)
+
+Releases (orch-fixes7): orch.py, skill/, example.orch.toml and tests/ are copied into ~/.local/share/orch/releases/<version>/
+(read-only), the copy is tested there (tests/test_orch.py against the copy, `--help`, a hook call), and only then
+~/.local/share/orch/current is switched to it with one atomic rename. ~/.local/bin/orch -> current/orch.py and the skill links
+-> current/skill, so orch.py and the skill change together and nothing ever points at the working tree: an edit in progress
+is never live. A developer runs the checks (./check) and then ./install --release-only to make a change live."""
 import argparse, ast, hashlib, json, os, shlex, shutil, subprocess, sys, time, tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent; HOME = Path.home()
 ap = argparse.ArgumentParser(); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--project"); ap.add_argument("--no-hosts", action="store_true"); ap.add_argument("--hosts-only", action="store_true")
-ap.add_argument("--pin-only", action="store_true", help="only install a pinned copy of orch.py and switch ~/.local/bin/orch to it")
+ap.add_argument("--release-only", "--pin-only", action="store_true", help="only build, test and switch to a new release of orch.py and the skill")
+ap.add_argument("--rollback", action="store_true", help="switch current back to the previous release")
+ap.add_argument("--skip-tests", action="store_true", help="skip tests/test_orch.py (the parse, --help and hook smoke tests still run)")
 A = ap.parse_args(); DRY = A.dry_run
 EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch", "Stop": None}
 ORCH = HOME / ".local/bin/orch"
+SHARE = HOME / ".local/share/orch"; REL = SHARE / "releases"; CUR = SHARE / "current"
+PARTS = ["orch.py", "skill", "example.orch.toml", "tests"]
+KEEP = 5   # releases kept (current and the newest others)
 
 def say(m): print(("[dry-run] " if DRY else "") + m, flush=True)
 def run(cmd, shell=False):
     say("run: " + (cmd if shell else shlex.join(cmd)))
     if not DRY and subprocess.run(cmd, shell=shell).returncode: print("  failed (continuing)", file=sys.stderr)
 
-def link(dst, src):
-    dst = Path(dst).expanduser()
-    if dst.is_symlink() and dst.resolve() == src.resolve(): say(f"link ok: {dst}"); return
-    if dst.exists() or dst.is_symlink(): say(f"SKIP {dst} exists and is not our link"); return
-    say(f"link {dst} -> {src}")
-    if not DRY: dst.parent.mkdir(parents=True, exist_ok=True); dst.symlink_to(src)
+def swap_link(dst, target):
+    """Point the symlink dst at target with one atomic rename (a temp link renamed over it)."""
+    tmp = dst.with_name(f".{dst.name}.tmp{os.getpid()}"); tmp.unlink(missing_ok=True); tmp.symlink_to(target); os.replace(tmp, dst)
 
-def pin():
-    """~/.local/bin/orch points at a pinned copy, ~/.local/share/orch/<hash>/orch.py, never at the working copy: hooks, the
-    watcher and the shims run only a version that parsed and passed a smoke test, and an edit in progress is never live (H11).
-    The switch is one atomic rename of the symlink."""
-    src = (HERE / "orch.py").read_bytes(); h = hashlib.sha256(src).hexdigest()[:12]
-    ast.parse(src)
-    d = HOME / ".local/share/orch" / h; dst = d / "orch.py"
-    say(f"pin orch.py {h} -> {dst}")
-    if DRY: return
-    d.mkdir(parents=True, exist_ok=True)
-    if not dst.exists(): tmp = d / ".orch.py.tmp"; tmp.write_bytes(src); tmp.chmod(0o755); tmp.rename(dst)
-    r = subprocess.run([sys.executable, str(dst), "--help"], capture_output=True, text=True)
-    if r.returncode: sys.exit(f"pinned orch.py failed its smoke test: {r.stderr.strip()[-200:]}")
-    r = subprocess.run([sys.executable, str(dst), "hook", "PreToolUse"], input="{}", capture_output=True, text=True)
-    if r.returncode: sys.exit(f"pinned orch.py hook failed its smoke test: {r.stderr.strip()[-200:]}")
+def ours(dst):
+    """dst is a link install may replace: one into ~/.local/share/orch, or (older installs) into an orch working tree."""
+    if not dst.is_symlink(): return False
+    t = Path(os.readlink(dst)); t = t if t.is_absolute() else dst.parent / t
+    return str(t).startswith(str(SHARE)) or (t.parent / "orch.py").is_file() or t.name in ("orch.py", "skill")
+
+def link(dst, target):
+    dst = Path(dst).expanduser()
+    if dst.is_symlink() and os.readlink(dst) == str(target): say(f"link ok: {dst} -> {target}"); return
+    if dst.exists() and not dst.is_symlink(): say(f"SKIP {dst} exists and is not a link: move it away, then rerun"); return
+    if dst.is_symlink() and not ours(dst): say(f"SKIP {dst} is a link to {os.readlink(dst)}, not orch's"); return
+    say(f"link {dst} -> {target}")
+    if not DRY: dst.parent.mkdir(parents=True, exist_ok=True); swap_link(dst, target)
+
+def version():
+    h = hashlib.sha256()
+    for part in PARTS:
+        p = HERE / part
+        for f in sorted([p] if p.is_file() else [x for x in p.rglob("*") if x.is_file() and "__pycache__" not in x.parts]):
+            h.update(str(f.relative_to(HERE)).encode()); h.update(f.read_bytes())
+    return time.strftime("%Y%m%d-%H%M%S-") + h.hexdigest()[:10], h.hexdigest()[:10]
+
+def smoke(d):
+    py = [sys.executable, str(d / "orch.py")]
+    ast.parse((d / "orch.py").read_bytes())
+    for args, inp in ((["--help"], None), (["hook", "PreToolUse"], "{}"), (["hook", "Stop"], "{}")):
+        r = subprocess.run(py + args, input=inp, capture_output=True, text=True)
+        if r.returncode: return f"orch.py {' '.join(args)} failed: {r.stderr.strip()[-300:]}"
+    if not A.skip_tests and (d / "tests/test_orch.py").is_file():
+        r = subprocess.run([sys.executable, "-m", "unittest", "-q", "tests.test_orch"], cwd=d, capture_output=True, text=True,
+                           env={**os.environ, "ORCH_PY": str(d / "orch.py"), "PYTHONDONTWRITEBYTECODE": "1"})
+        if r.returncode: return "tests/test_orch.py failed:\n" + (r.stderr or r.stdout)[-1500:]
+    return None
+
+def release():
+    """Build releases/<version> from this tree, test the copy, switch current to it atomically, point the links at current."""
+    for part in PARTS[:2]:
+        if not (HERE / part).exists(): sys.exit(f"{HERE / part} missing")
+    v, h = version()
+    have = [d for d in REL.glob(f"*-{h}") if d.is_dir()] if REL.is_dir() else []
+    d = have[0] if have else REL / v
+    say(f"release {d.name}" + (" (this content is already built)" if have else ""))
+    if DRY: say(f"copy {', '.join(PARTS)} -> {d}; test the copy; switch {CUR} -> {d}; {ORCH} -> {CUR}/orch.py; skill links -> {CUR}/skill"); return
+    if not have:
+        st = REL / f".staging-{os.getpid()}"; shutil.rmtree(st, ignore_errors=True); st.mkdir(parents=True)
+        for part in PARTS:
+            src = HERE / part
+            if src.is_dir(): shutil.copytree(src, st / part, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            elif src.is_file(): shutil.copy2(src, st / part)
+        (st / "VERSION").write_text(f"{v}\nfrom {HERE}\n" + subprocess.run(["git", "-C", str(HERE), "describe", "--always", "--dirty"], capture_output=True, text=True).stdout)
+        why = smoke(st)
+        if why: shutil.rmtree(st, ignore_errors=True); sys.exit(f"release NOT installed: {why}")
+        for f in st.rglob("*"):
+            if f.is_file(): f.chmod(0o555 if f.name == "orch.py" else 0o444)
+        os.rename(st, d)
+    else:
+        why = smoke(d)
+        if why: sys.exit(f"release NOT installed: {why}")
+    prev = os.readlink(CUR) if CUR.is_symlink() else None
+    swap_link(CUR, d); say(f"{CUR} -> {d}" + (f" (was {prev})" if prev else ""))
+    finish_links(); prune()
+
+def finish_links():
     if ORCH.exists() and not ORCH.is_symlink(): sys.exit(f"{ORCH} exists and is not a symlink: not replaced")
-    ORCH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ORCH.with_name(".orch.tmp"); tmp.unlink(missing_ok=True); tmp.symlink_to(dst); os.replace(tmp, ORCH)
-    say(f"{ORCH} -> {dst}")
+    link(ORCH, CUR / "orch.py")
+    link(HOME / ".claude/skills/orchestrating", CUR / "skill"); link(HOME / ".codex/skills/orchestrating", CUR / "skill")
+
+def prune():
+    cur = Path(os.readlink(CUR)).name if CUR.is_symlink() else ""
+    rels = sorted(x for x in REL.iterdir() if x.is_dir() and not x.name.startswith("."))
+    for x in rels[:-KEEP]:
+        if x.name != cur: say(f"remove old release {x.name}"); shutil.rmtree(x, ignore_errors=True)
+
+def rollback():
+    rels = sorted(x for x in REL.iterdir() if x.is_dir() and not x.name.startswith(".")) if REL.is_dir() else []
+    cur = Path(os.readlink(CUR)).name if CUR.is_symlink() else ""
+    older = [x for x in rels if x.name < cur]
+    if not older: sys.exit("no older release to roll back to")
+    say(f"rollback: {CUR} -> {older[-1]}")
+    if not DRY: swap_link(CUR, older[-1])
 
 def linux_watcher(project):
     """Linux: a systemd user timer runs `orch watch` in each project every 5 min (the launchd agent's counterpart)."""
@@ -92,7 +162,7 @@ def host_tools(name, h):
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", h["ssh"]]
     arch = {"aarch64": "aarch64", "x86_64": "x86_64"}[h["arch"]]
     bindir = h.get("bin", "~/.local/bin"); base = "https://github.com/Nukesor/pueue/releases/latest/download"
-    shared = name == "linux2" or bindir.startswith("/srv/")
+    shared = h.get("pueue_dir")   # a shared server: pueue's files under this dir, a linked user unit (no files in a shared home)
     cfg = h.get("pueue_config"); cflag = f"--config {cfg}" if cfg else ""
     say(f"== {name} ({h['ssh']}, {arch}), no sudo ==")
     steps = [f"mkdir -p {bindir}"]
@@ -100,7 +170,7 @@ def host_tools(name, h):
         steps.append(f"curl -fsSL -o {bindir}/{b}.new {base}/{b}-{arch}-unknown-linux-musl && chmod +x {bindir}/{b}.new && mv -f {bindir}/{b}.new {bindir}/{b}")
     unit = SERVICE.format(bin=bindir, cfg=cflag)
     if shared:
-        base_dir = "/srv/app-fleet/tools"
+        base_dir = shared
         steps.append(f"mkdir -p {base_dir}/pueue.d/data {base_dir}/pueue.d/run")
         if cfg: steps.append(f"printf 'shared:\\n  pueue_directory: {base_dir}/pueue.d/data\\n  runtime_directory: {base_dir}/pueue.d/run\\n' > {cfg}")
         steps.append(f"printf %s {shlex.quote(unit)} > {base_dir}/pueued.service")
@@ -115,12 +185,13 @@ def main():
     p = Path(A.project or os.getcwd()).resolve()
     for d in [p, *p.parents]:
         if (d / "orch.toml").is_file(): root = d; break
-    if A.pin_only: pin(); return
+    if A.rollback: rollback(); return
+    if A.release_only: release(); return
     if A.hosts_only:
         for n, h in tomllib.loads((root / "orch.toml").read_text()).get("hosts", {}).items(): host_tools(n, h)
         return
-    say("== links ==")
-    link("~/.claude/skills/orchestrating", HERE / "skill"); link("~/.codex/skills/orchestrating", HERE / "skill"); pin()
+    say("== release and links ==")
+    release()
     say("== hooks ==")
     merge_hooks("~/.claude/settings.json"); merge_hooks("~/.codex/hooks.json")
     say("   (Codex: trust the hooks once with /hooks)")

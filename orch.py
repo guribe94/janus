@@ -23,7 +23,7 @@ def find_root(start=None):
     p = Path(start or os.getcwd()).resolve()
     for d in [p, *p.parents]:
         if (d / "orch.toml").is_file(): return d
-    r = os.environ.get("ORCH_ROOT")   # shims (linux-test.sh, heavy.sh) run from a worktree outside the orch root
+    r = os.environ.get("ORCH_ROOT")   # tasks and project shims run from a worktree outside the orch root
     return Path(r).resolve() if not start and r and (Path(r) / "orch.toml").is_file() else None
 
 class Cfg:
@@ -210,12 +210,6 @@ d="%(root)s"; [ -d "$d" ] || d=/; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 
 echo "--pueue"; %(pueue)s status --json 2>/dev/null
 echo "--tmux"; tmux ls -F '#S' 2>/dev/null; true'''
 
-PROBE_LEGACY = {   # jobs of the old scripts: waiting and running, so a jammed old queue shows in orch check
-    "runsh": 'echo "legacy_wait=$(ls /srv/app-fleet/queue 2>/dev/null | wc -l)"; echo "legacy_run=$(podman ps -q --filter name=app-run- 2>/dev/null | wc -l)"',
-    "heavy": 'r=$(stat -c "%i %n" $HOME/app-fleet/heavy*.lock 2>/dev/null | awk \'$2 !~ /admit/ {print $1}\' | awk \'NR == FNR {l[$1]; next} $2 == "FLOCK" {split($6, f, ":"); if (f[3] in l) n++} END {print n+0}\' - /proc/locks); '
-             'a=$(pgrep -fc "^/bin/bash $HOME/app-fleet/bin/heavy.sh"); echo "legacy_run=$r"; echo "legacy_wait=$((a > r ? a - r : 0))"',
-}
-
 def probe_extra(h):
     """Running orch jobs still waiting in their admission (per lane), and the old scripts' queue."""
     rd = "$HOME/.orch-none" if h.get("local") else f"{h.get('root', '/tmp')}/runs"
@@ -223,7 +217,9 @@ def probe_extra(h):
     w = (f'g=0; j=0; o=0; ol=; for f in {rd}/*.gwait {rd}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
          f'case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -q admit.sh "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
          f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"')
-    return w + "\n" + PROBE_LEGACY.get(h.get("legacy", ""), "")
+    # legacy_probe (orch.toml, per host): shell that prints legacy_wait=<n> and legacy_run=<n> for a project's older job queue
+    # while it drains, so a jammed old queue shows in orch check
+    return w + "\n" + h.get("legacy_probe", "")
 
 def pueue(h):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
@@ -287,27 +283,183 @@ def cap_line(cfg, name, p, units):
     return (f"{name} room={n} avail={fl(p.get('avail_mb')) / 1024:.1f}G load={p.get('load')} psi={p.get('psi') or '-'} "
             f"disk={p.get('disk_gb')}G agents={sum(1 for u in units if u.get('host') == name)}" + (f" FULL: {why}" if n < 1 else ""))
 
-# ---------------------------------------------------------------- spend and models
-def committed(cfg, pv):
-    """Dollars spent plus budgets of still-open rows in the provider's ledger (same rule as fable-api.sh)."""
-    try: rows = [l.split("\t") for l in (cfg.root / pv["ledger"]).read_text().splitlines() if l.strip()]
-    except OSError: return 0.0
-    openb, spent = {}, 0.0
-    for r in rows:
-        r += [""] * 5; k = r[4] or r[1]
-        if r[2] == "running": openb[k] = fl(r[3]); continue
-        openb.pop(k, None); spent += fl(r[2])
-    return spent + sum(openb.values())
+# ---------------------------------------------------------------- the API ledger (orch owns it) and the secret store
+# One TSV per provider ([providers.<p>] ledger), one row per event:  ts  unit  running|<cost>  <budget>|done rc=<x>  <run id>.
+# Every run id has exactly one `running` row (its budget, written when the budget is reserved) and at most one `done` row
+# (its cost; the whole budget when the run never reported one). Every write takes the ledger's lock (<ledger>.lock, an fcntl
+# lock: the lock zsh's `zsystem flock` takes too) and is idempotent: a second running or done row for a run id is never
+# written, so a retry, a re-run or a looping launcher cannot duplicate rows (orch-fixes7: a launcher edited while it ran
+# looped and appended ~49,000 done rows; the cap check summed them all). Spend is computed per run id: its done cost, or its
+# budget while it runs. A malformed ledger refuses every new run until `orch ledger repair`.
+NUM = re.compile(r"^-?\d+(\.\d+)?([eE][-+]?\d+)?$")
+
+class Locked:
+    """The ledger's lock: `with Locked(path):` holds an exclusive fcntl lock on <path>.lock."""
+    def __init__(self, path): self.p = str(path) + ".lock"
+    def __enter__(self):
+        import fcntl
+        Path(self.p).parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.p, "a"); fcntl.lockf(self.f, fcntl.LOCK_EX); return self
+    def __exit__(self, *e): self.f.close()
+
+def ledger_path(cfg, pv): return cfg.root / pv["ledger"]
+
+def ledger_parse(text):
+    """(runs, problems, notes). runs: {run id: {unit, running: [line numbers], done: [...], budget, cost}}. problems make the
+    ledger malformed (a launch is refused); notes are only reported."""
+    runs, bad, notes = {}, [], []
+    for i, l in enumerate(text.splitlines(), 1):
+        if not l.strip(): continue
+        f = l.split("\t")
+        if len(f) != 5 or not f[1].strip() or not f[4].strip():
+            bad.append(f"line {i}: {len(f)} field(s), want 5 (ts, unit, running|cost, budget|done rc=, run id): {l[:80]!r}"); continue
+        r = runs.setdefault(f[4], {"unit": f[1], "running": [], "done": [], "budget": None, "cost": None})
+        if r["unit"] != f[1]: bad.append(f"line {i}: run id {f[4]} belongs to {r['unit']}, not {f[1]}"); continue
+        if f[2] == "running":
+            if not NUM.match(f[3].strip()): bad.append(f"line {i}: running row without a numeric budget: {f[3][:20]!r}"); continue
+            r["running"].append(i)
+            if r["budget"] is None: r["budget"] = float(f[3])
+        elif NUM.match(f[2].strip()) and f[3].startswith("done"):
+            r["done"].append(i)
+            if r["cost"] is None: r["cost"] = float(f[2])
+        else: bad.append(f"line {i}: neither a running row nor a done row: {l[:80]!r}")
+    for k, r in runs.items():
+        if len(r["running"]) > 1: bad.append(f"run {k} ({r['unit']}): {len(r['running'])} running rows (lines {', '.join(map(str, r['running'][:5]))}{'...' if len(r['running']) > 5 else ''})")
+        if len(r["done"]) > 1: bad.append(f"run {k} ({r['unit']}): {len(r['done'])} done rows (lines {', '.join(map(str, r['done'][:5]))}{'...' if len(r['done']) > 5 else ''})")
+        if r["done"] and not r["running"]: notes.append(f"run {k} ({r['unit']}): a done row without a running row (counted)")
+    return runs, bad, notes
+
+def ledger_read(cfg, pv):
+    try: return ledger_parse(ledger_path(cfg, pv).read_text())
+    except FileNotFoundError: return {}, [], []
+
+def spend(runs):
+    """Committed dollars: per run id, its done cost, or its budget while it runs."""
+    return sum(r["cost"] if r["done"] else (r["budget"] or 0.0) for r in runs.values())
+
+def committed(cfg, pv): return spend(ledger_read(cfg, pv)[0])
+
+def ledger_append(cfg, pv, row):
+    """One row, appended with a single write to an O_APPEND descriptor (the caller holds the lock)."""
+    p = ledger_path(cfg, pv); p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try: os.write(fd, ("\t".join(map(str, row)) + "\n").encode())
+    finally: os.close(fd)
+
+def tstamp(): return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def reserve_budget(cfg, mc, name, budget, run=None):
+    """Under the ledger's lock: refuse when the ledger is malformed or the budget would pass the cap, else write the run's one
+    running row. Idempotent: a run id that already has its running row is returned as it is. Returns the run id."""
+    pv = cfg.prov[mc["provider"]]; run = run or f"{name}.{os.getpid()}.{int(now())}"
+    if DRY: return run
+    with Locked(ledger_path(cfg, pv)):
+        runs, bad, _ = ledger_read(cfg, pv)
+        if bad: raise Err(f"refused: the {mc['provider']} ledger {pv['ledger']} is malformed ({bad[0]}; {len(bad)} problem(s)): run orch ledger check, then orch ledger repair")
+        r = runs.get(run)
+        if r and r["done"]: raise Err(f"refused: run {run} is already finished (done row at line {r['done'][0]}); a re-run gets a new run id")
+        if r and r["running"]: return run
+        if "cap_usd" in pv:
+            c = spend(runs)
+            if c + budget > pv["cap_usd"]: raise Err(f"refused: ${c:.2f} committed + ${budget} would pass the ${pv['cap_usd']} cap of {mc['provider']}")
+        ledger_append(cfg, pv, [tstamp(), name, "running", budget, run])
+    return run
+
+def ledger_done(cfg, pv, run, name, cost, rc):
+    """Write the run's one done row (idempotent: nothing when it already has one). Returns True when written."""
+    if DRY: return False
+    with Locked(ledger_path(cfg, pv)):
+        r = ledger_read(cfg, pv)[0].get(run)
+        if r and r["done"]: return False
+        ledger_append(cfg, pv, [tstamp(), name, cost, f"done rc={rc}", run])
+    return True
+
+def run_cost(path, budget):
+    """The cost an API run reported in its json output, else its whole budget (a run stopped before it wrote its cost is
+    charged everything, so the cap never undercounts)."""
+    try: c = json.loads(Path(path).read_text()).get("total_cost_usd")
+    except Exception: c = None
+    return (float(c), True) if isinstance(c, (int, float)) else (float(budget or 0), False)
+
+def settle_run(cfg, u, rc):
+    """Close an API unit's ledger run (its done row) when it ended without writing one: stopped, killed or closed."""
+    mc = cfg.models.get(u.get("model"), {}); pv = cfg.prov.get(mc.get("provider"), {})
+    if mc.get("kind") != "api" or not u.get("run") or "ledger" not in pv: return
+    cost, _ = run_cost(cfg.p("out", "out") / u["name"] / "api.json", u.get("budget") or pv.get("budget_per_unit", 0))
+    if ledger_done(cfg, pv, u["run"], u["name"], cost, rc): say(f"ledger: run {u['run']} closed at ${cost:.2f} ({rc})")
+
+def read_secret(pv):
+    """(variable, value) of a provider's API key from the configured secret store, never printed or written anywhere:
+    key_keychain (macOS keychain item, `security find-generic-password -s <item> -w`), else key_file (lines VAR=value; refused
+    unless only its owner can read it, mode 600)."""
+    var = pv.get("key_env", "ANTHROPIC_API_KEY"); tried = []
+    if pv.get("key_keychain") and sys.platform == "darwin":
+        rc, o, e = sh(["security", "find-generic-password", "-s", pv["key_keychain"], "-w"])
+        if rc == 0 and o.strip(): return var, o.strip()
+        tried.append(f"keychain item {pv['key_keychain']} (not found)")
+    if pv.get("key_file"):
+        p = Path(os.path.expanduser(pv["key_file"]))
+        try: st = p.stat()
+        except OSError: tried.append(f"{p} (missing)")
+        else:
+            if st.st_mode & 0o077: raise Err(f"{p} can be read by others (mode {oct(st.st_mode & 0o777)}): chmod 600 {p}")
+            for l in p.read_text().splitlines():
+                k, _, v = l.strip().removeprefix("export ").partition("=")
+                if k.strip() == var and v.strip(): return var, v.strip().strip("'\"")
+            tried.append(f"{p} (no {var}=)")
+    raise Err(f"no API key: " + ("; ".join(tried) or "set key_keychain (macOS) or key_file (mode 600) in the provider's orch.toml table"))
 
 def model_ok(cfg, m):
     c = cfg.models.get(m)
     if not c: return False, "unknown model"
     pv = cfg.prov.get(c["provider"], {})
     if not pv.get("enabled"): return False, f"provider {c['provider']} disabled"
-    if "cap_usd" in pv:
-        left = pv["cap_usd"] - committed(cfg, pv)
-        if left < pv.get("budget_per_unit", 0): return False, f"{c['provider']} budget left ${left:.0f}"
+    if "ledger" in pv:
+        runs, bad, _ = ledger_read(cfg, pv)
+        if bad: return False, f"{c['provider']} ledger malformed ({len(bad)} problem(s); orch ledger check)"
+        if "cap_usd" in pv:
+            left = pv["cap_usd"] - spend(runs)
+            if left < pv.get("budget_per_unit", 0): return False, f"{c['provider']} budget left ${left:.0f}"
     return True, ""
+
+def cmd_ledger(cfg, a):
+    """orch ledger check: every provider ledger, exit 1 when one is malformed. orch ledger repair: keep the first running row
+    and the first done row of each run id, drop rows that cannot be parsed, after a backup <ledger>.bak-<time>; the file is
+    replaced by write-then-rename under the lock."""
+    pvs = [(n, pv) for n, pv in cfg.prov.items() if "ledger" in pv and (not a.provider or n == a.provider)]
+    if not pvs: raise Err("no provider has a ledger in orch.toml")
+    worst = 0
+    for n, pv in pvs:
+        p = ledger_path(cfg, pv)
+        if a.action == "check":
+            runs, bad, notes = ledger_read(cfg, pv)
+            say(f"{n}: {p}: {sum(len(r['running']) + len(r['done']) for r in runs.values())} rows, {len(runs)} runs, "
+                f"${spend(runs):.2f} committed" + (f" of ${pv['cap_usd']}" if "cap_usd" in pv else "") + (f"; MALFORMED, {len(bad)} problem(s):" if bad else "; valid"))
+            for x in bad[:20] + notes[:10]: say("  " + x)
+            if len(bad) > 20: say(f"  ... {len(bad) - 20} more")
+            worst = max(worst, 1 if bad else 0); continue
+        if DRY: say(f"+ back up {p}, keep the first running and done row per run id, write-then-rename"); continue
+        with Locked(p):
+            for _ in range(5):
+                try: raw = p.read_bytes()
+                except FileNotFoundError: say(f"{n}: no ledger yet"); break
+                keep, seen, dropped = [], set(), 0
+                for l in raw.decode(errors="replace").splitlines():
+                    f = l.split("\t")
+                    ok = len(f) == 5 and f[1].strip() and f[4].strip() and ((f[2] == "running" and NUM.match(f[3].strip())) or (NUM.match(f[2].strip()) and f[3].startswith("done")))
+                    k = (f[4], "running" if ok and f[2] == "running" else "done") if ok else None
+                    if not ok or k in seen: dropped += bool(l.strip()); continue
+                    seen.add(k); keep.append(l)
+                bak = p.with_name(p.name + time.strftime(".bak-%Y%m%d-%H%M%S")); bak.write_bytes(raw)
+                tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp"); tmp.write_text("".join(x + "\n" for x in keep))
+                if p.stat().st_size != len(raw): tmp.unlink(); continue   # an unlocked writer appended meanwhile: read again
+                os.replace(tmp, p)
+                say(f"{n}: repaired {p}: kept {len(keep)} rows, dropped {dropped}; backup {bak}")
+                break
+            else: raise Err(f"{p} kept changing while it was repaired: stop the writer and retry")
+        runs, bad, _ = ledger_read(cfg, pv)
+        if bad: say(f"  still malformed: {bad[0]}"); worst = 1
+    return worst
 
 # ---------------------------------------------------------------- units
 def unit_state(u, ps, agents):
@@ -328,8 +480,13 @@ def unit_state(u, ps, agents):
     return "unknown"
 
 def verdict(cfg, u):
-    try: t = (cfg.p("out", "out") / u["name"] / "REPORT.md").read_text().splitlines()
+    """The unit's final VERDICT line, from the report it writes (a resumed unit: its original report, report_path). A resumed
+    report still holds the earlier run's verdict, so only a verdict written after the resume started counts, and a line 1
+    that is still PENDING means not finished."""
+    p = report_path(cfg, u)
+    try: t = p.read_text().splitlines()
     except OSError: return None
+    if u.get("resume") and (p.stat().st_mtime < u.get("started", 0) or (t and "PENDING" in t[0])): return None
     return next((l for l in reversed(t) if l.startswith("VERDICT:")), None)
 
 def herdr_agents(cfg):
@@ -394,13 +551,16 @@ def handoff_stale(cfg, running):
 
 def ready_work(cfg):
     """Ready work items in beads: not units (launched work), not orch's decision log, not owner instructions (audit H7)."""
-    skip = {"unit", "orch-log", "instruction"}
+    skip = {"unit", "orch-log", "instruction", "backlog"}   # backlog items have their own finding (idle with backlog)
     return [i for i in Beads(cfg).run("ready") if not skip & set(i.get("labels") or [])
             and not str(i.get("title", "")).startswith(("unit:", "orch:", "instr:"))]
 
 TEST_RX = re.compile(r"\bcargo(-\w+)? (test|nextest|build|clippy|bench)\b|\bpytest\b|\b(npm|pnpm) (run )?test\b|\bxcodebuild\b.*\btest\b")
 
-VIA_LANE = re.compile(r"orch(\.py)? (run|gate)\b|(linux|linux2)-test\.sh|heavy\.sh|run-handoff\.sh|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")
+VIA_LANE = re.compile(r"orch(\.py)? (run|gate)\b|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")   # plus paths.lane_scripts (project wrappers)
+
+def via_lane(cfg, c):
+    return bool(VIA_LANE.search(c)) or any(os.path.basename(x) in c for x in cfg.paths.get("lane_scripts", []))
 
 def secs(et):
     d, _, r = et.rpartition("-"); p = [int(x) for x in r.split(":")]
@@ -416,15 +576,51 @@ def proc_findings(cfg):
         f = l.split(None, 4)
         if len(f) == 5 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), fl(f[2]), f[3], f[4])
     up = lambda p: [q for q in ancestors({k: (v[0],) for k, v in t.items()}, p)[1:]]
+    launchers = {os.path.basename(m["launcher"]) for m in cfg.models.values() if m.get("launcher")}   # older project launchers
     F = []
     for p, (pp, cpu, et, c) in t.items():
         if AGENT_RX.search(c) or "pueued" in c: continue
-        anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "fable-api.sh" in t[q][3]), None)
+        anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "orch.py api-run" in t[q][3] or any(x in t[q][3] for x in launchers)), None)
         lane = any("pueued" in t[q][3] for q in anc)
         if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
             F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; stop its unit with orch stop"))
-        if TEST_RX.search(c) and not lane and not VIA_LANE.search(c) and not any(TEST_RX.search(t[q][3]) or VIA_LANE.search(t[q][3]) for q in anc):
-            F.append((f"localtest:{p}", f"test/build run on the Mac outside the pueue lanes (pid {p}, {et}): {c[:70]}; use orch run / heavy.sh"))
+        if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc):
+            F.append((f"localtest:{p}", f"test/build run on this machine outside the pueue lanes (pid {p}, {et}): {c[:70]}; use orch run"))
+    return F
+
+SCRIPT_RX = re.compile(r"^(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\s+(?:-\S+\s+)*(/\S+)")
+
+def held_inodes(pid):
+    """Inodes of the files process pid has open (Linux /proc, else lsof); None when it cannot be told."""
+    fd = Path(f"/proc/{pid}/fd")
+    if fd.is_dir():
+        out = set()
+        for x in fd.iterdir():
+            try: out.add(x.stat().st_ino)
+            except OSError: pass
+        return out
+    rc, o, e = sh(["lsof", "-n", "-P", "-a", "-p", str(pid), "-Fi"], timeout=10)
+    return {int(l[1:]) for l in o.splitlines() if l.startswith("i") and l[1:].isdigit()} if rc in (0, 1) and o else None
+
+def script_findings():
+    """Running shell scripts whose file was changed after they started (orch-fixes7, failure class 26): a shell reads its script
+    as it goes, so an in-place edit makes it run from the old byte offset of the new text (a loop of 49,000 ledger rows). A
+    file replaced by write-then-rename is safe (the shell keeps the old inode); only an edit of the inode it holds is flagged."""
+    rc, o, e = sh(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,lstart=,command="], timeout=10)
+    F = []
+    for l in o.splitlines():
+        f = l.split(None, 6)
+        if len(f) < 7 or not f[0].isdigit(): continue
+        m = SCRIPT_RX.match(f[6])
+        if not m: continue
+        try: start = time.mktime(time.strptime(" ".join(f[1:6]), "%a %b %d %H:%M:%S %Y")); st = os.stat(m.group(1))
+        except (ValueError, OSError): continue
+        if st.st_mtime <= start + 1: continue
+        held = held_inodes(int(f[0]))
+        if held is not None and st.st_ino not in held: continue   # replaced by rename: the old text keeps running, safe
+        F.append((f"script:{f[0]}:{int(st.st_mtime)}", f"running script {m.group(1)} (pid {f[0]}) was changed after it started"
+                  f" ({ts(st.st_mtime)}){' in place' if held else ''}: the shell may run from a wrong offset of the new text; stop it and relaunch,"
+                  " and replace scripts by write-then-rename, never in place"))
     return F
 
 def collect_findings(cfg, hs, units, ag, bd_err):
@@ -487,7 +683,12 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
     F += gate_findings(cfg)
     F += lane_findings(cfg, hs)
-    if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg)
+    if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg) + script_findings()
+    for n, pv in cfg.prov.items():
+        if "ledger" in pv:
+            bad = ledger_read(cfg, pv)[1]
+            if bad: F.append((f"ledger:{n}", f"{n} ledger {pv['ledger']} is malformed ({len(bad)} problem(s): {bad[0][:90]}); every launch is refused: orch ledger check, orch ledger repair"))
+    F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs)
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
@@ -496,7 +697,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if o.strip(): F.append(("git:dirty", f"{len(o.splitlines())} uncommitted path(s) in {cfg.root.name}"))
         rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=cfg.root)
         if rc == 0 and o.strip() != "0": F.append(("git:unpushed", f"{o.strip()} unpushed commit(s)"))
-        elif rc: F.append(("git:noupstream", "git has no upstream: set the bare repo on linux1 and push"))
+        elif rc: F.append(("git:noupstream", "git has no upstream: add a remote, then orch commit-state (it pushes with --set-upstream)"))
     try:
         ins = Beads(cfg).issues("instruction")
         if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done or bd remember): " + "; ".join(i['title'][:50] for i in ins[:3])))
@@ -596,19 +797,6 @@ def cmd_board_close(cfg, a):
     if rc: raise Err(f"board.sh close {a.agent}: {(e or o).strip()[:120]}")
     cfg.touch("changed"); say(f"board card {a.agent} archived")
 
-def cmd_init(cfg, a):
-    """Turn the old state docs named in paths.state_docs into a one-line pointer to .orch/HANDOFF.md (fixes5 item 6). The old
-    text is kept in .orch/history-<name> first."""
-    for x in cfg.paths.get("state_docs", []):
-        p = cfg.root / x
-        if not p.is_file(): continue
-        t = p.read_text(); ptr = f"Moved: the current state and handoff are in {cfg.state.name}/HANDOFF.md (orch check regenerates it). Old text: {cfg.state.name}/history-{p.name}\n"
-        if t == ptr: say(f"{x}: already a pointer"); continue
-        if DRY: say(f"+ keep {x} in {cfg.state.name}/history-{p.name}; write the pointer"); continue
-        k = cfg.f(f"history-{p.name}")
-        k.write_text((k.read_text() if k.exists() else "") + f"\n\n<!-- {ts()} moved from {x} -->\n" + t)
-        p.write_text(ptr); say(f"{x}: now a pointer (old text in {k})")
-
 def cmd_ack(cfg, a):
     k, d = a.problem, a.decision
     acks = live_acks(cfg); acks[k] = {"t": now()}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
@@ -677,51 +865,82 @@ def new_tab(cfg, label, cwd):
     if not r: raise Err("herdr tab create failed")
     return r["root_pane"]["pane_id"], r["tab"].get("tab_id")
 
-def ledger(cfg, mc, run, state, amount, name):
-    with open(cfg.root / cfg.prov[mc["provider"]]["ledger"], "a") as f: f.write(f"{ts()}\t{name}\t{state}\t{amount}\t{run}\n")
-
-def reserve_budget(cfg, mc, name, budget, write):
-    """Check (and with write, reserve) an API unit's budget under the ledger's lock, the same fcntl lock fable-api.sh takes
-    (audit M1): every API launch, local or remote, with an explicit --model or --budget too. Returns the run id."""
-    import fcntl
-    pv = cfg.prov[mc["provider"]]; lp = cfg.root / pv["ledger"]
-    with open(str(lp) + ".lock", "a") as lk:
-        fcntl.lockf(lk, fcntl.LOCK_EX)
-        if "cap_usd" in pv:
-            c = committed(cfg, pv)
-            if c + budget > pv["cap_usd"]: raise Err(f"refused: ${c:.2f} committed + ${budget} would pass the ${pv['cap_usd']} cap of {mc['provider']}")
-        run = f"{name}.{os.getpid()}.{int(now())}"
-        if write and not DRY: ledger(cfg, mc, run, "running", budget, name)
-        return run
-
-def deliver_key(h, fifo):
+def deliver_key(h, fifo, key):
     """Send the key into the task's fifo from a detached ssh with no time limit, so a full agents group queues the task instead
     of failing the launch (M13). The key goes over the pipe only: never a file or argv."""
-    k = sh(["security", "find-generic-password", "-s", "orch-anthropic-api", "-w"])
-    if k[0] or not k[1].strip(): return "no key in keychain item orch-anthropic-api"
     p = subprocess.Popen([*SSH, h["ssh"], f"cat > {fifo}"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=clean_env())
-    p.stdin.write(k[1].strip().encode() + b"\n"); p.stdin.close()
-    return None
+    p.stdin.write(key.encode() + b"\n"); p.stdin.close()
+
+API_CMD = ["claude", "--bare", "-p", "--model", "{api_id}", "--max-budget-usd", "{budget}", "--output-format", "json",
+           "--dangerously-skip-permissions", "{prompt}"]   # [providers.<p>] cmd overrides; --bare: the key only, never a login
+
+def api_argv(pv, mc, budget, prompt):
+    return [x.format(api_id=mc.get("api_id", mc.get("model", "")), model=mc.get("model", ""), budget=budget, prompt=prompt) for x in pv.get("cmd", API_CMD)]
+
+def put_script(h, path, text, mode="755"):
+    """Write a script on host h by write-then-rename: a script that is running keeps reading its old file (orch-fixes7: a shell
+    rereads its script at the old byte offset when the file is edited in place)."""
+    if h.get("local"): atomic_write(Path(path), text, int(mode, 8)); return 0, "", ""
+    return X(h, f"mkdir -p \"$(dirname {path})\" && cat > {path}.tmp.$$ && chmod {mode} {path}.tmp.$$ && mv -f {path}.tmp.$$ {path}", inp=text)
+
+def atomic_write(p, text, mode=0o644):
+    p = Path(p); p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp"); tmp.write_text(text); tmp.chmod(mode); os.replace(tmp, p)
 
 def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env):
-    """Headless claude as a pueue task on host h. The key goes over ssh stdin into a fifo that only that task reads: never a file or argv."""
+    """Headless agent as a pueue task on host h. The key goes over ssh stdin into a fifo that only that task reads: never a file,
+    argv or pueue's environment."""
+    pv = cfg.prov[mc["provider"]]; var, key = read_secret(pv)
     root = h["root"]; fifo = f"{root}/run/{name}.key"; od = f"{root}/out/{name}"; q = shlex.quote
     mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p MemoryMax={mm} -- " if mm else ""
     ex = "".join(f"export {k}={q(v)}\n" for k, v in env.items())
-    script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export ANTHROPIC_API_KEY=$K; unset K\n"
-              f"cd {q(rcwd)} || exit 1\nexec {sd}claude --bare -p --model {mc['api_id']} --max-budget-usd {budget} "
-              f"--output-format json --dangerously-skip-permissions {q(prompt)} < /dev/null > {od}/api.json 2> {od}/api.err\n")
-    if DRY: return X(h, f"mkfifo {fifo}; cat > {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {rcwd} --print-task-id -- sh {root}/run/{name}.sh; key | ssh cat > {fifo}")
-    rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo} && cat > {root}/run/{name}.sh", inp=script)
+    script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export {var}=$K; unset K\n"
+              f"cd {q(rcwd)} || exit 1\nexec {sd}{shlex.join(api_argv(pv, mc, budget, prompt))} < /dev/null > {od}/api.json 2> {od}/api.err\n")
+    if DRY: return X(h, f"mkfifo {fifo}; write {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {rcwd} --print-task-id -- sh {root}/run/{name}.sh; key | ssh cat > {fifo}")
+    rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo}")
     if rc: return rc, o, e
-    rc, o, e = hrun(h, f"cat > {root}/run/bin/.pueue.$$ && chmod 755 {root}/run/bin/.pueue.$$ && mv {root}/run/bin/.pueue.$$ {root}/run/bin/pueue", inp=clean_pueue_script(h))
+    rc, o, e = put_script(h, f"{root}/run/{name}.sh", script)
+    if rc: return rc, o, e
+    rc, o, e = put_script(h, f"{root}/run/bin/pueue", clean_pueue_script(h))
     if rc: return rc, o, e
     rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {q(rcwd)} --print-task-id -- sh {root}/run/{name}.sh")
     if rc: return rc, o, e
-    err = deliver_key(h, fifo)
-    if err: hrun(h, f"{pueue(h)} kill {o.strip()}; rm -f {fifo}"); return 1, "", err
+    deliver_key(h, fifo, key)
     return 0, o, ""
+
+ORCH_SELF = Path(__file__).resolve()   # the installed release when run as `orch`: a queued task runs the version that queued it
+
+def cmd_api_run(cfg, a):
+    """One API agent run on this machine, as a pueue task that `orch launch` queued (orch-fixes7: orch runs API agents itself,
+    no project launcher). The key is read here from the secret store and given only to the agent's process: never to pueue,
+    a file or argv. Ledger: the run's running row (reserved at launch; written here when missing) and exactly one done row,
+    both idempotent; a malformed ledger or a finished run id refuses the run."""
+    mc = cfg.models.get(a.model) or {}
+    if mc.get("kind") != "api": raise Err(f"model {a.model} is not an api model")
+    pv = cfg.prov[mc["provider"]]; name = a.unit; od = cfg.p("out", "out") / name; od.mkdir(parents=True, exist_ok=True)
+    run = reserve_budget(cfg, mc, name, a.budget, a.run)
+    hn = next((n for n, h in cfg.hosts.items() if h.get("local")), "local")
+    try: var, key = read_secret(pv)
+    except Err as e: ledger_done(cfg, pv, run, name, 0, "no-key"); raise
+    shim = cfg.f("bin"); put_script({"local": True}, str(shim / "pueue"), clean_pueue_script({"local": True}))
+    env = clean_env({"ORCH_ROLE": "agent", "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root), "ORCH_REPORT": a.report or str(od / "REPORT.md"), var: key})
+    env["PATH"] = f"{shim}:{env['PATH']}"   # the agent's own `pueue add` never stores the key in pueue's state file
+    argv = api_argv(pv, mc, a.budget, agent_prompt(cfg, name, a.brief, hn))
+    say(f"orch api-run {name}: run {run}, model {mc.get('api_id', a.model)}, budget ${a.budget}, cwd {a.cwd}")
+    import signal
+    with open(od / "api.json", "w") as fo, open(od / "api.err", "w") as fe:
+        p = subprocess.Popen(argv, cwd=a.cwd, env=env, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe)
+    del key, env
+    fwd = lambda s, _f: p.send_signal(s)   # pueue kill / orch stop: the agent stops too, and its done row is still written
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(s, fwd)
+    while True:
+        try: rc = p.wait(); break
+        except InterruptedError: continue
+    cost, reported = run_cost(od / "api.json", a.budget)
+    ledger_done(cfg, pv, run, name, cost, rc)
+    say(f"orch api-run {name}: exit {rc}, cost ${cost:.4f}" + ("" if reported else " (no cost reported: charged the whole budget)"))
+    return rc
 
 # A pueue that never stores the caller's environment: an agent holds ANTHROPIC_API_KEY in its own environment (claude passes
 # it to every tool command), and pueue stores a task's whole environment in its state file. The lane runner uses it, and
@@ -734,15 +953,18 @@ exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" PATH="$PATH" L
 '''
 
 def clean_pueue_script(h):
-    real = f"{h['bin']}/pueue" if h.get("bin") else "$HOME/.local/bin/pueue"
+    if h.get("local"):
+        import shutil
+        real = shutil.which("pueue", path=clean_env()["PATH"]) or "pueue"
+    else: real = f"{h['bin']}/pueue" if h.get("bin") else "$HOME/.local/bin/pueue"
     return CLEAN_PUEUE % {"real": real}
 
 def lane_runner(cfg, hn, h, name, rcwd):
     """<root>/run/<unit>.lane on host h: `lane <command>` runs the command in the agent's tree through this host's pueue jobs lane,
     with orch's admission (runs/admit.sh) and MemoryMax, waits, prints the log and exits with its code (M9; fixes5 item 2)."""
     a = argparse.Namespace(lane="jobs", subdir=None, usb=False, wt=rcwd)
-    rd = runs_dir(cfg, h); q = shlex.quote; F = h.get("fleet", "/srv/app-fleet")
-    crd = "/f" + rd[len(F):] if h.get("runner") == "podman" and rd.startswith(F + "/") else rd   # the runs dir as the job sees it
+    rd = runs_dir(cfg, h); q = shlex.quote
+    crd = in_container(h, rd)   # the runs dir as the job sees it
     js = job_script(cfg, hn, h, a, name, f"bash {crd}/__JID__.cmd", "__JID__", wd=rcwd)
     return ("#!/bin/bash\n# orch lane runner for unit " + name + f" on {hn}: lane <command>\nRD={q(rd)}; mkdir -p $RD\n"
             f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=$RD/$jid\nprintf '%s\\n' \"$*\" > $R.cmd\n"
@@ -757,8 +979,7 @@ def brief_header(cfg, hn, h, name, rcwd, local):
     return (f"<!-- orch: unit {name} runs on {hn} -->\n**Where you run (orch):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `orch collect` "
             f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
             f"`{lane} '<command>'` (for example `{lane} 'cargo test -p <crate>'`). It waits for admission, runs, prints the log and exits "
-            f"with the command's code. Do not run cargo, pytest or other heavy commands directly, and do not use linux-test.sh "
-            f"(that is the Mac's script).\n\n")
+            f"with the command's code. Do not run builds, tests or other heavy commands directly.\n\n")
 
 def place(cfg, a, brief, mc, units, hs):
     """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
@@ -778,6 +999,20 @@ def place(cfg, a, brief, mc, units, hs):
         want = st.read_text().strip() if st.is_file() else None
     if want and want in allowed: return [want], f"tests run on {want}"
     return allowed, ("tests run on " + want + ", but " + a.unit + "'s model is not allowed there; " if want else "") + "most room"
+
+RESUME_RX = re.compile(r"^REPORT:\s*`?(\S+?)`?\s*$|continue (?:the same|its|the original) report:?\s+`?(\S+?REPORT\.md)", re.M | re.I)
+
+def resume_report(cfg, a, brief):
+    """The report a resumed unit continues: --report, else out/<--resume-of>/REPORT.md, else a 'REPORT: <path>' or 'Continue the
+    same report <path>' line in the brief. None for a new unit (it writes out/<unit>/REPORT.md)."""
+    p = a.report or (str(cfg.p("out", "out") / a.resume_of / "REPORT.md") if a.resume_of else None)
+    if not p and brief.is_file():
+        m = RESUME_RX.search(brief.read_text()); p = m and (m.group(1) or m.group(2))
+    if not p: return None
+    p = Path(os.path.expanduser(p)); p = p if p.is_absolute() else cfg.root / p
+    return None if p == cfg.p("out", "out") / a.unit / "REPORT.md" else p.resolve()
+
+def report_path(cfg, u): return Path(u["report"]) if u.get("report") else cfg.p("out", "out") / u["name"] / "REPORT.md"
 
 def main_checkout(cwd):
     """True when cwd is the main working tree of a repository that has linked worktrees (agents get a worktree, H9)."""
@@ -845,15 +1080,26 @@ def cmd_launch(cfg, a):
     budget = None
     if mc["kind"] == "api":
         budget = a.budget if a.budget is not None else cfg.prov[mc["provider"]].get("budget_per_unit", 15)
-        run = reserve_budget(cfg, mc, name, budget, write=False)   # local: fable-api.sh reserves under the same lock; remote: below
+        read_secret(cfg.prov[mc["provider"]])   # the secret store answers before anything is reserved or recorded
+        ok, w = model_ok(cfg, mname)
+        if not ok and "ledger" in w: raise Err(f"refused: {w}")
+    # A resumed unit continues its original report (--report, --resume-of, or a REPORT: / 'continue the same report <path>'
+    # line in the brief); the unit records it, so check and the Stop hook read that report.
+    report = resume_report(cfg, a, brief)
+    if report and report.exists():
+        t = report.read_text().split("\n", 1)
+        if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not DRY: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
     u = {"host": hn, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
-         "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting"}
+         "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
+    if report: u["report"] = str(report); u["resume"] = True
+    item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
+    if item: u["item"] = item
     if DRY: say(f"+ bd create unit:{name}; bd update --status in_progress")
     else:
         u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
         bd.run("update", u["id"], "--status", "in_progress"); bd.save(u)
-    env = {"ORCH_ROLE": "agent", "ORCH_REPORT": str(outd / "REPORT.md"), "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root)}
+    env = {"ORCH_ROLE": "agent", "ORCH_REPORT": str(report or outd / "REPORT.md"), "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root)}
     try:
         if not local:
             root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
@@ -864,22 +1110,26 @@ def cmd_launch(cfg, a):
             elif sh(cmd, timeout=900)[0]: raise Err("rsync to " + hn + " failed")
             # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
             X(h, f"rm -rf {root}/base/{name} && cp -a {rcwd} {root}/base/{name}", timeout=300)
-            X(h, f"cat > {root}/run/{name}.lane && chmod +x {root}/run/{name}.lane", inp=lane_runner(cfg, hn, h, name, rcwd))
-            X(h, f"cat > {rbrief}", inp=brief_header(cfg, hn, h, name, rcwd, local) + brief.read_text())
-            X(h, f"[ -s {root}/out/{name}/REPORT.md ] || echo 'VERDICT: PENDING' > {root}/out/{name}/REPORT.md")
+            put_script(h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
+            put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local) + brief.read_text(), "644")
+            if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
+                put_script(h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
+            else: X(h, f"[ -s {root}/out/{name}/REPORT.md ] || echo 'VERDICT: PENDING' > {root}/out/{name}/REPORT.md")
         rep = outd / "REPORT.md"
-        if not rep.exists() and not DRY: rep.write_text("VERDICT: PENDING\n")
+        if not report and not rep.exists() and not DRY: rep.write_text("VERDICT: PENDING\n")
         prompt = agent_prompt(cfg, name, rbrief, hn)
         u["rcwd"] = rcwd
         if mc["kind"] == "api":
             X(h, ensure_lanes(h))
+            # the budget is reserved (cap check and the run's running row, under the ledger's lock) before anything is queued
+            run = reserve_budget(cfg, mc, name, budget); u["run"] = run
             if local:
-                cmd = shlex.join([str(cfg.root / mc["launcher"]), name, rbrief, rcwd, str(budget), mc["model"]])
+                cmd = shlex.join([sys.executable, str(ORCH_SELF), "api-run", name, "--run", run, "--model", mname, "--budget", str(budget),
+                                  "--brief", rbrief, "--cwd", rcwd, "--report", env["ORCH_REPORT"]])
                 rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {cmd}", env=env)
             else:
-                run = reserve_budget(cfg, mc, name, budget, write=True); u["run"] = run
                 rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env)
-                if rc and not DRY: ledger(cfg, mc, run, "0", "done rc=launch-failed", name)
+            if rc and not DRY: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
             if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
             u.update(via="pueue", task=int(o.strip() or 0))
             unit_tab(cfg, u, mname, hn, h)
@@ -995,6 +1245,7 @@ def cmd_stop(cfg, a):
         time.sleep(1)
     else: raise Err(f"{u['name']} is still alive after stop")
     if u.get("pane") and via != "herdr": herdr("pane", "close", u["pane"])
+    if h.get("local"): settle_run(cfg, u, "stopped")   # remote: collect brings back the cost first, close settles the rest
     bd.comment(u["id"], f"{ts()} stopped (every process group of the unit ended)"); cfg.touch("changed"); say("stopped: no process of the unit is left")
 
 def cmd_collect(cfg, a):
@@ -1011,10 +1262,11 @@ def cmd_collect(cfg, a):
     if DRY: say("+ " + shlex.join(cmd))
     elif sh(cmd, timeout=600)[0]: raise Err(f"collect from {u['host']} failed (unreachable?)")
     mc = cfg.models.get(u.get("model"), {})
-    if not DRY and u.get("via") == "pueue" and mc.get("kind") == "api" and not u.get("spent"):
-        try: cost = json.loads((od / "api.json").read_text()).get("total_cost_usd")
-        except Exception: cost = None
-        if cost is not None: ledger(cfg, mc, u.get("run") or f"{n}.{u['task']}", f"{cost}", "done rc=0", n); u["spent"] = cost; bd.save(u)
+    if not DRY and u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("run"):
+        cost, reported = run_cost(od / "api.json", None)
+        if reported: ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], n, cost, "collected")   # idempotent: once per run id
+    if not DRY and u.get("report") and (od / "REPORT.md").is_file():   # a resumed unit: its report goes back to the original path
+        atomic_write(Path(u["report"]), (od / "REPORT.md").read_text()); say(f"report -> {u['report']}")
     if not DRY: bd.comment(u["id"], f"{ts()} collected from {u['host']}"); cfg.touch("changed")
     p = od / "changes.patch"
     say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
@@ -1034,7 +1286,7 @@ def cmd_close(cfg, a):
         rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=u["cwd"])
         if rc == 0 and o.strip() != "0" and not a.force: raise Err("unpushed commits; push first, or --force")
     elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
-        raise Err(f"{u['name']} has no final VERDICT line in out/{u['name']}/REPORT.md")
+        raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
     if u.get("tab") or u.get("pane"):
         if DRY: say(f"+ herdr tab close {u.get('tab') or u.get('pane')}")
@@ -1048,8 +1300,161 @@ def cmd_close(cfg, a):
     if u.get("via") == "pueue": X(h, f"{pueue(h)} remove {u['task']} 2>/dev/null; true")
     X({"local": True}, f"{shlex.quote(str(cfg.p('board', 'bin/board.sh')))} close {u['name']} 2>/dev/null; true")
     if DRY: return
+    if u.get("run") and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"): settle_run(cfg, u, "closed")
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
     say("closed")
+
+# ---------------------------------------------------------------- backlog and landing (orch-fixes7)
+# The backlog lives in beads: `orch backlog import` turns every unfinished item of the project's status checklist into a beads
+# issue labelled backlog and status:<its status>, keyed by external ref backlog:<item id> (idempotent: a re-import updates
+# status labels, closes items that became done, reopens ones that came back). check then raises "idle with backlog" when a host
+# has room while backlog items have no open unit, and "finished, not landing" when a finished unit has no gate, or its gates
+# passed and it is not on the landing branch.
+def slug(t): return re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:40]
+
+def backlog_cfg(cfg):
+    b = dict(cfg.c.get("backlog", {})); b.setdefault("file", cfg.paths.get("checklist"))
+    return b
+
+def backlog_items(cfg):
+    """[(id, title, status, done, ready)] from the checklist ([backlog] file, default paths.checklist): markdown table rows (the
+    header row names the columns: id_col '#', title_col 'item', status_col 'status') and '- [ ] item' / '- [x] item' lines.
+    done: status starts with one of [backlog] done (default DONE). ready: not done, and the status starts with one of
+    [backlog] ready (default: every status), so items waiting on the owner can be left out of 'idle with backlog'."""
+    b = backlog_cfg(cfg)
+    if not b.get("file"): return None
+    try: text = (cfg.root / b["file"]).read_text()
+    except OSError: return None
+    idc, tc, sc = (b.get(k, d).lower() for k, d in (("id_col", "#"), ("title_col", "item"), ("status_col", "status")))
+    dn = [x.upper() for x in b.get("done", ["DONE"])]; rd = [x.upper() for x in b.get("ready", [])]
+    items, hdr, seen = [], None, set()
+    def add(i, t, st):
+        if not t or i in seen: return
+        seen.add(i); d = any(st.upper().startswith(x) for x in dn)
+        items.append((i, t, st, d, not d and (not rd or any(st.upper().startswith(x) for x in rd))))
+    for l in text.splitlines():
+        s = l.strip()
+        if s.startswith("#"): hdr = None; continue
+        if s.startswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if all(re.fullmatch(r":?-*:?", c) for c in cells): continue
+            low = [c.lower() for c in cells]
+            if tc in low and sc in low: hdr = low; continue
+            if hdr and len(cells) >= len(hdr):
+                r = dict(zip(hdr, cells)); t = r.get(tc, "")
+                add(r.get(idc) or slug(t), t, r.get(sc, ""))
+            continue
+        m = re.match(r"^[-*] \[( |x|X)\] (.+)$", s)
+        if m: add(slug(m.group(2)), m.group(2), "DONE" if m.group(1) != " " else "OPEN")
+    return items
+
+def backlog_issues(cfg):
+    r = Beads(cfg).run("list", "--label", "backlog", "--all", "-n", "0")
+    r = r.get("issues", r) if isinstance(r, dict) else r
+    return {i.get("external_ref"): i for i in r if str(i.get("external_ref", "")).startswith("backlog:")}
+
+def cmd_backlog(cfg, a):
+    items = backlog_items(cfg)
+    if items is None: raise Err("no checklist: set [backlog] file (or paths.checklist) in orch.toml")
+    if a.action == "list":
+        for i, t, st, d, rd in items: say(f"{'done ' if d else 'ready' if rd else 'wait '} {i:8} {st[:24]:24} {t[:90]}")
+        return
+    bd = Beads(cfg); ex = backlog_issues(cfg); n = {"created": 0, "updated": 0, "closed": 0, "reopened": 0, "same": 0}
+    for i, t, st, d, rd in items:
+        ref = f"backlog:{i}"; labels = ["backlog", "status:" + (slug(st) or "none")] + (["backlog-ready"] if rd else [])
+        x = ex.get(ref); title = f"backlog: {i} {t}"[:150]
+        if DRY: say(f"+ {ref}: {'close' if d and x else 'skip' if d else 'update' if x else 'create'} ({st[:30]})"); continue
+        if d:
+            if x and x.get("status") != "closed": bd.run("close", x["id"], "--reason", f"checklist: {st[:60]}"); n["closed"] += 1
+            continue
+        if not x:
+            r = bd.run("create", title, "-l", ",".join(labels), "-d", f"From {backlog_cfg(cfg)['file']}: {t}\nstatus: {st}", "--external-ref", ref)
+            n["created"] += 1; continue
+        if x.get("status") == "closed": bd.run("reopen", x["id"]); n["reopened"] += 1
+        if sorted(x.get("labels") or []) != sorted(labels) or x.get("title") != title:
+            bd.run("update", x["id"], "--title", title, "--set-labels", ",".join(labels)); n["updated"] += 1
+        else: n["same"] += 1
+    if not DRY: cfg.touch("backlog_imported"); cfg.touch("changed")
+    say(f"backlog: {len(items)} checklist items; " + ", ".join(f"{v} {k}" for k, v in n.items()))
+
+def unit_items(cfg, units):
+    """Backlog item ids that open units cover: their --item / ITEM: line, or an item id named in the first lines of their brief."""
+    out = set()
+    for u in units:
+        if u.get("item"): out.add(u["item"])
+        try: out.update(re.findall(r"[A-Za-z0-9][\w.-]*", "\n".join(Path(u["brief"]).read_text().splitlines()[:6])))
+        except (OSError, KeyError): pass
+    return out
+
+def backlog_findings(cfg, hs, units):
+    b = backlog_cfg(cfg)
+    if not b.get("file"): return []
+    try: iss = backlog_issues(cfg)
+    except Err: return []
+    if not iss:
+        return [("backlog:import", f"the checklist {b['file']} is not in beads: orch backlog import")]
+    F = []
+    if (cfg.root / b["file"]).exists() and (cfg.root / b["file"]).stat().st_mtime > cfg.mtime("backlog_imported") + 60:
+        F.append(("backlog:stale", f"{b['file']} changed since the last orch backlog import: run it again"))
+    cov = unit_items(cfg, units)
+    todo = [(r[8:], i.get("title", "")[9:]) for r, i in iss.items()
+            if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or []) and r[8:] not in cov]
+    if not todo: return F
+    for n, p in hs.items():
+        if not p.get("ok"): continue
+        r, why = room(cfg, n, p, units)
+        if r > 0:
+            F.append((f"idle-backlog:{n}", f"host {n} has room for {r} while {len(todo)} backlog item(s) have no open unit: write briefs for: "
+                      + "; ".join(t[:50] for _, t in todo[:6]) + ("..." if len(todo) > 6 else "") + " (then orch launch --item <id>)"))
+    return F
+
+def gate_results(cfg):
+    """{gate name: (time, PASS|FAIL)}, the latest line of each gate in paths.gate_log."""
+    try: lines = cfg.p("gate_log", "out/gates.log").read_text().splitlines()
+    except OSError: return {}
+    r = {}
+    for l in lines:
+        m = GATE_LINE.match(l)
+        if m: r[m.group(1)] = (l[:19], m.group(2))
+    return r
+
+def landed(cfg, u):
+    """True when the unit's worktree HEAD is on the landing branch ([landing] branch, default the main repo's HEAD branch);
+    None when it cannot be told (no worktree of its own)."""
+    c = Path(u.get("cwd", "/"))
+    if c.resolve() == cfg.root.resolve() or not c.is_dir(): return None
+    br = cfg.c.get("landing", {}).get("branch")
+    if not br:
+        rc, o, e = sh(["git", "-C", str(c), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        br = o.strip() if rc == 0 and o.strip() else "main"
+    rc, o, e = sh(["git", "-C", str(c), "merge-base", "--is-ancestor", "HEAD", br])
+    return True if rc == 0 else False if rc == 1 else None
+
+def landing_findings(cfg, units, hs=None):
+    ld = cfg.c.get("landing", {}); mins = ld.get("finished_min", 30); need = ld.get("gates_required", 1)
+    pats = ld.get("gate_names", ["{unit}", "land-{unit}", "land-{unit}-*", "{unit}-*"])
+    import fnmatch
+    res = gate_results(cfg); queued = set()
+    for p in (hs or {}).values():
+        for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
+            lab = t.get("label") or ""
+            if lab.startswith("gate:") and any(k in str(t.get("status")) for k in ("Queued", "Running")): queued.add(lab[5:])
+    F = []
+    for u in units:
+        v = u.get("verdict") or ""
+        if u.get("state") not in ("done", "failed", "gone", "idle") or "DONE" not in v: continue
+        try: fin = report_path(cfg, u).stat().st_mtime
+        except OSError: continue
+        age = (now() - fin) / 60
+        if age < mins: continue
+        names = set(u.get("gates", [])) | {n for n in set(res) | queued if any(fnmatch.fnmatch(n, x.format(unit=u["name"])) for x in pats)}
+        if names & queued: continue
+        passed = sorted(n for n in names if res.get(n, ("", ""))[1] == "PASS")
+        if not names:
+            F.append((f"landing:{u['name']}:nogate", f"{u['name']} finished {age:.0f} min ago (VERDICT DONE) with no gate queued: orch gate <name> --unit {u['name']}"))
+        elif len(passed) >= need and landed(cfg, u) is False:
+            F.append((f"landing:{u['name']}:unlanded", f"{u['name']}: gate(s) {', '.join(passed)} passed, finished {age:.0f} min ago, not landed: land it, then orch close"))
+    return F
 
 # ---------------------------------------------------------------- run / gate: build and test jobs in each host's own pueue
 # A job belongs to the host's pueue daemon, never to the ssh connection that queued it: if the caller dies the job keeps running,
@@ -1075,16 +1480,21 @@ def admit_lib(h):
     """runs/admit.sh for host h, written by every orch run; each waiting job re-reads it every 15 s, so a rule change reaches jobs
     already waiting, including those queued under older rules (they source it too). Admit while measured MemAvailable >=
     reserve_gb + the measured per-job working set, memory PSI some avg10 < 5, load1 < 1.5 x cores (the same load rule as
-    orch capacity) and disk >= min_disk_gb. The working set is the largest anonymous memory (memory.stat anon: page cache is
-    reclaimable and not counted, it filled memory.peak up to the cap) of the orch jobs running now (podman hosts: of the
-    orch-run/app-run containers), remembered in runs/ws_mb; with nothing measured yet, job_ws_gb (default half
-    of job_gb). It is clamped to job_gb, which stays each job's MemoryMax: the runaway guard, not the admission rule (audit H6)."""
+    orch capacity), disk >= min_disk_gb, and CPU: (running orch jobs + 1) x cores_per_job <= cores (orch-fixes7: load lags,
+    because builds ramp up after they are admitted; 8 jobs on 8 cores ran at load 17). The working set is the largest anonymous
+    memory (memory.stat anon: page cache is reclaimable and not counted, it filled memory.peak up to the cap) of the orch jobs
+    running now (podman hosts: of the containers named by container.name_prefixes), remembered in runs/ws_mb; with nothing
+    measured yet, job_ws_gb (default half of job_gb). It is clamped to job_gb, which stays each job's MemoryMax: the runaway
+    guard, not the admission rule (audit H6)."""
     cap = int(h.get("job_gb", 2) * 1024); ws0 = int(h.get("job_ws_gb", h.get("job_gb", 2) / 2) * 1024)
     pod = h.get("runner") == "podman"
+    flt = " ".join(f"--filter name={x}" for x in h.get("container", {}).get("name_prefixes", ["orch-run-"]))
+    ids = f"podman ps -q --no-trunc {flt} 2>/dev/null"
     return (ADMIT_LIB % {"reserve": int(h.get("reserve_gb", 2) * 1024), "cap": cap, "ws0": ws0, "load10": int(h.get("cores", 4) * 15),
-                         "cores": h.get("cores", 4), "disk": h.get("min_disk_gb", 10),
-                         "peaks": ('for i in $(podman ps -q --no-trunc --filter name=orch-run- --filter name=app-run- 2>/dev/null); do '
-                                   'awk \'/^anon /{print $2}\' $US/libpod-$i.scope/memory.stat 2>/dev/null; done' if pod else
+                         "cores": h.get("cores", 4), "cores10": int(h.get("cores", 4) * 10), "disk": h.get("min_disk_gb", 10),
+                         "cpj": h.get("cores_per_job", 1), "cpj10": int(h.get("cores_per_job", 1) * 10),
+                         "jobs": ids if pod else "ls -d $AS/orch-*.scope",
+                         "peaks": (f'for i in $({ids}); do awk \'/^anon /{{print $2}}\' $US/libpod-$i.scope/memory.stat 2>/dev/null; done' if pod else
                                    'for s in $AS/orch-*.scope; do awk \'/^anon /{print $2}\' $s/memory.stat 2>/dev/null; done')})
 
 ADMIT_LIB = r'''# orch admission for this host (written by orch run; see admit_lib in orch.py). Re-read by every waiting job each poll.
@@ -1098,8 +1508,9 @@ admit_ok() {
   if [ "$pk" -gt 0 ]; then echo $pk > $RD/ws_mb.$$ && mv $RD/ws_mb.$$ $RD/ws_mb; ws=$pk; else ws=$(cat $RD/ws_mb 2>/dev/null); fi
   ws=${ws:-%(ws0)d}; [ "$ws" -gt %(cap)d ] && ws=%(cap)d; [ "$ws" -lt 256 ] && ws=256
   need_mb=$((%(reserve)d + ws))
-  why="MemAvailable ${avail} MB (need ${need_mb} = reserve %(reserve)d + working set ${ws}), PSI ${psi}, load ${load} (limit 1.5 x %(cores)s cores), disk ${d} GB (floor %(disk)d)"
-  [ "$avail" -ge "$need_mb" ] && [ "$psi" -lt 5 ] && [ "$load10" -lt %(load10)d ] && [ "$d" -ge %(disk)d ]
+  nj=$( { %(jobs)s; } 2>/dev/null | wc -l | tr -d ' '); cpu10=$(( (nj + 1) * %(cpj10)d ))
+  why="MemAvailable ${avail} MB (need ${need_mb} = reserve %(reserve)d + working set ${ws}), PSI ${psi}, load ${load} (limit 1.5 x %(cores)s cores), disk ${d} GB (floor %(disk)d), CPU $((nj + 1)) x %(cpj)s of %(cores)s cores"
+  [ "$avail" -ge "$need_mb" ] && [ "$psi" -lt 5 ] && [ "$load10" -lt %(load10)d ] && [ "$d" -ge %(disk)d ] && { [ "$nj" -eq 0 ] || [ "$cpu10" -le %(cores10)d ]; }
 }
 '''
 
@@ -1128,18 +1539,38 @@ started() { for i in $(seq 20); do [ -d $AS/orch-%(jid)s.scope ] && break; kill 
   sleep 60 </dev/null >/dev/null 2>&1 & exec 7>&-; }
 '''
 
+def ctr(h):
+    """A podman host's container settings ([hosts.<h>.container]): image, mount (host dir, default the host's root), mount_at
+    (default /f), args, usb_args, usb_lock, host_dirs, name_prefixes, cpus."""
+    c = dict(h.get("container", {})); c.setdefault("mount", h.get("fleet", h.get("root", "/tmp"))); c.setdefault("mount_at", "/f")
+    return c
+
+def in_container(h, path):
+    """A host path as a podman job sees it (under the mount), or the path itself."""
+    if h.get("runner") != "podman": return path
+    c = ctr(h); m = c["mount"].rstrip("/")
+    return c["mount_at"] + path[len(m):] if path.startswith(m + "/") else path
+
+def remote_wt(h, name):
+    """Where `orch run` syncs a worktree on a remote host."""
+    if h.get("runner") == "podman": return f"{ctr(h)['mount']}/worktrees/{name}"
+    return f"{h.get('worktrees', h.get('root', '$HOME/orch') + '/worktrees')}/{name}"
+
 def job_script(cfg, hn, h, a, name, cmd, jid, wd=None):
     """The bash script pueue runs on the host. Output is tee'd to <runs>/<jid>.log, the exit code written to <jid>.rc.
-    wd: the tree on the host (a remote agent's copy); default the synced worktree of that name."""
-    q = shlex.quote; rd = runs_dir(cfg, h); sub = a.subdir or "."
+    wd: the tree on the host (a remote agent's copy); default the synced worktree of that name. Per host (orch.toml):
+    run_env (shell run first), job_setup (shell run in the worktree before the command), job_log (a line per job start/end),
+    and for runner = "podman" the [hosts.<h>.container] settings."""
+    q = shlex.quote; rd = runs_dir(cfg, h); sub = a.subdir or "."; sub_ = lambda x: str(x).replace("{name}", name).replace("{jid}", jid)
     head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={q(rd)}; R=$RD/{jid}\n"
+    setup = h.get("job_setup", ""); log = h.get("job_log", h.get("fleet_log", "/dev/null"))
     if h.get("local"):
         adm = ""
-        if a.lane == "land":   # Mac landing lane: the 5 GB internal-disk floor and agent-capacity's memory check, as heavy.sh's land lanes had
-            ck = h.get("admit_check", ""); base = h.get("legacy_lanes", "")
-            adm = (f"said=\nwhile :; do d=$(/bin/df -g /Users | awk 'NR==2{{print $4}}'); busy=\n"
+        if a.lane == "land":   # the local landing lane: the disk floor, the host's admit_check, and no legacy_lanes lane busy
+            ck = h.get("admit_check", ""); base = h.get("legacy_lanes", ""); ce = h.get("admit_check_env", "")
+            adm = (f"said=\nwhile :; do d=$(df -Pk {q(str(cfg.root))} | awk 'NR==2{{print int($4/1048576)}}'); busy=\n"
                    f"  for s in {base}; do o=$(cat $s/pid 2>/dev/null); [ -n \"$o\" ] && kill -0 $o 2>/dev/null && busy=$s; done\n"
-                   f"  [ \"$d\" -ge {h.get('min_disk_gb', 5)} ] && {{ [ -z {q(ck)} ] || app_FAKE_FREE_DISK_GB=99 sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
+                   f"  [ \"$d\" -ge {h.get('min_disk_gb', 5)} ] && {{ [ -z {q(ck)} ] || {ce + ' ' if ce else ''}sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
                    f"  [ \"$said\" ] || {{ echo \"orch: land lane waiting (disk ${{d}} GB, floor {h.get('min_disk_gb', 5)}; old lane busy: ${{busy:-none}})\"; said=1; }}; sleep 15; done\n")
         body = f"{adm}cd {q(str(Path(a.wt).resolve()))} && cd {q(sub)} || exit $?\nnice -n 10 bash -c {q(cmd)}\n"
     else:
@@ -1147,45 +1578,45 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None):
         adm = ADMIT_LINUX % {"need": int((h.get("job_gb", 2) + h.get("reserve_gb", 2)) * 1024), "cores": h.get("cores", 4),
                              "lane": a.lane, "disk": h.get("min_disk_gb", 10), "jid": jid}
         scope = f"systemd-run --user --scope -q --unit=orch-{jid} -p MemoryMax={cap}M --"
-        if h.get("runner") == "podman":   # linux2: run.sh's container settings, the job capped at job_gb (run.sh is not used)
-            F = h.get("fleet", "/srv/app-fleet"); inner = f"(cd processing && uv sync --locked -q) && cd {sub} && {cmd}"
-            hw = ("--device /dev/bus/usb --group-add keep-groups --mount type=tmpfs,destination=/run/app,tmpfs-mode=0700,chown=true " if a.usb else "")
-            hw_ = wd or f"{F}/worktrees/{name}"; cw = "/f" + hw_[len(F):] if hw_.startswith(F + "/") else f"/f/worktrees/{name}"
-            body = (f"[ -d {hw_} ] || {{ echo 'orch: no worktree {hw_} on {hn}'; exit 2; }}\nmkdir -p {F}/tmp/{name}\n"
-                    + (f"exec 8>{F}/run.usb.lock; flock 8\n" if a.usb else "") + adm +
-                    f"printf '%s orch-run start [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {F}/log/fleet.log\n"
+        if h.get("runner") == "podman":   # the job runs in the host's container settings, capped at job_gb
+            c = ctr(h)
+            if not c.get("image"): raise Err(f"host {hn}: runner podman needs [hosts.{hn}.container] image")
+            inner = (f"({setup}) && " if setup else "") + f"cd {sub} && {cmd}"
+            hw = " ".join(map(q, map(sub_, c.get("usb_args", [])))) + " " if a.usb else ""
+            hw_ = wd or remote_wt(h, name); cw = in_container(h, hw_)
+            args = " ".join(q(sub_(x)) for x in c.get("args", []))
+            body = (f"[ -d {hw_} ] || {{ echo 'orch: no worktree {hw_} on {hn}'; exit 2; }}\n"
+                    + "".join(f"mkdir -p {q(sub_(d))}\n" for d in c.get("host_dirs", []))
+                    + (f"exec 8>{c['usb_lock']}; flock 8\n" if a.usb and c.get("usb_lock") else "") + adm +
+                    f"printf '%s orch-run start [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {log}\n"
                     f"{scope} nice -n 15 ionice -c 3 podman run --rm --init --name orch-run-{jid} {hw}"
-                    f"--memory={cap}m --memory-swap={cap}m --cpus=2 --pids-limit=4096 --cpu-shares=256 --userns=keep-id --security-opt label=disable "
-                    f"--tmpfs /dev/shm:rw,exec,nosuid,nodev,size=2g -v {F}:/f -w {cw} -e CARGO_HOME=/f/cache/cargo -e RUSTC_WRAPPER=sccache "
-                    f"-e SCCACHE_DIR=/f/cache/sccache -e SCCACHE_CACHE_SIZE=8G -e CARGO_BUILD_JOBS=2 -e UV_CACHE_DIR=/f/cache/uv -e npm_config_store_dir=/f/cache/pnpm "
-                    f"-e TMPDIR=/f/tmp/{name} -e app_SCENE_CACHE=/f/cache/scenes -e PATH=/f/cache/cargo/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin "
-                    f"{h.get('image', 'localhost/app-build:2')} bash -c {q(inner)} 7>&- &\npid=$!; started $pid; wait $pid; rc=$?\n"
-                    f"printf '%s orch-run end [%s] {jid} exit %s\\n' \"$(date '+%F %T')\" {name} $rc >> {F}/log/fleet.log\nexit $rc\n")
-        else:   # linux1: build-env.sh (sccache, app_ARAVIS_TEST_ADDRS, TMPDIR, scene cache) and the processing venv, as linux-test.sh did
-            wd = wd or f"{h.get('worktrees', '$HOME/app-fleet/worktrees')}/{name}"
-            body = (f"{h.get('run_env', '')}\ncd {wd} && (cd processing && uv sync --locked -q) && cd {q(sub)} || exit $?\n" + adm +
-                    f"printf '%s orch-run [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {h.get('fleet_log', '/dev/null')}\n"
+                    f"--memory={cap}m --memory-swap={cap}m --cpus={c.get('cpus', h.get('cores_per_job', 2))} -v {c['mount']}:{c['mount_at']} -w {cw} {args} "
+                    f"{c['image']} bash -c {q(inner)} 7>&- &\npid=$!; started $pid; wait $pid; rc=$?\n"
+                    f"printf '%s orch-run end [%s] {jid} exit %s\\n' \"$(date '+%F %T')\" {name} $rc >> {log}\nexit $rc\n")
+        else:
+            wd = wd or remote_wt(h, name)
+            body = (f"{h.get('run_env', '')}\ncd {wd} && " + (f"({setup}) && " if setup else "") + f"cd {q(sub)} || exit $?\n" + adm +
+                    f"printf '%s orch-run [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {log}\n"
                     f"{scope} nice -n 10 bash -c {q(cmd)} 7>&- &\npid=$!; started $pid; wait $pid\n")
     return head + "main() {\n" + body + "}\nmain 2>&1 | tee -a $R.log\nrc=${PIPESTATUS[0]}; echo $rc > $R.rc; exit $rc\n"
 
 def sync_wt(cfg, hn, h, src, name):
-    """Sync a Mac worktree to the host as linux-test.sh / linux2-test.sh did: --checksum and no -t (failure class 45: a changed file
-    gets the transfer time as its mtime, so cargo never reuses an artifact built from older content), no .git or build output.
-    Nested folders named like build output (reviews/dispatch-evidence and its neighbours) are synced: excludes are anchored."""
-    ex = ["--exclude", "/target", "--exclude", "/processing/.venv", "--exclude", "/station/web/node_modules", "--exclude", ".git"]
-    if h.get("runner") == "podman":
-        F = h.get("fleet", "/srv/app-fleet"); dst = f"{F}/worktrees/{name}"
-        rc, o, e = hrun(h, f"[ -d {dst} ] || cp -a --reflink=always {F}/base {dst}", timeout=300)
+    """Sync a worktree to the host: --checksum and no -t (a changed file gets the transfer time as its mtime, so cargo never
+    reuses an artifact built from older content), without the host's sync_exclude list (default .git, target, .venv,
+    node_modules; anchor an entry with a leading / so nested folders of that name are still synced). A podman host first clones
+    its container.clone_base (cp --reflink) when the worktree is new. Every path in paths.sync_require that exists here must
+    arrive (a missing one has broken gates before)."""
+    ex = [y for x in h.get("sync_exclude", [".git", "target", ".venv", "node_modules"]) for y in ("--exclude", x)]
+    dst = remote_wt(h, name)
+    if h.get("runner") == "podman" and ctr(h).get("clone_base"):
+        rc, o, e = hrun(h, f"[ -d {dst} ] || cp -a --reflink=always {ctr(h)['clone_base']} {dst}", timeout=300)
         if rc: raise Err(f"reflink clone on {hn} failed: {(e or o).strip()[-120:]}")
-    else:
-        dst = f"{h.get('worktrees', 'app-fleet/worktrees').replace('$HOME/', '')}/{name}"
-        ex = ["--exclude", "target", "--exclude", ".venv", "--exclude", "node_modules", "--exclude", ".git"]   # linux1: exactly linux-test.sh's set
-    cmd = ["rsync", "-rlpgoD", "--checksum", "--delete", "-e", " ".join(SSH), *ex, f"{src}/", f"{h['ssh']}:{dst}/"]
+    rdst = dst.replace("$HOME/", "")   # rsync resolves a relative path under the remote home
+    cmd = ["rsync", "-rlpgoD", "--checksum", "--delete", "-e", " ".join(SSH), *ex, f"{src}/", f"{h['ssh']}:{rdst}/"]
     r = subprocess.run(cmd)
     if r.returncode: raise Err(f"rsync to {hn} failed (exit {r.returncode})")
-    if (Path(src) / "reviews/dispatch-evidence").exists():
-        rc, *_ = hrun(h, f"test -e {dst}/reviews/dispatch-evidence")
-        if rc: raise Err(f"reviews/dispatch-evidence did not arrive on {hn} (class 63)")
+    for x in cfg.paths.get("sync_require", []):
+        if (Path(src) / x).exists() and hrun(h, f"test -e {dst}/{x}")[0]: raise Err(f"{x} did not arrive on {hn}")
 
 def task_status(h, tid):
     rc, o, e = hrun(h, f"{pueue(h)} status --json", timeout=30)
@@ -1230,7 +1661,7 @@ def cmd_run(cfg, a):
     if a.lane == "land" and not h.get("local"): raise Err("the land lane is the Mac's")
     cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
     if not cmd: raise Err("no command")
-    cmd = cmd[0] if len(cmd) == 1 else shlex.join(cmd)   # one argument is shell text, as linux-test.sh's "$*" was
+    cmd = cmd[0] if len(cmd) == 1 else shlex.join(cmd)   # one argument is shell text; several are quoted words
     src = str(Path(a.wt).resolve()); name = Path(src).name
     if not Path(src).is_dir(): raise Err(f"worktree {src} not found")
     unit = a.unit or os.environ.get("ORCH_UNIT")
@@ -1275,20 +1706,33 @@ def collect_job(cfg, ref):
 
 GATE_LINE = re.compile(r"^\S+ \S+ (\S+) .*RESULT: (\S+)")
 
+GATE_DEFAULT = ('cd "$ORCH_ROOT" && bash "$1"; rc=$?; r=PASS; [ $rc -eq 0 ] || r=FAIL; '
+                'printf "%s %s EXIT_tests=%s RESULT: %s\\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$2" $rc $r >> "$3"; exit $rc')
+
 def cmd_gate(cfg, a):
-    """Run out/<name>/tests.sh as a gates-lane task on the Mac, through run-handoff.sh (same host choice, LINUX_TEST_FULL rule,
-    EXIT_ parsing and RESULT line in out/handoff-results.log, so orch check and the gate checker read it as before)."""
+    """Run out/<name>/tests.sh as a gates-lane task on this machine. paths.gate_runner (a project script called with <name>)
+    runs it when set; otherwise orch runs tests.sh itself and appends '<date> <time> <name> EXIT_tests=<rc> RESULT: PASS|FAIL'
+    to paths.gate_log, the line orch check reads. --host passes the test host in paths.gate_host_env (default ORCH_TEST_HOST).
+    --unit (default $ORCH_UNIT) records the gate on that unit, for the landing check."""
     out = cfg.p("out", "out"); t = out / a.name / "tests.sh"
     if not t.is_file(): raise Err(f"{t} not found")
     h = cfg.hosts[next(n for n, x in cfg.hosts.items() if x.get("local"))]
-    env = {"ORCH_LANE": "gates", "ORCH_ROOT": str(cfg.root)} | ({"LINUX_TEST_HOST": a.host} if a.host else {})
+    env = {"ORCH_LANE": "gates", "ORCH_ROOT": str(cfg.root)} | ({cfg.paths.get("gate_host_env", "ORCH_TEST_HOST"): a.host} if a.host else {})
     pre = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-    rh = cfg.root / cfg.paths.get("run_handoff", "bin/run-handoff.sh")
+    rh = cfg.paths.get("gate_runner") or cfg.paths.get("run_handoff")
+    run = (shlex.quote(str(cfg.root / rh)) + " " + shlex.quote(a.name)) if rh else \
+          shlex.join(["sh", "-c", GATE_DEFAULT, "gate", str(t), a.name, str(cfg.p("gate_log", "out/gates.log"))])
+    unit = a.unit or os.environ.get("ORCH_UNIT")
+    if unit and not DRY:
+        try:
+            bd, u = get_unit(cfg, unit)
+            if a.name not in u.get("gates", []): u["gates"] = [*u.get("gates", []), a.name]; bd.save(u)
+        except Err as e: say(f"note: gate not recorded on {unit}: {e}")
     X(h, ensure_lanes(h))
-    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l gate:{a.name} -w {shlex.quote(str(cfg.root))} --print-task-id -o {a.priority} -- {shlex.quote(str(rh))} {a.name}")
+    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l gate:{a.name} -w {shlex.quote(str(cfg.root))} --print-task-id -o {a.priority} -- {run}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
     if DRY: return
-    tid = o.strip(); say(f"queued gate {a.name} as mac:{tid}")
+    tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid}")
     if not a.wait: return
     subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {tid}"])
     lines = [l for l in cfg.p("gate_log").read_text().splitlines() if (m := GATE_LINE.match(l)) and m.group(1) == a.name]
@@ -1354,10 +1798,129 @@ def cmd_commit_state(cfg, a):
         if any(r.search(b) for r in SECRETS): hit.append(x)
     if hit: sh(["git", "reset", "-q"], cwd=cfg.root); raise Err("refused (unstaged again), possible secrets in: " + ", ".join(hit))
     if not paths: say("nothing to commit"); return
-    for cmd in (["git", "commit", "-m", a.message], ["git", "push"]):
+    for cmd in (["git", "commit", "-m", a.message], push_cmd(cfg.root, cfg)):
         rc, o, e = sh(cmd, cwd=cfg.root, timeout=120)
         if rc: raise Err(f"{shlex.join(cmd[:2])} failed: {(e or o).strip()[-200:]}")
     say(f"committed {len(paths)} path(s) and pushed")
+
+def push_cmd(repo, cfg=None):
+    """git push; on a branch without an upstream, push --set-upstream to [git] remote (default origin, else the only remote),
+    so the next check can count unpushed commits (orch-fixes7)."""
+    if sh(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "@{u}"])[0] == 0: return ["git", "push"]
+    rem = ((cfg.c.get("git", {}) if cfg else {}).get("remote")) or ""
+    if not rem:
+        rs = sh(["git", "-C", str(repo), "remote"])[1].split()
+        rem = "origin" if "origin" in rs or not rs else rs[0]
+    return ["git", "push", "--set-upstream", rem, "HEAD"]
+
+# ---------------------------------------------------------------- init, doctor, queue (orch-fixes7: shareable setup)
+def init_project(root, a):
+    """A new project: write a commented starter orch.toml (from example.orch.toml next to orch.py), create the state, briefs and
+    out folders, and say what is left. Never overwrites an orch.toml."""
+    root = Path(root).resolve(); t = root / "orch.toml"
+    if t.exists(): raise Err(f"{t} exists")
+    ex = ORCH_SELF.parent / "example.orch.toml"
+    if not ex.is_file(): print(f"orch: {ex} not found (install copies it next to orch.py)", file=sys.stderr); return 2
+    name = a.name or slug(root.name) or "project"
+    host = (os.uname().nodename.split(".")[0].lower() or "local").replace(" ", "-")
+    text = ex.read_text().replace('name = "myproject"', f'name = "{name}"').replace('workspace = "myproject"', f'workspace = "{name}"')
+    text = text.replace("[hosts.laptop]", f"[hosts.{host}]").replace('hosts = ["laptop"]', f'hosts = ["{host}"]')
+    if DRY: print(text); return 0
+    atomic_write(t, text)
+    for d in (".orch", "briefs", "out"): (root / d).mkdir(exist_ok=True)
+    say(f"wrote {t} (this machine is [hosts.{host}]); created .orch/, briefs/, out/")
+    say("next: edit orch.toml (hosts, models, the API key's secret store), run `bd init` here if there is no .beads/, then `orch doctor`")
+    return 0
+
+def cmd_init(cfg, a):
+    """In a project with an orch.toml: turn the old state docs in paths.state_docs into a one-line pointer to .orch/HANDOFF.md
+    (fixes5 item 6); the old text is kept in .orch/history-<name> first."""
+    for x in cfg.paths.get("state_docs", []):
+        p = cfg.root / x
+        if not p.is_file(): continue
+        t = p.read_text(); ptr = f"Moved: the current state and handoff are in {cfg.state.name}/HANDOFF.md (orch check regenerates it). Old text: {cfg.state.name}/history-{p.name}\n"
+        if t == ptr: say(f"{x}: already a pointer"); continue
+        if DRY: say(f"+ keep {x} in {cfg.state.name}/history-{p.name}; write the pointer"); continue
+        k = cfg.f(f"history-{p.name}")
+        k.write_text((k.read_text() if k.exists() else "") + f"\n\n<!-- {ts()} moved from {x} -->\n" + t)
+        atomic_write(p, ptr); say(f"{x}: now a pointer (old text in {k})")
+    say(f"{cfg.root / 'orch.toml'} exists; run orch doctor to check the setup")
+
+def cmd_doctor(cfg, a): return doctor(cfg, a)
+
+def doctor(cfg, a):
+    """Check a setup end to end and say what to fix: tools, the installed release, hooks, watcher, config, secret store,
+    ledger, beads and hosts. Exit 1 when anything FAILs."""
+    import shutil
+    res = []
+    def r(ok, what, fix=""): res.append((ok, what, fix)); say(f"{'ok  ' if ok is True else 'WARN' if ok is None else 'FAIL'} {what}" + (f"  -> {fix}" if fix and ok is not True else ""))
+    path = clean_env()["PATH"]; which = lambda t: shutil.which(t, path=path)
+    r(sys.version_info >= (3, 11), f"python {sys.version.split()[0]} (3.11+ for tomllib)", "install Python 3.11 or newer")
+    for t, need in (("git", True), ("ssh", True), ("rsync", True), ("bd", True), ("pueue", True), ("herdr", False), ("tmux", False)):
+        r(True if which(t) else (False if need else None), f"tool {t}" + (f" ({which(t)})" if which(t) else " missing"),
+          {"bd": "brew install beads (or see github.com/steveyegge/beads)", "pueue": "brew install pueue; brew services start pueue"}.get(t, f"install {t}"))
+    if which("pueue"): rc, o, e = sh(["pueue", "status"], clean=True); r(rc == 0, "pueued answers", "start it: brew services start pueue (macOS) or systemctl --user enable --now pueued")
+    me = Path.home() / ".local/bin/orch"
+    tgt = me.resolve() if me.exists() else None
+    rel = tgt and ".local/share/orch/" in str(tgt)
+    r(bool(rel), f"installed orch: {me} -> {tgt or 'missing'}", "run ./install from the orch repo (it copies a tested release; never a link to the working tree)")
+    sk = Path.home() / ".claude/skills/orchestrating"
+    r(True if sk.exists() and ".local/share/orch/" in str(sk.resolve()) else None if sk.exists() else False,
+      f"skill {sk} -> {sk.resolve() if sk.exists() else 'missing'}", "run ./install")
+    try: hk = json.loads((Path.home() / ".claude/settings.json").read_text()).get("hooks", {})
+    except Exception: hk = {}
+    miss = [ev for ev in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop") if not any("orch hook " + ev in h.get("command", "") for e in hk.get(ev, []) for h in e.get("hooks", []))]
+    r(not miss, "Claude Code hooks " + ("installed" if not miss else "missing: " + ", ".join(miss)), "run ./install")
+    if sys.platform == "darwin": r(sh(["launchctl", "list", "com.orch.watch"])[0] == 0 or None, "watcher com.orch.watch loaded", "run ./install")
+    else: r(sh(["systemctl", "--user", "is-active", "orch-watch.timer"])[0] == 0 or None, "watcher orch-watch.timer active", "run ./install")
+    if cfg is None:
+        r(False, f"no orch.toml in {Path.cwd()} or a parent", "orch init"); return 1
+    say(f"-- project {cfg.name} ({cfg.root})")
+    pl = Path.home() / ".config/orch/projects"
+    r(cfg.root in projects() or None, f"project listed in {pl} (the watcher visits it)", f"run ./install --project {cfg.root}")
+    if not cfg.hosts: r(False, "no [hosts.*] in orch.toml", "add [hosts.<this machine>] local = true")
+    elif not any(h.get("local") for h in cfg.hosts.values()): r(False, "no host has local = true", "mark this machine's [hosts.<name>] local = true")
+    for m, c in cfg.models.items():
+        if c.get("provider") not in cfg.prov: r(False, f"model {m}: provider {c.get('provider')} has no [providers] table", "add it")
+        if c.get("launcher"): r(None, f"model {m}: launcher {c['launcher']} is no longer used (orch runs API agents itself)", "remove the key")
+        if c.get("kind") == "api" and not c.get("api_id"): r(False, f"model {m}: kind api needs api_id (the model id the API takes)", "set api_id")
+        if c.get("kind") in ("claude", "codex", "opencode") or c.get("kind") == "api":
+            t = "claude" if c.get("kind") == "api" else c["kind"]
+            if not which(t): r(False if c.get("kind") == "api" else None, f"model {m}: {t} not on PATH", f"install {t}")
+    for tier, lst in cfg.route.items():
+        for m in lst:
+            if m not in cfg.models: r(False, f"routing {tier}: unknown model {m}", "fix [routing]")
+    for k, d in (("briefs", "briefs"), ("out", "out")):
+        r(cfg.p(k, d).is_dir() or None, f"paths.{k} {cfg.p(k, d)}", f"mkdir {cfg.p(k, d)}")
+    b = cfg.p("board", "bin/board.sh")
+    r(os.access(b, os.X_OK) or None, f"message board {b}", "optional: agents post progress through it (paths.board)")
+    rc, o, e = sh(["bd", "list", "-n", "1", "--json"], cwd=cfg.beads)
+    r(rc == 0, f"beads in {cfg.beads}", f"run bd init in {cfg.beads} ({(e or o).strip()[:80]})")
+    for n, pv in cfg.prov.items():
+        if not pv.get("enabled"): continue
+        api = any(c.get("provider") == n and c.get("kind") == "api" for c in cfg.models.values())
+        if api:
+            try: var, key = read_secret(pv); r(True, f"provider {n}: API key readable from the secret store ({var}, {len(key)} chars, not shown)"); del key
+            except Err as e: r(False, f"provider {n}: {e}", "macOS: security add-generic-password -s <item> -a $USER -w; elsewhere: a mode-600 key_file")
+        if "ledger" in pv:
+            runs, bad, notes = ledger_read(cfg, pv)
+            r(not bad, f"provider {n}: ledger {pv['ledger']} " + ("valid" if not bad else f"MALFORMED ({bad[0][:80]})") + f", ${spend(runs):.2f} committed" + (f" of ${pv['cap_usd']}" if "cap_usd" in pv else ""), "orch ledger repair")
+        elif api: r(None, f"provider {n}: no ledger, so no spend record or cap", "set ledger (and cap_usd)")
+    if not a.no_hosts:
+        with cf.ThreadPoolExecutor(8) as ex:
+            ps = dict(zip(cfg.hosts, ex.map(lambda kv: probe(*kv), cfg.hosts.items())))
+        for n, p in ps.items():
+            if not p["ok"]: r(False, f"host {n}: unreachable ({p['err']})", f"ssh {cfg.hosts[n].get('ssh', '')} must work with keys (BatchMode)"); continue
+            r(p.get("pueue") is not None or None, f"host {n}: reachable" + ("" if p.get("pueue") is not None else ", but pueue does not answer there"), "./install --hosts-only")
+    fails = sum(1 for ok, *_ in res if ok is False); warns = sum(1 for ok, *_ in res if ok is None)
+    say(f"doctor: {len(res)} checks, {fails} FAIL, {warns} WARN"); return 1 if fails else 0
+
+def cmd_queue(cfg, a):
+    """Read-only: each host's pueue status (or one task's log), so the orchestrator never needs ssh <host> pueue by hand."""
+    for n, h in cfg.hosts.items():
+        if a.host and n != a.host: continue
+        rc, o, e = hrun(h, f"{pueue(h)} " + (f"log {int(a.log)}" if a.log is not None else "status"), timeout=30)
+        say(f"== {n}" + ("" if rc == 0 else f" (exit {rc}: {(e or o).strip()[-100:]})")); say(o.rstrip())
 
 # ---------------------------------------------------------------- hooks (Claude Code and Codex share one format)
 # PreToolUse shell rules (audit H2, M5). The command is parsed, not pattern-matched: heredoc bodies are data unless fed to a
@@ -1368,7 +1931,7 @@ def cmd_commit_state(cfg, a):
 BD_OK = set("list show ready create update close reopen comment comments note label tag assign q query search find-duplicates duplicates count "
             "status statuses types stale history diff lint dep graph children blocked epic remember recall memories forget prime info where "
             "context help version heartbeat defer undefer priority promote set-state state unclaim reclaim todo kv".split())
-PUEUE_OK = {"status", "log", "follow", "wait", "help", "group"}
+PUEUE_OK = {"status", "log", "follow", "wait", "help", "group", "completions"}   # read-only, here or over ssh (group: listing only)
 HERDR_NO = {("pane", "close"), ("pane", "run"), ("pane", "send-text"), ("pane", "send-keys"), ("agent", "send-keys"), ("tab", "close"),
             ("workspace", "close"), ("worktree", "remove"), ("server", "stop")}
 WRAP = {"sudo": "-u -g -h -p -C", "doas": "-u", "env": "-u -C -S", "timeout": "-s -k --signal --kill-after", "nice": "-n", "nohup": "",
@@ -1380,7 +1943,11 @@ INTERP_BAD = re.compile(r"rmtree|os\.(remove|unlink|rmdir|kill|killpg)|\.unlink\
 DESTRUCT = {"kill": "kill by hand: use orch stop", "pkill": "kill by hand: use orch stop", "killall": "kill by hand: use orch stop",
             "truncate": "truncating files", "shred": "shred", "dd": "dd", "reboot": "reboot", "shutdown": "shutdown", "halt": "halt",
             "diskutil": "diskutil", "srm": "srm"}
-LOOP_RX = re.compile(r"(?s)\b(for|while|until)\b|\bxargs\b|\bparallel\b")
+QUOTED_TEXT = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+
+def unquoted(text):
+    """text without its quoted strings that hold whitespace (messages and prose: data); a quoted path stays."""
+    return QUOTED_TEXT.sub(lambda m: m.group(0) if not re.search(r"\s", m.group(0)) else "''", text)
 
 def scan_subst(c):
     """Replace $( ), backticks, <( ) and >( ) outside single quotes by a placeholder; turn unquoted newlines into ';' and drop
@@ -1525,7 +2092,7 @@ def judge_words(cfg, w, cwd, ok_dirs, remote, depth):
         if sub == "reflog" and ga[:1] and ga[0] in ("expire", "delete"): return "git reflog expire"
     if b == "pueue":
         i = 0
-        while i < len(args) and args[i].startswith("-"): i += 2 if args[i] in ("-c", "--config", "-p", "--profile") else 1
+        while i < len(args) and args[i].startswith("-"): i += 2 if args[i] in ("-c", "--config", "-p", "--profile", "--color") else 1
         sub = args[i] if i < len(args) else "status"
         if sub not in PUEUE_OK or (sub == "group" and len(args) > i + 1 and not args[i + 1].startswith("-")):
             return f"pueue {sub} by hand: use orch run/stop/close (pueue limits are orch's)"
@@ -1537,6 +2104,7 @@ def judge_words(cfg, w, cwd, ok_dirs, remote, depth):
         if tuple(a2) in HERDR_NO: return f"herdr {' '.join(a2)} by hand: orch launch/stop/close manage panes"
     if b == "board.sh" and args[:1] == ["close"]: return "board.sh close by hand: orch close does it"
     if b == "orch" and args[:1] == ["close"] and "--force" in args: return "orch close --force (owner: never on shared repos)"
+    if b == "orch" and args[:1] == ["api-run"]: return "orch api-run by hand: orch launch queues it (budget, ledger, lanes)"
     if b == "launchctl" and args[:1] and args[0] in ("bootout", "remove", "unload", "kill", "disable"): return f"launchctl {args[0]}"
     if b == "systemctl" and any(x in ("stop", "restart", "kill", "disable", "mask", "reboot", "poweroff") for x in args): return "systemctl stop/restart"
     if b in ("podman", "docker") and args[:1] and args[0] in ("rm", "kill", "stop", "rmi", "prune", "system", "volume", "restart"): return f"{b} {args[0]} by hand"
@@ -1558,6 +2126,9 @@ def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
     text, docs = split_heredocs(c)
     for line, body in docs:   # a heredoc fed to a shell or ssh is commands; any other is data
         lw = strip_wrappers(words_of(scan_subst(line.split("<<")[0])[0]))
+        fed = [x for x in (strip_wrappers(w) for w, _ in segments(scan_subst(line)[0])) if x]   # `cat <<EOF | bash` feeds a shell too
+        if not (lw and os.path.basename(lw[0]) in SHELLS | {"ssh", "eval"} and "-c" not in lw):
+            lw = next((x for x in fed[1:] if os.path.basename(x[0]) in SHELLS | {"ssh", "eval"} and "-c" not in x), lw)
         if lw and (os.path.basename(lw[0]) in SHELLS or os.path.basename(lw[0]) in ("ssh", "eval")) and not any(x == "-c" for x in lw):
             why = judge(cfg, body, cwd, ok_dirs, remote or os.path.basename(lw[0]) == "ssh", depth + 1)
             if why: return why
@@ -1566,8 +2137,11 @@ def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
     for x in inner:
         why = judge(cfg, x, cwd, ok_dirs, remote, depth + 1)
         if why: return why
-    loop = bool(LOOP_RX.search(text)) and re.search(r"\bworktrees?\b", text)
-    for w, redir in segments(text):
+    # A loop is judged from command words only (orch-fixes7): `for`/`while`/`until`/`select` or xargs/parallel in command
+    # position, over worktrees named outside quoted text; a commit message or an echo that says "while" or "worktrees" is data.
+    segs = segments(text)
+    loop = any(w and (w[0] in ("for", "while", "until", "select") or os.path.basename(w[0]) in ("xargs", "parallel")) for w, _ in segs) and re.search(r"\bworktrees?\b", unquoted(text))
+    for w, redir in segs:
         if w and w[0] == "cd" and len(w) > 1 and not remote: cwd = str((Path(cwd) / os.path.expanduser(w[1])).resolve())
         if w and w[0] in ("for", "case", "select", "function", "in"): continue
         why = judge_words(cfg, w, cwd, ok_dirs, remote, depth)
@@ -1610,6 +2184,14 @@ def pretool_why(cfg, d):
     if c is None: return None
     c = shlex.join(c) if isinstance(c, list) and not (len(c) >= 3 and c[0] in SHELLS and c[1] in ("-c", "-lc")) else (c[2] if isinstance(c, list) else c)
     return judge(cfg, c, cwd, ok)
+
+def deny_log(cfg, d, why):
+    """.orch/denied.log: every refused tool call, so a wrong refusal can be found and fixed (orch-fixes7)."""
+    ti = d.get("tool_input") or {}
+    c = ti.get("command") or ti.get("cmd") or ti.get("file_path") or "" if isinstance(ti, dict) else ti
+    try:
+        with cfg.f("denied.log").open("a") as f: f.write(f"{ts()} {d.get('tool_name', '')} ({why}): {json.dumps(c)[:400]}\n")
+    except OSError: pass
 
 def out(o): print(json.dumps(o))
 
@@ -1664,6 +2246,7 @@ def cmd_hook(ev):
             except Err: pass
     elif ev == "PreToolUse":
         why = pretool_why(cfg, d)
+        if why: deny_log(cfg, d, why)
         if why: out({"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny",
                      "permissionDecisionReason": f"Orchestrators do not operate by hand ({why}). Use orch launch/stop/collect/close, or brief an agent."}})
     elif ev == "Stop":
@@ -1679,7 +2262,7 @@ def hook_kind(d):
     return "codex" if ("codex" in tp or os.environ.get("CODEX_THREAD_ID")) else "claude"
 
 # ---------------------------------------------------------------- watch (launchd, one pass)
-URGENT = ("unit:", "board:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:")
+URGENT = ("unit:", "board:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:")
 
 def cmd_watch(cfg, a):
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
@@ -1739,19 +2322,27 @@ def main():
     add("capacity"); add("status"); add("watch")
     add("launch", A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
         A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
-        A("--test-host", help="host where the unit's builds and tests run; the agent is placed there"), A("--allow-main", action="store_true", help="allow a main checkout as cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"), dry=True)
+        A("--test-host", help="host where the unit's builds and tests run; the agent is placed there"), A("--allow-main", action="store_true", help="allow a main checkout as cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"),
+        A("--report", help="a resumed unit: the report it continues (default out/<unit>/REPORT.md)"), A("--resume-of", help="a resumed unit: the unit whose report it continues"),
+        A("--item", help="the backlog item this unit works on (orch backlog)"), dry=True)
+    add("api-run", A("unit"), A("--run", required=True), A("--model", required=True), A("--budget", type=float, required=True), A("--brief", required=True),
+        A("--cwd", required=True), A("--report"))
+    add("ledger", A("action", choices=["check", "repair"]), A("--provider"), dry=True)
+    add("doctor", A("--no-hosts", action="store_true", help="skip the ssh checks"))
+    add("backlog", A("action", choices=["import", "list"]), dry=True)
+    add("queue", A("host", nargs="?"), A("--log", type=int, help="print this task's log"))
     add("stop", A("unit"), dry=True)
     add("collect", A("unit", help="a unit, or <host>:<task id> for an orch run job"), dry=True)
     add("run", A("--host", required=True), A("--lane", choices=LANES, default="jobs"), A("--unit"), A("--wt", required=True),
-        A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="D435 job (linux2)"),
+        A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="a job that needs the host's USB devices (container.usb_args, usb_lock)"),
         A("--priority", type=int, default=0), A("--no-wait", action="store_true", help="queue, print <host>:<task>, return"),
         A("command", nargs=argparse.REMAINDER), dry=True)
-    add("gate", A("name"), A("--host", help="LINUX_TEST_HOST for the whole gate"), A("--priority", type=int, default=10),
+    add("gate", A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $ORCH_UNIT)"), A("--priority", type=int, default=10),
         A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"), dry=True)
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
     add("commit-state", A("-m", "--message", default="orch: state"), dry=True)
     add("ack", A("problem"), A("decision"))
-    add("init", dry=True)
+    add("init", A("--name", help="project name for a new orch.toml (default: the folder's name)"), dry=True)
     add("board-close", A("agent", help="a board card that is not an open unit"), dry=True)
     add("register", A("session", nargs="?"), dry=True)
     add("hook", A("event", choices=["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"]))
@@ -1761,9 +2352,12 @@ def main():
         except Exception as e: print(f"orch hook: {e}", file=sys.stderr)
         return 0
     DRY = getattr(a, "dry_run", False)
-    root = find_root()
-    if not root: print("orch: no orch.toml here or in a parent", file=sys.stderr); return 2
-    cfg = Cfg(root)
+    root = find_root(os.getcwd()) if a.cmd in ("init", "doctor") else find_root()   # never $ORCH_ROOT for setup commands
+    if a.cmd == "init" and not root: return init_project(Path.cwd(), a)
+    if a.cmd == "doctor" and not root: return doctor(None, a)
+    if not root: print("orch: no orch.toml here or in a parent (orch init writes a starter one)", file=sys.stderr); return 2
+    try: cfg = Cfg(root)
+    except (tomllib.TOMLDecodeError, OSError) as e: print(f"orch: {root / 'orch.toml'}: {e}", file=sys.stderr); return 2
     try: r = globals()["cmd_" + a.cmd.replace("-", "_")](cfg, a)
     except Err as e: print(f"orch: {e}", file=sys.stderr); return 1
     return r if isinstance(r, int) else 0
