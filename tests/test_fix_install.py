@@ -242,27 +242,33 @@ class Item7BlockedLane(unittest.TestCase):
 
 
 class Item7CallerWait(unittest.TestCase):
-    def test_a_task_held_by_admission_is_reported_but_one_not_yet_started_is_not(self):
-        """Catches (finding 9): the caller's notice fired only when the pueue task was NOT Running, so a job held in janus's own
-        admission (Running in pueue) was waited for in silence, and a task merely queued behind the group's slots was reported
-        as 'still waiting for admission' although admission said yes (the same rule the check uses)."""
+    def test_only_a_task_itself_held_in_admission_is_reported(self):
+        """Catches (finding 2, fix-install6): the caller reported a normally running job as 'held by admission' whenever the
+        host's admission said no (`cap_admit` is the answer for ONE MORE job, not for this task; a heavy job on a full host made
+        its own caller get the notice every 300 s), and probed the host for every waited job. Report only a task whose OWN
+        admission-wait file exists; never probe one that started and runs normally."""
         d, cfg = project(); h = cfg.hosts["here"]
-        def run_case(state, adm):
+        def run_case(state, wait, adm):
             states = [state, {"status": {"Done": {"result": "Success"}}}]
             def fake_run(cmd, **k): raise subprocess.TimeoutExpired(cmd, k.get("timeout", 0))
-            saved = (subprocess.run, janus.task_status, janus.probe)
+            calls = []
+            saved = (subprocess.run, janus.task_status, janus.probe, janus.hrun)
             subprocess.run = fake_run
             janus.task_status = lambda h_, tid: states.pop(0) if states else {"status": {"Done": {"result": "Success"}}}
-            janus.probe = lambda n, h_, **k: {"cap_admit": adm, "cap_pause": ""}
+            janus.probe = lambda n, h_, **k: (calls.append("probe"), {"cap_admit": adm, "cap_pause": ""})[1]
+            janus.hrun = lambda h_, script, **k: (0, "y\n" if wait else "", "")
             out = io.StringIO()
             try:
                 with contextlib.redirect_stderr(out): rc = janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
-            finally: subprocess.run, janus.task_status, janus.probe = saved
-            return rc, out.getvalue()
-        rc, msg = run_case({"status": {"Running": {}}}, "disk")   # a running task held in janus admission: reported
-        self.assertEqual(rc, 0); self.assertIn("held by admission", msg)
-        rc, msg = run_case({"status": {"Queued": {}}}, "yes")     # not started yet, admission says yes: silent
-        self.assertEqual(rc, 0); self.assertEqual(msg, "", "a task not yet started was reported while admission said yes")
+            finally: subprocess.run, janus.task_status, janus.probe, janus.hrun = saved
+            return rc, out.getvalue(), calls
+        rc, msg, calls = run_case({"status": {"Running": {}}}, True, "disk")     # in admission: reported, probed for the reason
+        self.assertEqual(rc, 0); self.assertIn("held by admission", msg); self.assertEqual(calls, ["probe"])
+        rc, msg, calls = run_case({"status": {"Running": {}}}, False, "cores")   # running normally: silent, no probe
+        self.assertEqual(rc, 0); self.assertEqual(msg, "", "a normally running task was reported")
+        self.assertEqual(calls, [], "a task that started and runs normally was probed")
+        rc, msg, calls = run_case({"status": {"Queued": {}}}, False, "yes")      # not started yet: silent
+        self.assertEqual(rc, 0); self.assertEqual(msg, "", "a task not yet started was reported")
 
 
 class Item10GiveUpResidues(unittest.TestCase):
