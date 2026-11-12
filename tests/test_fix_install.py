@@ -449,16 +449,24 @@ class Item25Soak(unittest.TestCase):
             self.assertIn("to pass", bad.stderr + bad.stdout, "pueue now accepts the space form: update janus")
 
     def test_a_one_package_cargo_run_is_not_broad(self):
-        """Catches (item 25b): the whole-suite guard matched `--all-targets` on a one-package cargo command
-        (`cargo test -p recorder --all-targets`), refusing a run that is not a whole suite."""
+        """Catches (item 25b + finding 1): the whole-suite guard matched `--all-targets`/`--all-features` on a one-package cargo
+        command, and any ` -p <word>` ANYWHERE on the line switched the guard off (so `mkdir -p logs && cargo test --workspace`
+        was not refused, and a project's own first broad_pattern lost its meaning). Each `;`/`&&`/`|` command is judged on its
+        own, `--all` never matches `--all-targets`, and the exception holds only for the cargo command itself."""
         d, cfg = project(); h = cfg.hosts["here"]
         saved = (janus.job_class, janus.host_history)
         janus.job_class = lambda *a: "job"; janus.host_history = lambda *a: []
+        one_pkg = ["cargo test -p recorder --all-targets", "cargo test --package=recorder --all-targets",
+                   "cd crates/x && cargo test --all-targets"]
+        broad = ["cargo test --workspace", "cargo test --workspace --exclude big", "cargo test --workspace -p recorder",
+                 "mkdir -p logs && cargo test --workspace 2>&1 | tee logs/t.log",
+                 "cargo build -p tools && cargo test --workspace", "ssh -p 22 h true; cargo clippy --all"]
         try:
-            self.assertIsNone(janus.broad_why(cfg, "here", h, "cargo test -p recorder --all-targets"))
-            self.assertIsNone(janus.broad_why(cfg, "here", h, "cargo test --package=recorder --all-targets"))
-            self.assertTrue(janus.broad_why(cfg, "here", h, "cargo test --workspace"))
-            self.assertTrue(janus.broad_why(cfg, "here", h, "cargo test --all-features"))
+            for c in one_pkg: self.assertIsNone(janus.broad_why(cfg, "here", h, c), f"a one-package run was refused: {c}")
+            for c in broad: self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a whole-suite run slipped the guard: {c}")
+            cfg.capc = {**cfg.capc, "broad_patterns": [r"pytest\s+tests/?(\s|$)", r"\bmake\b"]}
+            self.assertTrue(janus.broad_why(cfg, "here", h, "pytest tests -p no:cacheprovider"),
+                            "a stray -p switched off a project's own first broad_pattern")
         finally: janus.job_class, janus.host_history = saved
 
 

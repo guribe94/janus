@@ -291,8 +291,11 @@ def place_job(cfg, lane, needs):
 # then runs at the lowest priority (nice 19, pueue priority -5, counted double in the short-first order). Broad: the command matches
 # [capacity] broad_patterns (default below), or its job class ran a median of [capacity] broad_min minutes or more on that host.
 # Gates (their own steps too) and the land lane are exempt (whole-suite by design, and ordered by their own lanes).
-BROAD_PATTERNS = [r"\bcargo\s+(test|nextest\s+run|clippy|build|check)\b.*\s--(workspace|all)\b", r"(^|[;&|]\s*)(\S*/)?pytest\s*($|[;&|])"]
+BROAD_PATTERNS = [r"\bcargo\s+(test|nextest\s+run|clippy|build|check)\b.*\s--(workspace|all)(?![-\w])", r"(^|[;&|]\s*)(\S*/)?pytest\s*($|[;&|])"]
 PKG_RX = re.compile(r"(^|\s)(?:-p\s*|--package[=\s])\S")   # a cargo command that names one package (-p X, --package=X)
+WS_RX = re.compile(r"--(workspace|all)(?![-\w])")          # a whole-workspace/all-packages flag (never --all-targets/--all-features)
+CARGO_RX = re.compile(r"(^|\s)cargo\s+(test|nextest\s+run|clippy|build|check)\b")
+SEG_RX = re.compile(r"\|\||&&|[;&|]")                      # command separators: each command is judged alone (finding 1)
 
 def job_class(cfg, hn, h, cmd):
     """The job class runs/cap.sh will give cmd on host hn (cap_class, run here on the host's library)."""
@@ -306,14 +309,23 @@ def host_history(cfg, h):
         except OSError: return []
     return hrun(h, f"tail -n 2000 {qp(h['_rd'] + '/history.tsv')} 2>/dev/null")[1].splitlines()
 
+def one_package_cargo(seg):
+    """True when seg is a cargo test/build/check run that names ONE package (`-p X`/`--package=X`) and has no
+    `--workspace`/`--all`: only then is it not a whole-suite run (item 25b). `--all-targets`/`--all-features` do not count as
+    `--all` (finding 1), and `--workspace` wins over `-p` (cargo runs the whole workspace then)."""
+    return bool(CARGO_RX.search(seg)) and bool(PKG_RX.search(seg)) and not WS_RX.search(seg)
+
 def broad_why(cfg, hn, h, cmd):
     """Why cmd is a whole-suite run on host hn, or None. Item 25(b): a cargo command that names a package (`-p X`,
-    `--package=X`) covers one package, not the whole workspace, so the cargo pattern -- the FIRST of broad_patterns -- does not
-    apply to it (`cargo test -p X --all-targets` was flagged broad)."""
-    for i, rx in enumerate(cfg.capc.get("broad_patterns", BROAD_PATTERNS)):
-        if not re.search(rx, cmd): continue
-        if i == 0 and PKG_RX.search(cmd): continue
-        return f"it matches the broad pattern {rx!r}"
+    `--package=X`) covers one package, not the whole workspace. Finding 1: each `;`/`&&`/`||`/`|` command is judged on its own
+    (a ` -p x` in a *different* command never switches the guard off), `--all` never matches `--all-targets`/`--all-features`,
+    and the one-package exception holds only for the cargo command itself -- never for whatever pattern happens to be first
+    (a project's own first broad_pattern, e.g. pytest, keeps its meaning)."""
+    segs = [s.strip() for s in SEG_RX.split(cmd)]
+    for rx in cfg.capc.get("broad_patterns", BROAD_PATTERNS):
+        for seg in segs:
+            if re.search(rx, seg) and not one_package_cargo(seg):
+                return f"it matches the broad pattern {rx!r}"
     cls = job_class(cfg, hn, h, cmd); e = class_secs(host_history(cfg, h), cls); lim = capv(cfg, h, "broad_min")
     if e and e >= lim * 60: return f"its job class {cls} ran a median of {e // 60} min on {hn} (broad_min {lim:g})"
     return None
