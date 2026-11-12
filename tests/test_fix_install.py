@@ -1679,4 +1679,30 @@ class Item29RemotePatch(unittest.TestCase):
         self.assertTrue((chk / "empty").is_file() and (chk / "empty").stat().st_size == 0, "a new empty file did not arrive")
 
 
+class Item27ParkedFinished(unittest.TestCase):
+    def _hs(self, cfg, status):
+        return {"here": probe_of(pueue={"tasks": {"9": {"status": status, "label": janus.tag(cfg, "unit:u1")}}})}
+    def test_a_parked_unit_whose_jobs_finished_is_reported(self):
+        """Catches (item 27): a unit parked on jobs that had all finished was invisible to `janus check` while the resume_error
+        was not written yet (the watcher had not reached its next pass), so an orchestrator reading check could not see the unit
+        waiting, nor wake it. Seen live: test-exec-race2 sat parked on asgard:182-184 and check was silent."""
+        d, cfg = project()
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "herdr", "state": "idle", "parked": {"jobs": ["here:9"], "since": 1, "by": "janus park"}}
+        F = janus.parked_findings(cfg, self._hs(cfg, {"Done": {"result": "Success"}}), u, ["here:9"])
+        self.assertEqual([k for k, _ in F], ["parked:u1:finished"], F)
+        self.assertIn("janus resume u1", F[0][1])
+    def test_a_parked_unit_whose_job_cannot_finish_or_cannot_resume_keeps_its_own_finding(self):
+        """Pins the neighbours: a job that can never finish, and a finished job whose resume failed, are each still reported
+        (and a finished+failed resume is reported once, as :resume)."""
+        d, cfg = project()
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "herdr", "state": "idle"}
+        F = janus.parked_findings(cfg, self._hs(cfg, "Paused"), u, ["here:9"])
+        self.assertEqual([k for k, _ in F], ["parked:u1"])
+        u2 = {**u, "resume_error": {"why": "under resume_min_usd", "at": 1}}
+        F2 = janus.parked_findings(cfg, self._hs(cfg, {"Done": {"result": "Success"}}), u2, ["here:9"])
+        self.assertEqual([k for k, _ in F2], ["parked:u1:resume"])
+        F3 = janus.parked_findings(cfg, self._hs(cfg, "Running"), u, ["here:9"])   # a job still running: the normal park
+        self.assertEqual(F3, [])
+
+
 if __name__ == "__main__": unittest.main()
