@@ -149,10 +149,17 @@ def git(wt, *a, timeout=120): return sh(["git", "-C", str(wt), *a], timeout=time
 def final_gate_cmd(ld, unit, wt, branch):
     """The [landing] final_gate command with {unit}, {wt} and {branch} substituted (item 12), each shell-quoted (finding 7): an
     agent names its own branch and the command runs on the final-gate host, so a hostile branch name or a path with a space
-    must not split the command. A `${...}` in the config is left intact (only a bare {name} is substituted)."""
+    must not split the command. A `${...}` in the config is left intact (only a bare {name} is substituted), and a placeholder
+    already inside quotes in the config (`--wt "{wt}"`) is substituted unquoted, never quoted twice (finding 10)."""
     s = ld.get("final_gate") or ""
     for k, v in (("unit", unit), ("wt", str(wt)), ("branch", branch)):
-        s = re.sub(r"(?<!\$)\{" + k + r"\}", lambda m, q=shlex.quote(str(v)): q, s)
+        out, i = [], 0
+        for m in re.finditer(r"(?<!\$)\{" + k + r"\}", s):
+            if m.start() < i: continue
+            before = s[m.start() - 1] if m.start() else ""; after = s[m.end()] if m.end() < len(s) else ""
+            out += [s[i:m.start()], str(v) if before and before == after and before in "\"'" else shlex.quote(str(v))]
+            i = m.end()
+        s = "".join(out) + s[i:]
     return s
 
 def cmd_land(cfg, a):
@@ -251,12 +258,15 @@ def cmd_commit_state(cfg, a):
     if cfg.run.dry: say("+ janus index; git add -A; scan staged files; git commit; git push"); return
     write_index(cfg)   # out/INDEX.md is committed with the state (janus-swarm item 3)
     rc, o, e = sh(["git", "add", "-A"], cwd=cfg.root, timeout=120)
-    if rc:   # item 7: a file vanished between listing and add (a monitor deleted a temp file); retry, then carry on
+    for _ in range(3):   # item 7: a file vanished between listing and add (a monitor deleted a temp file); retry, then carry on
+        if not rc: break
         msg = (e or o).strip()
         if not re.search(r"unable to stat|No such file|did not match|does not exist", msg):
             raise Err(f"git add failed: {msg[-200:]}")   # finding 11: a file that fails to add every time is an error, not a note
         rc, o, e = sh(["git", "add", "-A", "--ignore-errors"], cwd=cfg.root, timeout=120)
-        if rc: raise Err(f"git add failed: {(e or o).strip()[-200:]}")
+    if rc:   # finding 10: a SECOND vanished file is not an error; only a real add failure is
+        msg = (e or o).strip()
+        if not re.search(r"unable to stat|No such file|did not match|does not exist", msg): raise Err(f"git add failed: {msg[-200:]}")
     rc, o, e = sh(["git", "diff", "--cached", "--name-only", "-z"], cwd=cfg.root)
     paths = [x for x in o.split("\0") if x]
     hit = []

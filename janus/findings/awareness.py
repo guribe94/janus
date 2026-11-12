@@ -31,16 +31,31 @@ def module_of(rel):
     return HERE if d in (".", "") else d
 
 
+REPO_KEYS = {}
+
 def repo_of(cwd):
-    """A stable key for the repository a unit's tree belongs to, or '' when it cannot be told. Item 16a: two units in different
-    repositories are never 'related' by a shared module or file name. Finding 10: two clones of one repository must compare
-    equal, so the key is the root commit (content-addressed, shared by every clone), else the remote URL, else the tree path --
-    never the git common dir (each clone has its own)."""
+    """The identities ('|'-joined) of the repository a unit's tree belongs to, or '' when it cannot be told. Item 16a: two units
+    in different repositories are never 'related'. Finding 10: the main checkout path (shared by its worktrees), the remote it
+    clones (and a local remote's path, so a SHALLOW clone -- whose root commit is only its own boundary -- relates to its
+    source), and, only for a repo with NO remote (so the whole-history walk is not paid on every check), its root commit."""
     if not cwd or not Path(cwd).is_dir(): return ""
-    roots = sorted(set(sh(["git", "-C", str(cwd), "rev-list", "--max-parents=0", "HEAD"])[1].split()))
-    if roots: return "root:" + " ".join(roots)
+    top = sh(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"])[1].strip()
+    if not top: return str(Path(cwd).resolve())
+    key0 = str(Path(top).resolve())
+    if key0 in REPO_KEYS: return REPO_KEYS[key0]
+    common = sh(["git", "-C", str(cwd), "rev-parse", "--git-common-dir"])[1].strip()
+    main = Path(cwd, common).resolve().parent if common and not Path(common).is_absolute() else (Path(common).resolve().parent if common else Path(key0))
+    parts = ["path:" + str(main)]
     url = sh(["git", "-C", str(cwd), "config", "--get", "remote.origin.url"])[1].strip()
-    return "url:" + url if url else str(Path(cwd).resolve())
+    if url:
+        parts.append("url:" + url.rstrip("/"))
+        p = re.sub(r"^file://", "", url).rstrip("/")
+        if p.startswith("/"): parts.append("path:" + str(Path(p).resolve()))   # /var and /private/var are one directory (macOS)
+    else:
+        roots = sorted(set(sh(["git", "-C", str(cwd), "rev-list", "--max-parents=0", "HEAD"])[1].split()))
+        if roots: parts.append("root:" + " ".join(roots))
+    REPO_KEYS[key0] = k = "|".join(dict.fromkeys(parts))
+    return k
 
 
 def unit_of_gate(name, names):
@@ -70,9 +85,10 @@ def related_cases(cfg, units, hs=None):
         return repo_of((au.get(n) or umap.get(n) or {}).get("cwd"))
 
     def same_repo(a, b):
-        """Item 16a: compare only units in the same repository (an unknown repo on either side compares as before)."""
+        """Item 16a: compare only units in the same repository (an unknown repo on either side compares as before). Finding 10:
+        the keys are identity sets, so a shallow clone matches its source on the shared main-checkout path."""
         ra, rb = repo_for(a), repo_for(b)
-        return not (ra and rb) or ra == rb
+        return not (ra and rb) or bool(set(ra.split("|")) & set(rb.split("|")))
 
     def add(a, b, reason, kind, topic=None):
         if not a or not b or a == b: return

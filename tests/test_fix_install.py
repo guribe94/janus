@@ -783,6 +783,119 @@ class Item9BudgetHistory(unittest.TestCase):
         self.assertLess(br, 15, f"the cheap review runs never taught it: {br} ({whyr})")
 
 
+class Item10Residues(unittest.TestCase):
+    def test_migrate_rewrites_only_what_it_renames(self):
+        """Catches (finding 10, old 1): migrate rewrote a kit folder (/opt/orchkit -> /opt/janus) and a remote state folder
+        (/home/dev/orch/.orch -> .../.janus) although it renames neither, pointing config values at paths that do not exist."""
+        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); p = d / "janus.toml"
+        p.write_text('[project]\nname = "t"\nstate = ".orch"\n'
+                     '[hosts.far]\nroot = "/home/dev/orch"\nkit = "/opt/orchkit/bin"\nstate_dir = "/home/dev/orch/.orch"\n'
+                     f'[paths]\nledger = "{d}/.orch/ledger.tsv"\n')
+        janus.rewrite_config(p, dry=False)
+        t = p.read_text()
+        self.assertIn('state = ".janus"', t)                              # the project's own state folder is renamed
+        self.assertIn(f'ledger = "{d}/.janus/ledger.tsv"', t)             # ... and a path under it
+        self.assertIn('kit = "/opt/orchkit/bin"', t, "a kit folder migrate does not rename was rewritten")
+        self.assertIn('state_dir = "/home/dev/orch/.orch"', t, "a remote state folder was rewritten")
+        self.assertIn('root = "/home/dev/orch"', t)
+
+    def test_a_job_in_a_unit_tree_outside_the_project_root_is_adopted(self):
+        """Catches (finding 10, old 6): migrate adopted a job only when its path was under the project root, so a unit's own
+        worktree outside the root (as every unit's is here) was left as machine state, never adopted."""
+        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "janus.toml").write_text('[project]\nname = "t"\nid = "proj"\n')
+        tree = Path(tempfile.mkdtemp(prefix="janus-unit-"))
+        tasks = {"1": {"label": "unit:u1", "path": str(tree), "status": {"Queued": {}}, "command": "true"}}
+        def fake_sh(cmd, **k):
+            if list(cmd)[-2:] == ["status", "--json"]: return 0, json.dumps({"tasks": tasks}), ""
+            if list(cmd)[:2] == ["tmux", "list-sessions"]: return 1, "", "no server"
+            return 0, "", ""
+        saved = (janus.sh, janus._local_pueue, janus.all_units)
+        janus.sh = fake_sh; janus._local_pueue = lambda view: ["pueue"]
+        janus.all_units = lambda cfg: {"u1": {"cwd": str(tree)}}
+        try: out = "\n".join(janus.adopt_items(d, dry=True, config=d / "janus.toml"))
+        finally: janus.sh, janus._local_pueue, janus.all_units = saved
+        self.assertIn("job 1: unit:u1 -> unit:u1@proj", out); self.assertNotIn("left alone", out)
+
+    def test_a_placeholder_already_quoted_in_the_config_is_not_quoted_twice(self):
+        """Catches (finding 10, old 7): a config that already quotes the placeholder (`--wt "{wt}"`) became `--wt "'/path'"`, a
+        path with literal quotes."""
+        self.assertEqual(janus.final_gate_cmd({"final_gate": 'gate.sh --wt "{wt}" --branch {branch}'}, "u", "/Users/me/My Code/wt", "b"),
+                         'gate.sh --wt "/Users/me/My Code/wt" --branch b')
+
+    def test_an_earlier_run_of_a_capped_unit_is_not_counted_as_capped(self):
+        """Catches (finding 10, old 9): capped was read from the unit's latest api.json, so an earlier tiny run of a unit whose
+        LAST run was capped counted as a capped run and taught the budget as if a cap proved the budget was too small."""
+        d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 15\nledger = "out/ledger.tsv"\nkey_file = "k"\n'
+                         '[models.m]\nprovider = "api"\nkind = "api"\n')
+        od = d / "out/c"; od.mkdir(parents=True); (od / "REPORT.md").write_text("VERDICT: PENDING\n")
+        (od / "api.json").write_text(json.dumps({"subtype": "error_max_budget_usd", "total_cost_usd": 5.0}))
+        (od / "api-c.2.json").write_text(json.dumps({"subtype": "error_max_budget_usd", "total_cost_usd": 5.0}))
+        (od / "api-c.1.json").write_text(json.dumps({"subtype": "success", "total_cost_usd": 0.01}))
+        runs = {"c.1": {"done": True, "cost": 0.01, "unit": "c", "budget": 0.01, "how": "done rc=0"},
+                "c.2": {"done": True, "cost": 5.0, "unit": "c", "budget": 5.0, "how": "capped"}}
+        cfg.run.all_units = {"c": {"name": "c", "kind": "implement", "tier": "normal", "run": "c.2", "status": "open"}}
+        real = janus.ledger_read; janus.ledger_read = lambda cfg, pv: (runs, [], [])
+        try: h = janus.cost_history(cfg, "api")
+        finally: janus.ledger_read = real
+        self.assertEqual(h.get(("implement", "normal")), [5.0], "the earlier tiny run counted as capped")
+
+    def test_a_second_vanished_file_does_not_fail_the_commit(self):
+        """Catches (finding 10, old 11): when a second file vanished between listing and add, the retry's failure was an error,
+        so under a busy monitor commit-state failed where item 7 wanted it to carry on."""
+        d = Path(tempfile.mkdtemp(prefix="janus-fix-")); (d / "janus.toml").write_text('[project]\nname = "t"\n'); (d / "out").mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True, check=True)
+        g("init", "-q"); (d / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a"); (d / "b").write_text("2\n")
+        cfg = janus.Cfg(d)
+        real_sh, real_push = janus.sh, janus.push_cmd; n = [0]
+        def sh_stub(cmd, **k):
+            c = list(cmd)
+            if c[:3] == ["git", "add", "-A"]:
+                n[0] += 1
+                if n[0] <= 2: return 128, "", f"fatal: unable to stat gone{n[0]}.tmp: No such file or directory"
+            return real_sh(cmd, **k)
+        janus.sh = sh_stub; janus.push_cmd = lambda repo, cfg=None: ["true"]
+        try: janus.cmd_commit_state(cfg, type("A", (), {"message": "state"})())
+        finally: janus.sh, janus.push_cmd = real_sh, real_push
+        self.assertEqual(g("log", "-1", "--format=%s").stdout.strip(), "state")
+
+    def test_a_staged_merge_of_a_landing_branch_that_moved_on_still_uses_its_side(self):
+        """Catches (finding 10, old 14): a staged merge whose landing branch advanced after `git merge` fell back to the merge
+        base, so the landing branch's files counted as the unit's and it overlapped every other such unit."""
+        base, R, g = git_repo("u10m")
+        g("checkout", "-q", "-b", "unit", "main"); (R / "u").write_text("u\n"); g("add", "."); g("commit", "-qm", "unit")
+        g("checkout", "-q", "main"); (R / "c").write_text("c\n"); g("add", "."); g("commit", "-qm", "main adds c")
+        g("checkout", "-q", "unit"); g("merge", "--no-commit", "--no-ff", "main")   # staged: MERGE_HEAD = main at c
+        W = base / "mainwt"; g("worktree", "add", "-q", str(W), "main")             # main moves on in its own worktree
+        (W / "d").write_text("d\n")
+        subprocess.run(["git", "-C", str(W), "-c", "user.email=t@t", "-c", "user.name=t", "add", "."], capture_output=True, check=True)
+        subprocess.run(["git", "-C", str(W), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "main moves on"], capture_output=True, check=True)
+        d, cfg = project(); cfg.c["landing"] = {"branch": "main"}
+        u = {"id": "t-1", "name": "u1", "host": "here", "cwd": str(R)}
+        br, fs = janus.unit_changes(cfg, u, [u])
+        self.assertIn("u", fs); self.assertNotIn("c", fs, "the landing branch's own file counted as the unit's change")
+
+    def test_a_shallow_clone_is_related_to_a_clone_of_the_same_repository(self):
+        """Catches (finding 10, old 10): repo identity was the root commit, so a shallow clone (whose root is only its own
+        boundary) was never related to a clone of the same repository, and the whole-history walk ran on every check."""
+        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u10s-")); R = base / "r"; R.mkdir()
+        g = lambda c, *a: subprocess.run(["git", "-C", str(c), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
+        g(R, "init", "-q", "-b", "main"); (R / "docs").mkdir(); (R / "docs/a.md").write_text("x\n"); g(R, "add", "."); g(R, "commit", "-qm", "a")
+        (R / "docs/b.md").write_text("y\n"); g(R, "add", "."); g(R, "commit", "-qm", "b")
+        C1 = base / "c1"; g(base, "clone", "-q", str(R), str(C1))
+        C2 = base / "c2"; g(base, "clone", "-q", "--depth", "1", "file://" + str(R), str(C2))
+        W1 = base / "w1"; g(R, "worktree", "add", "-q", str(W1), "-b", "u1"); (W1 / "docs/a.md").write_text("y\n")
+        W2 = base / "w2"; g(C2, "worktree", "add", "-q", str(W2), "-b", "u2"); (W2 / "docs/a.md").write_text("y2\n")
+        d, cfg = project()
+        units = [{"id": "t-1", "name": "u1", "host": "here", "cwd": str(W1), "state": "working"},
+                 {"id": "t-2", "name": "u2", "host": "here", "cwd": str(W2), "state": "working"}]
+        saved = {k: getattr(janus, k) for k in ("all_units", "gate_results", "learned_posts")}
+        janus.all_units = lambda cfg: {}; janus.gate_results = lambda cfg: {}; janus.learned_posts = lambda cfg: []
+        try: cases = janus.related_cases(cfg, units)
+        finally:
+            for k, v in saved.items(): setattr(janus, k, v)
+        self.assertIn(("u1", "u2"), cases, "a shallow clone of the same repository was not related")
+
+
 class Item10Clones(unittest.TestCase):
     def test_two_clones_of_one_repo_are_related(self):
         """Catches (finding 10): two clones of one repository compared different (git common dir), so units in separate clones
