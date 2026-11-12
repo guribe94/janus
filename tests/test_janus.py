@@ -233,10 +233,11 @@ class PromptFixes(unittest.TestCase):
         self.assertEqual(janus.deny_alt(w("rm -rf build")), "janus tidy --dry-run, then janus tidy")
         self.assertEqual(janus.deny_alt(w("janus api-run u --run x")), "janus launch")
     def test_the_wake_says_why_and_reads_handoff_only_after_clear(self):
-        w = janus.WAKE.format(reason="late: here:3, here:4")
+        w = janus.wake(self.cfg, "late: here:3, here:4")
         self.assertIn("late: here:3, here:4", w); self.assertNotIn("HANDOFF.md", w)   # no full read on every wake
-        self.assertIn("cycle overdue", janus.WAKE.format(reason="cycle overdue"))
-        self.assertIn("HANDOFF.md", janus.WAKE_CLEAR.format(reason="the context was cleared"))
+        self.assertIn(str(self.cfg.root), w)                                         # item 33: the root, by absolute path
+        self.assertIn("cycle overdue", janus.wake(self.cfg, "cycle overdue"))
+        self.assertIn(str(self.cfg.f("HANDOFF.md")), janus.wake_clear(self.cfg, "the context was cleared"))
     def test_read_shows_only_new_directions(self):
         bd = self.d / "board"; bd.mkdir(); (bd / ".master").write_text("here\n")
         B = lambda *a: janus.board(self.cfg, *a)
