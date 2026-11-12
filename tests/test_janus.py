@@ -337,6 +337,20 @@ class Resume(unittest.TestCase):
                                 capture_output=True, text=True).stdout.rstrip("\n")      # what pueue stores as the command
         self.assertEqual(subprocess.run(["sh", "-c", stored], capture_output=True, text=True).stdout.rstrip("\n"), odd)
 
+class LocaltestWords(unittest.TestCase):
+    def test_a_command_that_merely_mentions_pytest_is_not_a_localtest(self):
+        """Catches (item 23): localtest flagged the orchestrator's own commands that contain the word pytest (an ack quoting
+        it, a commit message), while a real test run is still flagged."""
+        d, cfg = project()
+        ps = (" 111     1     1   0.1 00:10 janus ack unit:x 'pytest failed on the gate'\n"
+              " 222     1     1   0.1 00:10 git commit -m 'fix the pytest helper'\n")
+        self.assertEqual([k for k, _ in janus.proc_findings(cfg, ps_text=ps)], [])
+        ps2 = " 333     1     1   0.1 00:10 pytest -q\n"
+        self.assertIn("localtest:333", [k for k, _ in janus.proc_findings(cfg, ps_text=ps2)])
+        ps3 = " 444     1     1   0.1 00:10 nice -n 10 /usr/bin/pytest tests/\n"
+        self.assertIn("localtest:444", [k for k, _ in janus.proc_findings(cfg, ps_text=ps3)])
+
+
 class LaunchQuoting(unittest.TestCase):
     """Defect 18:35 (row 56): launch built the agent's shell command with an unquoted report path that held '(' and a backtick;
     sh failed at once and launch still said 'launched'. Here real launches run from a project path with '(', a backtick, a
@@ -811,7 +825,7 @@ class FalseFindings(unittest.TestCase):
     """item 7: findings that were false."""
     def test_localtest_skips_a_shim_whose_child_is_janus_run(self):
         d, cfg = project()
-        shim = " 10     1    10   0.0    01:00 sh -c run-tests.sh cargo test -p x\n"
+        shim = " 10     1    10   0.0    01:00 sh -c cargo test -p x\n"
         self.assertIn("localtest:10", [k for k, _ in janus.proc_findings(cfg, shim)])          # a build outside the lanes: flagged
         child = shim + " 11    10    10   0.0    00:59 python3 /x/janus.py run --host h --wt /w -- cargo test -p x\n"
         self.assertNotIn("localtest:10", [k for k, _ in janus.proc_findings(cfg, child)])     # its child is janus run: a lane call

@@ -19,7 +19,37 @@ from janus.units import all_units, ws_id
 # mark, unless the checker is the test suite (which must see its own fixtures).
 def fixture_proc(cmd): return FIXTURE_MARK in (cmd or "") and not os.environ.get("JANUS_IN_TESTS")
 
-TEST_RX = re.compile(r"\bcargo(-\w+)? (test|nextest|build|clippy|bench)\b|\bpytest\b|\b(npm|pnpm) (run )?test\b|\bxcodebuild\b.*\btest\b")
+TEST_WRAP = {"nice", "env", "timeout", "nohup", "time", "command", "exec", "ionice", "stdbuf", "caffeinate", "setsid", "doas", "sudo"}
+TEST_SUB = ("test", "nextest", "build", "clippy", "bench")
+
+def test_command(c):
+    """True when a command *in* c is a test or build command (its command word, after wrappers and assignments, is cargo/a
+    cargo subcommand, pytest, npm/pnpm test or xcodebuild ... test). Item 23: a line that merely *mentions* pytest (an
+    orchestrator's `janus ack ... "pytest"`, a commit message) is not a test run."""
+    for seg in re.split(r"[;&|()\n]+", c):
+        w = seg.split(); i = 0
+        while i < len(w):
+            b = os.path.basename(w[i])
+            if re.match(r"^[A-Za-z_]\w*=", w[i]): i += 1; continue
+            if b in TEST_WRAP:
+                i += 1
+                while i < len(w):
+                    x = w[i]
+                    if x.startswith("-"):
+                        i += 2 if x in ("-n", "-u", "-g", "-p", "-c", "-o", "-e", "-t", "-s", "-k", "-C", "--signal", "--kill-after", "--user", "--group") and i + 1 < len(w) else 1
+                        continue
+                    if re.match(r"^[A-Za-z_]\w*=", x) or re.fullmatch(r"[\d.]+[smhd]?", x): i += 1; continue
+                    break
+                continue
+            rest = [os.path.basename(x) for x in w[i + 1:]]
+            if b in ("sh", "bash", "zsh", "dash", "ksh") and "-c" in w[i + 1:]:
+                j = w.index("-c", i + 1)
+                if test_command(" ".join(w[j + 1:])): return True   # a shell shim that runs a test (`sh -c 'cargo test'`)
+                break
+            if b == "cargo" and any(x in TEST_SUB for x in rest): return True
+            if re.fullmatch(r"pytest[\d.]*", b) or (b in ("npm", "pnpm") and "test" in rest) or (b == "xcodebuild" and "test" in rest): return True
+            break
+    return False
 
 VIA_LANE = re.compile(r"janus(\.py)? (run|gate)\b|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")   # plus paths.lane_scripts (project wrappers)
 
@@ -56,7 +86,7 @@ def proc_findings(cfg, ps_text=None, viol=None):
                       + ("it is stopped after [enforce] grace_min unless it moves to a lane (janus run)" if mine else "reported only (not under this project's agents)")))
             if viol is not None and mine: viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
                               "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": e.get("JANUS_UNIT")})
-        if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc) and not lane_below(p):
+        if test_command(c) and not lane and not via_lane(cfg, c) and not any(test_command(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc) and not lane_below(p):
             e = env_janus(p) if viol is not None else {}   # an agent's (JANUS_UNIT): warned once, then stopped (enforce)
             if e.get("JANUS_PROJECT") and e["JANUS_PROJECT"] != project_id(cfg): continue   # another project's: not shown, not touched
             u = e.get("JANUS_UNIT") if e.get("JANUS_PROJECT") == project_id(cfg) else None
