@@ -249,10 +249,10 @@ while :; do
     # that is waiting is not progressing, and one itself blocked on disk/memory must not hold a jobs job forever (the old `Y=1`
     # cleared the give-up clock on every poll, so the job exited only after the gate gave up plus its own limit; a new gate
     # restarted that). So the clock runs here, and `why` is the same admission cause the gate is waiting on.
-    lk; CAP_RO=; . "$RD/cap.sh"; admit_ok "$CLS" >/dev/null 2>&1; ulk
-    BLK="a gates job is waiting on this host (${why:-admission blocked})"
+    lk; CAP_RO=; . "$RD/cap.sh"; admit_ok gate >/dev/null 2>&1; ulk   # finding H: the cause is the GATE's own admission view
+    BLK="a gates job is waiting on this host"   # finding H: a stable key, so the line is not repeated when a load figure changes
     nowt=$(date +%%s)
-    if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): a jobs job yields while a gates job waits and goes after it"; said=$BLK; last=$nowt; fi
+    if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): the gate waits on ${why:-admission blocked}"; said=$BLK; last=$nowt; fi
   fi
   # finding 3: the give-up clock starts at the first poll this job is blocked, never at enqueue (TQ); a yield to an older job
   # means the queue is moving, so it clears the clock. So a job that queued long is not dropped at its first blocked poll.
