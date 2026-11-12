@@ -271,7 +271,30 @@ def rewrite_config(path, dry=False):
     if changes and not dry: atomic_write(path, "\n".join(lines))
     return changes
 
-def migrate(project=None, dry=False):
+OLD_ORCH_RX = re.compile(r"(^|[/\s])orch(\.py)?(\s|$)")   # a command naming the old toolkit: orch.py, `orch <cmd>` (item 14)
+
+def old_orch_procs(ps_text=None):
+    """[(pid, command)] of this machine's running old-orch processes (item 14): a command that names the old toolkit (orch.py /
+    `orch <cmd>`) and is not a janus process. migrate lists them; janus migrate --retire stops them (the owner's yes)."""
+    o = ps_text if ps_text is not None else sh(["ps", "-Aww", "-o", "pid=,command="], timeout=10)[1]
+    out = []
+    for l in o.splitlines():
+        f = l.split(None, 1)
+        if len(f) == 2 and f[0].isdigit() and OLD_ORCH_RX.search(f[1]) and "janus" not in f[1]: out.append((int(f[0]), f[1]))
+    return out
+
+def retire_old_orch(dry=False, retire=False, ps_text=None):
+    """Item 14: list the old orch's standing processes and, only with the owner's explicit yes (--retire), stop them (TERM)."""
+    procs = old_orch_procs(ps_text)
+    if not procs: return []
+    out = [f"old orch process {p} still running: {c[:100]}" for p, c in procs]
+    if retire and not dry:
+        for p, _ in procs: run(["kill", "-TERM", str(p)])
+        out.append(f"-> sent TERM to {len(procs)} old orch process(es) (--retire)")
+    else: out.append("-> not stopped (janus migrate --retire stops them, or stop them by hand)")
+    return out
+
+def migrate(project=None, dry=False, retire=False):
     """One-time, idempotent move from orch to janus: the project's orch.toml -> janus.toml and .orch/ -> .janus/, every config
     value that still names the old state folder or an old name (item 1), the hook commands a previous install wrote, the watcher,
     and the project's own pre-existing jobs, sessions and cards which get their project id (item 6). Safe to run twice; prints
@@ -297,6 +320,7 @@ def migrate(project=None, dry=False):
     if src.is_file(): did += rewrite_config(src, dry=dry)   # item 1
     did += migrate_hooks(dry=dry) + migrate_watcher(dry=dry)
     if new_cfg.is_file() or (dry and old_cfg.is_file()): did += adopt_items(root, dry=dry, config=src)   # item 6
+    did += retire_old_orch(dry=dry, retire=retire)   # item 14: the old orch's standing processes
     for x in did: say(x)
     say("janus migrate: " + ("done" if did else "nothing to do (already migrated)") + (" [dry-run: nothing changed]" if dry else ""))
     return 0
