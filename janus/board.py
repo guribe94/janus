@@ -54,14 +54,26 @@ def learned_posts(cfg):
         if m: n[m.group(1)] = n.get(m.group(1), 0) + 1; out.append((f"{m.group(1)}:{n[m.group(1)]}", m.group(2)))
     return out
 
-def board_findings(cfg, names):
-    """question:<id> (stays until answered), learned:<agent>:<n> (until remembered or rejected)."""
+def stale_board_findings(cfg):
+    """board:stale:<path>: a project's own board script (paths.board, or a leftover bin/board.sh) with no `answer` subcommand, a
+    pre-janus copy that prints its help instead of answering and misleads whoever runs it; janus answer q<N> <text> is the route."""
     F = []
+    for p in {board_script(cfg), cfg.root / "bin" / "board.sh"}:
+        try: txt = p.read_text()
+        except OSError: continue
+        if p != JANUS_SELF.parent / "board.sh" and "msgboard" not in txt and "answer" not in txt:
+            F.append((f"board:stale:{p}", f"{p} is an old board script with no answer subcommand: do not use it; answer a question with janus answer q<N> <text>"
+                      + " and delete it (and paths.board in janus.toml if it names it: janus then uses its shipped board)"))
+    return F
+
+def board_findings(cfg, names):
+    """question:<id> (stays until answered), learned:<agent>:<n> (until remembered or rejected), board:stale:<path>."""
+    F = stale_board_findings(cfg)
     for q, ag, at, tx in board_questions(cfg) or []:
         try: age = int((now() - time.mktime(time.strptime(at, "%Y-%m-%d %H:%M"))) / 60)
         except ValueError: age = 0
         F.append((f"question:{q}", f"{ag}{'' if ag in names else ' (not a unit)'} asks [{q}] ({age} min): {tx[:160]}; check janus "
-                  f"memory, janus decisions --grep <topic>, bd memories <word>; then board.sh answer {q} <text>"))
+                  f"memory, janus decisions --grep <topic>, bd memories <word>; then janus answer {q} <text>"))
     done = cfg.jget("learned.json")
     F += [(f"learned:{i}", f"{i.split(':')[0]} proposes for the session memory: {t[:160]}; janus remember --fact|--decision|--pitfall <text> --learned {i}, or janus learned --reject {i}")
           for i, t in learned_posts(cfg) if i not in done]
@@ -88,7 +100,7 @@ def board_alerts(cfg, log):
     if not new: return None
     pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
     msg = (JANUS_MARK + "Board needs you now: " + " | ".join(t for _, t in new) + ". Check janus memory, janus decisions --grep <topic>, "
-           "bd memories <word>; answer with board.sh answer <id> <text> (a block: board.sh direct <agent> <text>); janus remember what "
+           "bd memories <word>; answer with janus answer <id> <text> (a block: board.sh direct <agent> <text>); janus remember what "
            "every agent should know.")
     if not pane or herdr("agent", "prompt", pane, msg) is None: log(f"board alert not delivered (no orchestrator pane): {msg[:300]}"); return None
     log(f"board alert: {msg[:600]}"); cfg.jput("alerted.json", {**{k: v for k, v in seen.items() if now() - v < 7 * 86400}, **{k: now() for k, _ in new}})

@@ -14,7 +14,7 @@ for an owner instruction classified as a decision (beads label `decision`) with 
 This module imports context, beads, board and memory only (the bottom of the package), so check builds on it."""
 import re, time
 from janus.beads import Beads
-from janus.board import board_dir
+from janus.board import board, board_dir
 from janus.context import Err, JANUS_SELF, atomic_write, refuse_agent, say, sh, slug, ts
 
 DECNUM = re.compile(r"^(\d{4})-.*\.md$")
@@ -229,8 +229,21 @@ def cmd_ask(cfg, a):
     if cfg.run.dry: return 0, []
     return 0, [f"asked the owner [{it['n']}]: {q}" + (f" (recommend: {a.recommend})" if a.recommend else "")]
 
+def answer_board(cfg, a):
+    """`janus answer q<N> <text>`: answer a board question (the one route; board.sh answer needs BOARD_DIR from outside the project)."""
+    if a.decide: raise Err("--decide applies to the owner's questions (a number), not a board question")
+    ans = re.sub(r"\s+", " ", a.answer).strip()
+    if not ans: raise Err("an answer needs text")
+    if cfg.run.dry: say(f"+ board question {a.id} answered: {ans}"); return 0, []
+    rc, o, e = board(cfg, "answer", a.id, ans)
+    if rc: raise Err(f"board question {a.id}: {(e or o).strip()[:200] or 'the board refused the answer'}")
+    return 0, [f"answered board question {a.id}: {ans}"]
+
 def cmd_answer(cfg, a):
     refuse_agent("janus answer")
+    if re.fullmatch(r"q\d+", str(a.id)): return answer_board(cfg, a)
+    if not str(a.id).isdigit(): raise Err(f"'{a.id}' is not a question id: a board question is q<N>, an owner question a number")
+    a.id = int(a.id)
     items = owner_queue(cfg)
     it = next((x for x in items if x["n"] == a.id), None)
     if not it: raise Err(f"no question {a.id} in {queue_path(cfg)}")
