@@ -27,7 +27,8 @@ PY_RUN = re.compile(r"^(?:python|python\d+(?:\.\d+)?|Python)$")
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 OPTS_WITH_ARG = {"-n", "-u", "-g", "-p", "-c", "-o", "-e", "-t", "-s", "-k", "-C", "-L", "-P", "-I", "-d", "-a", "-i",
                  "--signal", "--kill-after", "--user", "--group", "--max-args", "--max-procs", "--delimiter", "--arg-file",
-                 "--replace", "--eof", "--lines"}
+                 "--replace", "--eof", "--lines", "--with", "--project", "--python", "--directory"}
+CARGO_OPT_ARG = {"--config", "--target", "--target-dir", "--features", "--manifest-path", "--profile", "--jobs", "-j", "-Z"}
 
 def _segments(c):
     """The commands in c, each a list of words: quoting and backslash escapes are honoured, so a ; or | inside a quoted
@@ -62,7 +63,9 @@ def _after_opts(w, i):
     return i
 
 def _test_argv(w, depth):
-    """True when the words w (one command, quotes already removed) are a test or build run (finding 4: the review's cases)."""
+    """True when the words w (one command, quotes already removed) are a test or build run (finding 4: the review's cases;
+    finding 3: uv/poetry/pdm `run`'s OWN options, hatch's `env:cmd`, cargo's own options before its subcommand, and the joined
+    `python -mpytest`, while a later word that merely names pytest (`python tool.py --runner pytest`) is not a run)."""
     if depth > 6: return False
     i = 0
     while i < len(w) and re.match(r"^[A-Za-z_]\w*=", w[i]): i += 1   # leading assignments
@@ -72,13 +75,19 @@ def _test_argv(w, depth):
             j = next((k for k in range(i + 1, len(w)) if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", w[k])), None)
             return j is not None and test_command(" ".join(w[j + 1:]), depth + 1)
         if b == "eval": return test_command(" ".join(w[i + 1:]), depth + 1)
-        if PY_RUN.match(b):   # python -m pytest, or a Python-app console script (.../Python .../bin/pytest)
+        if PY_RUN.match(b):   # python -m pytest / python -mpytest, or a Python-app console script (.../Python .../bin/pytest)
             rest = w[i + 1:]
-            if "-m" in rest and any(TEST_RUN.match(os.path.basename(x)) for x in rest[rest.index("-m") + 1:]): return True
-            return any(TEST_RUN.match(os.path.basename(x)) for x in rest if not x.startswith("-"))
+            for k, x in enumerate(rest):
+                if re.fullmatch(r"-m\S+", x): return bool(TEST_RUN.match(os.path.basename(x[2:])))
+                if x == "-m": return bool(k + 1 < len(rest) and TEST_RUN.match(os.path.basename(rest[k + 1])))
+            first = next((x for x in rest if not x.startswith("-")), None)   # the script, never a later word (finding 3)
+            return bool(first and TEST_RUN.match(os.path.basename(first)))
         if b in ("uv", "poetry", "pipenv", "pdm", "hatch", "rye", "bundle", "just"):
-            j = _after_opts(w, i)
-            if j < len(w) and w[j] in ("run", "exec", "x"): j += 1
+            j = _after_opts(w, i)   # the runner and its own options (`uv --no-cache run ...`)
+            if j < len(w) and w[j] in ("run", "exec", "x"):
+                j = _after_opts(w, j)   # `run`'s OWN options too (finding 3: `uv run --frozen pytest`, `uv run --with X pytest`)
+                if j < len(w) and not w[j].startswith("-") and ":" in os.path.basename(w[j]):
+                    return _test_argv([os.path.basename(w[j]).split(":", 1)[1], *w[j + 1:]], depth + 1)   # hatch run env:cmd
             i = j; continue
         if b == "rustup":
             j = _after_opts(w, i)
@@ -87,7 +96,9 @@ def _test_argv(w, depth):
         if b == "flock": i = _after_opts(w, i) + 1; continue   # the lock file
         if b in TEST_WRAP: i = _after_opts(w, i); continue
         if b == "cargo" or b.startswith("cargo-"):
-            rest = [x for x in w[i + 1:] if not x.startswith("+")]   # cargo +nightly test
+            rest = w[i + 1:]   # cargo's own options and a `+toolchain` come before its subcommand (finding 3: `cargo -q test`)
+            while rest and (rest[0].startswith("+") or rest[0].startswith("-")):
+                rest = rest[2:] if rest[0] in CARGO_OPT_ARG and len(rest) > 1 else rest[1:]
             return bool(rest) and rest[0] in TEST_SUB
         if b in ("npm", "pnpm", "yarn", "bun"): return "test" in w[i + 1:]
         if b == "xcodebuild": return "test" in w[i + 1:]
