@@ -234,6 +234,12 @@ def tidy_do(cfg, kind, t):
         import shutil; shutil.rmtree(t, ignore_errors=True); return 0, ""
     return 1, f"unknown kind {kind}"
 
+def disk_free_gb(path):
+    """Free GB on the filesystem holding path, from df (the real measure: on APFS/CoW, du over-counts shared clones)."""
+    rc, o, e = sh(["df", "-Pk", str(path)])
+    try: return int(o.splitlines()[1].split()[3]) / 1048576
+    except (IndexError, ValueError): return None
+
 def cmd_tidy(cfg, a):
     act = getattr(a, "action", None)
     if act == "holds":
@@ -245,12 +251,15 @@ def cmd_tidy(cfg, a):
         else: say(f"released {a.target}" if unhold_item(cfg, a.target) else f"no hold on {a.target}")
         return
     if not cfg.run.dry: refuse_agent("janus tidy")   # --dry-run only reads
+    free0 = disk_free_gb(cfg.root)
     units = Beads(cfg).units(); kept = []; au = all_units(cfg)
     P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg) + tidy_artifacts(cfg, units)
     for n, h in cfg.hosts.items(): P += tidy_host(cfg, n, h, units, au)
     P = apply_holds(cfg, P)
     for d, why in kept: say(f"kept worktree {d}: {why}")
     if not cfg.run.dry and not cfg.run.ro: cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P if x[0] == "disk"]})
+    free1 = disk_free_gb(cfg.root)
+    if free0 is not None and free1 is not None: say(f"disk free (df, the real measure; du over-counts shared clones): {free0:.1f} GB -> {free1:.1f} GB")
     if not [x for x in P if x[0] != "disk"]: say("nothing to tidy" + "".join(f"; {x[1]}: {x[2]}" for x in P if x[0] == "disk")); return
     for kind, t, why, mb in P:
         if kind == "disk": say(f"disk {t}: {why}"); continue
