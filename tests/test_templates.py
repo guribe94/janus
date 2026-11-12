@@ -53,6 +53,7 @@ class Templates(unittest.TestCase):
                "rd": janus.qp(h["_rd"]), "ro": "1", "cap": "cap_report() { :; }"}
         self.sh_n(janus.PROBE % ctx, "PROBE")
         self.sh_n(janus.DIRECT_PROBE % {"rx": "'cargo'"}, "DIRECT_PROBE")
+        self.sh_n(janus.API_PROBE, "API_PROBE")
 
     def test_job_templates(self):
         self.sh_n(janus.ADMIT % {"lane": "jobs", "clsrc": "'cargo test'", "jid": "'j1'", "maxrss": shlex.quote(janus.MAXRSS_PY), "broad": "''"}, "ADMIT")

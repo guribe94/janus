@@ -58,7 +58,7 @@ class Ledger(unittest.TestCase):
         self.assertFalse(janus.model_ok(self.cfg, "m")[0])
 
     def test_cap_refuses(self):
-        janus.reserve_budget(self.cfg, self.mc, "u1", 9)
+        janus.reserve_budget(self.cfg, self.mc, "u1", 7)   # $8.40 held with the overshoot margin
         with self.assertRaises(janus.Err): janus.reserve_budget(self.cfg, self.mc, "u2", 2)
 
     def test_repair(self):

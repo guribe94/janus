@@ -69,13 +69,14 @@ def env_unit(pid):
 def enforce(cfg, F, viol):
     """Warn, then stop (janus-fixes8; register items 22, 23). The first time a violation is seen its unit gets a board direction;
     when it is still there [enforce] grace_min (default 5) later, its process group is stopped: a CPU burner's (stop_burners,
-    default true) and an agent's direct build or test, here or on a remote host (stop_direct, default true since imp-autopilot).
+    default true), an agent's direct build or test, here or on a remote host (stop_direct, default true since imp-autopilot), and
+    a Claude/Anthropic API process janus did not start (stop_api, default true: spend safety).
     One warning per unit: a unit warned in the last day gets no second one, its next violation is stopped at once.
     Running lane jobs are never touched. Only the registered orchestrator's check and the watcher act; anyone else only reports."""
     ec = cfg.c.get("enforce", {}); grace = ec.get("grace_min", 5) * 60; st = cfg.jget("enforce.json"); new = {}; notes = {}
     wu = {k: t for k, t in (st.get("_units") or {}).items() if now() - t < 86400}   # unit -> when it got its one warning
     for v in viol:
-        s = st.get(v["key"]) or {}; stop_ok = ec.get("stop_burners", True) if v["kind"] == "burner" else ec.get("stop_direct", True)
+        s = st.get(v["key"]) or {}; stop_ok = ec.get({"burner": "stop_burners", "api": "stop_api"}.get(v["kind"], "stop_direct"), True)
         u = v.get("unit")
         if not s.get("warned") and u in wu and stop_ok:   # already warned once: no second warning, stopped at once
             s = {"warned": wu[u] - grace, "unit": u}
@@ -198,6 +199,7 @@ def host_findings(cfg, hs, units, viol):
     """host:, margin:, idle:<host>, pressure:, scheduler:, direct: (each also goes to viol for enforce), orphan:job: and
     orphan:tmux: from each host's probe."""
     F = []; names = {u["name"] for u in units}; un = cfg.jget("hosts.json")
+    orch_pid = (cfg.f("session_pid").read_text().split() or [""])[0] if cfg.f("session_pid").exists() else ""   # the orchestrator is not flagged
     ready = 0
     try: ready = len(ready_work(cfg))
     except Err: pass
@@ -230,6 +232,12 @@ def host_findings(cfg, hs, units, viol):
             F.append((f"direct:{n}:{f[0]}", f"agent {f[2]} runs a build or test directly on {n} (pid {f[0]}, {int(fl(f[3])) // 60} min, outside the lanes): "
                       f"{(f[4] if len(f) > 4 else '')[:80]}; it must use {cfg.hosts[n].get('root', '~')}/run/{f[2]}.lane"))
             viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
+        for a in p.get("apiproc", []):   # spend safety: an API process janus did not start spends outside the ledger
+            f = a.split(None, 3)
+            if len(f) < 3 or not f[0].isdigit() or (cfg.hosts[n].get("local") and f[0] == orch_pid): continue
+            F.append((f"spend:proc:{n}:{f[0]}", f"Claude/Anthropic API process pid {f[0]} on {n} ({f[2]}) was not started by janus (an API key, no JANUS_UNIT): "
+                      f"it spends outside the ledger and the caps: {(f[3] if len(f) > 3 else '')[:70]}; launch API work through janus; it is stopped after [enforce] grace_min"))
+            viol.append({"key": f"spend:proc:{n}:{f[0]}", "kind": "api", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": None})
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
             if k not in ("Running", "Queued"): continue

@@ -6,7 +6,7 @@ from janus.actions.jobs import job_state, unit_jobs
 from janus.board import board_dir, board_questions, board_rows
 from janus.budgets import bset, last_checkpoint, unit_spend, waste_paused, work_written
 from janus.context import DIFF_X, atomic_write, fl, hrun, now, qp, sh, ts
-from janus.ledger import committed, ledger_read, spend
+from janus.ledger import ledger_read, spend
 from janus.platform import herdr
 from janus.project import project_id
 from janus.transcripts import card_fields, transcript_where
@@ -197,14 +197,22 @@ def ledger_findings(cfg, units):
             if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
                 F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
                           + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": janus ledger check"))
-            ur = unreconciled(cfg, pv, units)
-            if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (${sum(x[2] for x in ur):.2f} held as running: "
+            ur = unreconciled(cfg, pv, units)   # each check: the done spend against the committed, and runs held for agents that are gone
+            done = sum(r["cost"] or 0.0 for r in runs.values() if r["done"])
+            if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (done ${done:.2f} vs committed ${spend(runs):.2f}; ${sum(x[2] for x in ur):.2f} held as running: "
                              + ", ".join(f"{x[0]} {x[3]}" for x in ur[:3])[:240] + "): janus ledger reconcile"))
     return F
 
 def spend_findings(cfg):
-    """spend:<provider>: a provider's committed spend is at its cap."""
+    """spend:<provider>: a provider's committed spend is at its cap; spend:<provider>:90 and :80 when it passed 90 or 80 % of it
+    (the highest only). Committed counts running runs at their reservation (budget plus overshoot margin)."""
     F = []
     for n, pv in cfg.prov.items():
-        if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap: launch on another provider, or ask the owner to raise the cap"))
+        if "cap_usd" not in pv or not pv["cap_usd"]: continue
+        runs = ledger_read(cfg, pv)[0]; c = spend(runs); done = sum(r["cost"] or 0.0 for r in runs.values() if r["done"]); cap = pv["cap_usd"]
+        if c >= cap: F.append((f"spend:{n}", f"{n} spend at its ${cap} cap: launch on another provider, or ask the owner to raise the cap"))
+        else:
+            pct = next((p for p in (90, 80) if c >= cap * p / 100), None)
+            if pct: F.append((f"spend:{n}:{pct}", f"{n} committed ${c:.2f} is over {pct} % of its ${cap} cap (${done:.2f} spent in finished runs, "
+                               f"${c - done:.2f} held by running ones): tell the owner; launch only what matters most"))
     return F

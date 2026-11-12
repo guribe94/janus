@@ -62,10 +62,17 @@ def ledger_append(cfg, pv, row):
 
 def tstamp(): return time.strftime("%Y-%m-%d %H:%M:%S")
 
+OVERSHOOT_PCT = 20   # [budget] overshoot_pct: runs overshoot their --max-budget-usd (observed: 21 runs over, worst 18 %)
+
+def reserved(cfg, budget):
+    """What a run's budget holds in the ledger while it runs: the budget plus [budget] overshoot_pct (default 20 %)."""
+    return round(float(budget) * (1 + cfg.c.get("budget", {}).get("overshoot_pct", OVERSHOOT_PCT) / 100), 2)
+
 def reserve_budget(cfg, mc, name, budget, run=None):
-    """Under the ledger's lock: refuse when the ledger is malformed or the budget would pass the cap, else write the run's one
-    running row. Idempotent: a run id that already has its running row is returned as it is. Returns the run id."""
-    pv = cfg.prov[mc["provider"]]; run = run or f"{name}.{os.getpid()}.{int(now())}"
+    """Under the ledger's lock: refuse when the ledger is malformed or the reservation (the budget plus the overshoot margin)
+    would pass the cap, else write the run's one running row holding the reservation. Idempotent: a run id that already has its
+    running row is returned as it is. Returns the run id."""
+    pv = cfg.prov[mc["provider"]]; run = run or f"{name}.{os.getpid()}.{int(now())}"; held = reserved(cfg, budget)
     if cfg.run.dry: return run
     with Locked(ledger_path(cfg, pv)):
         runs, bad, _ = ledger_read(cfg, pv)
@@ -75,8 +82,8 @@ def reserve_budget(cfg, mc, name, budget, run=None):
         if r and r["running"]: return run
         if "cap_usd" in pv:
             c = spend(runs)
-            if c + budget > pv["cap_usd"]: raise Err(f"refused: ${c:.2f} committed + ${budget} would pass the ${pv['cap_usd']} cap of {mc['provider']}")
-        ledger_append(cfg, pv, [tstamp(), name, "running", budget, run])
+            if c + held > pv["cap_usd"]: raise Err(f"refused: ${c:.2f} committed + ${held} (${budget} and its overshoot margin) would pass the ${pv['cap_usd']} cap of {mc['provider']}")
+        ledger_append(cfg, pv, [tstamp(), name, "running", held, run])
     return run
 
 def ledger_done(cfg, pv, run, name, cost, rc):
@@ -139,4 +146,4 @@ def model_ok(cfg, m):
 
 RECONCILED = "done unknown"   # a reconciled run: its agent is gone with no done row; its budget is counted as the upper bound
 
-__all__ = ["ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_cost", "settle_run", "read_secret", "model_ok", "RECONCILED"]
+__all__ = ["OVERSHOOT_PCT", "reserved", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_cost", "settle_run", "read_secret", "model_ok", "RECONCILED"]
