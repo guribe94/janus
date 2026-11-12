@@ -82,16 +82,20 @@ def related_cases(cfg, units, hs=None):
         if topic and topic not in d["topics"]: d["topics"].append(topic)
 
     def tip(br, c):
-        return sh(["git", "-C", c, "rev-parse", br])[1].strip() if c and Path(c).is_dir() else ""
+        """The commit a unit is compared by: its branch's tip, or, for a detached HEAD, its own commit (item 18: the literal
+        `HEAD` resolved in another worktree is *that* worktree's, which paired units whose branches do not contain each other)."""
+        if not c or not Path(c).is_dir(): return ""
+        return sh(["git", "-C", c, "rev-parse", "HEAD" if br == "HEAD" else br])[1].strip()
 
     def branch_related(a, b):
         ba, bb = info[a]["branch"], info[b]["branch"]
-        if ba in ("", "?") or bb in ("", "?") or ba == bb: return False
+        if ba in ("", "?") or bb in ("", "?"): return False
+        if ba == bb and ba != "HEAD": return False   # the same branch (two detached HEADs are compared by commit below)
         ca, cb = umap.get(a, {}).get("cwd"), umap.get(b, {}).get("cwd")
         ta, tb = tip(ba, ca), tip(bb, cb)
         if not ta or not tb or ta == tb: return False
-        return (ca and sh(["git", "-C", ca, "merge-base", "--is-ancestor", bb, ba])[0] == 0) or \
-               (cb and sh(["git", "-C", cb, "merge-base", "--is-ancestor", ba, bb])[0] == 0)
+        an = lambda c, x, y: bool(c and sh(["git", "-C", c, "merge-base", "--is-ancestor", x, y])[0] == 0)
+        return an(ca, tb, ta) or an(cb, ta, tb)   # one tip contains the other (a detached HEAD by its commit)
 
     names = sorted(info)
     for i, a in enumerate(names):
