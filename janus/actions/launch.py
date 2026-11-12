@@ -12,6 +12,7 @@ from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run
 from janus.memory import MEM_SECTIONS, mem_line, memory_read, mset
 from janus.platform import herdr
 from janus.probe import probe_all, pueue, room
+from janus.quality import qset
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import predecessor_name, related_pointers, transcript_of
 from janus.units import herdr_agents, main_checkout, report_path, unit_state, ws_id
@@ -35,7 +36,9 @@ def agent_prompt(cfg, unit, brief, hn, report=None):
     rp = f"your report {report}" if report else "REPORT.md (path in the brief)"
     return (f"Read {brief} and carry out every instruction exactly. Keep {rp} current after every step (a run "
             f"stopped by its budget must leave its state written): line 1 'VERDICT: PENDING' "
-            f"until done, then end with 'VERDICT: DONE' (or BLOCKED) and the real exit codes. {o.strip()}")
+            f"until done, then end with 'VERDICT: DONE' (or BLOCKED) and the real exit codes. Also write report.json "
+            f"beside it (verdict, files_changed, jobs with their exit codes, tests_added with the failure each catches, "
+            f"left); janus reads it before the prose. {o.strip()}")
 
 def wait_shell(pane, unit):
     for _ in range(30):
@@ -233,20 +236,31 @@ def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
     if rel: L += [rel, ""]
     return "\n".join(L)
 
+def quality_block(cfg, report=None):
+    """The quality rules every brief header carries: the project's rules file by pointer ([quality] rules_file), the fail-first
+    test rule, "run only the tests your change can affect", and the report.json contract."""
+    rf = qset(cfg, "rules_file")
+    L = ["**Quality (janus):** every new test names the failure it catches, shown failing first; run only the tests your change can affect."]
+    if rf: L.append(f"- Project quality rules: read `{rf}` in your tree where present, before you start.")
+    L.append(f"- Structured report: also write `report.json` beside {report or 'REPORT.md'} (verdict, files_changed, jobs with their exit codes, "
+             f"tests_added with the failure each catches, left); janus reads it before the prose.")
+    return "\n".join(L) + "\n"
+
 def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None):
-    """The header every unit's brief gets: where it runs, how it submits builds and tests (detached, then WAITING), its report,
-    then the session memory and the swarm pointers (swarm_header)."""
+    """The header every unit's brief gets: where it runs, how it submits builds and tests (detached, then WAITING), its report and
+    the quality rules, then the session memory and the swarm pointers (swarm_header; imp-awareness adds the RELATED: names and the
+    predecessor there)."""
     if local:
         b = build or hn
         return (f"<!-- janus: unit {name} runs on {hn} -->\n" + PARK_RULE.format(
             submit=f"janus run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=report or "REPORT.md")
-            + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
+            + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
     return (f"<!-- janus: unit {name} runs on {hn} -->\n**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
             f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
             f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=report or "REPORT.md")
-            + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
+            + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
 
 def place(cfg, a, brief, mc, units, hs):
     """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
@@ -348,6 +362,9 @@ def cmd_launch(cfg, a):
     if shared and not (local and a.kind in ("review", "audit")):
         raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}; give the unit its own worktree (H9)")
     if main_checkout(cwd) and not a.allow_main: raise Err(f"refused: {cwd} is a main checkout with linked worktrees; use a worktree (or --allow-main)")
+    if qset(cfg, "brief_lint"):   # [quality] brief_lint: a brief that fails is refused with every reason (opt-in, item 5)
+        probs = lint_brief(cfg, brief, cwd=cwd, reachable=local)
+        if probs: raise Err(f"brief {brief} fails the lint ([quality] brief_lint = true): " + "; ".join(probs))
     outd = cfg.p("out", "out") / name; outd.mkdir(parents=True, exist_ok=True)
     rbrief, rcwd = str(brief), str(cwd)
     budget = None
@@ -538,3 +555,34 @@ def ship_context(cfg, h, name, copy):
     lst = "".join(r + "\n" for _, r in copy)
     rc, o, e = sh(["rsync", "-a", "-r", "--files-from=-", "-e", " ".join(SSH), f"{cfg.root.resolve()}/", f"{h['ssh']}:{ctx}/"], inp=lst, timeout=600)
     if rc: raise Err(f"copying the brief's files to {h.get('ssh')} failed: {(e or o).strip()[-160:]}")
+
+# A brief must say what the unit does and how it is judged before anything runs: the lint names every missing part. It is off
+# unless [quality] brief_lint is set (the owner's projects carry briefs of every shape; a project turns it on once its briefs
+# carry the markers). The five parts are the tier line, a scope, the report path, done-criteria, and reachable paths.
+TIER_RX = re.compile(r"(?im)^\s*\**\s*TIER\s*[:=]\s*(\S+)")
+SCOPE_RX = re.compile(r"(?im)(?:^#{1,6}\s*scope\b)|(?<![\w-])(?:scope|in[- ]scope|out[- ]of[- ]scope|modules|your modules)\s*:")
+REPORT_RX = re.compile(r"(?i)report\.(?:md|json)")
+DONE_RX = re.compile(r"(?im)^\s*(?:[-*>]\s*)?\**\s*(done[- ]when|done|proof|acceptance|done[- ]criteria|accepted|exit codes?)\b\s*[:=-]")
+
+def lint_brief(cfg, brief, text=None, cwd=None, reachable=True):
+    """Problems that make a brief unfit to launch ([] when it is good): no tier line, no scope, no report path, no
+    done-criteria, or a path under the project root it names that is not there. `reachable=False` skips the path check (a remote
+    launch's paths are enforced by brief_plan). Reads the brief unless text is given."""
+    t = brief.read_text() if text is None else text
+    P = []
+    if not TIER_RX.search(t): P.append("no tier line: add 'TIER: NORMAL' or 'TIER: CRITICAL'")
+    if not SCOPE_RX.search(t): P.append("no scope: add 'SCOPE:' (or 'Your modules:') naming what the unit may touch")
+    if not REPORT_RX.search(t): P.append("no report path: name REPORT.md, where the unit writes its report")
+    if not DONE_RX.search(t): P.append("no done-criteria: add 'DONE-WHEN:' or 'PROOF:' saying what proves the unit done")
+    if reachable:
+        root = cfg.root.resolve(); cw = Path(cwd).resolve() if cwd else None
+        for p in brief_paths(t):
+            q = Path(p)
+            try: rq = q.resolve()
+            except OSError: rq = q
+            if cw and (rq == cw or cw in rq.parents): continue          # in the unit's own tree: it is what it edits
+            if rq == root or root in rq.parents:
+                rel = rq.relative_to(root) if rq != root else Path(".")
+                if not rq.exists() and rel.parts[:1] != ("out",):       # out/<unit> is created at launch
+                    P.append(f"path {p} is not reachable: under the project root but missing")
+    return P

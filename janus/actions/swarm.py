@@ -1,6 +1,6 @@
 """The swarm's shared knowledge and the owner's report: janus remember/forget/memory/learned, peers, transcript, index,
 report, and janus ledger (check, repair, reconcile)."""
-import os, re, time
+import json, os, re, time
 from janus.backlog import backlog_items, item_actors, unit_items
 from janus.beads import Beads
 from janus.board import board, board_dir, learned_posts
@@ -12,7 +12,7 @@ from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, spen
 from janus.memory import MEM_SECTIONS, learned_mark, mem_line, memory_history, memory_path, memory_read, memory_write
 from janus.probe import probe_all
 from janus.transcripts import pointer_text, read_transcript
-from janus.units import ENDED, herdr_agents, unit_any, unit_state, verdict, waiting_line_jobs
+from janus.units import ENDED, herdr_agents, report_summary, unit_any, unit_state, verdict, waiting_line_jobs
 
 def cmd_ledger(cfg, a):
     """janus ledger check: every provider ledger, exit 1 when one is malformed. janus ledger repair: keep the first running row
@@ -129,26 +129,16 @@ def cmd_peers(cfg, a):
         if not verdict(cfg, u) and u["state"] in ENDED: u["_park"] = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
     return 0, [peers_text(peer_rows(cfg, units, hs)).rstrip()]
 
-RESULT_RX = re.compile(r"^\W*(result|summary|outcome|conclusion)s?\b\W*", re.I)
-
-def report_summary(text):
-    """(verdict, one-line result) of a report: its final VERDICT line (else line 1), and a 'Result:'/'Summary:' line, else the
-    last content line before the final verdict."""
-    L = [l.rstrip() for l in text.splitlines()]
-    vi = next((i for i in range(len(L) - 1, -1, -1) if L[i].startswith("VERDICT:")), None)
-    v = L[vi][8:].strip() if vi is not None else "none"
-    res = next((RESULT_RX.sub("", l) for l in L if RESULT_RX.match(l) and len(RESULT_RX.sub("", l)) > 3), None)
-    if not res:
-        body = [l for l in L[1:vi if vi and vi > 0 else len(L)] if l.strip() and not l.lstrip().startswith(("#", "VERDICT:", "|---", "```"))]
-        res = body[-1] if body else ""
-    return (v[:24] or "none"), re.sub(r"\s+", " ", res.strip(" -*"))[:140]
-
 def write_index(cfg):
     """out/INDEX.md, one line per unit (verdict, result, report path), newest first; a copy in the board folder (index.md) so
-    the board sync carries it to every host. Returns the number of units."""
+    the board sync carries it to every host. A unit's report.json is preferred over its report's prose (units.report_summary).
+    Returns the number of units."""
     od = cfg.p("out", "out"); rows = []
     for rp in od.glob("*/REPORT.md"):
-        try: v, r = report_summary(rp.read_text(errors="replace")); rows.append((rp.stat().st_mtime, rp.parent.name, v, r, rp))
+        try:
+            try: j = json.loads(rp.with_name("report.json").read_text())
+            except (OSError, ValueError): j = None
+            v, r = report_summary(rp.read_text(errors="replace"), j); rows.append((rp.stat().st_mtime, rp.parent.name, v, r, rp))
         except OSError: continue
     rows.sort(reverse=True)
     text = (f"# Reports index ({ts()}; janus index, regenerated at janus commit-state)\n"

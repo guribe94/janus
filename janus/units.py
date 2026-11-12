@@ -1,9 +1,10 @@
 """A unit's derived state, its report and the unit queries every layer uses (section 7, Step 2).
 
-unit_state (from the live source it runs in), verdict (a resumed report only counts a verdict written after the resume
-started; PENDING is not a verdict), report_path, herdr_agents, ws_id (the workspace agents run in); get_unit/unit_any/
-all_units (open units, the latest record of any unit), unit_runs/unit_spent, api_out, the WAITING line of its report
-(waiting_line_jobs), agent_ended, and whether its tree is its own (own_tree, main_checkout)."""
+unit_state (from the live source it runs in), verdict (report.json's verdict first, else the prose; a resumed report only counts
+a verdict written after the resume started; PENDING is not a verdict), report_path/report_json/report_summary, herdr_agents,
+ws_id (the workspace agents run in); get_unit/unit_any/all_units (open units, the latest record of any unit), unit_runs/unit_spent,
+api_out, the WAITING line of its report (waiting_line_jobs), agent_ended, and whether its tree is its own (own_tree,
+main_checkout)."""
 from janus.beads import Beads, unit_record
 from janus.context import Err, sh
 from janus.ledger import ledger_read
@@ -29,13 +30,21 @@ def unit_state(u, ps, agents):
     return "unknown"
 
 def verdict(cfg, u):
-    """The unit's final VERDICT line, from the report it writes (a resumed unit: its original report, report_path). A resumed
-    report still holds the earlier run's verdict, so only a verdict written after the resume started counts, and a line 1
-    that is still PENDING means not finished."""
-    p = report_path(cfg, u)
+    """The unit's final VERDICT line: report.json's verdict when it states one (preferred over the prose), else the last
+    'VERDICT:' line of its report (a resumed unit: its original report, report_path). A resumed report still holds the earlier
+    run's verdict, so only a verdict written after the resume started counts, and a line 1 that is still PENDING means not
+    finished."""
+    p = report_path(cfg, u); j = report_json(cfg, u)
     try: t = p.read_text().splitlines()
-    except OSError: return None
-    if u.get("resume") and (p.stat().st_mtime < u.get("started", 0) or (t and "PENDING" in t[0])): return None
+    except OSError: t = []
+    if u.get("resume"):
+        try: mt = p.stat().st_mtime
+        except OSError: mt = 0
+        jp = p.with_name("report.json")
+        if jp.exists(): mt = max(mt, jp.stat().st_mtime)
+        if mt < u.get("started", 0) or (t and "PENDING" in t[0]): return None
+    v, present = verdict_line(j)
+    if present: return v
     return next((l for l in reversed(t) if l.startswith("VERDICT:") and "PENDING" not in l), None)   # PENDING is not a verdict
 
 def herdr_agents(cfg):
@@ -52,6 +61,36 @@ def ws_id(cfg, create=False):
         return r.get("workspace", {}).get("workspace_id")
 
 def report_path(cfg, u): return Path(u["report"]) if u.get("report") else cfg.p("out", "out") / u["name"] / "REPORT.md"
+
+def report_json(cfg, u):
+    """The unit's structured report, report.json next to its REPORT.md (verdict, files_changed, jobs with exit codes,
+    tests_added with the failure each catches, left), or {} when it is absent or not a JSON object. janus prefers it over
+    parsing the prose and falls back to REPORT.md cleanly (row: structured reports)."""
+    try: d = json.loads(report_path(cfg, u).with_name("report.json").read_text())
+    except (OSError, ValueError): return {}
+    return d if isinstance(d, dict) else {}
+
+def verdict_line(j):
+    """('VERDICT: <V>' | None, present): the verdict a report.json states, and whether the file stated one at all. PENDING is
+    not a verdict."""
+    if not j or "verdict" not in j: return None, False
+    v = str(j.get("verdict") or "").strip().upper()
+    return (f"VERDICT: {v}" if v and v != "PENDING" else None), True
+
+RESULT_RX = re.compile(r"^\W*(result|summary|outcome|conclusion)s?\b\W*", re.I)
+
+def report_summary(text, j=None):
+    """(verdict, one-line result) of a unit's report: report.json (j) wins over the prose; its verdict, and a
+    'Result:'/'Summary:' line, else the report.json 'left', else the last content line before the final verdict."""
+    L = [l.rstrip() for l in text.splitlines()]
+    vi = next((i for i in range(len(L) - 1, -1, -1) if L[i].startswith("VERDICT:")), None)
+    v = (str(j.get("verdict") or "").strip() if isinstance(j, dict) and j.get("verdict") else "") or (L[vi][8:].strip() if vi is not None else "none")
+    res = next((RESULT_RX.sub("", l) for l in L if RESULT_RX.match(l) and len(RESULT_RX.sub("", l)) > 3), None)
+    if not res and isinstance(j, dict) and j.get("left"): res = str(j["left"])
+    if not res:
+        body = [l for l in L[1:vi if vi and vi > 0 else len(L)] if l.strip() and not l.lstrip().startswith(("#", "VERDICT:", "|---", "```"))]
+        res = body[-1] if body else ""
+    return (v[:24] or "none"), re.sub(r"\s+", " ", res.strip(" -*"))[:140]
 
 def main_checkout(cwd):
     """True when cwd is the main working tree of a repository that has linked worktrees (agents get a worktree, H9)."""
@@ -133,4 +172,4 @@ def unit_any(cfg, name):
     except Err: u = None
     return u or all_units(cfg).get(name)
 
-__all__ = ["unit_state", "verdict", "herdr_agents", "ws_id", "report_path", "main_checkout", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
+__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]

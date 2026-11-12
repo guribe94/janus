@@ -187,6 +187,18 @@ report_stale_min = 10    # ... while its report has not changed for this long
 wrapup_usd = 0.5         # a run that ends at its budget cap without a final verdict is resumed once with this, to write its report
 resume_min_usd = 0.1     # a parked unit is resumed (same session) only while this much of its budget is left
 
+# [quality]                # quality enforcement; nothing here runs unless it is set
+# rules_file = "QUALITY.md"      # the project's quality rules: every brief header points at it (read where present)
+# brief_lint = false       # true: `janus launch` refuses a brief with no tier line, scope, report path or done-criteria
+#                          # (`DONE-WHEN:`/`PROOF:`); `janus quality lint <brief|unit>` runs the lint alone
+# review_model = "haiku"   # an api model that reviews a unit's diff (slop and test value) before `janus land`, into
+# review_budget_usd = 0.5  # out/<unit>/review.json; findings block the landing until fixed or `--override '<reason>'`
+# review_max_chars = 60000
+# review_timeout_s = 600
+# signal_runs = 5          # `janus check` raises test-signal:<gate> for a gate this long and never failed in this many runs
+# signal_min_min = 20
+# soak_every_s = 20        # `janus soak` repeats a read-only pass every this many seconds
+
 [report]                 # janus report (to the owner): backlog completeness, remaining work, spend by outcome
 every_h = 4              # check raises report-due at these checkpoints (every_h hours from midnight, and the times in at)
 # at = ["09:00", "18:00"]  # until `janus report --sent`

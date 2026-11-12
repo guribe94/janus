@@ -16,7 +16,9 @@ from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd
 from janus.actions.swarm import cmd_forget, cmd_index, cmd_introduce, cmd_learned, cmd_ledger, cmd_memory, cmd_peers, cmd_remember, cmd_report, cmd_transcript
 from janus.actions.tidy import cmd_tidy
 from janus.check import cmd_ack, cmd_capacity, cmd_check, cmd_status
+from janus.quality import cmd_quality
 from janus.setup import cmd_doctor, cmd_init, cmd_queue, cmd_register, migrate
+from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
 def main():
@@ -77,6 +79,10 @@ def main():
     add("index", cmd_index, dry=True); add("peers", cmd_peers)
     add("introduce", cmd_introduce, A("a"), A("b"), A("--why", required=True, help="why they should know each other (it goes to both)"),
         A("--topic", help="the regex each reads in the other's transcript (default: a path named in --why)"), dry=True)
+    add("quality", cmd_quality, A("action", choices=["lint", "review"], help="lint: a brief alone; review: the pre-landing review"),
+        A("arg", nargs="?", help="lint: a brief path or unit name; review: the unit"), A("--override", help="review: accept the findings with this reason"), dry=True)
+    add("soak", cmd_soak, A("--minutes", type=float, default=1.0, help="run this many minutes (0: one pass)"),
+        A("--live", action="store_true", help="also run one watcher pass (default: read-only)"))
     add("transcript", cmd_transcript, A("unit"), A("--grep", help="only the lines matching this regex (case-insensitive)"), A("--tail", type=int, default=40, help="the last N lines (0: all)"))
     add("memory", cmd_memory, A("--keep", type=int, help="re-date entry N after review (it stays)"), dry=True)
     add("decide", cmd_decide, A("title"), A("--by", choices=["owner", "orchestrator"], required=True),

@@ -533,6 +533,27 @@ with `[budget] wrapup_usd` (default 0.5) to write its report.
 - `janus resume <unit> [--message <text>] [--force]` resumes by hand (`--force` before its jobs finish).
 - `check` raises `parked:<unit>:resume` when a resume failed.
 
+## 6e. Quality: the rules, the brief lint, the review, and the soak
+
+`[quality]` holds the project's quality settings, and nothing there runs unless it is set.
+- **Every brief header** points at the project's rules file (`[quality] rules_file`, default `QUALITY.md`, read where present)
+  and states two rules: every new test names the failure it catches, shown failing first; run only the tests your change can
+  affect. Agents are also asked to write `report.json` beside `REPORT.md` (verdict, `files_changed`, jobs with their exit codes,
+  `tests_added` with the failure each catches, `left`); janus prefers it over the prose and falls back to `REPORT.md` when it is
+  absent or not JSON.
+- **Brief lint** (`[quality] brief_lint = true`): `janus launch` refuses a brief that fails and names every reason: no tier line,
+  no scope, no report path, no done-criteria (`DONE-WHEN:`/`PROOF:`), or an absolute path under the project root that is missing.
+  Off unless set, so a project turns it on once its briefs carry the markers; `janus quality lint <brief|unit>` runs it alone.
+- **Pre-landing review** (`[quality] review_model`, an api model): `janus quality review <unit>` has that cheap model read the
+  unit's diff for slop (filler, needless code, comments that restate the code, speculative abstractions) and test value (tests
+  with no real failure, duplicates, assertions that cannot fail), and writes `out/<unit>/review.json`. `janus land` refuses the
+  unit until the review passes or `janus quality review <unit> --override '<reason>'` accepts its findings.
+- `janus check` raises `test-signal:<gate>` for a gate that takes over `[quality] signal_min_min` (20) minutes and has not failed
+  in its last `signal_runs` (5) recorded runs: scope or trim it (deleting a step is the owner's call).
+- **`janus soak [--minutes N] [--live]`** exercises janus's read-only paths on a live project and prints one pass/fail line per
+  step: the watcher's wake decision, a check, peers, the reports index, a brief header (with the session memory), a transcript,
+  each ledger, and the decision log. Read-only by default; `--live` also runs one watcher pass. `--minutes 0` is one pass.
+
 ## 7. Troubleshooting
 
 | You see | Meaning |
