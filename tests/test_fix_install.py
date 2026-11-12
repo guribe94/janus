@@ -681,6 +681,17 @@ class Item25Soak(unittest.TestCase):
                 self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a project's own cargo pattern lost its meaning: {c}")
         finally: janus.job_class, janus.host_history = saved
 
+    def test_a_clobber_or_here_redirection_does_not_split_the_guard(self):
+        """Catches (finding E): the `|` of `>|` and the `&` of `<&` still split a command in the whole-suite guard, so
+        `cargo test >|t.log --workspace` and `cargo test <&3 --workspace` were not refused as whole-suite runs."""
+        d, cfg = project(); h = cfg.hosts["here"]
+        saved = (janus.job_class, janus.host_history)
+        janus.job_class = lambda *a: "job"; janus.host_history = lambda *a: []
+        try:
+            for c in ["cargo test >|t.log --workspace", "cargo test <&3 --workspace"]:
+                self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a redirect separator hid the guard: {c}")
+        finally: janus.job_class, janus.host_history = saved
+
 
 class Item26GateExec(unittest.TestCase):
     """Item 26: the wrapper `janus gate` queues (`janus gate-exec <name> --timeout-min <lim> -- <cmd>`) must run the gate
