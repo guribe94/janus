@@ -136,4 +136,25 @@ class Item12FinalGate(unittest.TestCase):
         self.assertEqual(janus.final_gate_cmd({}, "u", "/w", "b"), "")
 
 
+class Item9ResumeCard(unittest.TestCase):
+    def test_resume_posts_the_card_as_waiting_with_the_new_task(self):
+        """Catches: a unit resumed with janus resume --message whose run is queued in pueue (agents slot full) showed board GONE
+        (relaunch it), because resume did not post the card with the new run."""
+        d, cfg = project('\n[providers.api]\nenabled = true\n[models.m]\nprovider = "api"\nkind = "api"\n')
+        b = d / "briefs/u1.md"; b.write_text("# Brief: u1\n")
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "model": "m", "task": 5, "budget": 2.0, "run": "u1.1",
+             "brief": str(b), "rbrief": str(b), "rcwd": str(d), "started": 0}
+        posts = []
+        saved = {k: getattr(janus, k) for k in ("session_of", "run_cost", "ledger_done", "reserve_budget", "unit_spent", "X", "confirm_started", "save_task_log", "board")}
+        janus.session_of = lambda cfg, u: "sid"; janus.run_cost = lambda *a, **k: (0.1, True); janus.ledger_done = lambda *a, **k: None
+        janus.reserve_budget = lambda cfg, mc, name, budget, run=None: "u1.r2.1"; janus.unit_spent = lambda cfg, u, wrapup=False: 0.0
+        janus.X = lambda cfg, h, cmd, **k: (0, "7", ""); janus.confirm_started = lambda cfg, h, tid: ("running", ""); janus.save_task_log = lambda *a, **k: None
+        janus.board = lambda cfg, *args, env=None, **k: posts.append((args, env))
+        try: janus.resume_unit(cfg, u, "your jobs finished")
+        finally:
+            for k, v in saved.items(): setattr(janus, k, v)
+        self.assertEqual(u["task"], 7)
+        self.assertTrue(any(a[0] == "post" and a[2] == "waiting" and (e or {}).get("BOARD_CHECK") == "pueue here:7" for a, e in posts), posts)
+
+
 if __name__ == "__main__": unittest.main()
