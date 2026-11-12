@@ -232,7 +232,8 @@ stopped: no process of the unit is left
 ```
 
 **`janus collect <unit>`**: for a remote unit, makes `out/<unit>/changes.patch` on the host (the agent's tree against the copy
-it was sent), brings back `out/<unit>/` (patch, REPORT, logs) and records API cost in the ledger. It never writes over the
+it was sent, as a patch `git apply` takes: new and deleted files included, an empty new file too), brings back `out/<unit>/`
+(patch, REPORT, logs) and records API cost in the ledger. It never writes over the
 local checkout; apply the patch in the unit's worktree with `git apply --3way`. Local units: nothing to collect.
 
 **`janus close <unit> [--force] [--reason text]`**: for a unit with a worktree of its own, refuses on uncommitted or unpushed
@@ -577,7 +578,8 @@ refused without it; with it, the run gets nice 19, pueue priority -5 and goes af
   `history_n` recorded peaks + `margin_pct`, `job_gb` until learned) <= `ram_gb - services_gb`; not while back-pressure
   pauses admission (memory PSI over `psi_pause`, load over `load_pause` x `cores` for `hold_s`); disk >= `min_disk_gb`. The
   rule lives in `<root>/runs/cap.sh`, rewritten on every `janus run` and launch (by rename) and re-read by waiting jobs every
-  15 s; each job records its peak memory, run time, CPU seconds and queue wait in `runs/history.tsv`. Waiting jobs go
+  15 s; each job records its peak memory, run time, CPU seconds, queue wait and the signature of its command in
+  `runs/history.tsv` (a running job's overrun finding compares it with jobs of the same class AND the same command). Waiting jobs go
   shortest expected run time (their class's median) first, minus `age_weight` x seconds waited; a job is admitted only if it
   fits beside every job ahead of it. The admitted job is capped at its cores (`MAKEFLAGS=-jN`, `CARGO_BUILD_JOBS`,
   `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS`, `OMP_NUM_THREADS` unless set; Linux scope `CPUQuota`; podman `--cpus`). `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Local land
@@ -680,7 +682,9 @@ with `[budget] wrapup_usd` (default 0.5) to write its report.
 
 - `janus park <unit>` parks a live agent: its turn is stopped, its jobs keep running. Refused when it has no job of its own.
 - `janus resume <unit> [--message <text>] [--force]` resumes by hand (`--force` before its jobs finish).
-- `check` raises `parked:<unit>:resume` when a resume failed.
+- `check` raises `parked:<unit>:resume` when a resume failed, `parked:<unit>:finished` when its jobs all finished and it is
+  still parked (the watcher resumes it on its next pass; `janus resume <unit>` wakes it now), and `parked:<unit>` when a job
+  it waits on can never finish.
 
 ## 6e. Quality: the rules, the brief lint, the review, and the soak
 
@@ -724,7 +728,7 @@ with `[budget] wrapup_usd` (default 0.5) to write its report.
 | `[script:<pid>] running script ... was changed after it started` | stop that process and relaunch it; write scripts by rename |
 | `refused: <wt> has conflict markers` / `is N commits behind main` | finish the merge or merge the landing branch first; `--allow-unmerged` overrides |
 | `janus: waiting for admission (<class>; <what blocks>): reserved N job(s): C of K cores, M MB + agents A MB + this job J MB of T MB ...` (in a job log) | the host has not got that much room yet; it starts by itself when it has |
-| `[overrun:<host>:<job>] ... has run N min, Kx its expected M min` | the job runs far longer than its class's median there: read its log; `janus cancel` it if stuck |
+| `[overrun:<host>:<job>] ... has run N min, Kx its expected M min` | the job runs far longer than the median of its comparable jobs there (the same class AND the same command; jobs without comparable history are not judged): read its log; `janus cancel` it if stuck |
 | `refused: a whole-suite run (...) needs --broad <reason>` | narrow the command (one package, a filter), or pass `--broad <why it must be whole>`: it then runs at low priority |
 | `[old-rule:<host>] N job(s) still wait under the old cap rule` | jobs queued before the measured rule; re-queue them with `janus run`, then stop the old tasks |
 | `(read-only: not the registered orchestrator session ...)` after `janus check` | expected for anyone but the orchestrator: nothing was saved, tuned or stamped |
