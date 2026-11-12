@@ -1667,6 +1667,8 @@ def task_pid_roots(h, u):
 
 def cmd_stop(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; via = u.get("via"); p = pueue(h)
+    why = None if a.force else uncollected(cfg, u)
+    if why: raise Err(f"refused: {u['name']}: {why}")
     say(f"stop {u['name']} ({via} on {u['host']})")
     roots = task_pid_roots(h, u) if not DRY else ""
     if DRY: say(f"+ pueue kill / tmux kill-session; TERM then KILL every process group of {u['name']} (roots {roots or '-'}, env ORCH_UNIT)"); return
@@ -1685,25 +1687,58 @@ def cmd_stop(cfg, a):
     if h.get("local"): settle_run(cfg, u, "stopped")   # remote: collect brings back the cost first, close settles the rest
     bd.comment(u["id"], f"{ts()} stopped (every process group of the unit ended)"); cfg.touch("changed"); say("stopped: no process of the unit is left")
 
+DIFF_X = " ".join(f"-x {x}" for x in ("target", ".venv", "node_modules", "__pycache__", ".git"))
+
+def remote_patch(h, n, fname):
+    """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>)."""
+    return X(h, f"cd {shlex.quote(h['root'])} && [ -d base/{n} ] && {{ diff -ruN {DIFF_X} base/{n} worktrees/{n} | sed -e 's#^--- base/{n}/#--- a/#' -e 's#^+++ worktrees/{n}/#+++ b/#' "
+                f"-e 's#^diff -ruN .* base/{n}/\\(.*\\) worktrees/{n}/.*#diff --git a/\\1 b/\\1#' > out/{n}/{fname}; true; }}", timeout=300)
+
+# A remote copy's fingerprint: the checksum of the agent's changes and of its output folder (orch's own files left out), the
+# number of output files and the report's lines other than PENDING. collect records it; stop and close compare (item 4).
+FINGERPRINT = r'''cd %(root)s 2>/dev/null || exit 3
+d=$( { [ -d base/%(n)s ] && diff -ruN %(ex)s base/%(n)s worktrees/%(n)s 2>/dev/null; } | cksum)
+f() { cd out/%(n)s 2>/dev/null && find . -type f ! -name changes.patch ! -name backup.patch ! -name 'task-*.log' ! -name '*.key' "$@"; }
+o=$(f -exec cksum {} + | sort | cksum); n=$(f | wc -l); p=$(grep -cv '^VERDICT: PENDING$' out/%(n)s/REPORT.md 2>/dev/null)
+echo "fp=$d|$o"; echo "n=$n"; echo "p=${p:-0}"'''
+
+def fingerprint(cfg, u):
+    h = cfg.hosts[u["host"]]
+    rc, o, e = hrun(h, FINGERPRINT % {"root": shlex.quote(h["root"]), "n": u["name"], "ex": DIFF_X}, timeout=120)
+    if rc: return None
+    return dict(l.split("=", 1) for l in o.splitlines() if "=" in l)
+
+def uncollected(cfg, u):
+    """Why removing or stopping a remote unit now would lose work (None when nothing would): its copy has changes or output
+    that differ from what orch collect last brought here, or its host cannot be asked."""
+    h = cfg.hosts.get(u.get("host"), {})
+    if h.get("local") or u.get("via") in ("failed", "starting") or DRY: return None
+    kv = fingerprint(cfg, u)
+    if kv is None: return f"cannot read its copy on {u['host']} (unreachable?), so cannot tell whether work would be lost"
+    if kv.get("fp") == u.get("collected"): return None
+    d = kv.get("fp", "").split("|")[0].split()
+    if len(d) > 1 and d[1] == "0" and int(kv.get("n", "0").strip() or 0) <= 1 and int(kv.get("p", "0").strip() or 0) == 0: return None   # nothing written yet
+    return (f"its copy on {u['host']} has changes or output not collected " + (f"since {ts(u['collected_at'])}" if u.get("collected_at") else "yet")
+            + f": orch collect {u['name']} first, or --force")
+
 def cmd_collect(cfg, a):
     if ":" in a.unit: return collect_job(cfg, a.unit)
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]
     if h.get("local"): say("local unit: nothing to collect"); return
-    root = h["root"]; rsh = " ".join(SSH); n = u["name"]; od = cfg.p("out", "out") / n
+    root = h["root"]; n = u["name"]; od = cfg.p("out", "out") / n
     # The agent's changes come back as a patch against the tree it was sent (base/<unit>), never as an rsync over the Mac
     # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree.
-    ex = " ".join(f"-x {x}" for x in ("target", ".venv", "node_modules", "__pycache__", ".git"))
-    X(h, f"cd {shlex.quote(root)} && [ -d base/{n} ] && {{ diff -ruN {ex} base/{n} worktrees/{n} | sed -e 's#^--- base/{n}/#--- a/#' -e 's#^+++ worktrees/{n}/#+++ b/#' "
-         f"-e 's#^diff -ruN .* base/{n}/\\(.*\\) worktrees/{n}/.*#diff --git a/\\1 b/\\1#' > out/{n}/changes.patch; true; }}", timeout=300)
-    cmd = ["rsync", "-a", "-e", rsh, f"{h['ssh']}:{root}/out/{n}/", str(od) + "/"]
-    if DRY: say("+ " + shlex.join(cmd))
-    elif sh(cmd, timeout=600)[0]: raise Err(f"collect from {u['host']} failed (unreachable?)")
+    remote_patch(h, n, "changes.patch")
+    if not save_output(cfg, u): raise Err(f"collect from {u['host']} failed (unreachable?)")   # out/<unit>/, the task log
+    st = task_status(h, u["task"]) if u.get("via") == "pueue" and u.get("task") is not None and not DRY else None
+    if not (st and task_rc(st) is None): X(h, f"rm -f {root}/run/{n}.key")   # the key fifo, once no task can still read it (row 52)
     mc = cfg.models.get(u.get("model"), {})
     if not DRY and u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("run"):
         cost, reported = run_cost(od / "api.json", None)
         if reported: ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], n, cost, "collected")   # idempotent: once per run id
-    if not DRY and u.get("report") and (od / "REPORT.md").is_file():   # a resumed unit: its report goes back to the original path
-        atomic_write(Path(u["report"]), (od / "REPORT.md").read_text()); say(f"report -> {u['report']}")
+    if not DRY and u.get("report"): say(f"report -> {u['report']}")
+    kv = fingerprint(cfg, u) if not DRY else None
+    if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
     if not DRY: bd.comment(u["id"], f"{ts()} collected from {u['host']}"); cfg.touch("changed")
     p = od / "changes.patch"
     say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
@@ -1724,6 +1759,8 @@ def cmd_close(cfg, a):
         if rc == 0 and o.strip() != "0" and not a.force: raise Err("unpushed commits; push first, or --force")
     elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
         raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
+    why = None if a.force else uncollected(cfg, u)
+    if why: raise Err(f"refused: {u['name']}: {why}")
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
     if u.get("tab") or u.get("pane"):
         if DRY: say(f"+ herdr tab close {u.get('tab') or u.get('pane')}")
@@ -1734,7 +1771,9 @@ def cmd_close(cfg, a):
         others = [x["name"] for x in units if x["id"] != u["id"] and x.get("host") == u["host"] and x.get("rcwd") == u.get("rcwd")]
         if others: say(f"keeping {u.get('rcwd')} on {u['host']}: open unit(s) {', '.join(others)} use it")
         else: X(h, f"cd {shlex.quote(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
-    if u.get("via") == "pueue": X(h, f"{pueue(h)} remove {u['task']} 2>/dev/null; true")
+    if u.get("via") == "pueue":   # the task's log is kept under out/<unit>/ before the task is removed
+        if not DRY: save_task_log(cfg, h, u, u["task"])
+        X(h, f"{pueue(h)} remove {u['task']} 2>/dev/null; true")
     X({"local": True}, f"{shlex.quote(str(cfg.p('board', 'bin/board.sh')))} close {u['name']} 2>/dev/null; true")
     if DRY: return
     if u.get("run") and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"): settle_run(cfg, u, "closed")
@@ -1952,6 +1991,7 @@ def refresh_remote(cfg, u, bd, log):
     if cfg.hosts[u["host"]].get("local") or u.get("via") in ("failed", "starting"): return
     fin = u.get("state") in ENDED
     if not ((fin and u.get("saved") != u.get("task")) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60): return
+    remote_patch(cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
     if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed"); return
     u["saved_at"] = int(now())
     if fin: u["saved"] = u.get("task")
@@ -3448,7 +3488,7 @@ def main():
     add("doctor", A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", A("action", choices=["import", "list"]), dry=True)
     add("queue", A("host", nargs="?"), A("--log", type=int, help="print this task's log"))
-    add("stop", A("unit"), dry=True)
+    add("stop", A("unit"), A("--force", action="store_true", help="stop although its remote copy has uncollected work"), dry=True)
     add("collect", A("unit", help="a unit, or <host>:<task id> for an orch run job"), dry=True)
     add("run", A("--host", required=True), A("--lane", choices=LANES, default="jobs"), A("--unit"), A("--wt", required=True),
         A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="a job that needs the host's USB devices (container.usb_args, usb_lock)"),
