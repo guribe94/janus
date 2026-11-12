@@ -631,6 +631,25 @@ class Item1ParkedAfterDone(unittest.TestCase):
         self.assertNotIn("unit:u1:finished", [k for k, _ in F])
         self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [u])], [], "the parked unit's job was orphaned (cancelled)")
 
+    def test_a_park_with_its_job_ids_on_the_following_line_parks_the_unit(self):
+        """Catches (finding 1, high; fix-install6): verdict read the park word per line (the ids had to be on the SAME line) while
+        waiting_line_jobs read the whole text (WAIT_RX's `\\s*` spans the line break), so the two readers disagreed: a report that
+        ended with a bare `WAITING` line and its job ids on the next line (or after a `WAITING:`) was judged finished and its
+        still-running job became an orphan the watcher cancels."""
+        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
+        head = "VERDICT: PENDING\n## phase 1\nVERDICT: DONE - items 1-6\n## phase 2\nmore work\n"
+        for tail, want in (("WAITING\n- here:9\n", ["here:9"]), ("WAITING:\nhere:9 here:10\n", ["here:9", "here:10"])):
+            p.write_text(head + tail)
+            self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), tail)
+            self.assertEqual(janus.waiting_line_jobs(cfg, {"name": "u1", "host": "here", "started": 0}), want, tail)
+        p.write_text(head + "WAITING\n- here:9\n")
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0}
+        hs = {"here": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}},
+                                               "9": {"status": {"Running": {}}, "label": "unit:u1@" + janus.project_id(cfg)}}})}
+        F, _ = janus.unit_findings(cfg, hs, [u], {})
+        self.assertEqual(u.get("_park"), ["here:9"]); self.assertEqual(u.get("state"), "parked")
+        self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [u])], [], "the parked unit's job was orphaned (cancelled)")
+
     def test_the_last_of_verdict_line_and_park_line_decides(self):
         """Catches (finding 1, high): the rule is 'the last of {VERDICT line, WAITING line} decides' for EVERY unit; a closing
         VERDICT: DONE after an earlier park line is finished (no false park), and a park line after it is parked."""

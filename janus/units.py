@@ -37,8 +37,9 @@ def verdict(cfg, u):
     finished. A report whose LAST VERDICT line is PENDING or WAITING is not finished (item 11, finding 2): whatever earlier
     DONE lines or a stale report.json say, it is parked, not done."""
     p = report_path(cfg, u); j = report_json(cfg, u)
-    try: t = p.read_text().splitlines()
-    except OSError: t = []
+    try: text = p.read_text()
+    except OSError: text = ""
+    t = text.splitlines()
     if u.get("resume"):
         try: mt = p.stat().st_mtime
         except OSError: mt = 0
@@ -49,8 +50,11 @@ def verdict(cfg, u):
     # line means parked, never finished, whatever earlier DONE lines (or a stale report.json) say. Finding 5: a park line counts
     # only when it names a job janus knows (a host in cfg.hosts) -- a prose line, or a park line whose ids janus cannot read
     # (`mac:9` for an unknown host, a bare `9`), is not a park, so the closing VERDICT line still stands.
+    # Finding 1 (fix-install6): ONE reader for both readers -- the park jobs come from park_jobs, which reads the ids on the park
+    # line or on the line(s) after it (WAIT_RX's `\s*` spans the line break), so a unit parked with its ids on the next line is
+    # judged parked here exactly as waiting_line_jobs yields them.
     vi = next((i for i in range(len(t) - 1, -1, -1) if t[i].startswith("VERDICT:")), None)
-    pi = next((i for i in range(len(t) - 1, -1, -1) if _park_line(cfg, t[i])), None)
+    pi, _ = park_jobs(cfg, text)
     if pi is not None and (vi is None or pi > vi): return None
     last = t[vi] if vi is not None else None                                  # the report's last VERDICT line decides
     if last is not None and NONFINAL.search(last): return None                # ends parked/pending: not finished
@@ -131,27 +135,32 @@ WAIT_RX = re.compile(r"^[\s*>-]*WAITING\b\**:?\s*(.*)$", re.M)
 
 JOBREF = re.compile(r"(?<![\w/.-])([A-Za-z0-9][\w.-]*):(\d+)\b")
 
-def _park_line(cfg, line):
-    """True when line is a park line that names a job janus knows (a host in cfg.hosts): finding 5 -- a prose line, or a park
-    line whose ids janus cannot read (`mac:9` for an unknown host, a bare `9`), is not a park, so the report's closing VERDICT
-    line decides."""
-    m = WAIT_RX.match(line)
-    return bool(m) and any(h in cfg.hosts for h, _ in JOBREF.findall(m.group(1)))
+def park_jobs(cfg, text):
+    """(line index, jobs) of the report's last park line that names a job janus knows (a host in cfg.hosts): finding 1 -- the ONE
+    reader verdict and waiting_line_jobs share. The ids may sit on the park line itself or on the line(s) after it (WAIT_RX's
+    `\\s*` spans the line break), so a unit parked as `WAITING` with `here:9` on the next line is read the same either way.
+    Finding 5: a prose line, or a park line whose ids janus cannot read (`mac:9` for an unknown host, a bare `9`), is not a park.
+    (None, []) when there is no such park line."""
+    out = (None, [])
+    for m in WAIT_RX.finditer(text):
+        jobs = [f"{h}:{t}" for h, t in JOBREF.findall(m.group(1)) if h in cfg.hosts]
+        if jobs: out = (text.count("\n", 0, m.start()), jobs)
+    return out
 
 def report_text(cfg, u):
     try: return report_path(cfg, u).read_text()
     except OSError: return ""
 
 def waiting_line_jobs(cfg, u):
-    """The jobs (<host>:<task>) named on the latest WAITING line of the unit's report that it has not been resumed for yet.
-    A resumed unit's report counts only once written after the unit started."""
+    """The jobs (<host>:<task>) named on the latest park line of the unit's report that it has not been resumed for yet. A resumed
+    unit's report counts only once written after the unit started. Finding 1: the same reader verdict uses (park_jobs), so the two
+    never disagree about whether the unit is parked."""
     try:
         if u.get("resume") and report_path(cfg, u).stat().st_mtime < u.get("started", 0): return []
     except OSError: return []
-    m = WAIT_RX.findall(report_text(cfg, u))
-    if not m: return []
+    _, jobs = park_jobs(cfg, report_text(cfg, u))
     done = set(u.get("handled_jobs", []))
-    return [j for j in dict.fromkeys(f"{h}:{t}" for h, t in JOBREF.findall(m[-1]) if h in cfg.hosts) if j not in done]
+    return [j for j in dict.fromkeys(jobs) if j not in done]
 
 def unit_runs(u): return list(dict.fromkeys([*u.get("runs", []), *([u["run"]] if u.get("run") else [])]))
 

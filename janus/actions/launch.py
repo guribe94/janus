@@ -206,8 +206,9 @@ PARK_RULE = ("**Never wait for a build or test (janus rule).** Submit it with `{
              "Then write a line `WAITING <job ids>` in your report ({report}) and end your turn. Do not poll, sleep or wait for a job: "
              "janus resumes this same session with each job's exit code and log path when all of them have finished. A turn spent "
              "waiting costs money and can end the run at its budget cap with nothing written. When you are finished, write the closing "
-             "`VERDICT:` line as the **last line** of the report: a park line after it (other than one naming a job janus knows) "
-             "means the unit is parked, not finished.\n\n")
+             "`VERDICT:` line as the **last line** of the report: a park line after it that names a job janus knows (a `<host>:<task>` "
+             "for a host in this config, on the park line or the line after it) means the unit is parked, not finished; a park word "
+             "that names no such job does not park it, so the closing VERDICT line still stands.\n\n")
 
 def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
     """What every agent gets at start besides its brief (janus-swarm item 2): the session memory, then pointers (never content)
