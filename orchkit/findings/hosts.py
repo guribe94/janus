@@ -2,13 +2,16 @@
 lane stalls, idle slots and job ages, thrash acts, tidy and disk; enforce (warn, then stop a burner or a direct build)."""
 import os, re, time
 from pathlib import Path
-from orchkit.actions.jobs import LANES, lane_age, slots
+from orchkit.actions.jobs import LANES, lane_age, orphan_jobs, slots
+from orchkit.backlog import ready_work
 from orchkit.beads import Beads
 from orchkit.board import board
 from orchkit.cap import host_cap
-from orchkit.context import AGENT_RX, FIXTURE_MARK, ancestors, fl, hrun, now, secs, sh, ts
+from orchkit.context import AGENT_RX, Err, FIXTURE_MARK, ancestors, fl, hrun, now, sh, ts
+from orchkit.platform import secs
+from orchkit.probe import margins, room
 from orchkit.templates import STOP_GROUP
-from orchkit.units import all_units
+from orchkit.units import all_units, ws_id
 
 # Test fixtures never trip live findings (orch-fixes10 item 6): the test suite runs every process fixture under a temporary root
 # whose name holds FIXTURE_MARK (and sets ORCH_IN_TESTS for itself); the live checks skip a process whose command line holds the
@@ -179,4 +182,69 @@ def lane_findings(cfg, hs, units=()):
         for f in free.get(lane, []):
             if cfg.hosts[f].get("local") == cfg.hosts[ns[0]].get("local") and not (lane == "land"):
                 F.append((f"idle:{f}:{lane}:vs", f"{f} has free {lane} slots while {', '.join(ns)} has a backlog: re-queue waiting jobs on {f} (orch cancel, orch run --host {f})"))
+    return F
+
+def host_findings(cfg, hs, units, viol):
+    """host:, margin:, idle:<host>, pressure:, scheduler:, direct: (each also goes to viol for enforce), orphan:job: and
+    orphan:tmux: from each host's probe."""
+    F = []; names = {u["name"] for u in units}; un = cfg.jget("hosts.json")
+    ready = 0
+    try: ready = len(ready_work(cfg))
+    except Err: pass
+    for n, p in hs.items():
+        if not p["ok"]:
+            qd = [u["name"] for u in units if u.get("host") == n]
+            F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); units there: {', '.join(qd) or 'none'}; place new work elsewhere (unstarted jobs there: cancel and re-queue on another host)"))
+            continue
+        r, why = room(cfg, n, p, units)
+        mg = margins(cfg.hosts[n], p, cfg=cfg)
+        low = r < 1 and p.get("avail_mb") and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6
+        if mg or low:   # the key names the kinds (load, memory, disk), so an ack of one never hides another (H12)
+            kinds = sorted({w.split()[0] for w in mg} | ({"memory"} if low else set()))
+            F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}; launch elsewhere, or free it (orch tidy for disk)"))
+        elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} but {ready} unit(s) are ready: orch launch"))
+        hc = host_cap(cfg, n, p, units)
+        if hc["pause"]:   # back-pressure (orch-fixes8 item 2): reported, never acted on by killing
+            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile"))
+        # one scheduler per host (item 1): any other job-running process, or an old queue that still runs or holds work
+        sch = list(p.get("sched", []))
+        lg, lr = int(fl(p.get("legacy_wait"))), int(fl(p.get("legacy_run")))
+        if lg or lr: sch.append(f"old queue: {lr} running, {lg} waiting (legacy_probe)")
+        unt = [x for x in p.get("res", []) if " untracked " in x]
+        if unt: sch.append(f"{len(unt)} job(s) running without an orch reservation ({', '.join(x.split()[-1] for x in unt[:3])})")
+        if sch: F.append((f"scheduler:{n}", f"host {n} has job-running work outside its orch lanes, which must be the only admission: "
+                          + "; ".join(sch[:4])[:300] + ": retire the old queue (or move its jobs to orch run)"))
+        for d in p.get("direct", []):   # remote lane enforcement (register item 22)
+            f = d.split(None, 4)
+            if len(f) < 4 or not f[0].isdigit(): continue
+            F.append((f"direct:{n}:{f[0]}", f"agent {f[2]} runs a build or test directly on {n} (pid {f[0]}, {int(fl(f[3])) // 60} min, outside the lanes): "
+                      f"{(f[4] if len(f) > 4 else '')[:80]}; it must use {cfg.hosts[n].get('root', '~')}/run/{f[2]}.lane"))
+            viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
+        for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
+            st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
+            lab = t.get("label") or ""
+            owned = lab in names or (lab.startswith("unit:") and lab[5:] in names) or (t.get("group") in LANES and ":" in lab and not lab.startswith("unit:"))
+            if k in ("Running", "Queued") and not owned:   # a lane job labelled unit:<name> whose unit is closed is an orphan too (M3)
+                F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({lab or t.get('command', '')[:40]}) has no open unit: orch cancel {n}:{t.get('id')}"))
+        for s in p.get("tmux", []):
+            if s.startswith("orch-") and s[5:] not in names: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: collect what it wrote, then stop it (orch stop, or relaunch its unit)"))
+    return F
+
+def pane_findings(cfg, units, ag):
+    """orphan:pane: an agent in this project's herdr workspace with no open unit (not the orchestrator)."""
+    F = []; ws = ws_id(cfg); names = {u["name"] for u in units}
+    orch_pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
+    pane_units = {u.get("pane") for u in units}
+    for k, a in ag.items():
+        if ws and a.get("workspace_id") != ws: continue
+        if k in names or a.get("pane_id") in pane_units or a.get("pane_id") == orch_pane or k == "orchestrator": continue
+        F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit: orch tidy closes panes of closed units; otherwise register it as a unit or close it"))
+    return F
+
+def orphan_job_findings(cfg, hs, units, seen):
+    """orphan:job:<host>:<task> for a job whose owner is gone (orphan_jobs; the watcher cancels it), unless already reported."""
+    F = []
+    for r, why in orphan_jobs(cfg, hs, units):   # the watcher cancels these (item 3); check only reports them
+        k = f"orphan:job:{r}"
+        if k not in seen: F.append((k, f"orphan job {r}: {why}; the watcher cancels it (orch cancel {r})"))
     return F

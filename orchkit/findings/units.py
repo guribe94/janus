@@ -1,14 +1,15 @@
 """Findings about units: parked units that cannot resume, budgets nearly spent with a stale report, runs capped without
 a verdict, the waste pause and a due report, unreconciled ledger runs, and peers (peers.md, overlap)."""
-import concurrent.futures as cf, re, time
+import concurrent.futures as cf, json, re, time
 from pathlib import Path
 from orchkit.actions.jobs import job_state, unit_jobs
-from orchkit.board import board_dir
+from orchkit.board import board_dir, board_questions, board_rows
 from orchkit.budgets import bset, last_checkpoint, unit_spend, waste_paused, work_written
 from orchkit.context import DIFF_X, atomic_write, fl, hrun, now, qp, sh, ts
-from orchkit.ledger import ledger_read
+from orchkit.ledger import committed, ledger_read, spend
+from orchkit.platform import herdr
 from orchkit.transcripts import card_fields, transcript_where
-from orchkit.units import ENDED, all_units, api_out, own_tree, report_path, unit_runs
+from orchkit.units import ENDED, all_units, api_out, own_tree, report_path, unit_runs, unit_state, verdict, waiting_line_jobs
 
 def unreconciled(cfg, pv, units):
     """[(run id, unit, budget, why)] of runs with a running row and no done row whose agent is gone: the unit is closed, the run
@@ -125,4 +126,81 @@ def peer_findings(cfg, units, hs):
             both = sorted(set(a["files"]) & set(b["files"]))
             if both: F.append((f"overlap:{a['name']}:{b['name']}", f"{a['name']} and {b['name']} both change {', '.join(both[:4])}"
                                + (f" (+{len(both) - 4})" if len(both) > 4 else "") + ": tell them (board.sh direct), or land one first"))
+    return F
+
+def card_findings(cfg, names):
+    """board:<card>:blocked|question|gone|silent for every card on the board, including other launchers' (marked not a unit)."""
+    F = []; qids = board_questions(cfg) is not None
+    for card, r in board_rows(cfg).items():   # every card, including those other launchers posted (marked "not a unit")
+        tag = "" if card in names else " (not a unit)"
+        if r["state"] == "blocked" or (r["state"] == "question" and not qids):
+            F.append((f"board:{card}:{r['state']}", f"{card}{tag} is {r['state'].upper()} on the board: {r['text']}; answer with board.sh direct"))
+        if r["gone"]: F.append((f"board:{card}:gone", f"{card}{tag} GONE: its process ended without a done post: relaunch its unit from its report (--resume-of), or orch board-close it"))
+        elif r["silent"] and r["state"] not in ("question", "blocked"):
+            F.append((f"board:{card}:silent", f"{card}{tag} silent over {cfg.silent // 60} min on the board: read its report or transcript (orch transcript), then direct it"))
+    return F
+
+def unit_findings(cfg, hs, units, ag):
+    """(findings, running units): each unit's state and verdict (set on it), parked:, waiting:, unit:<name>:blocked|finished|
+    limit, provider:<name>."""
+    F = []; running = 0
+    for u in units:
+        st = unit_state(u, hs, ag); v = verdict(cfg, u); u["state"] = st; u["verdict"] = v
+        age = now() - u.get("started", now())
+        # parked (orch-fixes9 item 1): recorded, or its turn ended with a WAITING line; no verdict yet
+        pk = [] if v else ((u.get("parked") or {}).get("jobs") or (waiting_line_jobs(cfg, u) if st in ENDED or u.get("via") == "tmux" else []))
+        if pk:
+            u["_park"] = pk; u["state"] = st = "parked"
+            F += parked_findings(cfg, hs, u, pk)
+        elif st == "working":   # alive while its own jobs wait for admission: it pays to wait (cannot be acked)
+            jw = [j for j in unit_jobs(hs, u["name"]) if job_state(hs, j)[0] in ("queued", "admission")]
+            if jw:
+                sp, how = unit_spend(cfg, u); hrs = max((now() - max(u.get("started", now()), u.get("resumed_at", 0))) / 3600, 1 / 60)
+                rate = f"about ${sp / hrs:.2f}/h ({how})" if sp is not None else f"cost per hour unknown ({how})"
+                F.append((f"waiting:{u['name']}", f"{u['name']} is alive while its job(s) {', '.join(jw[:4])} wait for admission, {rate}: "
+                          f"orch park {u['name']} (stops it; it resumes, same session, when its jobs finish)"))
+        if st in ("working", "queued", "parked"): running += 1
+        if st == "blocked":
+            r = herdr("agent", "read", u["name"], "--source", "detection") or {}
+            F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}; answer it (board.sh direct) or relaunch with what it needs"))
+        elif st in ("done", "failed", "gone", "idle"):
+            F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
+            aj = api_out(cfg, u)   # issue 32: another limit than the budget (turns) before the report; the budget cap is waste:<unit>
+            if str(aj.get("subtype", "")).startswith("error") and aj.get("subtype") != "error_max_budget_usd" and not v:
+                F.append((f"unit:{u['name']}:limit", f"{u['name']} stopped by its limit ({aj.get('subtype')}, ${aj.get('total_cost_usd', '?')}) without a final verdict: "
+                          "resume it (orch resume --message, or --resume-of keeps its report)"))
+        if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
+            F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}: stop it, or relaunch it on an enabled model"))
+    return F, running
+
+def cap_findings(cfg, units):
+    """cap:total and cap:<host>: more agents than the owner's caps."""
+    F = []
+    if cfg.caps.get("total") is not None and len(units) > cfg.caps["total"]: F.append(("cap:total", f"{len(units)} agents over total cap {cfg.caps['total']}: launch nothing more; close finished units"))
+    for n, c in cfg.caps.get("host", {}).items():
+        k = sum(1 for u in units if u.get("host") == n)
+        if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
+    return F
+
+def ledger_findings(cfg, units):
+    """ledger:<provider> (malformed), ledger:<provider>:implausible, ledger:<provider>:unreconciled."""
+    F = []
+    for n, pv in cfg.prov.items():
+        if "ledger" in pv:
+            bad = ledger_read(cfg, pv)[1]
+            if bad: F.append((f"ledger:{n}", f"{n} ledger {pv['ledger']} is malformed ({len(bad)} problem(s): {bad[0][:90]}); every launch is refused: orch ledger check, orch ledger repair"))
+            runs = ledger_read(cfg, pv)[0]; odd = [k for k, r in runs.items() if r["done"] and r["budget"] and r["cost"] > 2 * r["budget"] + 1]
+            if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
+                F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
+                          + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": orch ledger check"))
+            ur = unreconciled(cfg, pv, units)
+            if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (${sum(x[2] for x in ur):.2f} held as running: "
+                             + ", ".join(f"{x[0]} {x[3]}" for x in ur[:3])[:240] + "): orch ledger reconcile"))
+    return F
+
+def spend_findings(cfg):
+    """spend:<provider>: a provider's committed spend is at its cap."""
+    F = []
+    for n, pv in cfg.prov.items():
+        if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap: launch on another provider, or ask the owner to raise the cap"))
     return F

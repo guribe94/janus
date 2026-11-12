@@ -1,10 +1,12 @@
 """Findings about work in flight: failed gates, known failures, finished units not gated or not landed, idle backlog,
 and the project's own git state."""
-import re, time
+import re, sys, time
 from orchkit.actions.backlog import fill_candidates, fill_plan
 from orchkit.backlog import backlog_cfg, backlog_issues, item_actors, unit_items
-from orchkit.context import Err, LE, handoff_path, now, sh
+from orchkit.beads import Beads
+from orchkit.context import Err, LE, handoff_path, handoff_stale, now, sh
 from orchkit.gates import gate_ids, gate_results, kf_active, known_failures, landed
+from orchkit.platform import launchd_watcher_loaded
 from orchkit.probe import room
 from orchkit.units import report_path
 
@@ -128,4 +130,23 @@ def known_failure_findings(cfg, names):
         for i in gate_ids(cfg, n, "passed") or []:
             if i in kf and i not in seen:
                 seen.add(i); F.append((f"known-failure:{i}:passes", f"known failure {i} passed in gate {n}: remove it from {cfg.c['landing']['known_failures']}"))
+    return F
+
+def orchestrator_findings(cfg):
+    """orchestrator:kind: the registered orchestrator's kind differs from orch.toml [orchestrator] kind."""
+    F = []
+    sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
+    if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
+        F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
+    return F
+
+def session_findings(cfg, running):
+    """instructions (owner instructions to classify), handoff (stale notes), watcher (not loaded)."""
+    F = []
+    try:
+        ins = Beads(cfg).issues("instruction")
+        if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done, or bd remember --key <subject>: same subject replaces): " + "; ".join(i['title'][:50] for i in ins[:3])))
+    except Err: pass
+    for s in handoff_stale(cfg, running): F.append(("handoff", s))
+    if sys.platform == "darwin" and not launchd_watcher_loaded(): F.append(("watcher", "watcher com.orch.watch is not running: run install"))
     return F
