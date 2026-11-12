@@ -4,9 +4,9 @@ import concurrent.futures as cf, json, re, time
 from pathlib import Path
 from janus.actions.jobs import job_state, unit_jobs
 from janus.board import board_dir, board_questions, board_rows
-from janus.budgets import bset, last_checkpoint, unit_spend, waste_paused, work_written
+from janus.budgets import bset, finish_reserve, last_checkpoint, names_some, unit_spend, waste_paused, work_written
 from janus.context import DIFF_X, atomic_write, fl, hrun, now, qp, sh, ts
-from janus.ledger import ledger_read, recost_plan, spend
+from janus.ledger import ledger_read, recost_plan, reserved, spend
 from janus.platform import herdr
 from janus.project import project_id
 from janus.transcripts import card_fields, transcript_where
@@ -225,6 +225,26 @@ def ledger_findings(cfg, units):
             done = sum(r["cost"] or 0.0 for r in runs.values() if r["done"])
             if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (done ${done:.2f} vs committed ${spend(runs):.2f}; ${sum(x[2] for x in ur):.2f} held as running: "
                              + ", ".join(f"{x[0]} {x[3]}" for x in ur[:3])[:240] + "): janus ledger reconcile"))
+    return F
+
+def reserve_findings(cfg, units):
+    """Budget-follow item 4, raised BEFORE the cap is reached. spend:<provider>:short: the open units' remaining budgets no longer
+    fit under the cap (some cannot finish). spend:<provider>:reserve: they fit, but no new unit does. Both ask the owner now."""
+    F = []
+    for n, pv in cfg.prov.items():
+        if not pv.get("cap_usd") or "ledger" not in pv: continue
+        keep, need = finish_reserve(cfg, n, units)
+        if not keep: continue
+        cap = pv["cap_usd"]; c = spend(ledger_read(cfg, pv)[0]); free = round(cap - c - keep, 2); per = pv.get("budget_per_unit") or 0
+        if c >= cap: continue                                          # spend:<provider> already says the cap is reached
+        if free < 0:
+            F.append((f"spend:{n}:short", f"{n} is ${-free:.2f} short of letting its open units finish: ${c:.2f} of its ${cap:g} cap is committed and {len(need)} open "
+                      f"unit(s) still need ${keep:.2f} of their budgets ({names_some(need)}): ask the owner now (janus ask) to raise {n}'s cap_usd by at least "
+                      f"${-free:.2f}, or close the unit that matters least (janus close <unit>); launch nothing new"))
+        elif per and free < reserved(cfg, per):
+            F.append((f"spend:{n}:reserve", f"{n} has ${free:.2f} free for new work, under one unit's ${per:g}: ${c:.2f} of its ${cap:g} cap is committed and ${keep:.2f} is "
+                      f"kept for {len(need)} open unit(s) to finish ({names_some(need)}): new units are refused; ask the owner now (janus ask) whether to raise "
+                      f"{n}'s cap_usd, before the cap is reached"))
     return F
 
 def spend_findings(cfg):
