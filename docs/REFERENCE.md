@@ -301,7 +301,9 @@ learned post).
 
 **`janus migrate [<project>] [--retire]`**: move a project still on the old `orch.toml`/`.orch` layout to `janus.toml`/`.janus`
 (projects, state and config are rewritten). `--retire` also stops the old orch's standing processes on this machine. An
-extracted release of the toolkit ships alongside it so a migrated project's own scripts keep working.
+extracted release of the toolkit ships alongside it so a migrated project's own scripts keep working. It also ports a shim
+calling the retired `orch` CLI to `janus` and lists any other script that still calls it (soak 39): a gate step that calls the
+retired CLI exits 2 at once, and `janus check` raises `gate-setup:<name>` for a gate whose steps all fail that way at once.
 
 **Notes.** After each decision, update the *Orchestrator notes* part of `.janus/HANDOFF.md` (see section 5).
 
@@ -429,6 +431,7 @@ table is the plain-language list of the families the reference must name; the re
 | `disk` | a host is over its disk budget (tidy's last pass) |
 | `gate` | a gate failed in the last 12 h (its latest result) |
 | `gate-common` | the same failure appears in two or more gates: suspect the test or fixture |
+| `gate-setup` | every step of a gate failed at once: a setup problem, not the tests |
 | `git` | the project's repository is dirty, unpushed or has no upstream |
 | `handoff` | the orchestrator notes are stale or too long, or the state folder has no `HANDOFF.md` |
 | `host` | a host is unreachable |

@@ -21,15 +21,26 @@ def gate_findings(cfg, hs=None):
     latest = {}
     for l in lines:
         if "RESULT:" in l and len(l) > 20: latest[l[20:].split()[0]] = l
-    fails, cut = [], now() - 12 * 3600; judged = gate_results(cfg)
+    fails, cut = [], now() - 12 * 3600; judged = gate_results(cfg); codes = {}
     for n, l in latest.items():
         if "RESULT: FAIL" not in l or n in busy or judged.get(n, ("", ""))[1] == "PASS": continue   # only known failures: passed
         try:
             if time.mktime(time.strptime(l[:19], "%Y-%m-%d %H:%M:%S")) < cut: continue
         except ValueError: continue
         fails.append((l[:19], n, [t.split("=")[0] for t in l.split() if re.match(r"EXIT_\w+=(?!0$)", t)]))
+        codes[n] = [(s, int(c)) for s, c in re.findall(r"EXIT_(\w+)=(\d+)", l)]
     out = [(f"gate:{n}@{t[11:]}", f"gate {n} FAILED at {t[11:]} ({' '.join(x[5:] for x in k[:4])}{'...' if len(k) > 4 else ''}); re-queue or classify")
            for t, n, k in fails]
+    # soak 39: a gate whose steps all exit at once with a usage / not-found code (2, 126, 127) in ~0 min is a SETUP problem (a
+    # broken script, or a migration that left a script calling the retired CLI), not a test failure. Say so, so nobody reads it as
+    # failing tests.
+    times = cfg.jget("gate-times.json")
+    for t, n, _ in fails:
+        cs = codes.get(n, []); last = (times.get(n) or [None])[-1]
+        if cs and all(c in (2, 126, 127) for _, c in cs) and (last is None or last <= 0.5):
+            out.append((f"gate-setup:{n}", f"gate {n} failed at {t[11:]} with every step exiting at once (" + ", ".join(f"EXIT_{s}={c}" for s, c in cs)
+                        + (f" in {last:g} min" if last is not None else "") + "): a setup problem (a broken gate script or a script still calling a "
+                        + f"retired CLI), not the tests: fix the script (janus gate-log {n}) and re-queue"))
     cnt = {}
     for t, n, ks in fails:
         for k in set(ks): cnt.setdefault(k, set()).add(n)
