@@ -810,6 +810,18 @@ class Item1ParkedAfterDone(unittest.TestCase):
         self.assertEqual(u.get("state"), "parked")
         self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [u])], [], "the parked unit's job was orphaned (cancelled)")
 
+    def test_a_word_after_the_park_word_does_not_hide_its_ids(self):
+        """Catches (finding B residue 1): any word between the park word and its line break kept the ids on the next line
+        unread, so the unit's running job was orphaned (cancelled)."""
+        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
+        head = "VERDICT: PENDING\nVERDICT: DONE - items 1-6\n"
+        for tail, want in (("WAITING on jobs:\n- here:9\n", ["here:9"]),
+                           ("WAITING for\nhere:9 here:10\n", ["here:9", "here:10"]),
+                           ("WAITING\nJobs:\n- here:9\n", ["here:9"])):
+            p.write_text(head + tail)
+            self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), repr(tail))
+            self.assertEqual(janus.waiting_line_jobs(cfg, {"name": "u1", "host": "here", "started": 0}), want, repr(tail))
+
 
 class Item2ResumeGuard(unittest.TestCase):
     """Finding 2 (medium-high): `janus resume <u> --message ...` had no guard: it started a second agent beside a running one
