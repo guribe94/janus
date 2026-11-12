@@ -731,7 +731,8 @@ class Report(unittest.TestCase):
         self.assertIn("waste pause", "refused (waste pause): " + (janus.waste_paused(cfg) or ""))   # 4 of 7 dollars capped: over 25 %
         self.assertIsNotNone(janus.waste_paused(cfg))
         janus.cmd_ack(cfg, type("A", (), {"problem": "waste-pause", "decision": "cause: budgets too small; fixed"})())
-        self.assertIsNone(janus.waste_paused(cfg))   # the orchestrator acked the cause
+        self.assertIsNotNone(janus.waste_paused(cfg), "waste_paused must still state the reason, or the ack is dropped as 'finding gone' (item 7)")
+        self.assertIsNone(janus.waste_block(cfg))   # the orchestrator acked the cause: launch and fill are not refused
         self.assertIn("report-due", [k for k, _ in janus.report_findings(cfg, [])])
         cfg.touch("report_sent"); self.assertNotIn("report-due", [k for k, _ in janus.report_findings(cfg, [])])
 
