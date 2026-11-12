@@ -3,7 +3,7 @@ subcommand wiring)."""
 import argparse, contextlib, os, sys, tomllib
 from pathlib import Path
 from janus.actions.jobs import LANES
-from janus.context import Cfg, Err, Run, find_root, say
+from janus.context import Cfg, Err, Run, find_root, projects, say, session_root
 from janus.decisions import cmd_answer, cmd_ask, cmd_decide, cmd_decisions
 from janus.hooks import cmd_hook
 from janus.memory import MEM_SECTIONS
@@ -130,7 +130,14 @@ def main():
     root = find_root(os.getcwd()) if a.cmd in ("init", "doctor") else find_root()   # never $JANUS_ROOT for setup commands
     if a.cmd == "init" and not root: return init_project(Path.cwd(), a)
     if a.cmd == "doctor" and not root: return doctor(None, a)
-    if not root: print("janus: no janus.toml here or in a parent (janus init writes a starter one)", file=sys.stderr); return 2
+    if not root:   # item 33: say WHERE the root is (the session's registered project, else the registered ones); never fail silently
+        sid = next((os.environ.get(k) for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "JANUS_SESSION") if os.environ.get(k)), "")
+        mine = session_root(sid) if sid else None
+        pr = projects()
+        hint = (f"; this session's janus root is {mine}" if mine else
+                f"; registered janus project(s): {', '.join(map(str, pr))}" if pr else
+                "; no janus project is registered here (janus register, or run from its folder)")
+        print(f"janus: no janus.toml here or in a parent{hint}", file=sys.stderr); return 2
     try: cfg = Cfg(root, Run(dry=getattr(a, "dry_run", False)))
     except (tomllib.TOMLDecodeError, OSError) as e: print(f"janus: {root / 'janus.toml'}: {e}", file=sys.stderr); return 2
     # the orchestrator's state-changing commands hold the writer lock (context.Cfg.writer); long ones (land, run, gate, api-run)

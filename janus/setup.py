@@ -8,8 +8,8 @@ from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, wait_shell
 from janus.beads import Beads
 from janus.board import board_dir, board_script
-from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, Run, atomic_write, clean_env, herdr, hrun, now, pending_age, qp,
-    record_session_proc, say, session_alive, sh, slug, ts)
+from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, Run, atomic_write, clean_env, herdr, hrun, now, pending_age, qp,
+    record_session_proc, say, session_alive, sh, slug, ts, wake_clear)
 from janus.hooks import session_start_text
 from janus.ledger import ledger_read, read_secret, spend
 from janus.platform import pane_tool, run, watcher_loaded, watcher_service
@@ -140,9 +140,9 @@ def start_orchestrator(cfg, kind):
     the decisions index, and the prompt makes its first act a fresh `janus check` (item 4)."""
     if pane_tool() is None: raise Err("neither herdr nor tmux is installed, so no new session can be started: run janus register in a Claude or Codex session and resume with --here")
     oc = cfg.c.get("orchestrator", {}); args = oc.get("args", []) if oc.get("kind", "claude") == kind else []
-    prompt = JANUS_MARK + "You are the orchestrator. Run janus register, then " + WAKE
+    prompt = JANUS_MARK + "You are the orchestrator. Run janus register, then " + wake_clear(cfg, "a new session")
     if cfg.run.dry:
-        say(f"+ start a {kind} orchestrator in " + ("a herdr tab" if pane_tool() == "herdr" else "tmux") + f" and prompt it: {WAKE}"); return
+        say(f"+ start a {kind} orchestrator in " + ("a herdr tab" if pane_tool() == "herdr" else "tmux") + f" and prompt it: {wake_clear(cfg, 'a new session')}"); return
     atomic_write(cfg.f("session"), f"pending:{int(now())}"); atomic_write(cfg.f("session_kind"), kind + "\n")
     if pane_tool() == "herdr":
         pane, tab = new_tab(cfg, "orchestrator", cfg.root); wait_shell(pane, "orchestrator")

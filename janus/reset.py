@@ -5,7 +5,7 @@ when a Stop passes (no late finding, notes fresh: everything worth keeping is in
 `janus watch --reset`, which sends /clear once the turn has ended and then the wake prompt. Every skipped reset says why in
 watch.log; check raises context when the context is over the threshold and no reset was asked."""
 import json, os, subprocess, sys, time
-from janus.context import JANUS_MARK, JANUS_SELF, WAKE_CLEAR, clean_env, herdr, now, ts
+from janus.context import JANUS_MARK, JANUS_SELF, clean_env, herdr, now, ts, wake_clear
 
 def log_line(cfg, m): cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
 
@@ -50,7 +50,7 @@ def reset_now(cfg, wait_s=60):
         time.sleep(5)
         if ((herdr("agent", "get", pane) or {}).get("agent") or {}).get("agent_status") != "working": break
     else: log_line(cfg, f"context reset skipped: the orchestrator kept working for {wait_s} s"); return
-    herdr("agent", "prompt", pane, "/clear"); time.sleep(5); herdr("agent", "prompt", pane, JANUS_MARK + WAKE_CLEAR.format(reason="the context was cleared"))
+    herdr("agent", "prompt", pane, "/clear"); time.sleep(5); herdr("agent", "prompt", pane, JANUS_MARK + wake_clear(cfg, "the context was cleared"))
     log_line(cfg, "context reset: /clear, then wake")
 
 def context_findings(cfg):

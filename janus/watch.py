@@ -10,7 +10,7 @@ from janus.board import board, board_alerts, board_dir, board_files
 from janus.autopilot import record, tend_autopilot
 from janus.check import run_check
 from janus.reset import orch_tokens, reset_now
-from janus.context import CLAIM_WINDOW, Err, JANUS_MARK, WAKE, WAKE_CLEAR, atomic_write, handoff_stale, herdr, now, pending_age, session_alive, sh, ts
+from janus.context import CLAIM_WINDOW, Err, JANUS_MARK, atomic_write, handoff_stale, herdr, now, pending_age, session_alive, sh, ts, wake, wake_clear
 from janus.setup import heartbeat_beat
 
 def cmd_watch(cfg, a):
@@ -98,7 +98,7 @@ def watch_pass(cfg, log):
         pane, _ = new_tab(cfg, "orchestrator", cfg.root); wait_shell(pane, "orchestrator")
         atomic_write(cfg.f("session"), f"pending:{int(now())}:{pane}")   # only a hook in this pane claims it (panel-eng F5)
         sh(["herdr", "agent", "start", "orchestrator", "--kind", kind, "--pane", pane, "--timeout", "90000", "--", *args], timeout=100)
-        atomic_write(cfg.f("pane"), pane); herdr("agent", "prompt", "orchestrator", JANUS_MARK + "You are the orchestrator. Run janus register, then " + WAKE_CLEAR.format(reason="a new session")); return
+        atomic_write(cfg.f("pane"), pane); herdr("agent", "prompt", "orchestrator", JANUS_MARK + "You are the orchestrator. Run janus register, then " + wake_clear(cfg, "a new session")); return
     st = ag["agent"].get("agent_status")
     if st == "working": return
     tok = orch_tokens(cfg)
@@ -111,4 +111,4 @@ def watch_pass(cfg, log):
             herdr("agent", "prompt", pane, JANUS_MARK + "Context is large: finish the Orchestrator notes in .janus/HANDOFF.md, then end the turn (janus resets the context then)."); return
     if (overdue or late) and now() - cfg.mtime("last_wake") > 600:
         cfg.touch("last_wake"); log(f"wake: overdue={bool(overdue)} late={late[:3]}")
-        herdr("agent", "prompt", pane, JANUS_MARK + WAKE.format(reason="cycle overdue" if overdue else "late: " + ", ".join(late[:3])))
+        herdr("agent", "prompt", pane, JANUS_MARK + wake(cfg, "cycle overdue" if overdue else "late: " + ", ".join(late[:3])))

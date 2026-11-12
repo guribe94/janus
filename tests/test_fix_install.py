@@ -1622,4 +1622,29 @@ class Item30BriefPath(unittest.TestCase):
         self.assertEqual(janus.brief_paths("B=`/root/x` and P=/tmp/y and see /a/b.md."), ["/root/x", "/tmp/y", "/a/b.md"])
 
 
+class Item33WakeRoot(unittest.TestCase):
+    def test_the_clear_wake_names_the_absolute_root_and_notes(self):
+        """Catches (item 33): the reset wake said `read .janus/HANDOFF.md` (relative), so a session whose cwd was outside the
+        janus root found no .janus and no janus.toml."""
+        d, cfg = project()
+        w = janus.wake_clear(cfg, "the context was cleared")
+        self.assertIn(str(cfg.f("HANDOFF.md")), w)
+        self.assertIn(str(cfg.root), w, "the wake does not name the janus root")
+        self.assertNotIn("read .janus/HANDOFF.md", w)
+        self.assertIn(str(cfg.root), janus.wake(cfg, "cycle overdue"))
+
+    def test_check_from_a_non_root_cwd_names_the_registered_root(self):
+        """Catches (item 33): `janus check` from a directory outside the root exited 2 with a message that never said where
+        the root was (the live session ran in the project repo while the root was a subdirectory of it)."""
+        d, cfg = project()
+        (cfg.state / "session").write_text("sess-1\n")
+        home = Path(tempfile.mkdtemp(prefix="janus-home-")); (home / ".config/janus").mkdir(parents=True)
+        (home / ".config/janus/projects").write_text(str(cfg.root.resolve()) + "\n")
+        away = Path(tempfile.mkdtemp(prefix="janus-away-"))
+        r = subprocess.run([sys.executable, str(JANUS_PY), "check"], cwd=away, capture_output=True, text=True,
+                           env={**os.environ, "JANUS_ROOT": "", "HOME": str(home), "CLAUDE_CODE_SESSION_ID": "sess-1"})
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(str(cfg.root.resolve()), r.stderr, "check did not say where the root is: " + r.stderr)
+
+
 if __name__ == "__main__": unittest.main()
