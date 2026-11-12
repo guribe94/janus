@@ -57,7 +57,7 @@ def main():
         A("--here", action="store_true", help="register this session as the orchestrator, instead of starting a new one"),
         A("--message", help="resume a unit with this text instead of its jobs' results"), A("--force", action="store_true", help="resume although its jobs have not finished"),
         A("--budget", type=float, help="a new budget for this run (same tree), instead of the unit's remaining budget"), dry=True)
-    add("ledger", cmd_ledger, A("action", choices=["check", "repair", "reconcile"]), A("--provider"), dry=True)
+    add("ledger", cmd_ledger, A("action", choices=["check", "repair", "reconcile", "recost"]), A("--provider"), dry=True)
     add("doctor", cmd_doctor, A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", cmd_backlog, A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...>"), dry=True)
     add("install-host", cmd_install_host, A("host", help="a host of janus.toml: folders, pueued as a user service, a janus copy, the heartbeat watchdog"), dry=True)

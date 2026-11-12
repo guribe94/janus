@@ -6,7 +6,7 @@ from janus.actions.jobs import job_state, unit_jobs
 from janus.board import board_dir, board_questions, board_rows
 from janus.budgets import bset, last_checkpoint, unit_spend, waste_paused, work_written
 from janus.context import DIFF_X, atomic_write, fl, hrun, now, qp, sh, ts
-from janus.ledger import ledger_read, spend
+from janus.ledger import ledger_read, recost_plan, spend
 from janus.platform import herdr
 from janus.project import project_id
 from janus.transcripts import card_fields, transcript_where
@@ -208,7 +208,7 @@ def cap_findings(cfg, units):
     return F
 
 def ledger_findings(cfg, units):
-    """ledger:<provider> (malformed), ledger:<provider>:implausible, ledger:<provider>:unreconciled."""
+    """ledger:<provider> (malformed), ledger:<provider>:implausible, ledger:<provider>:unreconciled, ledger:<provider>:recost."""
     F = []
     for n, pv in cfg.prov.items():
         if "ledger" in pv:
@@ -218,6 +218,9 @@ def ledger_findings(cfg, units):
             if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
                 F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
                           + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": janus ledger check"))
+            rc = recost_plan(cfg, pv) if not bad else []   # rows that charge a resumed run its session's whole total again
+            if rc: F.append((f"ledger:{n}:recost", f"{len(rc)} {n} done row(s) charge a resumed run its session's whole total again (${sum(c - own for _, _, c, own in rc):.2f} "
+                             f"counted twice: {', '.join(x[0] for x in rc[:3])}): janus ledger recost --dry-run, then janus ledger recost"))
             ur = unreconciled(cfg, pv, units)   # each check: the done spend against the committed, and runs held for agents that are gone
             done = sum(r["cost"] or 0.0 for r in runs.values() if r["done"])
             if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (done ${done:.2f} vs committed ${spend(runs):.2f}; ${sum(x[2] for x in ur):.2f} held as running: "

@@ -161,7 +161,7 @@ def cmd_api_run(cfg, a):
         except InterruptedError: continue
     resf.unlink(missing_ok=True)
     if peak: record_history(rd, "agent", peak, int(now() - t0), rc)
-    cost, reported = run_cost(od / "api.json", a.budget); how = ""
+    cost, reported = run_cost(od / "api.json", a.budget, run); how = ""   # its own cost: a resumed session reports its whole total
     if reported:
         try: atomic_write(od / f"api-{run}.json", (od / "api.json").read_text())   # every run's own json (janus report, resumes)
         except OSError: pass

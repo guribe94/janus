@@ -10,7 +10,7 @@ from janus.board import board, board_dir, board_script
 from janus.budgets import bset
 from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
     sh, ts)
-from janus.ledger import ledger_done, reserve_budget, run_cost, settle_run
+from janus.ledger import keep_run_json, ledger_done, reserve_budget, run_cost, settle_run
 from janus.project import project_id, tag, unit_tmux
 from janus.probe import probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
@@ -166,8 +166,8 @@ def cmd_collect(cfg, a):
     if not (st and task_rc(st) is None): X(cfg, h, f"rm -f {qp(f'{root}/run/{n}.key')}")   # the key fifo, once no task can still read it (row 52)
     mc = cfg.models.get(u.get("model"), {})
     if not cfg.run.dry and u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("run"):
-        cost, reported = run_cost(od / "api.json", None)
-        if reported: ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], n, cost, "collected")   # idempotent: once per run id
+        cost, reported = run_cost(od / "api.json", None, u["run"])
+        if reported: keep_run_json(cfg, od, u["run"]); ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], n, cost, "collected")   # idempotent: once per run id
     if not cfg.run.dry and u.get("report"): say(f"report -> {u['report']}")
     kv = fingerprint(cfg, u) if not cfg.run.dry else None
     if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
@@ -291,7 +291,8 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
     sid = session_of(cfg, u)
     if not sid: raise Err(f"{name}: no session id (api.json or transcript) to resume")
     if u.get("run"):   # the run before is closed first (idempotent): its reported cost, else its budget
-        cost, _ = run_cost(od / "api.json", (u.get("budget") or pv.get("budget_per_unit", 0)) if u.get("run") != u.get("wrapup") else bset(cfg, "wrapup_usd"))
+        cost, rep = run_cost(od / "api.json", (u.get("budget") or pv.get("budget_per_unit", 0)) if u.get("run") != u.get("wrapup") else bset(cfg, "wrapup_usd"), u["run"])
+        if rep: keep_run_json(cfg, od, u["run"])   # the next run of this session is charged against it
         ledger_done(cfg, pv, u["run"], name, cost, "resumed")
     spent = unit_spent(cfg, u); explicit = budget is not None
     if wrapup: budget = bset(cfg, "wrapup_usd")
