@@ -103,4 +103,28 @@ class Item7WastePause(unittest.TestCase):
         finally: janus.waste_state = real
 
 
+class Item13Handover(unittest.TestCase):
+    def test_close_force_allows_the_unit_when_own_tree_holds(self):
+        """Catches: janus close <u> --force was refused although own_tree() held, because the `2` of `2>&1` counted as a second
+        unit name (the shell tokenizer leaves it in the words)."""
+        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-h13-")); R = base / "repo"; R.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(R), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
+        g("init", "-q"); (R / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a")
+        W = base / "wt"; g("worktree", "add", "-q", str(W), "-b", "unit")
+        d, cfg = project()
+        u = {"id": "t-1", "name": "merge-u15", "cwd": str(W)}
+        real = janus.Beads; janus.Beads = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [u]})
+        try:
+            self.assertTrue(janus.force_close_ok(cfg, ["close", "merge-u15", "--force", "--reason", "a; b", "2"]))
+        finally: janus.Beads = real
+
+    def test_resume_of_takes_the_predecessors_cwd(self):
+        """Catches: 'janus launch u15-seams --resume-of merge-u15 --cwd <its tree>' was refused by H9, so no route handed a unit's
+        dirty worktree to a successor."""
+        d, cfg = project(); W = d / "wt"; W.mkdir()
+        units = [{"id": "t-1", "name": "merge-u15", "cwd": str(W)}]
+        self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u15-seams"), (["merge-u15"], None))
+        self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u15-seams", resume_of="merge-u15"), ([], "merge-u15"))
+
+
 if __name__ == "__main__": unittest.main()

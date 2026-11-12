@@ -220,13 +220,13 @@ MUTATORS = {"rm", "mv", "cp", "ln", "rsync", "touch", "chmod", "chown", "install
 
 def force_close_ok(cfg, args):
     """janus close <unit> --force on the unit's own worktree (not the project root, no other open unit's cwd, not a main checkout
-    with linked worktrees) is the orchestrator's to run (janus-fixes10 item 5)."""
+    with linked worktrees) is the orchestrator's to run (janus-fixes10 item 5). Item 13: the unit is found among the positional
+    names, so a stray token (the `2` of `2>&1`, which the shell tokenizer leaves in the words) never refuses it."""
     names = [x for x in args[1:] if not x.startswith("-")]
     if "--reason" in args:
         i = args.index("--reason"); names = [x for x in names if x != (args[i + 1] if i + 1 < len(args) else None)]
-    if len(names) != 1: return False
     try:
-        units = Beads(cfg).units(); u = next((x for x in units if x["name"] == names[0]), None)
+        units = Beads(cfg).units(); u = next((x for x in units if x["name"] in names), None)
         return bool(u and u.get("cwd") and own_tree(cfg, u, units) and not main_checkout(Path(u["cwd"])))
     except Exception: return False
 

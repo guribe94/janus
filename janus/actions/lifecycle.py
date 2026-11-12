@@ -163,7 +163,7 @@ def unit_dirty(cfg, cwd):
 
 def cmd_close(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
-    mine = own_tree(cfg, u, units)
+    mine = own_tree(cfg, u, units) or getattr(a, "handover", False)   # item 13: a successor took its tree, so --force is right
     if a.force and not mine: raise Err(f"--force refused: {u['cwd']} is shared (project root or another open unit's cwd)")
     if mine:
         dirty, state_repo = unit_dirty(cfg, u["cwd"])
