@@ -40,6 +40,9 @@ class Cfg:
         self.hosts = self.c.get("hosts", {}); self.prov = self.c.get("providers", {})
         self.models = self.c.get("models", {}); self.route = self.c.get("routing", {})
         self.paths = self.c.get("paths", {}); self.caps = self.c.get("caps", {})
+        self.capc = self.c.get("capacity", {})
+        for h in self.hosts.values():   # each host's runs dir: lane job scripts, logs, reservations, history (see cap_lib)
+            h["_rd"] = str(self.state / "runs") if h.get("local") else f"{h.get('root', '/tmp')}/runs"
     def p(self, k, d=""): return self.root / self.paths.get(k, d)
     def f(self, n): return self.state / n
     def jget(self, n, d=None):
@@ -209,39 +212,70 @@ else
 fi
 d="%(root)s"; [ -d "$d" ] || d=/; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
 %(extra)s
+RD=%(rd)s; CAP_RO=%(ro)s
+%(cap)s
+cap_report
 echo "--pueue"; %(pueue)s status --json 2>/dev/null
 echo "--tmux"; tmux ls -F '#S' 2>/dev/null; true'''
 
 def probe_extra(h):
-    """Running orch jobs still waiting in their admission (per lane), and the old scripts' queue."""
-    rd = "$HOME/.orch-none" if h.get("local") else f"{h.get('root', '/tmp')}/runs"
-    # old_rule: waiting jobs whose script does not source runs/admit.sh (queued before the measured rule; audit H5)
+    """Running orch jobs still waiting in their admission (per lane), the old scripts' queue, other job schedulers on the host
+    (one scheduler per host, orch-fixes8), and on remote hosts builds or tests an agent runs outside the lanes (issue 22)."""
+    rd = h["_rd"]
+    # old_rule: waiting jobs whose script sources neither runs/cap.sh nor runs/admit.sh (queued before the measured rule; audit H5)
     w = (f'g=0; j=0; o=0; ol=; for f in {rd}/*.gwait {rd}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
-         f'case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -q admit.sh "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
+         f'case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
          f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"')
+    # schedulers (orch.toml, per host): extended regexes for the command lines of other job-running processes (an old queue); each
+    # running one prints sched=<pid> <command>. legacy_lanes (the Mac): pid-file folders of an old lane; a live pid is one too.
+    for rx in h.get("schedulers", []):
+        w += f"\nps -A -o pid=,command= | grep -E {shlex.quote(rx)} | grep -v -e grep -e pueued -e 'cap_report' | head -5 | sed 's/^ */sched=/'"
+    for s in h.get("legacy_lanes", "").split():
+        w += f'\no=$(cat {shlex.quote(s)}/pid 2>/dev/null); [ -n "$o" ] && kill -0 "$o" 2>/dev/null && echo "sched=$o old lane {s}"'
+    if not h.get("local"): w += "\n" + DIRECT_PROBE % {"rx": shlex.quote(BUILD_ERE)}
     # legacy_probe (orch.toml, per host): shell that prints legacy_wait=<n> and legacy_run=<n> for a project's older job queue
     # while it drains, so a jammed old queue shows in orch check
     return w + "\n" + h.get("legacy_probe", "")
+
+# Remote lane enforcement (issue 22): processes on a Linux host whose environment carries ORCH_UNIT (an agent and what it starts),
+# whose command is a build or test, and that do not run under pueued (a lane job): printed as direct=<pid> <pgid> <unit> <secs> <cmd>.
+# Only the topmost such process of a tree is printed; a call of the unit's lane runner (<root>/run/<unit>.lane) is the lane.
+BUILD_ERE = "(^|[ /])cargo(-[a-z]+)? (test|nextest|build|clippy|bench)( |$)|(^|[ /])pytest( |$)|(^|[ /])(npm|pnpm) (run )?test( |$)|xcodebuild.* test"
+DIRECT_PROBE = r'''if [ -d /proc/1 ]; then
+ for f in /proc/[0-9]*/environ; do u=$(tr '\0' '\n' < $f 2>/dev/null | sed -n 's/^ORCH_UNIT=//p'); [ -n "$u" ] && echo "${f#/proc/} $u"; done 2>/dev/null | sed 's#/environ##' > /tmp/.orch-units.$$
+ ps -A -o pid=,ppid=,pgid=,etimes=,args= | awk -v rx=%(rx)s 'NR == FNR {u[$1] = $2; next} {pp[$1] = $2; pg[$1] = $3; et[$1] = $4; c = $0; sub(/^ *[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+ +/, "", c); cmd[$1] = c}
+   END {for (p in u) {if (!(p in cmd) || cmd[p] !~ rx || cmd[p] ~ /\.lane( |$)|orch(\.py)? (run|gate) /) continue; q = pp[p]; lane = 0; n = 0
+          while (q > 1 && n++ < 50) {if (cmd[q] ~ /pueued/ || cmd[q] ~ /cmd\.sh|\/runs\/[^ ]*\.sh/) {lane = 1; break}; if (u[q] != "" && cmd[q] ~ rx) {lane = 1; break}; q = pp[q]}
+          if (!lane) print "direct=" p, pg[p], u[p], et[p], substr(cmd[p], 1, 100)}}' /tmp/.orch-units.$$ - 2>/dev/null
+ rm -f /tmp/.orch-units.$$
+fi'''
 
 def pueue(h):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
     return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
-def probe(name, h):
-    rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": h.get("root", "/"), "pueue": pueue(h), "extra": probe_extra(h)}, timeout=20)
+LIST_KEYS = ("res", "hist", "sched", "direct")   # probe lines that repeat: kept as lists
+
+def probe(name, h, ro=True, cfg=None):
+    """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,
+    history), other schedulers, direct builds, pueue status and tmux sessions. ro: the overload tracker is only read."""
+    lib = cap_lib(cfg, name, h) if cfg else ""
+    rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": h.get("root", "/"), "pueue": pueue(h), "extra": probe_extra(h),
+                                "rd": shlex.quote(h["_rd"]), "ro": "1" if ro else "", "cap": lib or "cap_report() { :; }"}, timeout=25)
     if rc: return {"name": name, "ok": False, "err": (e or o).strip().splitlines()[-1][:80] if (e or o).strip() else f"rc {rc}"}
     head, _, rest = o.partition("--pueue\n"); pj, _, tm = rest.partition("--tmux\n")
-    p = {"name": name, "ok": True, "tmux": tm.split()}
+    p = {"name": name, "ok": True, "tmux": tm.split(), **{k: [] for k in LIST_KEYS}}
     for l in head.splitlines():
         k, _, v = l.partition("=")
-        p[k] = v
+        if k in LIST_KEYS: p[k].append(v)
+        else: p[k] = v
     try: p["pueue"] = json.loads(pj) if pj.strip() else None
     except Exception: p["pueue"] = None
     return p
 
 def probe_all(cfg):
     with cf.ThreadPoolExecutor(8) as ex:
-        ps = list(ex.map(lambda kv: probe(*kv), cfg.hosts.items()))
+        ps = list(ex.map(lambda kv: probe(*kv, ro=cfg.ro, cfg=cfg), cfg.hosts.items()))
     d = {p["name"]: p for p in ps}
     un = cfg.jget("hosts.json")
     for n, p in d.items():
@@ -254,37 +288,252 @@ def fl(x, d=0.0):
     try: return float(x)
     except Exception: return d
 
-def margins(h, p, cleanup=False):
-    """Why the host is over its load, memory-pressure or disk margins. A cleanup unit is exempt from the load limit and the disk
-    floor (it is what frees them); memory pressure still counts."""
+def margins(h, p, cleanup=False, cfg=None):
+    """Why the host is over its disk or memory-pressure margins. A cleanup unit is exempt from the disk floor (it is what frees
+    it); memory pressure still counts. Load is judged by back-pressure (cap_paused: sustained, not one reading)."""
     why = []
-    if not cleanup and fl(p.get("load")) > h.get("cores", 4) * 1.5: why.append(f"load {p.get('load')} over {h.get('cores', 4) * 1.5:g}")
-    if p.get("psi") and fl(p["psi"]) >= 5: why.append(f"memory pressure {p['psi']}")
+    if p.get("cap_psi") and fl(p["cap_psi"]) > capv(cfg, h, "psi_pause"): why.append(f"memory pressure {p['cap_psi']}")
+    elif not p.get("cap_psi") and p.get("psi") and fl(p["psi"]) >= 5: why.append(f"memory pressure {p['psi']}")
     if not cleanup and p.get("disk_gb") and fl(p["disk_gb"]) < h.get("min_disk_gb", 10): why.append(f"disk {p['disk_gb']}G")
     return why
 
 def room(cfg, name, p, units, cleanup=False):
-    """(number of agents that fit now, why not). Measured live against the host's margins."""
+    """(number of agents that fit now, why not), by reservations: the host's memory for reservations (ram_gb - services_gb)
+    minus its jobs' and agents' reservations, over the agent figure (learned: class agent in the host's history, else
+    agent_gb); none while admission is paused (back-pressure), and the owner's caps."""
     h = cfg.hosts[name]
     if not p["ok"]: return 0, "unreachable"
-    why = margins(h, p, cleanup)
-    if p.get("avail_mb"):
-        avail = fl(p.get("avail_mb")) / 1024
-        n = int((avail - h.get("reserve_gb", 2)) // h.get("agent_gb", 1.0))
-        if n < 1: why.append(f"memory {avail:.1f}G free, reserve {h.get('reserve_gb', 2)}G")
-    else: n = 1   # no memory reading this time (probe under load): one agent, judged by the other margins
+    why = margins(h, p, cleanup, cfg); hc = host_cap(cfg, name, p, units)
+    n = (hc["memcap"] - hc["rm"] - hc["agents_mb"]) // max(hc["amb"], 1)
+    if n < 1: why.append(f"memory reserved: jobs {hc['rm']} MB + {hc['on']} agent(s) {hc['agents_mb']} MB of {hc['memcap']} MB (RAM - services)")
+    if hc["pause"] and not cleanup: why.append(f"admission paused: {hc['pause']}")
     caps = cfg.caps
     if caps.get("host", {}).get(name) is not None:
         n = min(n, caps["host"][name] - sum(1 for u in units if u.get("host") == name))
     if caps.get("total") is not None: n = min(n, caps["total"] - len(units))
-    return (0, "; ".join(why) or "caps") if why or n < 1 else (n, "")
+    return (0, "; ".join(why) or "caps") if why or n < 1 else (int(n), "")
 
 def cap_line(cfg, name, p, units):
     if not p["ok"]: return f"{name} UNREACHABLE ({p['err']})"
-    n, why = room(cfg, name, p, units)
-    av = f"{fl(p.get('avail_mb')) / 1024:.1f}G" if p.get("avail_mb") else "unknown(probe gave no memory reading)"
-    return (f"{name} room={n} avail={av} load={p.get('load') or 'unknown'} psi={p.get('psi') or '-'} "
-            f"disk={p.get('disk_gb')}G agents={sum(1 for u in units if u.get('host') == name)}" + (f" FULL: {why}" if n < 1 else ""))
+    n, why = room(cfg, name, p, units); hc = host_cap(cfg, name, p, units)
+    av = f"{fl(p.get('avail_mb')) / 1024:.1f}G" if p.get("avail_mb") else "unknown"
+    return (f"{name} room={n} build: {hc['rj']} running ({hc['rc']}/{hc['cores']} cores, {hc['rm']}/{hc['memcap']} MB reserved), "
+            f"{hc['queued']} queued, {len(hc['agents'])} agent(s) for {hc['slots']} slot(s), free {hc['free']} x {hc['jmb']} MB; "
+            f"avail={av} load={p.get('load') or 'unknown'} psi={p.get('cap_psi') or p.get('psi') or '-'} disk={p.get('disk_gb')}G"
+            + (f" PAUSED: {hc['pause']}" if hc["pause"] else "") + (f" FULL: {why}" if n < 1 else ""))
+
+# ---------------------------------------------------------------- capacity: reservations, back-pressure, history (orch-fixes8)
+# "Launch as much as we can, but no more." Admission is by reservations, never by a momentary reading: each running job holds
+# cores_per_job cores and the memory its job class needed before (the peak resident memory of past runs of that class on that
+# host, plus margin_pct), each agent with a reservation file holds the agent class's figure; a job is admitted while the sum
+# fits cores and ram_gb - services_gb. Back-pressure pauses admission (memory PSI avg10 over psi_pause, or load over
+# load_pause x cores for hold_s); a running job is never killed for it. One shell library per host (runs/cap.sh) holds the
+# rule: every waiting job sources it each poll, and every probe carries it inline, so orch check, launch and fill read the
+# same numbers the admission uses. Settings: per host, else [capacity], else the default below.
+CAP_DEFAULTS = {"cores": 4, "cores_per_job": 1, "ram_gb": 4, "services_gb": 0, "job_gb": 2, "agent_gb": 1.0, "psi_pause": 10,
+                "load_pause": 1.25, "hold_s": 60, "history_n": 5, "margin_pct": 15, "min_disk_gb": 10}
+
+def capv(cfg, h, k):
+    return h.get(k, (cfg.capc if cfg else {}).get(k, CAP_DEFAULTS[k]))
+
+def cap_nums(cfg, h):
+    """The host's capacity in integers: cores, cores per job, memory for reservations (MB), job default/cap (MB), agent (MB)."""
+    return {"cores": int(capv(cfg, h, "cores")), "cpj": max(1, int(-(-capv(cfg, h, "cores_per_job") // 1))),
+            "memcap": int((capv(cfg, h, "ram_gb") - capv(cfg, h, "services_gb")) * 1024), "capmb": int(capv(cfg, h, "job_gb") * 1024),
+            "agmb": int(capv(cfg, h, "agent_gb") * 1024), "hn": int(capv(cfg, h, "history_n")), "margin": int(capv(cfg, h, "margin_pct"))}
+
+CAP_LIB = r'''# orch capacity library for host %(name)s (written by orch, see cap_lib in orch.py; do not edit: the next orch run rewrites it).
+# Sourced by every waiting job each poll and sent inline with every probe. Needs RD (the runs dir).
+CORES=%(cores)d CPJ=%(cpj)d MEMCAP=%(memcap)d CAPMB=%(capmb)d AGMB=%(agmb)d PSIP=%(psip)s LOADX=%(loadx)s HOLD=%(hold)d DISK=%(disk)d HN=%(hn)d MARGIN=%(margin)d
+U=$(id -u); AS=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/app.slice; US=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/user.slice
+cap_mb() {  # $1 class, $2 default MB, $3 cap MB (0: none): the max of the class's last HN recorded peaks + MARGIN %%, at least
+  # 256 (class agent: the median of its last 3 x HN peaks, at least 128: many light agents seldom peak together)
+  [ -f "$RD/history.tsv" ] || { echo "$2"; return; }
+  awk -F'\t' -v c="$1" -v n=$HN -v m=$MARGIN -v d="$2" -v cap="$3" 'BEGIN {if (c == "agent") n *= 3} $2 == c && $3 > 0 {p[k++ %% n] = $3}
+    END {if (!k) {print d; exit}; j = 0; for (i in p) v_[++j] = p[i] + 0
+         for (a = 2; a <= j; a++) {x = v_[a]; b = a - 1; while (b > 0 && v_[b] > x) {v_[b + 1] = v_[b]; b--}; v_[b + 1] = x}
+         mx = (c == "agent") ? v_[int((j + 1) / 2)] : v_[j]; lo = (c == "agent") ? 128 : 256
+         v = int(mx * (100 + m) / 100); if (v < lo) v = lo; if (cap > 0 && v > cap) v = cap; print v}' "$RD/history.tsv"
+}
+cap_class() {  # the job class of a command: the first [capacity.classes] pattern it matches, else its first command words
+  c=$1
+%(classes)s  printf '%%s\n' "$c" | awk '{n = split($0, seg, /&&|;|\|\|/)
+    for (s = 1; s <= n; s++) {m = split(seg[s], w, " "); i = 1; wr = 0
+      while (i <= m && (w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || w[i] ~ /^(env|nice|ionice|timeout|nohup|time|exec|command|stdbuf|systemd-run)$/ || (wr && (w[i] ~ /^-/ || w[i] ~ /^[0-9.]+[smhd]?$/)))) {if (w[i] !~ /=/ || w[i] ~ /^-/) wr = 1; i++}
+      if (i > m || w[i] ~ /^(cd|export|source|\.|set|true|:|\(|\)|echo|printf)$/) continue
+      out = ""; k = 0
+      for (; i <= m && k < 3; i++) {x = w[i]; if (x ~ /^-/ || x ~ /=/ || x ~ /^[<>|&]/ || x ~ /^[0-9.:]+$/) break
+        if (x ~ /\//) {sub(/.*\//, "", x); out = out (k ? "_" : "") x; k++; break}
+        out = out (k ? "_" : "") x; k++}
+      gsub(/[^A-Za-z0-9_.+-]/, "", out); if (out != "") {print out; exit}}
+    print "job"}'
+}
+res_sum() {  # live reservations: RJ jobs holding RC cores and RM MB, RA agents holding RAM MB; RL lists them. A reservation
+  # whose process is gone is removed (not by a read-only probe). Jobs without one (older scripts, another scheduler) count at CAPMB.
+  RJ=0 RC=0 RM=0 RA=0 RAM=0 RL=
+  for f in "$RD"/*.res; do
+    [ -e "$f" ] || continue
+    p= c= m= t= k=; { read -r p c m t k < "$f"; } 2>/dev/null
+    case "$p$c$m" in *[!0-9]*|"") continue;; esac
+    if ! kill -0 "$p" 2>/dev/null; then [ -n "$CAP_RO" ] || rm -f "$f"; continue; fi
+    case $k in agent*) RA=$((RA + 1)); RAM=$((RAM + m));; *) RJ=$((RJ + 1)); RC=$((RC + c)); RM=$((RM + m));; esac
+    RL="$RL
+res=$p $c $m $t $k ${f##*/}"
+  done
+  for j in $( { %(jobids)s; } 2>/dev/null); do
+    [ -e "$RD/$j.res" ] && continue
+    RJ=$((RJ + 1)); RC=$((RC + CPJ)); RM=$((RM + CAPMB)); RL="$RL
+res=- $CPJ $CAPMB - untracked $j"
+  done
+}
+cap_measure() {  # PSI (macOS: the kernel's pressure level, warn = 50, critical = 100), LOAD (1 min), DF (GB free in RD)
+  if [ "$(uname)" = Darwin ]; then
+    case $(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) in 4) PSI=100;; 2) PSI=50;; *) PSI=0;; esac
+    LOAD=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
+  else
+    PSI=$(awk '/^some/{sub("avg10=", "", $2); print $2}' /proc/pressure/memory 2>/dev/null); LOAD=$(awk '{print $1}' /proc/loadavg)
+  fi
+  PSI=${PSI:-0}; LOAD=${LOAD:-0}; DF=$(df -Pk "$RD" 2>/dev/null | awk 'NR==2{print int($4/1048576)}'); DF=${DF:-0}
+}
+cap_paused() {  # back-pressure: PAUSE is why admission waits (memory PSI over PSIP; load over LOADX x CORES for HOLD s, tracked in RD/overload)
+  PAUSE=; nowt=$(date +%%s)
+  awk -v a="$PSI" -v b="$PSIP" 'BEGIN {exit !(a + 0 > b + 0)}' && PAUSE="memory PSI avg10 $PSI over $PSIP"
+  if awk -v l="$LOAD" -v c="$CORES" -v x="$LOADX" 'BEGIN {exit !(l + 0 > c * x)}'; then
+    since= last=; { read -r since last < "$RD/overload"; } 2>/dev/null
+    { [ -n "$last" ] && [ $((nowt - last)) -le $((HOLD + 60)) ]; } || since=$nowt   # a gap in the readings starts a new period
+    [ -n "$CAP_RO" ] || { echo "$since $nowt" > "$RD/overload.$$" && mv -f "$RD/overload.$$" "$RD/overload"; }
+    [ $((nowt - since)) -ge "$HOLD" ] && PAUSE="${PAUSE:+$PAUSE; }load $LOAD over $LOADX x $CORES cores for $((nowt - since)) s"
+  else [ -n "$CAP_RO" ] || rm -f "$RD/overload"; fi
+}
+admit_ok() {  # $1 the job's class. Sets MB (its reservation) and why; true when it may start now
+  MB=$(cap_mb "${1:-job}" $CAPMB $CAPMB); res_sum; cap_measure; cap_paused
+  why="reserved $RJ job(s): $RC of $CORES cores, $RM MB + agents $RAM MB + this ${1:-job} $MB MB of $MEMCAP MB (RAM - services); PSI $PSI, load $LOAD, disk $DF GB (floor $DISK)${PAUSE:+; PAUSED: $PAUSE}"
+  BLK=; [ -n "$PAUSE" ] && BLK="paused"; [ "$DF" -ge "$DISK" ] || BLK="$BLK disk"
+  if [ "$RJ" -gt 0 ]; then [ $((RC + CPJ)) -le "$CORES" ] || BLK="$BLK cores"; [ $((RM + RAM + MB)) -le "$MEMCAP" ] || BLK="$BLK memory"; fi
+  [ -z "$BLK" ]
+}
+job_mb() {  # $1 pid, $2 job id: the job's resident memory now, in MB (empty when it cannot be read)
+  v=
+%(sample)s
+  echo "$v"
+}
+tree_mb() {  # resident memory of process $1 and all its descendants, MB
+  ps -A -o pid=,ppid=,rss= | awk -v r="$1" '{pp[$1] = $2; rs[$1] = $3} END {q[r] = 1; do {ch = 0; for (x in pp) if (!(x in q) && (pp[x] in q)) {q[x] = 1; ch = 1}} while (ch); for (x in q) s += rs[x]; print int(s / 1024)}'
+}
+cap_record() {  # $1 class $2 peak MB $3 seconds $4 exit code: one line of RD/history.tsv (its last 2000 lines are kept)
+  [ "${2:-0}" -gt 0 ] 2>/dev/null || return 0
+  printf '%%s\t%%s\t%%s\t%%s\t%%s\n' "$(date +%%s)" "$1" "$2" "$3" "$4" >> "$RD/history.tsv"
+  [ "$(wc -l < "$RD/history.tsv")" -gt 2400 ] && tail -n 2000 "$RD/history.tsv" > "$RD/history.tsv.$$" && mv -f "$RD/history.tsv.$$" "$RD/history.tsv"
+  return 0
+}
+cap_report() {  # for orch's probe: the sums, the pause, each reservation, the last 300 history lines
+  res_sum; cap_measure; cap_paused
+  echo "cap_rj=$RJ"; echo "cap_rc=$RC"; echo "cap_rm=$RM"; echo "cap_ra=$RA"; echo "cap_ram=$RAM"; echo "cap_pause=$PAUSE"; echo "cap_psi=$PSI"
+  [ -n "$RL" ] && printf '%%s\n' "$RL" | sed '/^$/d'
+  [ -f "$RD/history.tsv" ] && tail -n 300 "$RD/history.tsv" | sed 's/^/hist=/'
+  true
+}
+'''
+
+def cap_lib(cfg, hn, h):
+    """runs/cap.sh for host h: the rule above with the host's numbers, its [capacity.classes], and how its jobs are seen
+    (systemd scopes orch-<jid>.scope; podman containers by container.name_prefixes; the Mac: process trees)."""
+    n = cap_nums(cfg, h); pod = h.get("runner") == "podman"
+    if pod:
+        pre = h.get("container", {}).get("name_prefixes", ["orch-run-"])
+        jobids = "podman ps --format '{{.Names}}' | awk '" + " ".join(
+            f"/^{re.escape(x)}/ {{" + ("sub(/^orch-run-/, \"\"); " if x == "orch-run-" else "") + "print; next}" for x in pre) + "'"
+        sample = ('  i=$(podman ps -q --no-trunc --filter name=orch-run-$2 2>/dev/null | head -1)\n'
+                  '  [ -n "$i" ] && v=$(awk \'/^anon /{print int($2/1048576)}\' "$US/libpod-$i.scope/memory.stat" 2>/dev/null)')
+    elif h.get("local"):
+        jobids, sample = "true", '  v=$(tree_mb "$1")'
+    else:
+        jobids = "ls -d $AS/orch-*.scope | sed 's#.*/orch-##; s#[.]scope$##'"
+        sample = ('  v=$(awk \'/^anon /{print int($2/1048576)}\' "$AS/orch-$2.scope/memory.stat" 2>/dev/null)\n'
+                  '  [ -n "$v" ] || v=$(tree_mb "$1")')
+    cls = "".join(f"  printf '%s\\n' \"$c\" | grep -Eq {shlex.quote(rx)} && {{ echo {shlex.quote(k)}; return; }}\n"
+                  for k, rx in (cfg.capc.get("classes", {}) if cfg else {}).items())
+    return CAP_LIB % {**n, "name": hn, "psip": capv(cfg, h, "psi_pause"), "loadx": capv(cfg, h, "load_pause"), "hold": int(capv(cfg, h, "hold_s")),
+                      "disk": int(capv(cfg, h, "min_disk_gb")), "jobids": jobids, "sample": sample, "classes": cls}
+
+def class_mb(hist, cls, d, cap, hn=5, margin=15):
+    """The reservation of a job class from history lines (time, class, peak MB, secs, rc): the same rule as cap_mb in runs/cap.sh."""
+    ag = cls == "agent"
+    pk = sorted([int(f[2]) for f in (l.split("\t") for l in hist) if len(f) >= 3 and f[1] == cls and f[2].isdigit() and int(f[2]) > 0][-(hn * 3 if ag else hn):])
+    if not pk: return d
+    v = max(128 if ag else 256, int((pk[(len(pk) - 1) // 2] if ag else pk[-1]) * (100 + margin) / 100))
+    return min(v, cap) if cap > 0 else v
+
+def class_secs(hist, cls):
+    """Median run time (s) of a job class from history lines, None without history."""
+    s = sorted(int(f[3]) for f in (l.split("\t") for l in hist) if len(f) >= 4 and f[1] == cls and f[3].isdigit())
+    return s[len(s) // 2] if s else None
+
+def tree_rss_mb(pid):
+    """Resident memory (MB) of process pid and its descendants (one ps call)."""
+    rc, o, e = sh(["ps", "-A", "-o", "pid=,ppid=,rss="], timeout=10)
+    pp, rs = {}, {}
+    for l in o.splitlines():
+        f = l.split()
+        if len(f) == 3 and f[0].isdigit(): pp[int(f[0])] = int(f[1]); rs[int(f[0])] = int(f[2])
+    q, ch = {pid}, True
+    while ch:
+        ch = False
+        for x, y in pp.items():
+            if y in q and x not in q: q.add(x); ch = True
+    return sum(rs.get(x, 0) for x in q) // 1024
+
+def record_history(rd, cls, peak, secs, rc):
+    """One line of <runs>/history.tsv (the format cap_record writes)."""
+    with open(Path(rd) / "history.tsv", "a") as f: f.write(f"{int(now())}\t{cls}\t{int(peak)}\t{int(secs)}\t{rc}\n")
+
+def host_cap(cfg, n, p, units):
+    """The host's capacity now, from its probe (the numbers the admission sees) and the open units:
+    slots: build jobs that fit when nothing runs; free: further jobs that fit now; agents: open units whose builds run here."""
+    h = cfg.hosts[n]; c = cap_nums(cfg, h); hist = p.get("hist", [])
+    # a typical job here: the largest reservation of the classes run lately (job_gb when nothing is recorded yet)
+    recent = {l.split("\t")[1] for l in hist[-50:] if l.count("\t") >= 2}
+    jmb = max([class_mb(hist, k, c["capmb"], c["capmb"], c["hn"], c["margin"]) for k in recent] or [c["capmb"]])
+    amb = class_mb(hist, "agent", c["agmb"], 0, c["hn"], c["margin"])
+    rj, rc, rm, ra, ram = (int(fl(p.get(k))) for k in ("cap_rj", "cap_rc", "cap_rm", "cap_ra", "cap_ram"))
+    t = list(((p.get("pueue") or {}).get("tasks") or {}).values())
+    qd = sum(1 for x in t if x.get("group") in ("jobs", "gates") and "Queued" in str(x.get("status")))
+    qd += int(fl(p.get("wait_jobs"))) + int(fl(p.get("wait_gates")))
+    here = [u for u in units if (u.get("build") or u.get("host")) == n and u.get("state") not in ("done", "failed", "gone", "idle")]
+    on = [u for u in units if u.get("host") == n and u.get("state") not in ("done", "failed", "gone", "idle")]
+    agents_mb = max(ram, len(on) * amb)   # every open agent on the host holds the agent figure (reservation files of api agents at least)
+    slots = max(1, min(c["cores"] // c["cpj"], (c["memcap"] - agents_mb) // max(jmb, 1)))
+    pause = p.get("cap_pause", "")
+    free = 0 if pause else max(0, min((c["cores"] - rc) // c["cpj"], (c["memcap"] - rm - agents_mb) // max(jmb, 1)))
+    if rj == 0 and not pause: free = max(free, 1)
+    return {**c, "jmb": jmb, "amb": amb, "rj": rj, "rc": rc, "rm": rm, "ra": ra, "agents_mb": agents_mb, "queued": qd, "slots": slots,
+            "free": free, "pause": pause, "agents": [u["name"] for u in here], "on": len(on), "hist": hist, "res": p.get("res", [])}
+
+def next_free(hc):
+    """When a build reservation is expected to free: the earliest (start + median run time of its class) of the running jobs."""
+    ends = []
+    for r in hc["res"]:
+        f = r.split()
+        if len(f) >= 5 and f[3].isdigit():
+            s = class_secs(hc["hist"], f[4])
+            if s: ends.append(int(f[3]) + s)
+    return min(ends) if ends else None
+
+def build_room(cfg, n, hc, kind="implement"):
+    """(ok, why) for one more agent whose builds and tests run on host n (orch-fixes8 item 3): it needs a free build reservation
+    there (agents for the host < its build slots), or a bounded queue position: at most one queued job per running job, and
+    no more agents than twice the slots. A paused host takes none. Refusals say when to expect room."""
+    if kind in cfg.capc.get("no_build_kinds", []): return True, "no builds"
+    a = len(hc["agents"]); s = hc["slots"]
+    if hc["pause"]: return False, f"{n} admission paused ({hc['pause']}); retry when it clears (running jobs are not killed)"
+    if a < s: return True, f"build reservation {a + 1} of {s} on {n}"
+    used = max(hc["queued"], a - s)   # queue positions in use: jobs queued now, or agents past the slots (each may queue one)
+    if a < 2 * s and used < hc["rj"]: return True, f"queue position on {n} ({used} of {hc['rj']} in use: one queued job per running job)"
+    nf = next_free(hc)
+    when = (f"a build slot should free about {ts(nf)}" if nf and nf > now() else "a build slot frees when a running job ends") + \
+           (f", or when one of {', '.join(hc['agents'][:4])} closes" if hc["agents"] else "")
+    return False, (f"{n} build capacity full: {a} agent(s) for {s} build slot(s) + {s} queue position(s); {hc['rj']} running, "
+                   f"{hc['queued']} queued; {when}")
 
 # ---------------------------------------------------------------- the API ledger (orch owns it) and the secret store
 # One TSV per provider ([providers.<p>] ledger), one row per event:  ts  unit  running|<cost>  <budget>|done rc=<x>  <run id>.
@@ -573,11 +822,11 @@ def secs(et):
 def proc_findings(cfg):
     """On this machine (the Mac): CPU burners an agent started (busy over 10 min, under an agent or orphaned from one), and test
     or build runs outside the pueue lanes (orch run / orch gate put them in a lane)."""
-    rc, o, e = sh(["ps", "-Aww", "-o", "pid=,ppid=,pcpu=,etime=,command="], timeout=10)
-    t = {}
+    rc, o, e = sh(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,pcpu=,etime=,command="], timeout=10)
+    t, pg = {}, {}
     for l in o.splitlines():
-        f = l.split(None, 4)
-        if len(f) == 5 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), fl(f[2]), f[3], f[4])
+        f = l.split(None, 5)
+        if len(f) == 6 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), fl(f[3]), f[4], f[5]); pg[int(f[0])] = int(f[2])
     up = lambda p: [q for q in ancestors({k: (v[0],) for k, v in t.items()}, p)[1:]]
     launchers = {os.path.basename(m["launcher"]) for m in cfg.models.values() if m.get("launcher")}   # older project launchers
     F = []
@@ -586,10 +835,57 @@ def proc_findings(cfg):
         anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "orch.py api-run" in t[q][3] or any(x in t[q][3] for x in launchers)), None)
         lane = any("pueued" in t[q][3] for q in anc)
         if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
-            F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; stop its unit with orch stop"))
+            F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}"))
+            cfg._viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
+                              "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": env_unit(p)})
         if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc):
             F.append((f"localtest:{p}", f"test/build run on this machine outside the pueue lanes (pid {p}, {et}): {c[:70]}; use orch run"))
     return F
+
+def env_unit(pid):
+    """ORCH_UNIT of a local process (macOS ps -E appends the environment after the command), or None."""
+    rc, o, e = sh(["ps", "-Eww", "-p", str(pid), "-o", "command="], timeout=10)
+    rc2, c, e2 = sh(["ps", "-ww", "-p", str(pid), "-o", "command="], timeout=10)
+    m = re.search(r"(?:^|\s)ORCH_UNIT=(\S+)", o[len(c.rstrip("\n")):] if o.startswith(c.rstrip("\n")) else "")
+    return m.group(1) if m else None
+
+# Stop a process group after one warning (register item 23): TERM the group, KILL what is left after 5 s. When the group also
+# holds an agent (claude, codex) or pueued, only the process and its descendants are stopped, never the agent.
+STOP_GROUP = r'''p=%(pid)d g=%(pgid)d
+kids() { ps -A -o pid=,ppid= | awk -v r=$p '{pp[$1] = $2} END {q[r] = 1; do {c = 0; for (x in pp) if (!(x in q) && (pp[x] in q)) {q[x] = 1; c = 1}} while (c); for (x in q) print x}'; }
+if [ "$g" -gt 1 ] && ! ps -A -o pgid=,args= | awk -v g=$g '$1 == g' | grep -Eq '(^|/)(claude|codex)( |$)|node .*(claude|codex)|pueued'; then
+  kill -TERM -$g 2>/dev/null; sleep 5; kill -KILL -$g 2>/dev/null; echo "group $g stopped"
+else
+  t=$(kids); kill -TERM $t 2>/dev/null; sleep 5; kill -KILL $t 2>/dev/null; echo "process $p and its children stopped (group $g holds the agent)"
+fi'''
+
+def enforce(cfg, F):
+    """Warn, then stop (orch-fixes8; register items 22, 23). The first time a violation is seen its unit gets a board direction;
+    when it is still there [enforce] grace_min (default 5) later, a CPU burner's process group is stopped (stop_burners,
+    default true) and a remote direct build's (stop_direct, default false: flagged and warned only). Running lane jobs are
+    never touched. Only the registered orchestrator's check and the watcher act; anyone else only reports."""
+    ec = cfg.c.get("enforce", {}); grace = ec.get("grace_min", 5) * 60; st = cfg.jget("enforce.json"); new = {}; notes = {}
+    for v in getattr(cfg, "_viol", []):
+        s = st.get(v["key"]) or {}; stop_ok = ec.get("stop_burners", True) if v["kind"] == "burner" else ec.get("stop_direct", False)
+        u = v.get("unit")
+        if not s.get("warned"):
+            if u: sh([str(cfg.p("board", "bin/board.sh")), "direct", u, f"orch: your process {v['pid']} ({v['kind']}) on {v['host']} breaks the lane rule: "
+                      + ("stop it now and run builds and tests through the lane" if v["kind"] == "direct" else "stop this CPU burner now") +
+                      (f"; orch stops it at {ts(now() + grace)}" if stop_ok else "")])
+            s = {"warned": now(), "unit": u}; notes[v["key"]] = f"warned {u or 'no unit'} at {ts()}" + (f"; stops at {ts(now() + grace)}" if stop_ok else "")
+        elif stop_ok and not s.get("stopped") and now() - s["warned"] >= grace:
+            h = cfg.hosts[v["host"]]
+            rc, o, e = hrun(h, STOP_GROUP % {"pid": v["pid"], "pgid": v["pgid"] if v["pgid"] != v.get("agent_pgid") else 0}, timeout=30)
+            s["stopped"] = now(); notes[v["key"]] = f"STOPPED after the warning at {ts(s['warned'])}: {o.strip() or e.strip()[:80]}"
+            try: cfg.f("watch.log").open("a").write(f"{ts()} enforce: {v['key']} {notes[v['key']]}\n")
+            except OSError: pass
+            if u:
+                x = all_units(cfg).get(u)
+                if x and x.get("id"): Beads(cfg).comment(x["id"], f"{ts()} orch stopped {v['kind']} pid {v['pid']} on {v['host']} after one warning")
+        else: notes[v["key"]] = (f"warned at {ts(s['warned'])}" + (f"; stopped at {ts(s['stopped'])}" if s.get("stopped") else f"; stops at {ts(s['warned'] + grace)}" if stop_ok else ""))
+        new[v["key"]] = s
+    cfg.jput("enforce.json", new)
+    return [(k, t + (f" [{notes[k]}]" if k in notes else "")) for k, t in F]
 
 SCRIPT_RX = re.compile(r"^(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\s+(?:-\S+\s+)*(/\S+)")
 
@@ -627,9 +923,10 @@ def script_findings():
     return F
 
 def collect_findings(cfg, hs, units, ag, bd_err):
-    F = []
+    F = []; cfg._viol = []
     if bd_err: F.append(("beads", f"beads unavailable: {bd_err}"))
     ws = ws_id(cfg); names = {u["name"] for u in units}
+    for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no build position (host_cap)
     un = cfg.jget("hosts.json")
     ready = 0
     try: ready = len(ready_work(cfg))
@@ -640,12 +937,29 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); units there: {', '.join(qd) or 'none'}"))
             continue
         r, why = room(cfg, n, p, units)
-        mg = margins(cfg.hosts[n], p)
+        mg = margins(cfg.hosts[n], p, cfg=cfg)
         low = r < 1 and p.get("avail_mb") and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6
         if mg or low:   # the key names the kinds (load, memory, disk), so an ack of one never hides another (H12)
             kinds = sorted({w.split()[0] for w in mg} | ({"memory"} if low else set()))
             F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}"))
         elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} but {ready} unit(s) are ready: orch launch"))
+        hc = host_cap(cfg, n, p, units)
+        if hc["pause"]:   # back-pressure (orch-fixes8 item 2): reported, never acted on by killing
+            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits"))
+        # one scheduler per host (item 1): any other job-running process, or an old queue that still runs or holds work
+        sch = list(p.get("sched", []))
+        lg, lr = int(fl(p.get("legacy_wait"))), int(fl(p.get("legacy_run")))
+        if lg or lr: sch.append(f"old queue: {lr} running, {lg} waiting (legacy_probe)")
+        unt = [x for x in p.get("res", []) if " untracked " in x]
+        if unt: sch.append(f"{len(unt)} job(s) running without an orch reservation ({', '.join(x.split()[-1] for x in unt[:3])})")
+        if sch: F.append((f"scheduler:{n}", f"host {n} has job-running work outside its orch lanes, which must be the only admission: "
+                          + "; ".join(sch[:4])[:300] + ": retire the old queue (or move its jobs to orch run)"))
+        for d in p.get("direct", []):   # remote lane enforcement (register item 22)
+            f = d.split(None, 4)
+            if len(f) < 4 or not f[0].isdigit(): continue
+            F.append((f"direct:{n}:{f[0]}", f"agent {f[2]} runs a build or test directly on {n} (pid {f[0]}, {int(fl(f[3])) // 60} min, outside the lanes): "
+                      f"{(f[4] if len(f) > 4 else '')[:80]}; it must use {cfg.hosts[n].get('root', '~')}/run/{f[2]}.lane"))
+            cfg._viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
             lab = t.get("label") or ""
@@ -690,7 +1004,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         k = sum(1 for u in units if u.get("host") == n)
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
     F += gate_findings(cfg)
-    F += lane_findings(cfg, hs)
+    F += lane_findings(cfg, hs, units)
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg) + script_findings()
     for n, pv in cfg.prov.items():
         if "ledger" in pv:
@@ -700,7 +1014,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
                 F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
                           + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": orch ledger check"))
-    F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs)
+    F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units)
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
@@ -718,22 +1032,18 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     if sys.platform == "darwin" and sh(["launchctl", "list", "com.orch.watch"])[0]: F.append(("watcher", "watcher com.orch.watch is not running: run install"))
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap"))
+    if not cfg.ro and not DRY: F = enforce(cfg, F)
     return F
 
 def tune_pueue(cfg, hs, units):
-    """Set each reachable host's jobs and agents parallel limits from measured room (kept at least 1). jobs: running jobs plus
-    (avail - reserve) / job_gb, capped by cores (each job still passes its own measured admission). agents: running agents plus (avail - reserve) /
-    agent_gb, capped by the owner's caps (caps.host, and caps.total minus the agents on other hosts)."""
-    caps = cfg.caps
+    """Set each reachable host's pueue limits: jobs = cores // cores_per_job (admission by reservations decides what starts),
+    agents = running agents plus the agents that fit by reservations (room), capped by the owner's caps."""
     for n, p in hs.items():
         t = p.get("pueue")
         if not p["ok"] or not t: continue
-        h = cfg.hosts[n]; groups = t.get("groups") or {}; free = fl(p.get("avail_mb")) / 1024 - h.get("reserve_gb", 2)
+        h = cfg.hosts[n]; groups = t.get("groups") or {}
         run = lambda grp: sum(1 for x in (t.get("tasks") or {}).values() if x.get("group") == grp and "Running" in str(x.get("status")))
-        want = {"jobs": min(h.get("cores", 4), run("jobs") + int(free // h.get("job_gb", 2))),
-                "agents": run("agents") + int(free // h.get("agent_gb", 1.0))}
-        if caps.get("host", {}).get(n) is not None: want["agents"] = min(want["agents"], caps["host"][n])
-        if caps.get("total") is not None: want["agents"] = min(want["agents"], caps["total"] - sum(1 for u in units if u.get("host") != n))
+        want = {"jobs": slots(h, cfg), "agents": run("agents") + room(cfg, n, p, units)[0]}
         for grp, w in want.items():
             w = max(1, w); g = groups.get(grp)
             if g and g.get("parallel_tasks") != w: hrun(h, f"{pueue(h)} parallel -g {grp} {w}")
@@ -911,8 +1221,13 @@ def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env):
     root = h["root"]; fifo = f"{root}/run/{name}.key"; od = f"{root}/out/{name}"; q = shlex.quote
     mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p MemoryMax={mm} -- " if mm else ""
     ex = "".join(f"export {k}={q(v)}\n" for k, v in env.items())
+    rd = h["_rd"]; amb = cap_nums(cfg, h)["agmb"]
+    # the agent's reservation (runs/agent-<unit>.res, its pid: exec keeps it) and a sampler that records the agent class's peak
+    res = (f"RD={rd}; if [ -f $RD/cap.sh ]; then . $RD/cap.sh; echo \"$$ 0 $(cap_mb agent {amb} 0) $(date +%s) agent\" > $RD/agent-{name}.res\n"
+           f"  ( t0=$(date +%s); pk=0; while kill -0 $$ 2>/dev/null; do v=$(tree_mb $$); [ \"${{v:-0}}\" -gt $pk ] && pk=$v; sleep 10; done\n"
+           f"    cap_record agent $pk $(( $(date +%s) - t0 )) 0; rm -f $RD/agent-{name}.res ) </dev/null >/dev/null 2>&1 &\nfi\n")
     script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export {var}=$K; unset K\n"
-              f"cd {q(rcwd)} || exit 1\nexec {sd}{shlex.join(api_argv(pv, mc, budget, prompt))} < /dev/null > {od}/api.json 2> {od}/api.err\n")
+              f"cd {q(rcwd)} || exit 1\n{res}exec {sd}{shlex.join(api_argv(pv, mc, budget, prompt))} < /dev/null > {od}/api.json 2> {od}/api.err\n")
     if DRY: return X(h, f"mkfifo {fifo}; write {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {rcwd} --print-task-id -- sh {root}/run/{name}.sh; key | ssh cat > {fifo}")
     rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo}")
     if rc: return rc, o, e
@@ -950,9 +1265,18 @@ def cmd_api_run(cfg, a):
     del key, env
     fwd = lambda s, _f: p.send_signal(s)   # pueue kill / orch stop: the agent stops too, and its done row is still written
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(s, fwd)
+    # the agent's reservation on this host (runs/agent-<unit>.res) while it runs; its peak memory goes to the history (class agent)
+    h = cfg.hosts.get(hn, {"_rd": str(cfg.f("runs"))}); rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True); t0 = now(); peak = 0
+    try: hist = (rd / "history.tsv").read_text().splitlines()
+    except OSError: hist = []
+    n = cap_nums(cfg, h); resf = rd / f"agent-{name}.res"
+    atomic_write(resf, f"{p.pid} 0 {class_mb(hist, 'agent', n['agmb'], 0, n['hn'], n['margin'])} {int(t0)} agent\n")
     while True:
-        try: rc = p.wait(); break
+        try: rc = p.wait(timeout=10); break
+        except subprocess.TimeoutExpired: peak = max(peak, tree_rss_mb(p.pid))
         except InterruptedError: continue
+    resf.unlink(missing_ok=True)
+    if peak: record_history(rd, "agent", peak, int(now() - t0), rc)
     cost, reported = run_cost(od / "api.json", a.budget)
     ledger_done(cfg, pv, run, name, cost, rc)
     say(f"orch api-run {name}: exit {rc}, cost ${cost:.4f}" + ("" if reported else " (no cost reported: charged the whole budget)"))
@@ -979,11 +1303,11 @@ def clean_pueue_script(h):
 
 def lane_runner(cfg, hn, h, name, rcwd):
     """<root>/run/<unit>.lane on host h: `lane <command>` runs the command in the agent's tree through this host's pueue jobs lane,
-    with orch's admission (runs/admit.sh) and MemoryMax, waits, prints the log and exits with its code (M9; fixes5 item 2)."""
+    with orch's admission (runs/cap.sh: reservations) and MemoryMax, waits, prints the log and exits with its code (M9; fixes5 item 2)."""
     a = argparse.Namespace(lane="jobs", subdir=None, usb=False, wt=rcwd)
     rd = runs_dir(cfg, h); q = shlex.quote
     crd = in_container(h, rd)   # the runs dir as the job sees it
-    js = job_script(cfg, hn, h, a, name, f"bash {crd}/__JID__.cmd", "__JID__", wd=rcwd)
+    js = job_script(cfg, hn, h, a, name, f"bash {crd}/__JID__.cmd", "__JID__", wd=rcwd, clsrc='"$(cat $R.cmd)"')
     return ("#!/bin/bash\n# orch lane runner for unit " + name + f" on {hn}: lane <command>\nRD={q(rd)}; mkdir -p $RD\n"
             f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=$RD/$jid\nprintf '%s\\n' \"$*\" > $R.cmd\n"
             f"cat > $R.sh <<'ORCH_JOB_EOF'\n{js}ORCH_JOB_EOF\nsed -i \"s/__JID__/$jid/g\" $R.sh\n"
@@ -1015,8 +1339,27 @@ def place(cfg, a, brief, mc, units, hs):
     if not want:
         st = cfg.p("out", "out") / "linux-host" / a.unit
         want = st.read_text().strip() if st.is_file() else None
-    if want and want in allowed: return [want], f"tests run on {want}"
-    return allowed, ("tests run on " + want + ", but " + a.unit + "'s model is not allowed there; " if want else "") + "most room"
+    if want and want in allowed: return [want], f"tests run on {want}", want
+    if want and want not in cfg.hosts: want = None
+    return allowed, ("tests run on " + want + ", but " + a.unit + "'s model is not allowed there; " if want else "") + "most room", want
+
+def choose(cfg, a, brief, mc, units, hs):
+    """(agent host, build host, why) for a new unit, or Err saying why not and when to expect room. The agent host has room for
+    one more agent by reservations (room); the build host (where its builds and tests run: placement, else the agent host) has
+    a free build reservation or a bounded queue position (build_room, orch-fixes8 item 3)."""
+    hosts, why_place, want = place(cfg, a, brief, mc, units, hs)
+    if a.host and a.host not in cfg.hosts: raise Err(f"unknown host {a.host}")
+    best, bn, notes = None, 0, []
+    for n in hosts:
+        r, why = room(cfg, n, hs[n], units, a.kind == "cleanup")
+        if r < 1: notes.append(f"{n}: {why}"); continue
+        b = want or n
+        if not hs.get(b, {}).get("ok"): notes.append(f"{n}: build host {b} unreachable"); continue
+        ok, bw = build_room(cfg, b, host_cap(cfg, b, hs[b], units), a.kind)
+        if not ok: notes.append(bw); continue
+        if r > bn: best, bn = (n, b, f"{why_place}; {bw}"), r
+    if not best: raise Err("refused, no room (" + "; ".join(dict.fromkeys(notes)) + ")")
+    return best
 
 RESUME_RX = re.compile(r"^REPORT:\s*`?(\S+?)`?\s*$|continue (?:the same|its|the original) report:?\s+`?(\S+?REPORT\.md)", re.M | re.I)
 
@@ -1078,26 +1421,26 @@ def cmd_launch(cfg, a):
         if not ok: raise Err(f"model {a.model}: {w}")
     mname = a.model or pick_model(cfg, a.tier, a.kind, of.get("vendor") if of else None, a.host)
     mc = cfg.models[mname]
-    hs = probe_all(cfg); hosts, why_place = place(cfg, a, brief, mc, units, hs)
-    best, bn, notes = None, 0, []
-    for n in hosts:
-        r, why = room(cfg, n, hs[n], units, a.kind == "cleanup")
-        if r < 1: notes.append(f"{n}: {why}")
-        elif r > bn: best, bn = n, r
-    if not best: raise Err("refused, no host has room (" + "; ".join(notes) + ")")
-    hn = best; h = cfg.hosts[hn]; local = h.get("local", False)
+    hs = getattr(a, "probes", None) or probe_all(cfg)
+    ag = herdr_agents(cfg) if not getattr(a, "probes", None) else {}
+    for x in units: x.setdefault("state", unit_state(x, hs, ag))   # finished units hold no build position
+    hn, build, why_place = choose(cfg, a, brief, mc, units, hs)
+    h = cfg.hosts[hn]; local = h.get("local", False)
     cwd = cfg.p("worktrees", "worktrees") / name
     cwd = (Path(a.cwd) if a.cwd else cwd if cwd.is_dir() else cfg.root).resolve()
     shared = [u["name"] for u in units if u.get("cwd") and Path(u["cwd"]).resolve() == cwd and u["name"] != name and cwd != cfg.root.resolve()]
+    if shared and getattr(a, "share_with", None): shared = [x for x in shared if x != a.share_with]   # orch land's merge unit
     if shared and not (local and a.kind in ("review", "audit")):
         raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}; give the unit its own worktree (H9)")
     if main_checkout(cwd) and not a.allow_main: raise Err(f"refused: {cwd} is a main checkout with linked worktrees; use a worktree (or --allow-main)")
     outd = cfg.p("out", "out") / name; outd.mkdir(parents=True, exist_ok=True)
     rbrief, rcwd = str(brief), str(cwd)
-    say(f"launch {name}: model={mname} host={hn} ({why_place}) cwd={cwd}")
     budget = None
     if mc["kind"] == "api":
-        budget = a.budget if a.budget is not None else cfg.prov[mc["provider"]].get("budget_per_unit", 15)
+        budget, bwhy = (a.budget, "--budget") if a.budget is not None else budget_for(cfg, mc, a.kind, a.tier)
+        why_place += f"; budget ${budget:g} ({bwhy})"
+    say(f"launch {name}: model={mname} host={hn} builds on {build} ({why_place}) cwd={cwd}")
+    if mc["kind"] == "api":
         read_secret(cfg.prov[mc["provider"]])   # the secret store answers before anything is reserved or recorded
         ok, w = model_ok(cfg, mname)
         if not ok and "ledger" in w: raise Err(f"refused: {w}")
@@ -1108,7 +1451,7 @@ def cmd_launch(cfg, a):
         t = report.read_text().split("\n", 1)
         if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not DRY: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
-    u = {"host": hn, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
+    u = {"host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
     if report: u["report"] = str(report); u["resume"] = True
     item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
@@ -1129,6 +1472,7 @@ def cmd_launch(cfg, a):
             # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
             X(h, f"rm -rf {root}/base/{name} && cp -a {rcwd} {root}/base/{name}", timeout=300)
             put_script(h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
+            if not DRY: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
             put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local) + brief.read_text(), "644")
             if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
                 put_script(h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
@@ -1138,7 +1482,8 @@ def cmd_launch(cfg, a):
         prompt = agent_prompt(cfg, name, rbrief, hn)
         u["rcwd"] = rcwd
         if mc["kind"] == "api":
-            X(h, ensure_lanes(h))
+            X(h, ensure_lanes(h, cfg))
+            if local and not DRY: write_cap(cfg, hn, h)
             # the budget is reserved (cap check and the run's running row, under the ledger's lock) before anything is queued
             run = reserve_budget(cfg, mc, name, budget); u["run"] = run
             if local:
@@ -1418,12 +1763,17 @@ def backlog_findings(cfg, hs, units):
     todo = [(r[8:], i.get("title", "")[9:]) for r, i in iss.items()
             if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or []) and r[8:] not in cov]
     if not todo: return F
-    for n, p in hs.items():
-        if not p.get("ok"): continue
-        r, why = room(cfg, n, p, units)
-        if r > 0:
-            F.append((f"idle-backlog:{n}", f"host {n} has room for {r} while {len(todo)} backlog item(s) have no open unit: write briefs for: "
-                      + "; ".join(t[:50] for _, t in todo[:6]) + ("..." if len(todo) > 6 else "") + " (then orch launch --item <id>)"))
+    plan, stops = fill_plan(cfg, hs, units)
+    if plan:   # orch-fixes8 item 4: how many ready units with briefs fit now
+        per = {}
+        for x in plan: per[x[3]] = per.get(x[3], 0) + 1
+        F.append(("idle-with-backlog", f"{len(plan)} ready backlog unit(s) with briefs would fit now ({', '.join(f'{k}: {v}' for k, v in per.items())}): "
+                  + ", ".join(x[0] for x in plan[:6]) + ("..." if len(plan) > 6 else "") + "; run orch fill (orch fill --dry-run shows why it stops there)"))
+    briefed = {x[2] for x in fill_candidates(cfg, units)}
+    nob = [(i, t) for i, t in todo if i not in briefed]
+    if nob and any(room(cfg, n, p, units)[0] > 0 for n, p in hs.items() if p.get("ok")):
+        F.append(("idle-backlog:nobrief", f"{len(nob)} ready backlog item(s) have no unlaunched brief while hosts have room: write briefs (ITEM: <id> line) for: "
+                  + "; ".join(t[:50] for _, t in nob[:6]) + ("..." if len(nob) > 6 else "")))
     return F
 
 def gate_results(cfg):
@@ -1474,6 +1824,214 @@ def landing_findings(cfg, units, hs=None):
             F.append((f"landing:{u['name']}:unlanded", f"{u['name']}: gate(s) {', '.join(passed)} passed, finished {age:.0f} min ago, not landed: land it, then orch close"))
     return F
 
+# ---------------------------------------------------------------- budgets from history, spend so far (orch-fixes8 item 5)
+# A unit's default budget is the median cost of the past finished runs of its kind and tier (ledger done rows joined to the
+# units that ran them), plus [budget] margin_pct; with fewer than min_runs runs, the provider's budget_per_unit. A running
+# API unit's spend so far is estimated from its Claude Code transcript (tokens per model, priced at the rate learned from
+# finished runs' api.json), so check can say when a unit nears its budget with its report not updated.
+BUDGET_DEFAULTS = {"margin_pct": 30, "min_runs": 3, "min_usd": 0.5, "max_usd": None, "warn_pct": 80, "report_stale_min": 10,
+                   "token_weights": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.1}}
+
+def bset(cfg, k): return cfg.c.get("budget", {}).get(k, BUDGET_DEFAULTS[k])
+
+def all_units(cfg):
+    """Every unit ever recorded (open and closed): {name: meta}; the latest record of a name wins."""
+    if getattr(cfg, "_all_units", None) is None:
+        try:
+            r = Beads(cfg).run("list", "--label", "unit", "--all", "-n", "0")
+            r = r.get("issues", r) if isinstance(r, dict) else r
+        except Err: r = []
+        out = {}
+        for i in sorted(r, key=lambda i: i.get("created_at", "")):
+            t = i.get("title", "")
+            if not t.startswith("unit:"): continue
+            try: m = json.loads(i.get("notes") or "{}")
+            except Exception: m = {}
+            out[t[5:]] = {**m, "id": i["id"], "name": t[5:], "status": i.get("status")}
+        cfg._all_units = out
+    return cfg._all_units
+
+def cost_history(cfg, provider):
+    """{(kind, tier): [cost of each finished run]} of a provider, oldest first."""
+    pv = cfg.prov[provider]
+    if "ledger" not in pv: return {}
+    runs = ledger_read(cfg, pv)[0]; us = all_units(cfg); byrun = {u.get("run"): u for u in us.values() if u.get("run")}
+    out = {}
+    for k, r in runs.items():
+        if not r["done"] or r["cost"] is None: continue
+        u = byrun.get(k) or us.get(r["unit"])
+        if not u or not u.get("kind"): continue
+        out.setdefault((u["kind"], u.get("tier") or "normal"), []).append(r["cost"])
+    return out
+
+def budget_for(cfg, mc, kind, tier):
+    """(budget USD, why) for a new API unit of this kind and tier."""
+    pv = cfg.prov[mc["provider"]]; d = pv.get("budget_per_unit", 15)
+    c = cost_history(cfg, mc["provider"]).get((kind, tier), [])
+    if len(c) < bset(cfg, "min_runs"): return d, f"budget_per_unit; {len(c)} past {kind}/{tier} run(s), {bset(cfg, 'min_runs')} needed to learn"
+    s = sorted(c); med = s[len(s) // 2] if len(s) % 2 else (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2
+    b = max(bset(cfg, "min_usd"), -(-med * (100 + bset(cfg, "margin_pct")) / 100 * 2 // 1) / 2)   # rounded up to $0.50
+    if bset(cfg, "max_usd"): b = min(b, bset(cfg, "max_usd"))
+    return b, f"median ${med:.2f} of {len(c)} past {kind}/{tier} run(s) + {bset(cfg, 'margin_pct')}%"
+
+def token_cost(usage, w, rate):
+    """Dollars for a usage dict (api.json usage or transcript message usage) at rate $ per weighted token."""
+    return rate * (w["input"] * usage.get("input_tokens", usage.get("inputTokens", 0)) + w["output"] * usage.get("output_tokens", usage.get("outputTokens", 0))
+                   + w["cache_write"] * usage.get("cache_creation_input_tokens", usage.get("cacheCreationInputTokens", 0))
+                   + w["cache_read"] * usage.get("cache_read_input_tokens", usage.get("cacheReadInputTokens", 0)))
+
+def learned_rates(cfg):
+    """{model id: $ per weighted token}, from the modelUsage of the newest finished api.json files (cost / weighted tokens)."""
+    if getattr(cfg, "_rates", None) is not None: return cfg._rates
+    w = bset(cfg, "token_weights"); acc = {}
+    fs = sorted(cfg.p("out", "out").glob("*/api.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:60]
+    for f in fs:
+        try: mu = json.loads(f.read_text()).get("modelUsage") or {}
+        except Exception: continue
+        for m, x in mu.items():
+            wt = token_cost(x, w, 1.0)
+            if wt > 0 and isinstance(x.get("costUSD"), (int, float)): a = acc.setdefault(m, [0.0, 0.0]); a[0] += x["costUSD"]; a[1] += wt
+    cfg._rates = {m: c / wt for m, (c, wt) in acc.items() if wt}
+    return cfg._rates
+
+def transcript_of(cfg, u):
+    """The Claude Code transcript of a local API unit: under ~/.claude/projects/<its cwd>, started after the unit, whose first
+    prompt names its brief."""
+    d = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9-]", "-", str(u.get("rcwd") or u.get("cwd") or ""))
+    try: fs = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError: return None
+    for f in fs[:20]:
+        if f.stat().st_mtime < u.get("started", 0): break
+        try:
+            with open(f) as fh: head = "".join(next(fh, "") for _ in range(8))
+        except OSError: continue
+        if u.get("brief") and (u["brief"] in head or Path(u["brief"]).name in head): return f
+    return None
+
+def unit_spend(cfg, u):
+    """(dollars so far, how known) of an API unit: its api.json cost when finished, else its transcript priced at the learned
+    rate; (None, why) when it cannot be told (remote, no transcript, no learned rate)."""
+    try:
+        c = json.loads((cfg.p("out", "out") / u["name"] / "api.json").read_text()).get("total_cost_usd")
+        if isinstance(c, (int, float)): return float(c), "api.json"
+    except Exception: pass
+    if not cfg.hosts.get(u.get("host"), {}).get("local"): return None, "remote"
+    f = transcript_of(cfg, u)
+    if not f: return None, "no transcript"
+    rates = learned_rates(cfg); w = bset(cfg, "token_weights"); seen = {}; model = None
+    for l in open(f, errors="replace"):
+        if '"usage"' not in l: continue
+        try: d = json.loads(l)
+        except Exception: continue
+        m = d.get("message") or {}
+        if d.get("type") == "assistant" and isinstance(m, dict) and m.get("usage"): seen[m.get("id") or len(seen)] = (m.get("model"), m["usage"]); model = m.get("model") or model
+    if not seen: return 0.0, "transcript"
+    tot = 0.0
+    for mdl, us in seen.values():
+        r = rates.get(mdl) or (sum(rates.values()) / len(rates) if rates else None)
+        if r is None: return None, "no learned rate (no finished api.json yet)"
+        tot += token_cost(us, w, r)
+    return tot, "transcript"
+
+def budget_findings(cfg, units):
+    F = []
+    for u in units:
+        if u.get("state") not in ("working", "queued") or not u.get("budget"): continue
+        sp, how = unit_spend(cfg, u)
+        if sp is None or sp < bset(cfg, "warn_pct") / 100 * u["budget"]: continue
+        try: age = (now() - report_path(cfg, u).stat().st_mtime) / 60
+        except OSError: age = (now() - u.get("started", now())) / 60
+        if age >= bset(cfg, "report_stale_min"):
+            F.append((f"budget80:{u['name']}", f"{u['name']} has spent about ${sp:.2f} of its ${u['budget']:g} budget ({100 * sp / u['budget']:.0f}%, {how}) "
+                      f"and its report has not changed for {age:.0f} min: direct it to write its state to the report now (board.sh direct), "
+                      f"or stop it and resume with a larger --budget (--resume-of keeps its report)"))
+    return F
+
+# ---------------------------------------------------------------- fill: launch ready work up to capacity (orch-fixes8 item 4)
+BRIEF_KEYS = re.compile(r"^(ITEM|KIND|TIER|TEST-HOST|PRIORITY):\s*(\S+)", re.M)
+
+def brief_index(cfg):
+    """[(path, unit name, {ITEM, KIND, TIER, TEST-HOST, PRIORITY}, head text)] of every brief, newest first."""
+    out = []
+    for f in sorted(cfg.p("briefs", "briefs").glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with open(f, errors="replace") as fh: head = "".join(next(fh, "") for _ in range(12))
+        except OSError: continue
+        out.append((f, f.stem, {k: v.rstrip(".,;") for k, v in BRIEF_KEYS.findall(head)}, head))
+    return out
+
+def fill_candidates(cfg, units):
+    """Ready backlog items with a brief and no unit, highest priority first: [(priority, order, item, brief path, unit name,
+    kind, tier)]. Items: the beads backlog (open, backlog-ready; priority from beads), else the checklist (its order). A brief
+    is for an item when its ITEM: line names it (else its first 6 lines name the item id); a brief whose unit name was ever
+    launched, or that already has a report, is spent. Without ITEM: lines the newest such brief of an item is taken."""
+    try: iss = backlog_issues(cfg)
+    except Err: iss = {}
+    if iss: items = [(int(i.get("priority", 2) if i.get("priority") is not None else 2), n, r[8:], i.get("title", "")[9:]) for n, (r, i) in enumerate(iss.items())
+                     if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or [])]
+    else: items = [(int(2), n, i, t) for n, (i, t, st, d, rd) in enumerate(backlog_items(cfg) or []) if rd]
+    cov = unit_items(cfg, units); ever = all_units(cfg); out = []; idx = brief_index(cfg); taken = set()
+    for pr, order, item, title in sorted(items):
+        if item in cov: continue
+        rx = re.compile(r"(?<![A-Za-z0-9])" + re.escape(item) + r"(?![A-Za-z0-9])", re.I)
+        for f, name, keys, head in sorted(idx, key=lambda x: "ITEM" not in x[2]):
+            if keys.get("ITEM"):
+                if keys["ITEM"].lower() != item.lower(): continue
+            elif not rx.search("\n".join(head.splitlines()[:6])): continue
+            if name in ever or name in taken or (cfg.p("out", "out") / name / "REPORT.md").exists(): continue
+            if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): continue
+            tier = "critical" if keys.get("TIER", "").upper() in ("CRITICAL", "HIGH") else "normal"
+            kind = keys.get("KIND", "implement").lower()
+            pr2 = int(keys["PRIORITY"]) if keys.get("PRIORITY", "").isdigit() else pr
+            out.append((pr2, order, item, f, name, kind if kind in ("implement", "review", "audit", "cleanup") else "implement", tier)); taken.add(name)
+            break
+    return sorted(out, key=lambda x: (x[0], x[1]))
+
+def fill_plan(cfg, hs, units, limit=None):
+    """(plan [(name, item, model, agent host, build host, budget, why)], stops [why the rest does not launch now]): candidates
+    in priority order, each placed by choose() against the open units plus those planned before it, until the hosts'
+    reservations or the provider budgets are used."""
+    plan, stops, virt, spent = [], [], [dict(u) for u in units], {}
+    cands = fill_candidates(cfg, units)
+    if not cands: return plan, ["no ready backlog item has an unlaunched brief (write briefs with an ITEM: <id> line)"]
+    for pr, order, item, f, name, kind, tier in cands:
+        if limit and len(plan) >= limit: stops.append(f"--max {limit} reached; {len(cands) - len(plan)} more candidate(s)"); break
+        a = argparse.Namespace(unit=name, host=None, test_host=None, kind=kind, tier=tier)
+        try: m = pick_model(cfg, tier, kind, None)
+        except Err as e: stops.append(f"{name}: {e}"); continue
+        mc = cfg.models[m]; budget, bwhy = budget_for(cfg, mc, kind, tier) if mc.get("kind") == "api" else (None, "")
+        pv = cfg.prov.get(mc.get("provider"), {})
+        if budget is not None and "cap_usd" in pv:
+            left = pv["cap_usd"] - committed(cfg, pv) - spent.get(mc["provider"], 0)
+            if left < budget: stops.append(f"budget: {mc['provider']} has ${left:.2f} left, {name} needs ${budget:g}"); break
+        try: hn, b, why = choose(cfg, a, f, mc, virt, hs)
+        except Err as e: stops.append(f"{name} ({item}): {str(e).removeprefix('refused, ')}"); continue
+        if budget is not None: spent[mc["provider"]] = spent.get(mc["provider"], 0) + budget
+        plan.append((name, item, m, hn, b, budget, f"{why}; priority {pr}", kind, tier, f))
+        virt.append({"name": name, "host": hn, "build": b, "state": "working", "item": item})
+    if not stops: stops.append("every ready candidate is planned")
+    return plan, stops
+
+def cmd_fill(cfg, a):
+    """Launch ready backlog units that have briefs, highest priority first, until every host's reservations or the budget are
+    used, and no further. --dry-run lists what it would launch now and why it stops there."""
+    hs = probe_all(cfg); units = Beads(cfg).units(); ag = herdr_agents(cfg)
+    for u in units: u["state"] = unit_state(u, hs, ag)
+    plan, stops = fill_plan(cfg, hs, units, a.max)
+    say(f"fill: {len(plan)} unit(s) fit now" + (" (dry run: nothing launched)" if DRY else ""))
+    for name, item, m, hn, b, budget, why, kind, tier, f in plan:
+        say(f"  {name} [{item}] {kind}/{tier} model {m} on {hn}, builds on {b}" + (f", ${budget:g}" if budget is not None else "") + f": {why}")
+    say("stops: " + "; ".join(dict.fromkeys(stops)))
+    if DRY: return 0
+    rc = 0
+    for name, item, m, hn, b, budget, why, kind, tier, f in plan:
+        la = argparse.Namespace(unit=name, kind=kind, tier=tier, host=None, model=m, brief=str(f), cwd=None, budget=None, test_host=None,
+                                allow_main=False, of=None, report=None, resume_of=None, item=item, dry_run=False)
+        try: cmd_launch(cfg, la)
+        except Err as e: say(f"fill: {name} not launched: {e}"); rc = 1
+    cfg.touch("last_fill")
+    return rc
+
 # ---------------------------------------------------------------- run / gate: build and test jobs in each host's own pueue
 # A job belongs to the host's pueue daemon, never to the ssh connection that queued it: if the caller dies the job keeps running,
 # and its log and exit code stay under <root>/runs/<jid>.{log,rc} on that host for `orch collect <host>:<task>`.
@@ -1483,78 +2041,49 @@ LSSH = [*SSH, "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
 
 def lane_age(cfg, lane): return cfg.c.get("lanes", {}).get(lane, {}).get("age_min", AGE_MIN.get(lane, 120))
 
-def slots(h):
-    """Job caps that fit on the host: (RAM minus measured service use) // job_gb, at least 1."""
-    return max(1, int((h.get("ram_gb", 4) - h.get("services_gb", 0)) // h.get("job_gb", 2)))
+def slots(h, cfg=None):
+    """pueue parallel limit of a host's jobs lane: the jobs its cores hold (cores // cores_per_job). Pueue only orders the
+    work; each job still waits for admission by reservations (runs/cap.sh), which also counts memory."""
+    n = cap_nums(cfg, h); return max(1, n["cores"] // n["cpj"])
 
-def ensure_lanes(h):
-    p = pueue(h); n = slots(h)
+def ensure_lanes(h, cfg=None):
+    p = pueue(h); n = slots(h, cfg)
     g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1} if h.get("local") else {})
     return "; ".join(f"{p} group add -p {k} {g_} >/dev/null 2>&1" for g_, k in g.items()) + "; true"
 
-def runs_dir(cfg, h): return str(cfg.f("runs")) if h.get("local") else f"{h['root']}/runs"
+def runs_dir(cfg, h): return h["_rd"]
 
-def admit_lib(h):
-    """runs/admit.sh for host h, written by every orch run; each waiting job re-reads it every 15 s, so a rule change reaches jobs
-    already waiting, including those queued under older rules (they source it too). Admit while measured MemAvailable >=
-    reserve_gb + the measured per-job working set, memory PSI some avg10 < 5, load1 < 1.5 x cores (the same load rule as
-    orch capacity), disk >= min_disk_gb, and CPU: (running orch jobs + 1) x cores_per_job <= cores (orch-fixes7: load lags,
-    because builds ramp up after they are admitted; 8 jobs on 8 cores ran at load 17). The working set is the largest anonymous
-    memory (memory.stat anon: page cache is reclaimable and not counted, it filled memory.peak up to the cap) of the orch jobs
-    running now (podman hosts: of the containers named by container.name_prefixes), remembered in runs/ws_mb; with nothing
-    measured yet, job_ws_gb (default half of job_gb). It is clamped to job_gb, which stays each job's MemoryMax: the runaway
-    guard, not the admission rule (audit H6)."""
-    cap = int(h.get("job_gb", 2) * 1024); ws0 = int(h.get("job_ws_gb", h.get("job_gb", 2) / 2) * 1024)
-    pod = h.get("runner") == "podman"
-    flt = " ".join(f"--filter name={x}" for x in h.get("container", {}).get("name_prefixes", ["orch-run-"]))
-    ids = f"podman ps -q --no-trunc {flt} 2>/dev/null"
-    return (ADMIT_LIB % {"reserve": int(h.get("reserve_gb", 2) * 1024), "cap": cap, "ws0": ws0, "load10": int(h.get("cores", 4) * 15),
-                         "cores": h.get("cores", 4), "cores10": int(h.get("cores", 4) * 10), "disk": h.get("min_disk_gb", 10),
-                         "cpj": h.get("cores_per_job", 1), "cpj10": int(h.get("cores_per_job", 1) * 10),
-                         "jobs": ids if pod else "ls -d $AS/orch-*.scope",
-                         "peaks": (f'for i in $({ids}); do awk \'/^anon /{{print $2}}\' $US/libpod-$i.scope/memory.stat 2>/dev/null; done' if pod else
-                                   'for s in $AS/orch-*.scope; do awk \'/^anon /{print $2}\' $s/memory.stat 2>/dev/null; done')})
+def write_cap(cfg, hn, h):
+    """Write runs/cap.sh on host h (write-then-rename): waiting jobs pick up the current rule at their next poll."""
+    rd = h["_rd"]
+    if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True); atomic_write(Path(rd) / "cap.sh", cap_lib(cfg, hn, h)); return 0, "", ""
+    return hrun(h, f"mkdir -p {rd} && cat > {rd}/.cap.sh.$$ && mv -f {rd}/.cap.sh.$$ {rd}/cap.sh", inp=cap_lib(cfg, hn, h))
 
-ADMIT_LIB = r'''# orch admission for this host (written by orch run; see admit_lib in orch.py). Re-read by every waiting job each poll.
-U=$(id -u); AS=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/app.slice; US=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/user.slice
-admit_ok() {
-  avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
-  psi=$(awk '/^some/{sub("avg10=","",$2); print int($2)}' /proc/pressure/memory 2>/dev/null); psi=${psi:-0}
-  load=$(awk '{print $1}' /proc/loadavg); load10=$(awk '{printf "%%d", $1 * 10}' /proc/loadavg)
-  d=$(df -Pk $RD | awk 'NR==2{print int($4/1048576)}')
-  pk=$( { %(peaks)s; } | awk '{v = int($1 / 1048576); if (v > m) m = v} END {print m + 0}')
-  if [ "$pk" -gt 0 ]; then echo $pk > $RD/ws_mb.$$ && mv $RD/ws_mb.$$ $RD/ws_mb; ws=$pk; else ws=$(cat $RD/ws_mb 2>/dev/null); fi
-  ws=${ws:-%(ws0)d}; [ "$ws" -gt %(cap)d ] && ws=%(cap)d; [ "$ws" -lt 256 ] && ws=256
-  need_mb=$((%(reserve)d + ws))
-  nj=$( { %(jobs)s; } 2>/dev/null | wc -l | tr -d ' '); cpu10=$(( (nj + 1) * %(cpj10)d ))
-  why="MemAvailable ${avail} MB (need ${need_mb} = reserve %(reserve)d + working set ${ws}), PSI ${psi}, load ${load} (limit 1.5 x %(cores)s cores), disk ${d} GB (floor %(disk)d), CPU $((nj + 1)) x %(cpj)s of %(cores)s cores"
-  [ "$avail" -ge "$need_mb" ] && [ "$psi" -lt 5 ] && [ "$load10" -lt %(load10)d ] && [ "$d" -ge %(disk)d ] && { [ "$nj" -eq 0 ] || [ "$cpu10" -le %(cores10)d ]; }
-}
-'''
-
-ADMIT_LINUX = r'''# Admission: one job at a time under admit.lock, by the host's rule in runs/admit.sh (re-read each poll; admit_lib). An admitted job keeps the lock
-# for 60 s after its scope exists, so its memory shows in MemAvailable before the next job is judged. A jobs-lane job yields
-# while a gates-lane job waits.
-need_mb=%(need)d cores=%(cores)d lane=%(lane)s mindisk=%(disk)d
-AS=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice
-gates_waiting() { for f in $RD/*.gwait; do [ -e "$f" ] && kill -0 "$(cat $f)" 2>/dev/null && return 0; done; return 1; }
+ADMIT = r'''# Admission (orch-fixes8): by reservations, rule in $RD/cap.sh (re-read each poll). One job is judged at a time under the lock;
+# an admitted job writes its reservation ($R.res) before the lock is released. A jobs-lane job yields while a gates job waits.
+[ -f "$RD/cap.sh" ] || { echo "orch: no $RD/cap.sh on this host (orch run or orch launch writes it)"; exit 125; }
+lane=%(lane)s; . "$RD/cap.sh"; CLS=$(cap_class %(clsrc)s)
+if command -v flock >/dev/null 2>&1; then exec 7>>"$RD/admit.lock"; lk() { flock 7; }; ulk() { flock -u 7; }
+else lk() { until mkdir "$RD/admit.d" 2>/dev/null; do sleep 1; done; }; ulk() { rmdir "$RD/admit.d" 2>/dev/null; }; fi
+gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && return 0; done; return 1; }
 W=$R.wait; [ $lane = gates ] && W=$R.gwait; echo $$ > $W
-trap 'rm -f $W' EXIT; trap 'rm -f $W; exit 143' TERM INT HUP   # a job killed while waiting leaves no waiter file (L1)
-exec 7>>$RD/admit.lock
+trap 'rm -f $W $R.res' EXIT; trap 'rm -f $W $R.res; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
+said=
 while :; do
   if [ $lane = gates ] || ! gates_waiting; then
-    flock 7
-    . $RD/admit.sh
-    admit_ok && break
-    [ "$said" = "$why" ] || { echo "orch: waiting for admission: $why"; said=$why; }
-    flock -u 7
+    lk; CAP_RO=; . "$RD/cap.sh"
+    if admit_ok "$CLS"; then echo "$$ $CPJ $MB $(date +%%s) $CLS" > $R.res.$$ && mv -f $R.res.$$ $R.res; ulk; break; fi
+    ulk; [ "$said" = "$BLK" ] || { echo "orch: waiting for admission ($CLS; $BLK): $why"; said=$BLK; }
   fi
-  sleep 15
+  sleep ${ORCH_POLL_S:-15}
 done
-rm -f $W; trap - EXIT TERM INT HUP
-echo "orch: admitted: $why"
-started() { for i in $(seq 20); do [ -d $AS/orch-%(jid)s.scope ] && break; kill -0 $1 2>/dev/null || break; sleep 1; done
-  sleep 60 </dev/null >/dev/null 2>&1 & exec 7>&-; }
+rm -f $W; exec 7>&-; trap 'rm -f $R.res' EXIT
+echo "orch: admitted ($CLS, reserves $CPJ cores and $MB MB): $why"
+run_sampled() {  # run "$@", sample its memory every 5 s, then add class, peak MB, seconds and exit code to $RD/history.tsv
+  t0=$(date +%%s); "$@" & pid=$!; peak=0
+  while kill -0 $pid 2>/dev/null; do v=$(job_mb $pid %(jid)s); [ "${v:-0}" -gt "$peak" ] 2>/dev/null && peak=$v; sleep 5; done
+  wait $pid; rc=$?; cap_record "$CLS" "$peak" $(( $(date +%%s) - t0 )) $rc; return $rc
+}
 '''
 
 def ctr(h):
@@ -1574,27 +2103,28 @@ def remote_wt(h, name):
     if h.get("runner") == "podman": return f"{ctr(h)['mount']}/worktrees/{name}"
     return f"{h.get('worktrees', h.get('root', '$HOME/orch') + '/worktrees')}/{name}"
 
-def job_script(cfg, hn, h, a, name, cmd, jid, wd=None):
+def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     """The bash script pueue runs on the host. Output is tee'd to <runs>/<jid>.log, the exit code written to <jid>.rc.
-    wd: the tree on the host (a remote agent's copy); default the synced worktree of that name. Per host (orch.toml):
-    run_env (shell run first), job_setup (shell run in the worktree before the command), job_log (a line per job start/end),
-    and for runner = "podman" the [hosts.<h>.container] settings."""
-    q = shlex.quote; rd = runs_dir(cfg, h); sub = a.subdir or "."; sub_ = lambda x: str(x).replace("{name}", name).replace("{jid}", jid)
+    Every lane on every host (the Mac too, register item 5) waits for admission by reservations (ADMIT, runs/cap.sh), holds
+    its reservation while it runs, and records its class's peak memory in runs/history.tsv. clsrc: shell text giving the
+    command whose class it is (default the command itself). wd: the tree on the host (a remote agent's copy); default the
+    synced worktree of that name. Per host (orch.toml): run_env (shell run first), job_setup (shell run in the worktree before
+    the command), job_log (a line per job start/end), and for runner = "podman" the [hosts.<h>.container] settings."""
+    q = shlex.quote; rd = h["_rd"]; sub = a.subdir or "."; sub_ = lambda x: str(x).replace("{name}", name).replace("{jid}", jid)
     head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={q(rd)}; R=$RD/{jid}\n"
     setup = h.get("job_setup", ""); log = h.get("job_log", h.get("fleet_log", "/dev/null"))
+    adm = ADMIT % {"lane": a.lane, "clsrc": clsrc or q(cmd), "jid": jid}
     if h.get("local"):
-        adm = ""
-        if a.lane == "land":   # the local landing lane: the disk floor, the host's admit_check, and no legacy_lanes lane busy
+        pre = ""
+        if a.lane == "land":   # the local landing lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
             ck = h.get("admit_check", ""); base = h.get("legacy_lanes", ""); ce = h.get("admit_check_env", "")
-            adm = (f"said=\nwhile :; do d=$(df -Pk {q(str(cfg.root))} | awk 'NR==2{{print int($4/1048576)}}'); busy=\n"
+            pre = (f"said=\nwhile :; do d=$(df -Pk {q(str(cfg.root))} | awk 'NR==2{{print int($4/1048576)}}'); busy=\n"
                    f"  for s in {base}; do o=$(cat $s/pid 2>/dev/null); [ -n \"$o\" ] && kill -0 $o 2>/dev/null && busy=$s; done\n"
                    f"  [ \"$d\" -ge {h.get('min_disk_gb', 5)} ] && {{ [ -z {q(ck)} ] || {ce + ' ' if ce else ''}sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
                    f"  [ \"$said\" ] || {{ echo \"orch: land lane waiting (disk ${{d}} GB, floor {h.get('min_disk_gb', 5)}; old lane busy: ${{busy:-none}})\"; said=1; }}; sleep 15; done\n")
-        body = f"{adm}cd {q(str(Path(a.wt).resolve()))} && cd {q(sub)} || exit $?\nnice -n 10 bash -c {q(cmd)}\n"
+        body = f"{pre}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n 10 bash -c {q(cmd)}\n"
     else:
         cap = int(h.get("job_gb", 2) * 1024)
-        adm = ADMIT_LINUX % {"need": int((h.get("job_gb", 2) + h.get("reserve_gb", 2)) * 1024), "cores": h.get("cores", 4),
-                             "lane": a.lane, "disk": h.get("min_disk_gb", 10), "jid": jid}
         scope = f"systemd-run --user --scope -q --unit=orch-{jid} -p MemoryMax={cap}M --"
         if h.get("runner") == "podman":   # the job runs in the host's container settings, capped at job_gb
             c = ctr(h)
@@ -1607,15 +2137,15 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None):
                     + "".join(f"mkdir -p {q(sub_(d))}\n" for d in c.get("host_dirs", []))
                     + (f"exec 8>{c['usb_lock']}; flock 8\n" if a.usb and c.get("usb_lock") else "") + adm +
                     f"printf '%s orch-run start [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {log}\n"
-                    f"{scope} nice -n 15 ionice -c 3 podman run --rm --init --name orch-run-{jid} {hw}"
+                    f"run_sampled {scope} nice -n 15 ionice -c 3 podman run --rm --init --name orch-run-{jid} {hw}"
                     f"--memory={cap}m --memory-swap={cap}m --cpus={c.get('cpus', h.get('cores_per_job', 2))} -v {c['mount']}:{c['mount_at']} -w {cw} {args} "
-                    f"{c['image']} bash -c {q(inner)} 7>&- &\npid=$!; started $pid; wait $pid; rc=$?\n"
+                    f"{c['image']} bash -c {q(inner)}; rc=$?\n"
                     f"printf '%s orch-run end [%s] {jid} exit %s\\n' \"$(date '+%F %T')\" {name} $rc >> {log}\nexit $rc\n")
         else:
             wd = wd or remote_wt(h, name)
             body = (f"{h.get('run_env', '')}\ncd {wd} && " + (f"({setup}) && " if setup else "") + f"cd {q(sub)} || exit $?\n" + adm +
                     f"printf '%s orch-run [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {log}\n"
-                    f"{scope} nice -n 10 bash -c {q(cmd)} 7>&- &\npid=$!; started $pid; wait $pid\n")
+                    f"run_sampled {scope} nice -n 10 bash -c {q(cmd)}\n")
     return head + "main() {\n" + body + "}\nmain 2>&1 | tee -a $R.log\nrc=${PIPESTATUS[0]}; echo $rc > $R.rc; exit $rc\n"
 
 def sync_wt(cfg, hn, h, src, name):
@@ -1690,9 +2220,8 @@ def cmd_run(cfg, a):
     if not h.get("local"): sync_wt(cfg, hn, h, src, name)
     rd = runs_dir(cfg, h)
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True)
-    rc, o, e = hrun(h, f"mkdir -p {rd} && cat > {rd}/{jid}.sh && {ensure_lanes(h)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
-    if not rc and not h.get("local"):
-        rc, o, e = hrun(h, f"cat > {rd}/.admit.sh.$$ && mv {rd}/.admit.sh.$$ {rd}/admit.sh", inp=admit_lib(h))
+    rc, o, e = hrun(h, f"mkdir -p {rd} && cat > {rd}/{jid}.sh && {ensure_lanes(h, cfg)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
+    if not rc: rc, o, e = write_cap(cfg, hn, h)
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
     label = f"unit:{unit}" if unit else f"run:{name}"   # unit:<name>: check reports it once that unit is closed (M3)
     rc, o, e = hrun(h, f"{pueue(h)} add -g {a.lane} -l {shlex.quote(label)} -w {rd} --print-task-id"
@@ -1769,12 +2298,19 @@ def cmd_gate(cfg, a):
     run = (shlex.quote(str(cfg.root / rh)) + " " + shlex.quote(a.name)) if rh else \
           shlex.join(["sh", "-c", GATE_DEFAULT, "gate", str(t), a.name, str(cfg.p("gate_log", "out/gates.log"))])
     unit = a.unit or os.environ.get("ORCH_UNIT")
+    if unit:   # a gate refuses its unit's tree mid-merge, with conflict markers, or too far behind the landing branch (item 41)
+        try:
+            bd0, u0 = get_unit(cfg, unit)
+            why = tree_guard(cfg, u0["cwd"]) if own_tree(cfg, u0, bd0.units()) else None
+            if why and not a.allow_unmerged: raise Err(f"refused: {unit}'s tree {u0['cwd']} {why} (--allow-unmerged to gate anyway)")
+        except Err as e:
+            if str(e).startswith("refused"): raise
     if unit and not DRY:
         try:
             bd, u = get_unit(cfg, unit)
             if a.name not in u.get("gates", []): u["gates"] = [*u.get("gates", []), a.name]; bd.save(u)
         except Err as e: say(f"note: gate not recorded on {unit}: {e}")
-    X(h, ensure_lanes(h))
+    X(h, ensure_lanes(h, cfg))
     rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l gate:{a.name} -w {shlex.quote(str(cfg.root))} --print-task-id -o {a.priority} -- {run}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
     if DRY: return
@@ -1785,7 +2321,7 @@ def cmd_gate(cfg, a):
     say(lines[-1] if lines else f"no RESULT line for {a.name}")
     return 0 if lines and lines[-1].endswith("RESULT: PASS") else 1
 
-def lane_findings(cfg, hs):
+def lane_findings(cfg, hs, units=()):
     """Per host and lane: queued work with free slots (stalled), queued work while the host has room (idle), a host with free
     slots while another waits, and jobs over their class age limit."""
     F, free, backlog = [], {}, {}
@@ -1802,7 +2338,7 @@ def lane_findings(cfg, hs):
             wt = int(p.get(f"wait_{lane}", 0) or 0)   # running tasks still waiting in orch's own admission
             if q and (g.get("status") != "Running" or len(r) < par):
                 F.append((f"stalled:{n}:{lane}", f"{n} {lane} STALLED: {len(q)} queued, {len(r)} of {par} slots running, group {g.get('status')}"))
-            elif (q or wt) and len(r) - wt < slots(h) and (h.get("local") or fl(p.get("avail_mb")) / 1024 - h.get("reserve_gb", 2) >= h.get("job_gb", 2)):
+            elif (q or wt) and lane != "land" and host_cap(cfg, n, p, list(units))["free"] > 0 and len(r) - wt < slots(h, cfg):
                 F.append((f"idle:{n}:{lane}", f"{n} {lane} IDLE: {len(q)} queued, {wt} waiting for admission, {len(r) - wt} running, room for more"))
             if q: backlog.setdefault(lane, []).append(n)
             elif len(r) < par: free.setdefault(lane, []).append(n)
@@ -1823,6 +2359,98 @@ def lane_findings(cfg, hs):
             if cfg.hosts[f].get("local") == cfg.hosts[ns[0]].get("local") and not (lane == "land"):
                 F.append((f"idle:{f}:{lane}:vs", f"{f} has free {lane} slots while {', '.join(ns)} has a backlog"))
     return F
+
+# ---------------------------------------------------------------- land: merge main, gate the merged tree, squash-land (register item 41)
+MERGE_BRIEF = """# Brief: {m}: merge {br} into {unit}'s branch
+
+TIER: {tier}
+ITEM: {item}
+
+`orch land {unit}` stopped: merging the current `{br}` into the branch `{branch}` of `{wt}` conflicts in:
+{files}
+
+In `{wt}`: run `git merge {br}`, resolve every conflict keeping both sides' intent (read each side's commits), build and test
+through the lanes, commit the merge. Do not land: when it is committed, the orchestrator runs `orch land {unit}` again, which
+gates the merged tree and squash-lands it. Write REPORT.md with what each conflict was and how it was resolved.
+"""
+
+def git(wt, *a, timeout=120): return sh(["git", "-C", str(wt), *a], timeout=timeout)
+
+def cmd_land(cfg, a):
+    """orch land <unit>: in the unit's worktree, merge the current landing branch ([landing] branch, default main); on a conflict
+    stop (the tree is left as it was) and dispatch a merge unit merge-<unit> (--no-dispatch: only say so); gate the merged tree
+    on [landing] final_gate_host with [landing] final_gate (a command run through orch run, gates lane); then squash-land: one
+    commit whose tree is the gated tree and whose parent is the landing branch tip that was merged. When the landing branch is
+    checked out (the main checkout), it is moved there with git merge --ff-only, so that checkout's files follow; a landing
+    branch that moved meanwhile, or a dirty main checkout, stops it. --dry-run checks the merge with git merge-tree and prints
+    each step, changing nothing."""
+    ld = cfg.c.get("landing", {}); br = ld.get("branch") or "main"
+    u = next((x for x in Beads(cfg).units() if x["name"] == a.unit), None) or all_units(cfg).get(a.unit)
+    if not u: raise Err(f"no unit {a.unit}")
+    wt = Path(u.get("cwd", "/"))
+    if not own_tree(cfg, u, [x for x in Beads(cfg).units()]) or not wt.is_dir(): raise Err(f"{a.unit} has no worktree of its own ({wt}): nothing to land")
+    rc, branch, e = git(wt, "symbolic-ref", "--short", "HEAD"); branch = branch.strip()
+    if rc: raise Err(f"{wt} is not on a branch")
+    if branch == br: raise Err(f"{wt} is on {br} itself")
+    if git(wt, "status", "--porcelain", "--untracked-files=no")[1].strip(): raise Err(f"{wt} has uncommitted changes: commit them first")
+    if git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")[0] == 0: raise Err(f"{wt} has a merge in progress (MERGE_HEAD): finish or abort it")
+    base = git(wt, "rev-parse", br)[1].strip()
+    if not base: raise Err(f"no branch {br}")
+    ahead = int(git(wt, "rev-list", "--count", f"{br}..HEAD")[1].strip() or 0); behind = int(git(wt, "rev-list", "--count", f"HEAD..{br}")[1].strip() or 0)
+    if not ahead: raise Err(f"{branch} has no commits over {br}: nothing to land")
+    say(f"land {a.unit}: {branch} in {wt}, {ahead} commit(s) ahead of {br} ({base[:9]}), {behind} behind")
+    # 1. merge the current landing branch (dry run: merge-tree only)
+    rc, o, e = git(wt, "merge-tree", "--write-tree", "--name-only", "HEAD", br)
+    if rc not in (0, 1): raise Err(f"git merge-tree failed: {(e or o).strip()[:120]}")
+    if rc == 1:
+        files = [l for l in o.split("\n\n")[0].splitlines()[1:] if l.strip()][:20] or ["(see git merge)"]   # tree id, then the conflicted paths
+        say(f"STOP: merging {br} conflicts in {len(files)} file(s): {', '.join(files[:6])}")
+        m = f"merge-{a.unit}"[:32]
+        if a.no_dispatch or DRY: say(f"{'would dispatch' if DRY else 'dispatch with'}: orch launch {m} --kind implement --cwd {wt} (brief {cfg.p('briefs', 'briefs') / (m + '.md')})"); return 3
+        bp = cfg.p("briefs", "briefs") / f"{m}.md"
+        if not bp.exists(): atomic_write(bp, MERGE_BRIEF.format(m=m, br=br, unit=a.unit, branch=branch, wt=wt, tier=(u.get("tier") or "normal").upper(),
+                                                              item=u.get("item") or a.unit, files="\n".join(f"- `{f}`" for f in files)))
+        cmd_launch(cfg, argparse.Namespace(unit=m, kind="implement", tier=u.get("tier") or "normal", host=None, model=None, brief=str(bp), cwd=str(wt),
+                                           budget=None, test_host=u.get("build"), allow_main=False, of=None, report=None, resume_of=None, item=u.get("item"),
+                                           dry_run=False, share_with=a.unit))
+        return 3
+    if behind:
+        if DRY: say(f"+ git -C {wt} merge --no-edit {br}  (merge-tree: clean)")
+        else:
+            rc, o, e = git(wt, "merge", "--no-edit", br, timeout=600)
+            if rc: git(wt, "merge", "--abort"); raise Err(f"git merge {br} failed although merge-tree was clean: {(e or o).strip()[-160:]}; aborted")
+            say(f"merged {br} into {branch}")
+    # 2. gate the merged tree on the final-gate host
+    gh, gc = ld.get("final_gate_host"), ld.get("final_gate")
+    if a.no_gate: say("gate skipped (--no-gate)")
+    elif not gh or not gc: raise Err("set [landing] final_gate_host and final_gate (the command that gates a merged tree) in orch.toml, or --no-gate")
+    else:
+        ra = argparse.Namespace(host=gh, lane="gates", unit=a.unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False, allow_unmerged=False, command=[gc])
+        if DRY: say(f"+ orch run --host {gh} --lane gates --unit {a.unit} --wt {wt} -- {gc}"); 
+        else:
+            grc = cmd_run(cfg, ra)
+            if grc: raise Err(f"final gate on {gh} failed (exit {grc}): not landed; the merge stays committed in {wt}")
+            say(f"final gate on {gh}: PASS")
+    # 3. squash-land: tree of the gated HEAD, parent = the landing tip that was merged
+    if DRY: say(f"+ git commit-tree HEAD^{{tree}} -p {base[:9]}; move {br} (ff-only in its checkout); {ahead} commit(s) squashed"); return 0
+    if git(wt, "rev-parse", br)[1].strip() != base: raise Err(f"{br} moved while {a.unit} was gated: run orch land {a.unit} again (it merges the new tip)")
+    tree = git(wt, "rev-parse", "HEAD^{tree}")[1].strip()
+    subj = git(wt, "log", "--format=%s", f"{base}..HEAD", "--no-merges")[1].splitlines()
+    msg = f"{a.unit}: land {branch} ({len(subj)} commit(s), squashed)\n\n" + "\n".join(f"- {s}" for s in subj[:40]) + "\n"
+    rc, new, e = sh(["git", "-C", str(wt), "commit-tree", tree, "-p", base, "-F", "-"], inp=msg)
+    if rc: raise Err(f"git commit-tree failed: {e.strip()[:120]}")
+    new = new.strip(); wl = git(wt, "worktree", "list", "--porcelain")[1]
+    co = next((blk.split("\n")[0][9:] for blk in wl.split("\n\n") if f"branch refs/heads/{br}" in blk), None)
+    if co:
+        rc, o, e = git(co, "merge", "--ff-only", new, timeout=300)
+        if rc: raise Err(f"{co} (where {br} is checked out) did not take the landing commit {new[:9]} fast-forward: {(e or o).strip()[-160:]}")
+    else:
+        rc, o, e = git(wt, "update-ref", f"refs/heads/{br}", new, base)
+        if rc: raise Err(f"update-ref {br} failed: {e.strip()[:120]}")
+    say(f"landed {a.unit}: {br} {base[:9]} -> {new[:9]} ({len(subj)} commit(s) squashed); push and close are separate (orch close {a.unit})")
+    if u.get("id"): Beads(cfg).comment(u["id"], f"{ts()} landed on {br} as {new[:9]}")
+    cfg.touch("changed")
+    return 0
 
 SECRETS = [re.compile(x.encode()) for x in ("sk" + "-ant-[A-Za-z0-9_-]{20,}", "sk" + "-or-[A-Za-z0-9_-]{20,}", "sk" + "-proj-[A-Za-z0-9_-]{20,}",
     "\\bsk" + "-[a-f0-9]{32,}\\b", "AK" + "IA[0-9A-Z]{16}", "gh" + "p_[A-Za-z0-9_-]{20,}", "xo" + "x[A-Za-z0-9_-]{10,}",
@@ -2308,11 +2936,23 @@ def hook_kind(d):
     return "codex" if ("codex" in tp or os.environ.get("CODEX_THREAD_ID")) else "claude"
 
 # ---------------------------------------------------------------- watch (launchd, one pass)
-URGENT = ("unit:", "board:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:")
+URGENT = ("unit:", "board:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:",
+          "idle-with-backlog", "scheduler:", "pressure:", "direct:", "budget80:")
 
 def cmd_watch(cfg, a):
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
+    # [fill] watcher = true (owner autonomy: "launch within capacity"): launch ready backlog units up to capacity, at most every
+    # [fill] every_min (default 10) minutes, only when check found something that fits (idle-with-backlog)
+    fc = cfg.c.get("fill", {})
+    if fc.get("watcher") and any(k == "idle-with-backlog" for k, _ in F) and now() - cfg.mtime("last_fill") > fc.get("every_min", 10) * 60:
+        cfg.touch("last_fill")
+        try:
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf): cmd_fill(cfg, argparse.Namespace(max=fc.get("max_per_pass")))
+            log("fill: " + " | ".join(l.strip() for l in buf.getvalue().splitlines())[:600])
+        except Exception as e: log(f"fill failed: {e}")
     running = any(u.get("state") in ("working", "queued") for u in units)
     op = cfg.jget("open.json"); late = [k for k, t in op.items() if now() - t > cfg.deadline]
     overdue = (running or F) and now() - cfg.mtime("last_cycle") > cfg.cycle
@@ -2385,8 +3025,12 @@ def main():
         A("--allow-unmerged", action="store_true", help="run on a tree with a merge in progress, conflict markers or far behind the landing branch"),
         A("command", nargs=argparse.REMAINDER), dry=True)
     add("gate", A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $ORCH_UNIT)"), A("--priority", type=int, default=10),
-        A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"), dry=True)
+        A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"),
+        A("--allow-unmerged", action="store_true", help="gate a tree mid-merge, with conflict markers or far behind the landing branch"), dry=True)
     add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), dry=True)
+    add("fill", A("--max", type=int, help="launch at most this many"), dry=True)
+    add("land", A("unit"), A("--no-gate", action="store_true", help="skip the final gate (it is still refused mid-merge)"),
+        A("--no-dispatch", action="store_true", help="on a conflict, only say what merge unit to dispatch"), dry=True)
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
     add("commit-state", A("-m", "--message", default="orch: state"), dry=True)
     add("ack", A("problem"), A("decision"))
