@@ -161,4 +161,52 @@ class Item2ResumeFloor(unittest.TestCase):
         self.assertEqual(use["ctx"], 150000); self.assertAlmostEqual(janus.reload_usd(self.cfg, use), 0.75)
         self.assertIn("python3 -", calls[0][0]); self.assertIn("sid-0001.jsonl", calls[0][0]); self.assertIn("def usage_scan", calls[0][1])
 
+class Item3RemoteSettle(unittest.TestCase):
+    """A remote unit's run that ended on its host is closed in the ledger when its output is brought here, not at collect."""
+    def setUp(self):
+        self.d, self.cfg = project(); self.pv = self.cfg.prov["api"]; self.mc = self.cfg.models["m"]
+        self.cfg.hosts["far"] = {"ssh": "far", "root": "/srv/p", "_rd": "/srv/p/runs"}
+        self.u = api_unit(self.d, host="far", state="done", run=janus.reserve_budget(self.cfg, self.mc, "u1", 2, "u1.1.100"), runs=["u1.1.100"])
+        self.bd = type("B", (), {"save": lambda s, u: None})()
+
+    def saved(self, text):
+        def save(cfg, u):
+            od = self.d / "out/u1"; od.mkdir(exist_ok=True); (od / "api.json").write_text(text)
+            (od / "REPORT.md").write_text("VERDICT: PENDING\nstep 1 done, exit 0\nVERDICT: DONE - exit 0\n"); return True
+        return [mock.patch.object(janus, "save_output", save), mock.patch.object(janus, "remote_patch", lambda *a, **k: None)]
+
+    def test_check_closes_an_ended_remote_run_at_its_own_cost(self):
+        """Catches (item 3): a remote unit that finished for $0.60 kept its whole reservation ($2.40) in the ledger until someone
+        ran janus collect; with several such units the cap read as reached and launches were refused."""
+        with contextlib.ExitStack() as st:
+            for m in self.saved(json.dumps({"total_cost_usd": 0.6, "session_id": "S"})): st.enter_context(m)
+            janus.sync_remote_outputs(self.cfg, [self.u], self.bd)
+        self.assertAlmostEqual(janus.committed(self.cfg, self.pv), 0.6)
+        self.assertEqual(janus.verdict(self.cfg, self.u), "VERDICT: DONE - exit 0")
+
+    def test_the_watcher_closes_it_too(self):
+        """Catches (item 3): the watcher saved the ended remote unit's output and left its run open at the reservation."""
+        with contextlib.ExitStack() as st:
+            for m in self.saved(json.dumps({"total_cost_usd": 0.6, "session_id": "S"})): st.enter_context(m)
+            janus.refresh_remote(self.cfg, self.u, self.bd, lambda m: None)
+        self.assertAlmostEqual(janus.committed(self.cfg, self.pv), 0.6)
+
+    def test_a_run_that_reported_no_cost_stays_held(self):
+        """Catches (item 3): closing a run whose json is empty (killed) at $0 would undercount the cap."""
+        with contextlib.ExitStack() as st:
+            for m in self.saved(""): st.enter_context(m)
+            janus.sync_remote_outputs(self.cfg, [self.u], self.bd)
+        self.assertAlmostEqual(janus.committed(self.cfg, self.pv), 2.4)
+
+    def test_reconcile_charges_the_cost_the_run_reported(self):
+        """Catches (item 3): janus ledger reconcile charged a gone run its whole reservation although its saved json says what it
+        cost."""
+        od = self.d / "out/u1"; od.mkdir(); (od / "api.json").write_text(json.dumps({"total_cost_usd": 0.6, "session_id": "S"}))
+        beads = type("B", (), {"__init__": lambda s, cfg: None, "units": lambda s: [dict(self.u)]})
+        with mock.patch.object(janus, "Beads", beads), mock.patch.object(janus, "probe_all", lambda cfg: {}), mock.patch.object(janus, "herdr_agents", lambda cfg: {}), \
+             mock.patch.object(janus, "unit_state", lambda u, hs, ag: "gone"), mock.patch.object(janus, "all_units", lambda cfg: {"u1": self.u}), \
+             mock.patch.object(janus, "refuse_agent", lambda *a, **k: None):
+            rc, out = said(janus.cmd_ledger, self.cfg, ns(action="reconcile", provider=None))
+        self.assertAlmostEqual(janus.committed(self.cfg, self.pv), 0.6, msg=out)
+
 if __name__ == "__main__": unittest.main()
