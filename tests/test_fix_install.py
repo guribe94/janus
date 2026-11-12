@@ -497,6 +497,26 @@ class Item3AdmitClock(unittest.TestCase):
         self.assertIn("blocked (limit 3s", p.stdout, p.stdout)
 
 
+class Item4Localtest(unittest.TestCase):
+    def test_the_reviews_case_table(self):
+        """Catches (finding 4): test_command judged only a segment's first word, so a real test/build run was missed (a pytest
+        console script ps shows as the interpreter, `python -m pytest`, uv/poetry run, rustup/cargo-nextest, a shell -c,
+        xargs/arch/flock, node npm), while a word pytest inside a quoted argument (an ack or a commit message) was flagged."""
+        caught = [
+            "/opt/homebrew/Cellar/python/3.12/Frameworks/Python.app/Contents/MacOS/Python fake/bin/pytest -q tests",
+            "python3 -m pytest tests/calibration", "uv run pytest -q", "poetry run pytest", "node /opt/homebrew/bin/npm test",
+            "cargo-nextest nextest run", "rustup run stable cargo test", "bash -lc 'cargo test'", "xargs -n1 pytest",
+            "arch -arm64 pytest", "flock /tmp/l cargo build", "zsh -c -l source ~/.zshrc && eval 'pytest -q tests'",
+            "pytest -q", "npm test", "cargo +nightly test", "time cargo build", "nice -n 10 /usr/bin/pytest tests/",
+        ]
+        missed = [c for c in caught if not janus.test_command(c)]
+        self.assertEqual(missed, [], f"a real test/build run was not judged one: {missed}")
+        not_test = ["git commit -m 'run (pytest -q) before push'", "janus ack unit:x 'gate failed; pytest tests/a exit 1'",
+                    "cargo run --bin build", "janus ack unit:x 'cargo test failed'"]
+        false_pos = [c for c in not_test if janus.test_command(c)]
+        self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
+
+
 class Item5ReportSync(unittest.TestCase):
     def _remote(self, state="done", via="pueue", **kw):
         d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/home/x"\n')
