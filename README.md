@@ -10,7 +10,7 @@ ssh, rsync and git.
 An orchestrator session is supposed to dispatch work, monitor it, verify, land, clean up and report. In practice one went
 idle for hours with nothing to wake it, left orphan agents and jobs running, did operations by hand and broke more things,
 launched far more agents than the machines could carry, let one machine thrash, and was told the same instructions many
-times (the full story is in `docs/PLAN.md`). Reminders in a prompt did not fix it.
+times (the design is in `docs/DESIGN.md`). Reminders in a prompt did not fix it.
 
 `orch` makes the role enforced by hooks and scripts instead of reminders:
 
@@ -492,7 +492,7 @@ Open items and their reasons are tracked in `docs/ISSUES.md`. Not yet verified l
 - A full herdr-backed agent via `orch launch`, including the startup-dialog answers.
 - Codex's PreToolUse tool names (the handler accepts `Bash`, `shell`, `local_shell` and any tool input with `command`/`cmd`).
 
-Described in `docs/PLAN.md` or asked for but not in the code: moving unstarted jobs to another host after `unreachable_min`
+Asked for but not in the code: moving unstarted jobs to another host after `unreachable_min`
 (the setting is read but unused), pushing state to a bare repo, `MemoryMax` for herdr agents (they run on the Mac, which has
 no systemd), host roles (target/build/agents/dev) with parallel gates per host, and the remote agent's git (a remote copy has
 no `.git`; its work comes back as a patch).

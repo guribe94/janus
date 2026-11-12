@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """orch: thin glue over beads (bd), pueue, tmux, herdr, ssh, rsync and git. Python 3.11+, standard library only.
-Reads orch.toml from the current directory or a parent. See docs/PLAN.md and skill/SKILL.md."""
+Reads orch.toml from the current directory or a parent. See docs/DESIGN.md and skill/SKILL.md."""
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, time, tomllib
 from pathlib import Path
 
@@ -1781,7 +1781,7 @@ def cmd_launch(cfg, a):
     bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); cfg.touch("changed")
     chk = f"herdr {name}" if u["via"] == "herdr" else f"pueue {hn}:{u['task']}" if u["via"] == "pueue" else f"tmux {hn}:orch-{name}"
     board(cfg, "post", name, "status", f"launched ({mname}, {hn})",
-       env={"BOARD_MACHINE": hn, "BOARD_BRIEF": str(brief), "BOARD_CHECK": chk})
+       env={"BOARD_MACHINE": hn, "BOARD_BRIEF": str(brief), "BOARD_CHECK": chk, "BOARD_REPORT": str(report_path(cfg, u))})   # row 26: a resumed unit's own report
     st = u.get("start_state", "running" if u["via"] == "herdr" else "unknown")
     say((f"launched {name} on {hn} via {u['via']}" if st in ("running", "queued", "finished") else f"queued {name} on {hn} via {u['via']}, NOT confirmed running ({st})")
         + (f" (task {u['task']}{', waiting for an agents slot' if st == 'queued' else ''})" if u.get("task") is not None else ""))
@@ -4059,9 +4059,9 @@ def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
     return None
 
 def edit_ok_dirs(cfg):
-    """Paths the orchestrator may write: its state dir, briefs, orch.toml, and the project's status checklist and old state docs
-    (paths.checklist, paths.state_docs) (audit M7)."""
-    ok = [cfg.state, cfg.p("briefs", "briefs"), cfg.root / "orch.toml"]
+    """Paths the orchestrator may write: its state dir, briefs, orch.toml, its own plan files (~/.claude/plans: plan mode writes
+    there), and the project's status checklist and old state docs (paths.checklist, paths.state_docs) (audit M7)."""
+    ok = [cfg.state, cfg.p("briefs", "briefs"), cfg.root / "orch.toml", Path.home() / ".claude/plans"]   # its own plan files (plan mode)
     if cfg.paths.get("checklist"): ok.append(cfg.p("checklist"))
     ok += [cfg.root / x for x in cfg.paths.get("state_docs", [])]
     return [p.resolve() for p in ok]
