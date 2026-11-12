@@ -242,7 +242,9 @@ def cmd_commit_state(cfg, a):
     if cfg.run.dry: say("+ janus index; git add -A; scan staged files; git commit; git push"); return
     write_index(cfg)   # out/INDEX.md is committed with the state (janus-swarm item 3)
     rc, o, e = sh(["git", "add", "-A"], cwd=cfg.root, timeout=120)
-    if rc: raise Err("git add failed: " + e.strip()[:80])
+    if rc:   # item 7: a file vanished between listing and add (a monitor deleted a temp file); retry, then carry on
+        rc, o, e = sh(["git", "add", "-A", "--ignore-errors"], cwd=cfg.root, timeout=120)
+    if rc: say(f"note: git add reported {(e or o).strip()[:100]}; committing what was staged")
     rc, o, e = sh(["git", "diff", "--cached", "--name-only", "-z"], cwd=cfg.root)
     paths = [x for x in o.split("\0") if x]
     hit = []

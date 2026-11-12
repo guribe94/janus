@@ -155,11 +155,17 @@ def waste_state(cfg, outs=None):
     return w, tot, (100 * w / tot if tot else 0.0)
 
 def waste_paused(cfg):
-    """Why launch and fill are paused (wasted spend over [report] waste_pause % of recent spend, not acked), or None."""
+    """Why launch and fill are paused (wasted spend over [report] waste_pause % of recent spend). Item 7: the reason is stated
+    even while the ack is live, so the finding exists, run_check's ack filter hides it, and the ack lasts its TTL; waste_block is
+    the ack-aware refusal launch and fill use."""
     w, tot, pct = waste_state(cfg)
-    if pct <= rset(cfg, "waste_pause") or "waste-pause" in live_acks(cfg): return None
+    if pct <= rset(cfg, "waste_pause"): return None
     return (f"${w:.2f} of ${tot:.2f} ({pct:.0f} %) of the last {rset(cfg, 'recent_h')} h went to runs that ended at their budget cap without a "
             f"verdict (limit {rset(cfg, 'waste_pause')} %): find the cause (janus report), then janus ack waste-pause \"<cause and fix>\"")
+
+def waste_block(cfg):
+    """Why launch and fill are refused now: waste_paused, unless the orchestrator acked waste-pause (the ack lasts its TTL)."""
+    return None if "waste-pause" in live_acks(cfg) else waste_paused(cfg)
 
 def last_checkpoint(cfg):
     """The latest report checkpoint passed: [report] at (local HH:MM times) and every every_h hours from midnight."""

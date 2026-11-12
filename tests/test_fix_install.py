@@ -65,4 +65,42 @@ class Item11Verdict(unittest.TestCase):
         self.assertIn("sync_remote_outputs(cfg, units, bd)", inspect.getsource(janus.collect_findings))
 
 
+class Item7CommitState(unittest.TestCase):
+    def test_a_file_that_vanishes_mid_commit_does_not_fail_the_commit(self):
+        """Catches: janus commit-state failed with 'git add failed: fatal: unable to stat ...' when a monitor deleted a temp file
+        between listing and add."""
+        d = Path(tempfile.mkdtemp(prefix="janus-fix-")); (d / "janus.toml").write_text('[project]\nname = "t"\n'); (d / "out").mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True, check=True)
+        g("init", "-q"); (d / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a")
+        (d / "b").write_text("2\n")   # the file the commit should still make
+        cfg = janus.Cfg(d); calls = []
+        real_sh, real_push = janus.sh, janus.push_cmd
+        def sh_stub(cmd, **k):
+            calls.append(list(cmd))
+            if cmd == ["git", "add", "-A"]: return 128, "", "fatal: unable to stat b.tmp: No such file or directory"
+            return real_sh(cmd, **k)
+        janus.sh = sh_stub; janus.push_cmd = lambda repo, cfg=None: ["true"]
+        try: janus.cmd_commit_state(cfg, type("A", (), {"message": "state"})())
+        finally: janus.sh, janus.push_cmd = real_sh, real_push
+        self.assertEqual(g("log", "-1", "--format=%s").stdout.strip(), "state")
+        self.assertTrue(any(c[:4] == ["git", "add", "-A", "--ignore-errors"] for c in calls), "the add was not retried")
+
+
+class Item7WastePause(unittest.TestCase):
+    def test_an_ack_of_waste_pause_keeps_launch_unpaused(self):
+        """Catches: waste_paused returned None while its ack was live, so the finding was gone and the next check dropped the ack
+        ('finding gone') and re-paused launch and fill."""
+        d, cfg = project()
+        cfg.jput("acks.json", {"waste-pause": {"t": janus.now(), "d": "cause found"}})
+        real = janus.waste_state; janus.waste_state = lambda cfg, outs=None: (10.0, 20.0, 50.0)
+        try:
+            for _ in range(2):
+                self.assertTrue(janus.waste_paused(cfg), "waste_paused hid the reason while its ack was live")
+                keys = {k for k, _ in janus.report_findings(cfg, [])}
+                self.assertIn("waste-pause", keys)
+                self.assertIn("waste-pause", janus.live_acks(cfg, keys), "the ack was dropped as 'finding gone'")
+                self.assertIsNone(janus.waste_block(cfg), "launch is refused although waste-pause is acked")
+        finally: janus.waste_state = real
+
+
 if __name__ == "__main__": unittest.main()

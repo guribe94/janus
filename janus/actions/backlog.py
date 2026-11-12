@@ -3,7 +3,7 @@ import argparse, re
 from janus.actions.launch import choose, cmd_launch, pick_model
 from janus.backlog import backlog_cfg, backlog_issues, backlog_items, item_actors, unit_items
 from janus.beads import Beads
-from janus.budgets import budget_for, waste_paused
+from janus.budgets import budget_for, waste_block
 from janus.context import Err, say, slug
 from janus.ledger import committed
 from janus.probe import probe_all
@@ -113,7 +113,7 @@ def cmd_fill(cfg, a):
     if cfg.run.dry: cfg.run.ro = True   # a dry run changes nothing anywhere (the probe leaves the hosts' reservation files alone)
     hs = probe_all(cfg); units = Beads(cfg).units(); ag = herdr_agents(cfg)
     for u in units: u["state"] = unit_state(u, hs, ag)
-    wp = waste_paused(cfg)
+    wp = waste_block(cfg)
     if wp: say(f"fill: PAUSED: {wp}"); return 1
     plan, stops = fill_plan(cfg, hs, units, a.max)
     say(f"fill: {len(plan)} unit(s) fit now" + (" (dry run: nothing launched)" if cfg.run.dry else ""))

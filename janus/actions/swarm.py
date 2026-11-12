@@ -4,7 +4,7 @@ import json, os, re, time
 from janus.backlog import backlog_items, item_actors, unit_items
 from janus.beads import Beads
 from janus.board import board, board_dir, learned_posts
-from janus.budgets import OUTCOMES, rset, run_outcomes, waste_paused, waste_state
+from janus.budgets import OUTCOMES, rset, run_outcomes, waste_block, waste_state
 from janus.context import Err, Locked, NUM, atomic_write, note_event, now, refuse_agent, say, slug, ts
 from janus.findings.awareness import introduced_recently, related_cases
 from janus.findings.units import peer_rows, peers_text, unreconciled
@@ -97,7 +97,7 @@ def cmd_report(cfg, a):
                             + ("" if a.brief or k in ("verdict",) else ": " + ", ".join(dict.fromkeys(x[2] for x in xs))[:120]))
     w, tot, pct = waste_state(cfg, outs)
     L.append(f"Last {rset(cfg, 'recent_h')} h: ${w:.2f} of ${tot:.2f} ({pct:.0f} %) capped without a verdict; limit {rset(cfg, 'waste_pause')} %"
-             + (": launch and fill PAUSED until janus ack waste-pause" if waste_paused(cfg) else ""))
+             + (": launch and fill PAUSED until janus ack waste-pause" if waste_block(cfg) else ""))
     try:
         us = Beads(cfg).units()
         L.append(f"Open units: {len(us)}" + ("" if a.brief else ": " + ", ".join(u["name"] for u in us)[:300]))
