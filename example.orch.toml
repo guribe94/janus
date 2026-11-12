@@ -168,6 +168,9 @@ report_stale_min = 10    # ... while its report has not changed for this long
 wrapup_usd = 0.5         # a run that ends at its budget cap without a final verdict is resumed once with this, to write its report
 resume_min_usd = 0.1     # a parked unit is resumed (same session) only while this much of its budget is left
 
+[collect]                # remote units: the watcher saves out/<unit>/ and the agent's changes as out/<unit>/backup.patch this often;
+backup_min = 30          # stop and close refuse while a remote copy has work orch collect has not brought here (--force overrides)
+
 [enforce]                # warn first (a board direction), stop after grace_min
 grace_min = 5
 stop_burners = true      # a CPU burner's process group (never a group that holds the agent)

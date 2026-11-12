@@ -375,6 +375,21 @@ class Park(unittest.TestCase):
         self.assertEqual(orch.stop_job_cmd({"runner": "podman"}, "j1").split(";")[0], "podman stop -t 5 orch-run-j1 >/dev/null 2>&1")
         self.assertIn("orch-j1.scope", orch.stop_job_cmd({}, "j1"))
 
+    def test_uncollected_guard(self):
+        """item 4: a remote copy with changes or output that collect has not brought here refuses stop/close; a fresh copy does not."""
+        d, cfg = project(); r = d / "remote"
+        for x in ("base/u", "worktrees/u", "out/u"): (r / x).mkdir(parents=True)
+        (r / "base/u/f").write_text("a\n"); (r / "worktrees/u/f").write_text("a\n"); (r / "out/u/REPORT.md").write_text("VERDICT: PENDING\n")
+        cfg.hosts["r"] = {"ssh": "nowhere", "root": str(r), "_rd": str(r / "runs")}
+        real = orch.hrun; orch.hrun = lambda h, script, **k: real({"local": True}, script, **k)
+        try:
+            u = {"name": "u", "host": "r", "via": "tmux"}
+            self.assertIsNone(orch.uncollected(cfg, u))                        # nothing written yet
+            (r / "worktrees/u/f").write_text("a\nb\n"); self.assertIn("not collected", orch.uncollected(cfg, u))
+            u["collected"] = orch.fingerprint(cfg, u)["fp"]; self.assertIsNone(orch.uncollected(cfg, u))   # as collect records it
+            (r / "out/u/REPORT.md").write_text("VERDICT: PENDING\nstep 2\n"); self.assertIn("not collected", orch.uncollected(cfg, u))
+        finally: orch.hrun = real
+
     def test_resume_argv_and_no_ack(self):
         mc = {"api_id": "x"}
         a = orch.api_argv({}, mc, 1, "go", "S1")
