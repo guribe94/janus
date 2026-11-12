@@ -37,7 +37,7 @@ def pueue(h):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
     return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
-LIST_KEYS = ("res", "hist", "sched", "direct", "waitjob", "apiproc")   # apiproc: API processes janus did not start   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
+LIST_KEYS = ("res", "hist", "sched", "direct", "waitjob", "apiproc", "apiinfo")   # apiproc/apiinfo: API processes janus did not start, and whose they are   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
 
 def probe(name, h, ro=True, cfg=None):
     """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,

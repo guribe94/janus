@@ -1,14 +1,14 @@
 """Findings about hosts and processes: CPU burners and tests outside the lanes on this machine, changed running scripts,
 lane stalls, idle slots and job ages, thrash acts, tidy and disk; enforce (warn, then stop a burner or a direct build)."""
-import os, re, time
+import os, re, time, tomllib
 from pathlib import Path
 from janus.actions.jobs import LANES, lane_age, orphan_jobs, slots
-from janus.project import label_owner, own_label, tmux_name, unit_tmux, untagged
+from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
 from janus.backlog import ready_work
 from janus.beads import Beads
 from janus.board import board
 from janus.cap import host_cap
-from janus.context import AGENT_RX, Err, FIXTURE_MARK, ancestors, fl, hrun, now, sh, ts
+from janus.context import AGENT_RX, Err, FIXTURE_MARK, ancestors, fl, hrun, now, projects, sh, ts
 from janus.platform import secs
 from janus.probe import margins, room
 from janus.templates import STOP_GROUP
@@ -70,13 +70,13 @@ def enforce(cfg, F, viol):
     """Warn, then stop (janus-fixes8; register items 22, 23). The first time a violation is seen its unit gets a board direction;
     when it is still there [enforce] grace_min (default 5) later, its process group is stopped: a CPU burner's (stop_burners,
     default true), an agent's direct build or test, here or on a remote host (stop_direct, default true since imp-autopilot), and
-    a Claude/Anthropic API process janus did not start (stop_api, default true: spend safety).
+    a Claude/Anthropic API process janus did not start inside this project's unit trees (stop_api, default false: report only).
     One warning per unit: a unit warned in the last day gets no second one, its next violation is stopped at once.
     Running lane jobs are never touched. Only the registered orchestrator's check and the watcher act; anyone else only reports."""
     ec = cfg.c.get("enforce", {}); grace = ec.get("grace_min", 5) * 60; st = cfg.jget("enforce.json"); new = {}; notes = {}
     wu = {k: t for k, t in (st.get("_units") or {}).items() if now() - t < 86400}   # unit -> when it got its one warning
     for v in viol:
-        s = st.get(v["key"]) or {}; stop_ok = ec.get({"burner": "stop_burners", "api": "stop_api"}.get(v["kind"], "stop_direct"), True)
+        s = st.get(v["key"]) or {}; stop_ok = ec.get({"burner": "stop_burners", "api": "stop_api"}.get(v["kind"], "stop_direct"), v["kind"] != "api") and v.get("stop", True)
         u = v.get("unit")
         if not s.get("warned") and u in wu and stop_ok:   # already warned once: no second warning, stopped at once
             s = {"warned": wu[u] - grace, "unit": u}
@@ -195,11 +195,25 @@ def lane_findings(cfg, hs, units=()):
                 F.append((f"idle:{f}:{lane}:vs", f"{f} has free {lane} slots while {', '.join(ns)} has a backlog: re-queue waiting jobs on {f} (janus cancel, janus run --host {f})"))
     return F
 
+def other_projects(cfg):
+    """(resolved root, registered orchestrator pid or '') of every project in ~/.config/janus/projects other than this one."""
+    out = []
+    for r in projects():
+        if r.resolve() == cfg.root.resolve(): continue
+        try: st = r / tomllib.loads((r / "janus.toml").read_text()).get("project", {}).get("state", ".janus"); o = ((st / "session_pid").read_text().split() or [""])[0]
+        except (OSError, ValueError): o = ""
+        out.append((str(r.resolve()), o))
+    return out
+
 def host_findings(cfg, hs, units, viol):
     """host:, margin:, idle:<host>, pressure:, scheduler:, direct: (each also goes to viol for enforce), orphan:job: and
     orphan:tmux: from each host's probe."""
     F = []; names = {u["name"] for u in units}; un = cfg.jget("hosts.json")
     orch_pid = (cfg.f("session_pid").read_text().split() or [""])[0] if cfg.f("session_pid").exists() else ""   # the orchestrator is not flagged
+    others = other_projects(cfg); orch = {orch_pid, *(o for _, o in others)} - {""}; pid_self = project_id(cfg)
+    def other_root(r):   # under another listed project (the deepest listed root holding r is not this project)
+        hold = [x for x in [str(cfg.root.resolve())] + [x for x, _ in others] if r == x or r.startswith(x.rstrip("/") + "/")]
+        return bool(hold) and max(hold, key=len) != str(cfg.root.resolve())
     ready = 0
     try: ready = len(ready_work(cfg))
     except Err: pass
@@ -232,12 +246,20 @@ def host_findings(cfg, hs, units, viol):
             F.append((f"direct:{n}:{f[0]}", f"agent {f[2]} runs a build or test directly on {n} (pid {f[0]}, {int(fl(f[3])) // 60} min, outside the lanes): "
                       f"{(f[4] if len(f) > 4 else '')[:80]}; it must use {cfg.hosts[n].get('root', '~')}/run/{f[2]}.lane"))
             viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
+        info = {x.split()[0]: x.split(None, 3)[1:] for x in p.get("apiinfo", []) if x.split()}   # pid -> [tty, owner, root]
         for a in p.get("apiproc", []):   # spend safety: an API process janus did not start spends outside the ledger
             f = a.split(None, 3)
-            if len(f) < 3 or not f[0].isdigit() or (cfg.hosts[n].get("local") and f[0] == orch_pid): continue
+            if len(f) < 3 or not f[0].isdigit() or (cfg.hosts[n].get("local") and f[0] in orch): continue
+            tty, owner, root = (info.get(f[0], []) + ["", "", ""])[:3]
+            # cross-project safety (re-check N2): another project's (its unit tree, its root or cwd, its orchestrator) and the
+            # owner's own sessions (a terminal janus did not start) are neither shown nor touched; only this project's unit
+            # trees are ever stopped, and only with [enforce] stop_api = true; the rest is reported
+            mine = owner == pid_self
+            if not mine and (owner not in ("", "-") or tty not in ("", "-", "?", "??") or other_root(root)): continue
             F.append((f"spend:proc:{n}:{f[0]}", f"Claude/Anthropic API process pid {f[0]} on {n} ({f[2]}) was not started by janus (an API key, no JANUS_UNIT): "
-                      f"it spends outside the ledger and the caps: {(f[3] if len(f) > 3 else '')[:70]}; launch API work through janus; it is stopped after [enforce] grace_min"))
-            viol.append({"key": f"spend:proc:{n}:{f[0]}", "kind": "api", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": None})
+                      f"it spends outside the ledger and the caps: {(f[3] if len(f) > 3 else '')[:70]}; launch API work through janus"
+                      + ("; it is in a unit's tree: stopped after [enforce] grace_min when [enforce] stop_api = true" if mine else "; reported only (not in this project's unit trees)")))
+            viol.append({"key": f"spend:proc:{n}:{f[0]}", "kind": "api", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": None, "stop": mine})
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
             if k not in ("Running", "Queued"): continue

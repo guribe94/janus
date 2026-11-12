@@ -225,7 +225,8 @@ backup_min = 30          # stop and close refuse while a remote copy has work ja
 grace_min = 5
 stop_burners = true      # a CPU burner's process group (never a group that holds the agent)
 stop_direct = false      # a build or test an agent runs outside the lanes on a remote host (flagged and warned either way)
-stop_api = true          # a Claude/Anthropic API process janus did not start, on any host (spend:proc:<host>:<pid>)
+stop_api = false         # a Claude/Anthropic API process janus did not start, inside this project's unit trees (spend:proc:<host>:<pid>);
+                         # reported either way; another project's processes and the owner's terminal sessions are never flagged
 
 # [landing] final_gate_host = "<host>"; final_gate = "<command>"   # janus land gates the merged tree there before it squash-lands
 
