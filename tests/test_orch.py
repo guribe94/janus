@@ -113,6 +113,11 @@ class Hooks(unittest.TestCase):
                   'ssh h pueue kill 3', 'ssh h pueue parallel -g jobs 4', 'echo "$(kill 1)"', 'git push --force',
                   'orch api-run u --run x', 'cat <<EOF | bash\nkill 1\nEOF']:
             self.assertIsNotNone(self.j(c), c)
+    def test_plan_files_are_writable(self):
+        """Plan mode writes ~/.claude/plans/<name>.md: the hook blocked it (2026-11-11); other files stay denied."""
+        w = lambda fp: orch.pretool_why(self.cfg, {"tool_name": "Write", "tool_input": {"file_path": fp}, "cwd": str(self.d)})
+        self.assertIsNone(w(str(Path.home() / ".claude/plans/next-steps.md")))
+        self.assertIsNotNone(w(str(Path.home() / ".claude/settings.json"))); self.assertIsNotNone(w(str(self.d / "src.py")))
 
 class Backlog(unittest.TestCase):
     def test_table_and_checkboxes(self):
@@ -669,12 +674,14 @@ class Board(unittest.TestCase):
 
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
+        """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project)."""
         import re
         bad = re.compile(r"collection-rig|slurp|asgard|midgard|fable|vegtam|/Users/|/srv/|d435|orch-anthropic-api|claude-(opus|sonnet|haiku)", re.I)
-        here = ORCH_PY.parent
-        for f in [ORCH_PY, here / "install", *sorted((here / "skill").glob("*")), here / "example.orch.toml"]:
+        here = ORCH_PY.parent; me = Path(__file__).resolve()
+        for f in [ORCH_PY, here / "install", here / "board.sh", me, here / "README.md", here / "example.orch.toml",
+                  *sorted((here / "skill").glob("*")), *sorted((here / "docs").glob("*.md"))]:
             if f.is_file():
-                hits = [f"{f.name}:{i}" for i, l in enumerate(f.read_text().splitlines(), 1) if bad.search(l)]
+                hits = [f"{f.name}:{i}" for i, l in enumerate(f.read_text().splitlines(), 1) if bad.search(l) and not (f == me and "bad = re.compile" in l)]
                 self.assertEqual(hits, [], f"project details in {f}")
 
 if __name__ == "__main__": unittest.main()
