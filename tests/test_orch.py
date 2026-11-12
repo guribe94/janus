@@ -404,6 +404,25 @@ class Park(unittest.TestCase):
         d, cfg = project()
         with self.assertRaises(orch.Err): orch.cmd_ack(cfg, type("A", (), {"problem": "waiting:u", "decision": "x"})())
 
+class Report(unittest.TestCase):
+    def test_outcomes_waste_pause_and_checkpoint(self):
+        """item 6: spend by outcome; capped-without-verdict spend over waste_pause % pauses launch until acked; report-due."""
+        d, cfg = project('\n[report]\nevery_h = 0\nat = ["00:00"]\n'); mc = cfg.models["m"]; pv = cfg.prov["api"]
+        for n, cost, sub, rep in (("ok", 1.0, "success", "VERDICT: DONE\nexit codes 0\n"), ("cap", 3.0, "error_max_budget_usd", "VERDICT: PENDING\n"),
+                                  ("half", 1.0, "error_max_budget_usd", "VERDICT: PENDING\nstep 1 done\nstep 2 done\n")):
+            run = orch.reserve_budget(cfg, mc, n, 5, f"{n}.1"); orch.ledger_done(cfg, pv, run, n, cost, 0)
+            o = d / "out" / n; o.mkdir(); (o / "REPORT.md").write_text(rep); (o / f"api-{run}.json").write_text(json.dumps({"subtype": sub}))
+        orch.reserve_budget(cfg, mc, "lost", 2, "lost.1")
+        cfg._all_units = {n: {"name": n, "run": f"{n}.1", "status": "closed"} for n in ("ok", "cap", "half", "lost")}
+        got = {x[2]: x[4] for x in orch.run_outcomes(cfg)}
+        self.assertEqual(got, {"ok": "verdict", "cap": "capped-nothing", "half": "capped-partial", "lost": "unknown"})
+        self.assertIn("waste pause", "refused (waste pause): " + (orch.waste_paused(cfg) or ""))   # 4 of 7 dollars capped: over 25 %
+        self.assertIsNotNone(orch.waste_paused(cfg))
+        orch.cmd_ack(cfg, type("A", (), {"problem": "waste-pause", "decision": "cause: budgets too small; fixed"})())
+        self.assertIsNone(orch.waste_paused(cfg))   # the orchestrator acked the cause
+        self.assertIn("report-due", [k for k, _ in orch.report_findings(cfg, [])])
+        cfg.touch("report_sent"); self.assertNotIn("report-due", [k for k, _ in orch.report_findings(cfg, [])])
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         import re
