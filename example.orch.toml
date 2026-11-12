@@ -1,7 +1,10 @@
-# Example orch.toml. Put it in the project root; `orch` finds it from any subdirectory. Paths are relative to this file.
+# orch.toml: one per project, in the project root; `orch` finds it from any subdirectory. Paths are relative to this file.
+# `orch init` writes this file as a starter (this machine named after its host name); `orch doctor` checks the setup.
+# Everything project-specific lives here, never in orch.py.
+
 [project]
 name = "myproject"
-beads = "."              # directory holding .beads/ (units, instructions, rules)
+beads = "."              # directory holding .beads/ (units, instructions, rules, backlog); `bd init` there once
 state = ".orch"          # HANDOFF.md, history.md and orch's bookkeeping
 cycle_min = 15           # a check/ack cycle is overdue after this
 deadline_min = 30        # an unacknowledged problem blocks Stop after this
@@ -10,11 +13,17 @@ reset_tokens = 150000    # context size at which the watcher asks for notes, the
 unreachable_min = 20
 
 [paths]
-board = "bin/board.sh"   # message board script (post/read/summary/rule/close)
-gate_log = "out/gates.log"   # lines: 'YYYY-MM-DD HH:MM:SS <name> EXIT_x=0 ... RESULT: PASS|FAIL'
 briefs = "briefs"        # <briefs>/<unit>.md
-out = "out"              # <out>/<unit>/REPORT.md
+out = "out"              # <out>/<unit>/REPORT.md, api.json, api.err
 worktrees = "worktrees"  # <worktrees>/<unit> is the unit's cwd when it exists
+board = "bin/board.sh"   # optional message board script (post/read/summary/rule/close); agents post progress through it
+gate_log = "out/gates.log"   # lines: 'YYYY-MM-DD HH:MM:SS <name> EXIT_x=0 ... RESULT: PASS|FAIL' (orch gate writes them)
+# gate_runner = "bin/run-gate.sh"   # a project script orch gate calls with <name>; default: orch runs out/<name>/tests.sh itself
+# gate_host_env = "ORCH_TEST_HOST"  # the variable `orch gate --host` sets
+# checklist = "STATUS.md"           # the project's status checklist: the orchestrator may edit it; `orch backlog import` reads it
+# state_docs = ["STATE.md"]         # old state docs: `orch init` turns them into a pointer to .orch/HANDOFF.md
+# lane_scripts = ["bin/test.sh"]    # project wrappers that already run tests through orch's lanes (not flagged as local tests)
+# sync_require = ["fixtures"]       # paths that must arrive on a remote host when `orch run` syncs a worktree
 
 [herdr]
 workspace = "myproject"  # herdr workspace label
@@ -22,6 +31,23 @@ workspace = "myproject"  # herdr workspace label
 [orchestrator]           # what the watcher starts when the orchestrator pane is gone
 kind = "claude"          # a herdr agent kind
 args = []
+
+# [git]
+# remote = "origin"      # where pushes go; a branch without an upstream is pushed with --set-upstream
+
+# [backlog]              # `orch backlog import`: unfinished checklist items become beads issues (label backlog)
+# file = "STATUS.md"     # default paths.checklist; markdown table rows or '- [ ] item' lines
+# id_col = "#"           # table header names of the id, title and status columns
+# title_col = "item"
+# status_col = "status"
+# done = ["DONE"]        # statuses (prefixes) that are finished
+# ready = ["READY", "FIX"]   # statuses an agent can start; default every unfinished one. Others wait (on the owner, say)
+
+# [landing]              # "finished, not landing" in orch check
+# finished_min = 30      # a unit with VERDICT DONE this long ago needs a gate, or landing once its gates passed
+# gates_required = 1
+# gate_names = ["{unit}", "land-{unit}", "land-{unit}-*", "{unit}-*"]   # gate names that belong to a unit (plus orch gate --unit)
+# branch = "main"        # where landed work is; default origin's HEAD branch
 
 # Caps exist only when the owner sets them.
 # [caps]
@@ -38,36 +64,68 @@ reserve_gb = 4           # memory kept free
 agent_gb = 1.5           # per agent
 job_gb = 3               # per pueue job
 min_disk_gb = 20
+# services_gb = 8        # memory other programs use: (ram_gb - services_gb) // job_gb job slots
+# admit_check = "bin/mem-check.sh"   # land lane: a script that must pass before a landing job starts
+# admit_check_env = "FOO=1"          # variables for it
+# legacy_lanes = ""                  # dirs with a pid file of an older lane the land lane waits for
 
-[hosts.server]
-ssh = "me@server.lan"
-arch = "x86_64"          # aarch64 or x86_64: picks pueue's static binary
-ram_gb = 16
-cores = 8
-reserve_gb = 3
-agent_gb = 1.0
-job_gb = 3
-min_disk_gb = 20
-root = "/home/me/orch"   # synced worktrees, briefs and outputs live here
-bin = "/home/me/.local/bin"
-memory_max = "6G"        # systemd-run MemoryMax for each job on this Linux host
-# pueue_config = "/srv/tools/pueue/pueue.yml"   # when the host keeps pueue's files elsewhere
+# A Linux build server (uncomment and adjust; `./install --hosts-only` puts pueue there, no sudo):
+# [hosts.server]
+# ssh = "me@server.lan"
+# arch = "x86_64"          # aarch64 or x86_64: picks pueue's static binary
+# ram_gb = 16
+# cores = 8
+# reserve_gb = 3
+# agent_gb = 1.0
+# job_gb = 3               # each job's MemoryMax (runaway guard)
+# cores_per_job = 2        # CPU admission: (running jobs + 1) x cores_per_job <= cores
+# min_disk_gb = 20
+# root = "/home/me/orch"   # synced worktrees, briefs, outputs and job runs live here
+# bin = "/home/me/.local/bin"
+# memory_max = "6G"        # systemd-run MemoryMax for each remote agent
+# run_env = ". $HOME/env.sh"         # shell run before every job
+# job_setup = "make deps"            # shell run in the worktree before every job's command
+# job_log = "/home/me/orch/jobs.log" # a line per job start and end
+# sync_exclude = [".git", "target", ".venv", "node_modules"]   # a leading / anchors an entry to the worktree root
+# worktrees = "/home/me/orch/worktrees"
+# agent_env = "export PATH=$HOME/.local/bin:$PATH"   # shell run before a remote agent starts
+# pueue_config = "/data/tools/pueue/pueue.yml"        # when the host keeps pueue's files elsewhere
+# pueue_dir = "/data/tools"                           # a shared server: pueue's files and unit under this dir
+# legacy_probe = 'echo "legacy_wait=$(ls /data/old-queue | wc -l)"; echo legacy_run=0'   # an older job queue, while it drains
+# runner = "podman"        # run each job in a container:
+# [hosts.server.container]
+# image = "localhost/build:1"
+# mount = "/data/work"      # host dir mounted into the container (worktrees live under it)
+# mount_at = "/w"
+# args = ["--userns=keep-id", "-e", "CARGO_HOME=/w/cache/cargo", "-e", "TMPDIR=/w/tmp/{name}"]   # {name} = the worktree, {jid} = the job
+# host_dirs = ["/data/work/tmp/{name}"]   # created before the job
+# usb_args = ["--device", "/dev/bus/usb"]   # orch run --usb
+# usb_lock = "/data/work/usb.lock"
+# clone_base = "/data/work/base"            # a new worktree starts as a reflink copy of this
+# name_prefixes = ["orch-run-"]            # containers whose memory counts as job working set
 
+# API providers. orch runs API agents itself (`orch launch` queues `orch api-run` in pueue): it reads the key from the secret
+# store at run time and gives it only to the agent process, never to pueue, a file or argv.
 [providers.claude_api]
 enabled = true
-cap_usd = 100
-ledger = "out/api-ledger.tsv"   # tsv: ts, unit, cost|running, budget, run id
+cap_usd = 100            # launches are refused when committed spend + the unit's budget would pass this
 budget_per_unit = 15
+ledger = "out/api-ledger.tsv"   # ts, unit, running|cost, budget|done rc=, run id: one running and one done row per run
+key_env = "ANTHROPIC_API_KEY"   # the variable the agent gets
+key_keychain = "orch-api-key"   # macOS: security add-generic-password -s orch-api-key -a "$USER" -w
+key_file = "~/.config/orch/anthropic.env"   # elsewhere: ANTHROPIC_API_KEY=... in a file only you can read (chmod 600)
+# cmd = ["claude", "--bare", "-p", "--model", "{api_id}", "--max-budget-usd", "{budget}", "--output-format", "json",
+#        "--dangerously-skip-permissions", "{prompt}"]   # the default; it must write JSON with total_cost_usd to stdout
 [providers.codex]
 enabled = true
 
-# kind "api" = headless launcher run as a pueue task; claude|codex|opencode = a herdr agent (tmux on remote hosts).
-[models.opus]
+# kind "api" = an API agent run by orch as a pueue task; claude|codex|opencode = a herdr agent (tmux on remote hosts).
+[models.claude]
 provider = "claude_api"
 vendor = "anthropic"
 kind = "api"
-model = "opus"
-launcher = "bin/api-agent.sh"   # called: <unit> <brief> <cwd> <budget> <model>
+model = "claude"
+api_id = "<model id>"    # the model id your API key can use
 hosts = ["laptop"]
 [models.codex]
 provider = "codex"
@@ -76,6 +134,6 @@ kind = "codex"
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
 [routing]                # ordered; first model whose provider is enabled and within budget
-critical = ["opus"]
-review = ["codex", "opus"]   # skips the implementer's vendor
+critical = ["claude"]
+review = ["codex", "claude"]   # skips the implementer's vendor
 normal = ["codex"]
