@@ -648,7 +648,8 @@ class AdmitBound(unittest.TestCase):
         self.assertIn("disk", p.stdout); self.assertIn("giving up", p.stdout)
 
     def test_the_caller_reports_a_slow_admission_and_keeps_waiting(self):
-        """Catches (item 21): the caller's pueue wait had no timeout and no output."""
+        """Catches (item 21; finding 7): the caller's pueue wait had no timeout and no output; a task that has not STARTED is
+        reported with the host's admission reason (a running one is not)."""
         d, cfg = project(); h = cfg.hosts["here"]
         real_run = subprocess.run; n = [0]
         def fake_run(cmd, **k):
@@ -657,7 +658,7 @@ class AdmitBound(unittest.TestCase):
                 if n[0] == 1: raise subprocess.TimeoutExpired(cmd, k.get("timeout", 0))
                 return type("R", (), {"returncode": 0})()
             return real_run(cmd, **k)
-        states = [{"status": {"Running": {}}}, {"status": {"Done": {"result": "Success"}}}]
+        states = [{"status": {"Queued": {}}}, {"status": {"Done": {"result": "Success"}}}]
         real = janus.task_status, janus.probe
         subprocess.run = fake_run
         janus.task_status = lambda h, tid: states.pop(0) if states else {"status": {"Done": {"result": "Success"}}}
