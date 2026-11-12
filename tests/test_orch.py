@@ -851,6 +851,40 @@ class RemoteBrief(unittest.TestCase):
             self.assertIn("/no/such/path", str(e.exception)); self.assertIn("elsewhere-xyz", str(e.exception))
         finally: orch.hrun = real
 
+class Tidy(unittest.TestCase):
+    """fixes10 item 5: orch tidy removes clean, landed, unused worktrees, panes of closed units and gone cards of no open unit;
+    the hook judges a loop by the commands inside it and allows orch close --force on a unit's own tree."""
+    def test_tidy_plan_and_run(self):
+        d, cfg = project('\n[landing]\nbranch = "main"\n[paths]\nworktrees = "wts"\n'); r = d / "repo"; r.mkdir(); w = d / "wts"; w.mkdir()
+        g = lambda *a, cwd=r: subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *a], capture_output=True, text=True)
+        g("init", "-q", "-b", "main"); (r / "a").write_text("1\n"); g("add", "a"); g("commit", "-qm", "base")
+        for n in ("landed", "dirty", "unlanded", "inuse", "untracked"): g("worktree", "add", "-q", "-b", f"wk/{n}", str(w / n))
+        (w / "dirty/a").write_text("2\n"); (w / "untracked/new").write_text("x\n")
+        (w / "unlanded/b").write_text("b\n"); g("add", "b", cwd=w / "unlanded"); g("commit", "-qm", "b", cwd=w / "unlanded")
+        cfg._all_units = {"old": {"status": "closed"}, "live": {"status": "open"}}
+        ag = {"old": {"pane_id": "p1", "agent_status": "idle"}, "live": {"pane_id": "p2"}, "orchestrator": {"pane_id": "p0"}}
+        rows = {"ghost": {"gone": True}, "live": {"gone": True}, "fine": {"gone": False}}
+        real = orch.ws_id; orch.ws_id = lambda cfg, create=False: None
+        try: P = orch.tidy_plan(cfg, [{"name": "live", "cwd": str(w / "inuse")}], ag, rows)
+        finally: orch.ws_id = real
+        self.assertEqual([(k, Path(t).name if k == "worktree" else t) for k, t, _ in P], [("worktree", "landed"), ("pane", "p1"), ("card", "ghost")])
+
+    def test_hook_loops_and_force_close(self):
+        d, cfg = project(); j = lambda c: orch.judge(cfg, c, str(d), orch.edit_ok_dirs(cfg))
+        self.assertIsNone(j("git merge -q origin/main && git push -q; for w in worktrees/a worktrees/b; do orch ack x \"y\"; orch status; done"))
+        self.assertIsNone(j("git -C worktrees/a merge origin/main; for p in 1 2; do echo $p; done"))   # the merge is not in the loop
+        for c in ("for w in worktrees/*; do git -C $w merge origin/main; done", "for w in worktrees/*; do orch close $w; done",
+                  "ls worktrees | xargs -I{} git -C {} add -A", "while read w; do rm $w/f; done < worktrees.txt"):
+            self.assertIsNotNone(j(c), c)
+        wt = d / "wt"; wt.mkdir(); units = [{"id": "x-1", "name": "u", "cwd": str(wt)}, {"id": "x-2", "name": "v", "cwd": str(d)}]
+        real = orch.Beads.units; orch.Beads.units = lambda s: units
+        try:
+            self.assertIsNone(j("orch close u --force --reason 'capped; continued elsewhere'"))
+            self.assertIsNotNone(j("orch close v --force"))             # the project root: shared
+            units.append({"id": "x-3", "name": "w", "cwd": str(wt)}); self.assertIsNotNone(j("orch close u --force"))   # shared tree
+            self.assertIsNotNone(j("orch close nosuch --force"))
+        finally: orch.Beads.units = real
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project).
