@@ -243,6 +243,12 @@ while :; do
     fi
     ulk; nowt=$(date +%%s)
     if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): $why"; said=$BLK; last=$nowt; fi
+  else
+    # finding 10: a jobs-lane job yields while a gates job waits; say why (the old branch left BLK empty, so the give-up message
+    # read "no reason reported"), and treat it as a yield -- the queue is moving (the gate is progressing), so the clock clears.
+    Y=1; BLK="a gates job is waiting on this host"
+    nowt=$(date +%%s)
+    if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): a jobs job yields while a gates job waits and goes after it"; said=$BLK; last=$nowt; fi
   fi
   # finding 3: the give-up clock starts at the first poll this job is blocked, never at enqueue (TQ); a yield to an older job
   # means the queue is moving, so it clears the clock. So a job that queued long is not dropped at its first blocked poll.

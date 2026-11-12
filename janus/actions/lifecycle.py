@@ -233,7 +233,11 @@ def resume_message(cfg, hs, u, jobs):
     L = [f"Your jobs finished (spent ${s:.2f} of ${b:g}):"]
     for j in jobs:
         rc, log = job_result(cfg, hs, j, u.get("host"))
-        L.append(f"- {j}: exit {rc if rc is not None else 'unknown (the task is gone and left no exit code)'}; log {log}")
+        note = ""
+        if rc == 121:   # finding 10: nothing read exit 121; the unit is told what it means (the command never ran)
+            note = " (never admitted: its host's admission never freed within the job's wait limit, so the command never ran; the log says why)"
+        elif rc == 124: note = " (the command hit its own timeout)"
+        L.append(f"- {j}: exit {rc if rc is not None else 'unknown (the task is gone and left no exit code)'}{note}; log {log}")
     L.append(f"Read only the logs you need, then continue the brief from where {report} stands. Same rules: submit builds and "
              f"tests detached, write 'WAITING <job ids>' in the report and end your turn; finish with the VERDICT line and the "
              f"real exit codes.")
