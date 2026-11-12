@@ -330,6 +330,25 @@ class Item7CallerWait(unittest.TestCase):
         rc, msg, calls = run_case({"status": {"Queued": {}}}, False, "yes")      # not started yet: silent
         self.assertEqual(rc, 0); self.assertEqual(msg, "", "a task not yet started was reported")
 
+    def test_a_held_task_whose_admission_answer_is_yes_does_not_read_yes(self):
+        """Catches (finding C): when the task waited in admission and admission's answer for ONE MORE job was yes (a yield to
+        older jobs, or a class heavier than job), the notice read 'held by admission after 300s (yes)'."""
+        d, cfg = project(); h = cfg.hosts["here"]
+        states = [{"status": {"Running": {}}}, {"status": {"Done": {"result": "Success"}}}]
+        saved = (subprocess.run, janus.task_status, janus.probe, janus.hrun)
+        def fake_run(cmd, **k): raise subprocess.TimeoutExpired(cmd, k.get("timeout", 0))
+        subprocess.run = fake_run
+        janus.task_status = lambda h_, tid: states.pop(0) if states else {"status": {"Done": {"result": "Success"}}}
+        janus.probe = lambda n, h_, **k: {"cap_admit": "yes", "cap_pause": ""}
+        janus.hrun = lambda h_, script, **k: (0, "y\n", "")
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(out): janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
+        finally: subprocess.run, janus.task_status, janus.probe, janus.hrun = saved
+        msg = out.getvalue()
+        self.assertIn("held by admission", msg)
+        self.assertNotIn("(yes)", msg, msg)
+
 
 class Item10GiveUpResidues(unittest.TestCase):
     """Finding 10: the give-up clock residues -- a jobs job yielding to a gates job said "no reason reported", and nothing read

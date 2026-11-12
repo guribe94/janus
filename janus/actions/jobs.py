@@ -219,7 +219,10 @@ def finish_job(cfg, hn, h, tid, jid, quiet=False):
                 if admission_wait(cfg, h, jid):   # only a task this job's own admission is holding, never one merely queued/running
                     p = probe(hn, h, cfg=cfg)
                     adm = (p.get("cap_admit") or "").strip(); paused = (p.get("cap_pause") or "").strip()
-                    print(f"janus: {hn} task {tid} is held by admission after {WAIT_STEP}s ({paused or adm or 'admission blocked'}): see janus queue {hn}", file=sys.stderr)
+                    # finding C: `cap_admit` is the answer for ONE MORE job; when it is "yes" (a yield to older jobs, or a
+                    # class heavier than job) the notice read "held by admission (yes)". Say what it means instead.
+                    why = paused or (adm if adm and adm != "yes" else "admission says room for one more, so it may start soon")
+                    print(f"janus: {hn} task {tid} is held by admission after {WAIT_STEP}s ({why}): see janus queue {hn}", file=sys.stderr)
             continue
         t = task_status(h, tid)
         if task_rc(t) is not None: break
