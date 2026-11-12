@@ -482,4 +482,78 @@ class Item7Resumable(unittest.TestCase):
         self.assertEqual(self.tend(), []); self.assertEqual(self.u["resumable"]["need"], 1.5)
         self.assertIn("janus resume u1 --budget 1.5", dict(janus.resumable_findings(self.cfg, [self.u])).get("unit:u1:resumable", ""))
 
+class Item8Unattended(unittest.TestCase):
+    """With a spending cap the watcher keeps work moving on its own (relaunch, resume, fill), says so when that is off, and one
+    failing step never stops the rest of a pass."""
+    STEPS = ("heartbeat_beat", "board_alerts", "tend_parked", "tend_checkpoint", "tend_resumable", "tend_autopilot", "tend_thrash", "tend_tidy")
+    def setUp(self):
+        self.real = janus.Beads; janus.Beads = FakeBeads; FakeBeads.units_ = []; self.log = []
+    def tearDown(self): janus.Beads = self.real; FakeBeads.units_ = []
+
+    def crashed(self, d): return {"name": "u1", "id": "b-1", "host": "here", "state": "done", "via": "pueue", "model": "m", "brief": "b.md", "cwd": str(d), "run": "u1.1"}
+    def relaunched(self, cfg, d):
+        got = []
+        with mock.patch.object(janus, "cmd_launch", lambda cfg, a: got.append(a.unit)), mock.patch.object(janus, "board", lambda c, *a, **k: (0, "", "")), \
+             mock.patch.object(janus, "board_questions", lambda c: []):
+            janus.tend_autopilot(cfg, {}, [self.crashed(d)], [], self.log.append)
+        return got
+    def watch(self, cfg, F=(), **more):
+        """One watcher pass with every step stubbed (`more` replaces some); returns the names of the steps that ran."""
+        ran = []
+        stubs = {n: (lambda *a, _n=n, **k: ran.append(_n) or []) for n in self.STEPS + ("orphan_jobs", "cmd_fill")}
+        stubs.update(run_check=lambda cfg, cycle=False, writer=True: ([janus.finding(k, "t") for k in F], None, {}, []), herdr=lambda *a: None, **more)
+        with mock.patch.multiple(sys.modules["janus.watch"], **stubs): janus.watch_pass(cfg, self.log.append)
+        return ran
+
+    def test_with_a_cap_the_watcher_relaunches_and_fills_without_being_configured(self):
+        """Catches (item 8): a project with a cap and no [autopilot]/[fill] section left a crashed unit dead and ready backlog
+        units unlaunched all night: the unattended loop was off unless the owner had found both settings."""
+        d, cfg = project()
+        self.assertEqual(self.relaunched(cfg, d), ["u1-r1"], "a crashed unit was not relaunched in a project with a cap")
+        self.assertIn("cmd_fill", self.watch(cfg, F=["idle-with-backlog"]), "ready backlog units were not launched in a project with a cap")
+        self.assertEqual(janus.unattended_findings(cfg, [self.crashed(d)]), [])
+
+    def test_the_owner_can_turn_it_off_and_check_says_that_it_is_off(self):
+        """Catches (item 8): the loop forced on against an explicit setting; and a loop that is off with nobody told, so the
+        orchestrator leaves for the night believing the watcher will keep work moving."""
+        d, cfg = project("\n[autopilot]\nenabled = false\n[fill]\nwatcher = false\n[backlog]\nfile = \"S.md\"\n")
+        self.assertEqual(self.relaunched(cfg, d), []); self.assertNotIn("cmd_fill", self.watch(cfg, F=["idle-with-backlog"]))
+        F = dict(janus.unattended_findings(cfg, [self.crashed(d)]))
+        self.assertEqual(list(F), ["unattended:off"]); self.assertIn("[autopilot] enabled", F["unattended:off"]); self.assertIn("[fill] watcher", F["unattended:off"])
+        self.assertFalse(janus.finding("unattended:off", F["unattended:off"]).urgent)   # registered: check can report it
+        d, cfg = project("\n[fill]\nwatcher = false\n")   # the autopilot on by the cap; a fill with no backlog file does nothing
+        self.assertEqual(janus.unattended_findings(cfg, [self.crashed(d)]), [])
+
+    def test_without_a_cap_it_stays_off_and_check_says_so_while_work_is_open(self):
+        """Catches (item 8): the watcher launching and relaunching agents in a project with no spending cap; and that project's
+        orchestrator not told that nothing recovers its units while it is away."""
+        d, cfg = project(); del cfg.prov["api"]["cap_usd"]
+        self.assertEqual(self.relaunched(cfg, d), []); self.assertNotIn("cmd_fill", self.watch(cfg, F=["idle-with-backlog"]))
+        F = dict(janus.unattended_findings(cfg, [self.crashed(d)]))
+        self.assertEqual(list(F), ["unattended:off"]); self.assertIn("cap_usd", F["unattended:off"])
+        self.assertEqual(janus.unattended_findings(cfg, []), [], "reported with no open unit and no backlog: nothing to keep moving")
+        cfg.c["autopilot"] = {"enabled": True}
+        self.assertEqual(self.relaunched(cfg, d), ["u1-r1"]); self.assertEqual(janus.unattended_findings(cfg, [self.crashed(d)]), [])
+
+    def test_a_failing_step_is_logged_and_the_rest_of_the_pass_still_runs(self):
+        """Catches (item 8): one watcher step that raised (a unit record it could not read) ended the whole pass, every pass: no
+        resume, no relaunch, no fill and no orchestrator wake until someone looked at the log."""
+        d, cfg = project()
+        def bad(*a, **k): raise KeyError("host")
+        for i in range(3):
+            ran = self.watch(cfg, F=["idle-with-backlog"], tend_parked=bad); os.utime(cfg.f("last_fill"), (time.time() - 7200,) * 2)
+        self.assertEqual([n for n in self.STEPS + ("cmd_fill",) if n not in ran], ["tend_parked"], "steps after the failing one did not run")
+        self.assertTrue(any("tend_parked" in l and "KeyError" in l for l in self.log), self.log)
+        F = dict(janus.watch_step_findings(cfg)); self.assertEqual(list(F), ["watcher:step:tend_parked"]); self.assertIn("3 passes", F["watcher:step:tend_parked"])
+        self.assertIn("tend_parked", self.watch(cfg)); self.assertEqual(janus.watch_step_findings(cfg), [], "still reported after the step worked again")
+
+    def test_a_pass_that_dies_is_logged_and_the_watcher_command_still_ends_cleanly(self):
+        """Catches (item 8): an unexpected error in a pass (not a janus refusal) ended the watcher command with a traceback and
+        nothing in watch.log, so nobody could see why no pass had acted."""
+        d, cfg = project()
+        def dies(cfg, log): raise ValueError("bad state file")
+        with mock.patch.object(sys.modules["janus.watch"], "watch_pass", dies): janus.cmd_watch(cfg, ns())
+        self.assertIn("ValueError: bad state file", cfg.f("watch.log").read_text())
+        self.assertEqual([k for k, _ in janus.watch_step_findings(cfg)], [], "one failed pass is not yet a finding")
+
 if __name__ == "__main__": unittest.main()

@@ -71,11 +71,12 @@ FAMILIES = {
     "test-signal": Family("a long gate/test step that has not failed in N runs: scope or trim it (deletion stays the owner's call)"),
     "thrash": Family("the watcher stopped and re-queued a job on a thrashing shared host"),
     "tidy": Family("what janus tidy can reclaim"),
+    "unattended": Family("the unattended loop (autopilot, watcher fill) is off while work is open", ack_ttl=7 * 24 * H),
     "unit": Family("a unit is blocked, finished, or stopped by a limit without a verdict", urgent=True),
     "waiting": Family("a live agent waits for its jobs' admission and pays for it", urgent=True, ack_ttl=0),
     "waste": Family("a run ended at its budget cap without a verdict", urgent=True),
     "waste-pause": Family("launch and fill are paused by the waste limit", urgent=True),
-    "watcher": Family("the watcher is not running"),
+    "watcher": Family("the watcher is not running, or one of its steps keeps failing"),
 }
 
 

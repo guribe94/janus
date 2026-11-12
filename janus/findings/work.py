@@ -162,4 +162,13 @@ def session_findings(cfg, running):
                   f"the notes skeleton); if the state folder is really {cfg.state.name}, janus migrate rewrites [project] state, or set it by hand"))
     for s in handoff_stale(cfg, running): F.append(("handoff", s))
     if not watcher_loaded(): F.append(("watcher", f"watcher {watcher_service()[1]} ({watcher_service()[0]}) is not running: run install"))
-    return F
+    return F + watch_step_findings(cfg)
+
+STEP_FAILS = 3   # passes in a row before a failing watcher step is a finding (one failure is retried by the next pass)
+
+def watch_step_findings(cfg):
+    """watcher:step:<name>: a step of the watcher's pass failed STEP_FAILS passes in a row (watch.watch_step records it and
+    carries on with the other steps); it clears when the step works again."""
+    return [(f"watcher:step:{n}", f"the watcher's step {n} failed {x['n']} passes in a row ({x.get('err', '?')}); its other steps still run and it is tried "
+             f"again every pass. What that step does is not happening: find the cause in {cfg.f('watch.log')}")
+            for n, x in sorted(cfg.jget("watch_steps.json").items()) if x.get("n", 0) >= STEP_FAILS]

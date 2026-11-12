@@ -1,13 +1,14 @@
 """janus watch: the watcher's one pass (launchd/systemd every few minutes): board sync and alerts, check as a writer, tend
-parked units, thrash and tidy, cancel orphans, fill, and wake or restart the orchestrator."""
-import argparse, os
+parked units, thrash and tidy, cancel orphans, fill, and wake or restart the orchestrator. Each step is guarded (watch_step):
+one that fails is logged and counted, the others still run, and the next pass tries it again."""
+import argparse, os, traceback
 from janus.actions.backlog import cmd_fill
 from janus.actions.jobs import cancel_job, job_state, orphan_jobs, task_rc, tend_thrash, wrap_token, wrapped_jobs
 from janus.actions.launch import new_tab, wait_shell
 from janus.actions.lifecycle import tend_checkpoint, tend_parked, tend_resumable
 from janus.actions.tidy import tend_tidy
 from janus.board import board, board_alerts, board_dir, board_files
-from janus.autopilot import record, tend_autopilot
+from janus.autopilot import fill_watcher, record, tend_autopilot
 from janus.check import run_check
 from janus.reset import orch_tokens, reset_now
 from janus.context import CLAIM_WINDOW, Err, JANUS_MARK, atomic_write, handoff_stale, herdr, now, pending_age, session_alive, sh, ts, wake, wake_clear
@@ -20,34 +21,51 @@ def cmd_watch(cfg, a):
     try:
         with cfg.writer(wait=120): return watch_pass(cfg, log)   # the whole pass is one writer (panel problem 2)
     except Err as e: log(f"pass skipped: {e}")
+    except Exception as e:   # never a silent death (budget-follow item 8): the cause is in watch.log, and the next pass runs
+        log(f"pass failed: {type(e).__name__}: {e} | " + " | ".join(traceback.format_exc().strip().splitlines()[-3:-1])[:400])
+
+def watch_step(cfg, log, name, fn, *a):
+    """Run one step of the pass. Any failure is logged and counted in .janus/watch_steps.json (check: watcher:step:<name> after
+    three passes in a row), and the pass goes on: one bad unit record or host cannot stop the resumes, the relaunches, the fill
+    or the orchestrator's wake (budget-follow item 8)."""
+    try: r = fn(*a)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"[:300]
+        if not cfg.run.dry:
+            rec = cfg.jget("watch_steps.json"); rec[name] = {"n": (rec.get(name) or {}).get("n", 0) + 1, "err": err, "t": int(now())}; cfg.jput("watch_steps.json", rec)
+        log(f"step {name} failed, the pass goes on: {err}"); return None
+    rec = cfg.jget("watch_steps.json")
+    if name in rec and not cfg.run.dry: rec.pop(name); cfg.jput("watch_steps.json", rec); log(f"step {name} works again")
+    return r
 
 def watch_pass(cfg, log):
     def sync():   # the shipped board only, when there are other hosts (or posts this machine made before it was the board)
         if cfg.paths.get("board") or cfg.run.dry: return
         board_files(cfg)
         if (board_dir(cfg) / ".hosts").read_text().strip() or (board_dir(cfg).parent / "board-outbox" / "outbox.log").is_file(): board(cfg, "sync", timeout=180)
-    sync()   # the shipped board: merge the hosts' outboxes (their questions alert at once through .notify) before the check
+    step = lambda name, fn, *a: watch_step(cfg, log, name, fn, *a)
+    step("sync", sync)   # the shipped board: merge the hosts' outboxes (their questions alert at once through .notify) before the check
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     F = [f for f in F if f.family != "machine"]   # machine state (no project id) never wakes or starts an orchestrator
-    heartbeat_beat(cfg)   # the watchdog host sees this pass (inert until heartbeat/ ships and [heartbeat] watchdog is set)
-    board_alerts(cfg, log)
-    tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (janus-fixes9)
-    tend_checkpoint(cfg, hs, units, log)   # a run near its budget is ordered once to commit, report and park (budget-follow item 6)
-    tend_resumable(cfg, hs, units, log)   # units stopped by their budget: recorded, and resumed first when the cap has room (item 7)
-    tend_autopilot(cfg, hs, units, F, log)   # [autopilot] enabled: the ending policy's fixed-rule actions (janus/autopilot.py)
-    tend_thrash(cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job (fixes10 item 3)
-    tend_tidy(cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)
-    sync()   # push what this pass wrote (peers.md, directions) to every host
-    for r, why in orphan_jobs(cfg, hs, units):   # nothing whose owner is gone keeps running or waiting (item 3)
+    step("heartbeat_beat", heartbeat_beat, cfg)   # the watchdog host sees this pass (inert until heartbeat/ ships and [heartbeat] watchdog is set)
+    step("board_alerts", board_alerts, cfg, log)
+    step("tend_parked", tend_parked, cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (janus-fixes9)
+    step("tend_checkpoint", tend_checkpoint, cfg, hs, units, log)   # a run near its budget is ordered once to commit, report and park (budget-follow item 6)
+    step("tend_resumable", tend_resumable, cfg, hs, units, log)   # units stopped by their budget: recorded, and resumed first when the cap has room (item 7)
+    step("tend_autopilot", tend_autopilot, cfg, hs, units, F, log)   # [autopilot] enabled: the ending policy's fixed-rule actions (janus/autopilot.py)
+    step("tend_thrash", tend_thrash, cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job (fixes10 item 3)
+    step("tend_tidy", tend_tidy, cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)
+    step("sync", sync)   # push what this pass wrote (peers.md, directions) to every host
+    for r, why in step("orphan_jobs", orphan_jobs, cfg, hs, units) or []:   # nothing whose owner is gone keeps running or waiting (item 3)
         try: d = "; ".join(cancel_job(cfg, r)); log(f"orphan {r} ({why}): {d}"); record(cfg, f"orphan:job:{r}", "cancel", f"{why}: {d}")
         except Err as e: log(f"orphan {r} ({why}): not cancelled: {e}")
     live = {wrap_token(t) for p in hs.values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values() if task_rc(t) is None}
     for f in (cfg.f("runs") / "wrap").glob("*") if (cfg.f("runs") / "wrap").is_dir() else []:   # finished wrappers' records, after a day
         if f.name not in live and now() - f.stat().st_mtime > 86400 and all(job_state(hs, r)[0] in ("done", "gone") for r in wrapped_jobs(cfg, f.name)): f.unlink()
-    # [fill] watcher = true (owner autonomy: "launch within capacity"): launch ready backlog units up to capacity, at most every
-    # [fill] every_min (default 10) minutes, only when check found something that fits (idle-with-backlog)
+    # [fill] watcher (owner autonomy: "launch within capacity"; on by default with a cap, item 8): launch ready backlog units up to
+    # capacity, at most every [fill] every_min (default 10) minutes, only when check found something that fits (idle-with-backlog)
     fc = cfg.c.get("fill", {})
-    if fc.get("watcher") and any(k == "idle-with-backlog" for k, _ in F) and now() - cfg.mtime("last_fill") > fc.get("every_min", 10) * 60:
+    if fill_watcher(cfg) and any(k == "idle-with-backlog" for k, _ in F) and now() - cfg.mtime("last_fill") > fc.get("every_min", 10) * 60:
         cfg.touch("last_fill")
         try:
             import io, contextlib
