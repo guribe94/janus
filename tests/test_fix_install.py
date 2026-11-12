@@ -202,31 +202,77 @@ class Item14OldOrch(unittest.TestCase):
         """Catches (finding 4): migrate matched any process with an `orch` token (a job waiter, an ssh, an editor) and never
         listed the old orch's standing loops (fleet-loops.sh, handoff-queue.sh, orch-backup.sh, wip-snapshot.sh, its watcher),
         and cut the list at 100 characters."""
-        ps = (" 101 1 /bin/zsh /Users/x/proj/bin/fleet-loops.sh\n"
-              " 102 1 /bin/zsh /Users/x/proj/bin/handoff-queue.sh w1 /Users/x/proj/out/handoff-queue-linux2\n"
-              " 103 1 /bin/zsh /Users/x/proj/bin/orch-backup.sh 30\n"
-              " 104 1 /bin/zsh /Users/x/proj/bin/wip-snapshot.sh 30\n"
-              " 105 1 /bin/zsh /Users/x/proj/bin/watch-stream.sh\n"
-              " 106 1 /usr/bin/python3 /Users/x/proj/orch.py run --host h --lane jobs --wt /w -- cargo test\n"
-              " 107 1 /bin/zsh /Users/x/proj/bin/pueue wait -q 9\n"
-              " 108 1 ssh host cd /Users/x/proj && ls\n"
-              " 109 1 /usr/bin/vim /Users/x/proj/orch.py\n"
-              " 111 1 /usr/bin/python3 /Users/x/proj/janus.py watch\n")
-        self.assertEqual([p for p, _ in janus.old_orch_procs(ps)], [101, 102, 103, 104, 105])
-        out = janus.retire_old_orch(dry=False, retire=False, ps_text=ps)
+        ps = (" 101 /bin/zsh /Users/x/proj/bin/fleet-loops.sh\n"
+              " 102 /bin/zsh /Users/x/proj/bin/handoff-queue.sh w1 /Users/x/proj/out/handoff-queue-linux2\n"
+              " 103 /bin/zsh /Users/x/proj/bin/orch-backup.sh 30\n"
+              " 104 /bin/zsh /Users/x/proj/bin/wip-snapshot.sh 30\n"
+              " 105 /bin/zsh /Users/x/proj/bin/watch-stream.sh\n"
+              " 106 /usr/bin/python3 /Users/x/proj/orch.py run --host h --lane jobs --wt /w -- cargo test\n"
+              " 107 /bin/zsh /Users/x/proj/bin/pueue wait -q 9\n"
+              " 108 ssh host cd /Users/x/proj && ls\n"
+              " 109 /usr/bin/vim /Users/x/proj/orch.py\n"
+              " 111 /usr/bin/python3 /Users/x/proj/janus.py watch\n")
+        self.assertEqual([p for p, _ in janus.old_orch_procs(ps, "/Users/x/proj")], [101, 102, 103, 104, 105])
+        out = janus.retire_old_orch(dry=False, retire=False, ps_text=ps, root="/Users/x/proj")
         self.assertTrue(any("101" in l for l in out)); self.assertTrue(any("not stopped" in l for l in out))
         self.assertTrue(any("handoff-queue-linux2" in l for l in out), "the command line was cut before its argument")
-        kills = []; real = janus.run; janus.run = lambda cmd, **k: (kills.append(list(cmd)), 0, "", "")[1:]
-        try: janus.retire_old_orch(dry=False, retire=True, ps_text=ps)
+        kills = []
+        def fake_run(cmd, **k):   # finding 6: retire first asks for each process's live children (pgrep), never a kill
+            if cmd[:1] == ["pgrep"]: return (0, "", "")
+            kills.append(list(cmd)); return (0, "", "")
+        real = janus.run; janus.run = fake_run
+        try: janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/Users/x/proj")
         finally: janus.run = real
         self.assertEqual(kills, [["kill", "-TERM", str(p)] for p in (101, 102, 103, 104, 105)])
 
     def test_old_orch_procs_are_scoped_to_this_project(self):
         """Catches (finding 4): another project's old-orch loop was listed for this project's migrate."""
         root = "/Users/x/proj"
-        ps = (" 101 1 /bin/zsh /Users/x/proj/bin/fleet-loops.sh\n"
-              " 110 1 /bin/zsh /other/proj/bin/fleet-loops.sh\n")
+        ps = (" 101 /bin/zsh /Users/x/proj/bin/fleet-loops.sh\n"
+              " 110 /bin/zsh /other/proj/bin/fleet-loops.sh\n")
         self.assertEqual([p for p, _ in janus.old_orch_procs(ps, root)], [101])
+
+
+class Item6RetireMatch(unittest.TestCase):
+    def test_retire_matches_only_the_old_orchs_own_loops(self):
+        """Catches (finding 6): `migrate --retire` matched a sibling project's loop (a path-prefix substring), a job waiter
+        (`janus.py run ... -- bash bin/handoff-queue.sh`), a reader (`tail -f .../orch-backup.sh`) and an agent's own `-c` shell
+        that merely named the scripts (the live listing showed 19 matches where 18 were loops)."""
+        root = "/Users/x/proj"
+        ps = (" 101 /bin/zsh /Users/x/proj/bin/fleet-loops.sh far\n"
+              " 102 /bin/bash /Users/x/proj-two/bin/fleet-loops.sh far\n"
+              " 103 /usr/bin/python3 /x/janus.py run --host far --wt /Users/x/proj -- bash bin/handoff-queue.sh\n"
+              " 104 tail -f /Users/x/proj/bin/orch-backup.sh\n"
+              " 105 /bin/zsh -c source ~/.zshenv && /Users/x/proj/bin/watch-stream.sh\n"
+              " 106 /bin/zsh /Users/x/proj/orch.py watch\n"
+              " 107 /bin/zsh /Users/x/proj/bin/pueue wait -q 9\n")
+        self.assertEqual([p for p, _ in janus.old_orch_procs(ps, root)], [101, 106])
+
+    def test_a_relative_loop_script_is_matched_by_the_process_own_cwd(self):
+        """Catches (finding 6): a loop started with a relative script path (the old orch's own cwd) was not listed; and a loop
+        started the same way in another project's tree must never be this project's."""
+        ps = (" 201 /bin/zsh bin/fleet-loops.sh far\n"
+              " 202 /bin/zsh bin/fleet-loops.sh far\n")
+        real = janus._proc_cwd
+        janus._proc_cwd = lambda pid: {201: Path("/w/proj"), 202: Path("/other/proj")}.get(pid)
+        try: got = [p for p, _ in janus.old_orch_procs(ps, "/w/proj")]
+        finally: janus._proc_cwd = real
+        self.assertEqual(got, [201])
+
+    def test_retire_keeps_a_mid_handoff_worker_whose_child_gate_runs(self):
+        """Catches (finding 6): TERM to a handoff-queue.sh worker mid-handoff orphaned its child gate; the worker is listed but
+        kept while it has a live child."""
+        ps = (" 101 /bin/zsh /w/proj/bin/fleet-loops.sh\n"
+              " 102 /bin/zsh /w/proj/bin/handoff-queue.sh w1 /w/proj/out/handoff-queue\n")
+        kills = []
+        def fake_run(cmd, **k):
+            if cmd[:1] == ["pgrep"]: return 0, ("999\n" if cmd[-1] == "102" else ""), ""
+            kills.append(list(cmd)); return 0, "", ""
+        real = janus.run; janus.run = fake_run
+        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
+        finally: janus.run = real
+        self.assertEqual(kills, [["kill", "-TERM", "101"]], "a mid-handoff worker was TERMed, orphaning its child gate")
+        self.assertTrue(any("102" in l and "child" in l for l in out), out)
 
 
 class Item15ReadyWork(unittest.TestCase):

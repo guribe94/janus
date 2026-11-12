@@ -284,39 +284,88 @@ def rewrite_config(path, dry=False):
     if changes and not dry: atomic_write(path, "\n".join(lines))
     return changes
 
-# Item 14 (finding 4): the old orch's standing loops only -- its bin scripts and its watcher -- whose command names this
-# project (root), never a job waiter (`orch run ... --lane`, `pueue wait`), an ssh/rsync, an editor, or another project's
-# process. The command word (not the whole line) decides, so a path holding `code` or `less` is not an editor.
-OLD_ORCH_LOOP_RX = re.compile(r"(^|[/\s])(fleet-loops|handoff-queue|orch-backup|wip-snapshot|watch-stream)\.sh(\s|$)")
-OLD_ORCH_WATCH_RX = re.compile(r"(^|[/\s])orch(\.py)?\s+watch(\s|$)")
-OLD_ORCH_NOT = {"ssh", "mosh", "rsync", "scp", "sftp", "vim", "vi", "nvim", "nano", "emacs", "less", "more", "ed", "make"}
+# Item 14 (finding 4; finding 6): the old orch's standing loops only. The process's OWN script argument must be this project's
+# <root>/bin/<loop>.sh or <root>/orch.py watch. A supervisor or waiter that merely NAMES a loop in its arguments
+# (`janus.py run --host h -- bash bin/handoff-queue.sh`), a reader (`tail -f .../orch-backup.sh`, an editor), another project's
+# tree (a path prefix such as /w/proj-two), and an agent's own `sh -c ...` shell whose command string names the scripts are never
+# the loop. A loop started with a relative script path is told apart by the process's own cwd (finding 6).
+OLD_ORCH_LOOPS = ("fleet-loops", "handoff-queue", "orch-backup", "wip-snapshot", "watch-stream")
+OLD_ORCH_SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+
+def _sh_words(cmd):
+    """The words of a command line, honouring quotes and backslashes (a script named inside an argument stays one word)."""
+    w, cur, q, esc = [], "", None, False
+    for ch in cmd:
+        if esc: cur += ch; esc = False; continue
+        if q:
+            if ch == q: q = None
+            else: cur += ch
+        elif ch in "'\"": q = ch
+        elif ch in " \t":
+            if cur: w.append(cur); cur = ""
+        else: cur += ch
+    if cur: w.append(cur)
+    return w
+
+def _proc_cwd(pid):
+    """A process's working directory (Linux /proc, else lsof), or None when it cannot be told."""
+    try: return Path(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError: pass
+    rc, o, e = sh(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=10)
+    if rc in (0, 1) and o:
+        for l in o.splitlines():
+            if l.startswith("n"): return Path(l[1:])
+    return None
+
+def _old_orch_script(pid, w, r):
+    """True when the shell words w run this project's own old loop as their own script: <root>/bin/<loop>.sh, a relative
+    bin/<loop>.sh from a process whose cwd is under the root, or <root>/orch.py watch."""
+    if not w or os.path.basename(w[0]) not in OLD_ORCH_SHELLS or not r: return False
+    i = 1
+    while i < len(w) and w[i].startswith("-"):
+        if "c" in w[i][1:]: return False   # a shell shim whose command string merely names the script (an agent's own shell)
+        i += 1
+    if i >= len(w): return False
+    script = w[i]; base = os.path.basename(script)
+    if base == "orch.py":
+        return w[i + 1:i + 2] == ["watch"] and Path(script).is_absolute() and Path(script).resolve() == (r / "orch.py")
+    name = base[:-3] if base.endswith(".sh") else base
+    if name not in OLD_ORCH_LOOPS: return False
+    if Path(script).is_absolute(): return Path(script).resolve() == r / "bin" / f"{name}.sh"
+    if script not in (f"bin/{name}.sh", f"./bin/{name}.sh"): return False
+    cw = _proc_cwd(pid)
+    return bool(cw) and (cw.resolve() == r or cw.resolve().is_relative_to(r))
 
 def old_orch_procs(ps_text=None, root=None):
-    """[(pid, command)] of this machine's running old-orch standing processes (item 14, finding 4): one of the old toolkit's
-    loop scripts (fleet-loops.sh, handoff-queue.sh, orch-backup.sh, wip-snapshot.sh, watch-stream.sh) or its watcher, whose
-    command names this project (root); never a job waiter, an ssh/rsync, an editor or another project's process. migrate lists
-    them; janus migrate --retire stops them (the owner's yes)."""
+    """[(pid, command)] of this machine's running old-orch standing loops (item 14; finding 6): a shell whose own script is
+    this project's <root>/bin/<loop>.sh or its watcher; never a job waiter or supervisor, a reader, an editor or another
+    project's process. migrate lists them; janus migrate --retire stops them (the owner's yes)."""
     o = ps_text if ps_text is not None else sh(["ps", "-Aww", "-o", "pid=,command="], timeout=10)[1]
-    out = []
-    for l in o.splitlines():
-        f = l.split(None, 1)
-        if len(f) != 2 or not f[0].isdigit(): continue
-        cmd = f[1]
-        if not (OLD_ORCH_LOOP_RX.search(cmd) or OLD_ORCH_WATCH_RX.search(cmd)): continue
-        if os.path.basename(cmd.split(None, 1)[0]) in OLD_ORCH_NOT: continue
-        if root is not None and str(root) not in cmd: continue
-        out.append((int(f[0]), cmd))
-    return out
+    r = Path(root).resolve() if root is not None else None
+    return [(int(f[0]), f[1]) for f in (l.split(None, 1) for l in o.splitlines())
+            if len(f) == 2 and f[0].isdigit() and _old_orch_script(int(f[0]), _sh_words(f[1]), r)]
+
+def live_children(pid):
+    """pids of the process's living children: a handoff-queue worker mid-handoff has its child gate running."""
+    rc, o, e = run(["pgrep", "-P", str(pid)], timeout=10)
+    return [int(x) for x in o.split()] if rc == 0 and o.strip() else []
 
 def retire_old_orch(dry=False, retire=False, ps_text=None, root=None):
     """Item 14: list the old orch's standing processes (the full command line, so the owner can tell a loop from a waiter) and,
-    only with the owner's explicit yes (--retire), stop them (TERM)."""
+    only with the owner's explicit yes (--retire), stop them (TERM). Finding 6: a process that still holds a live child (a
+    handoff-queue worker mid-handoff, whose child gate TERM would orphan) is listed and left alone."""
     procs = old_orch_procs(ps_text, root)
     if not procs: return []
     out = [f"old orch process {p} still running: {c}" for p, c in procs]
     if retire and not dry:
-        for p, _ in procs: run(["kill", "-TERM", str(p)])
-        out.append(f"-> sent TERM to {len(procs)} old orch process(es) (--retire)")
+        n = 0
+        for p, _ in procs:
+            ch = live_children(p)
+            if ch:
+                out.append(f"-> kept pid {p}: it has a live child ({', '.join(map(str, ch))}): a mid-handoff worker, TERM would orphan its gate")
+                continue
+            run(["kill", "-TERM", str(p)]); n += 1
+        out.append(f"-> sent TERM to {n} old orch process(es) (--retire)")
     else: out.append("-> not stopped (janus migrate --retire stops them, or stop them by hand)")
     return out
 
