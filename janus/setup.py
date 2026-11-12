@@ -644,6 +644,17 @@ def adopt_items(root, dry=False, config=None):
 
 def cmd_doctor(cfg, a): return doctor(cfg, a)
 
+def model_host_warnings(cfg):
+    """A warning per routed model whose [models.<m>] hosts is narrower than the configured hosts (decision 0004: agents run on
+    every host): 'model X: runs on 1 of 3 host(s)'. A model with no hosts key may run anywhere and is not warned."""
+    routed = {m for lst in cfg.route.values() for m in lst}
+    out = []
+    for m, c in cfg.models.items():
+        hs = c.get("hosts")
+        if hs and m in routed and set(hs) < set(cfg.hosts):
+            out.append(f"model {m}: runs on {len(hs)} of {len(cfg.hosts)} host(s) ({', '.join(hs)}): remove [models.{m}] hosts to allow every host")
+    return out
+
 def doctor(cfg, a):
     """Check a setup end to end and say what to fix: tools, the installed release, hooks, watcher, config, secret store,
     ledger, beads and hosts. Exit 1 when anything FAILs."""
@@ -689,6 +700,7 @@ def doctor(cfg, a):
     for tier, lst in cfg.route.items():
         for m in lst:
             if m not in cfg.models: r(False, f"routing {tier}: unknown model {m}", "fix [routing]")
+    for w in model_host_warnings(cfg): r(None, w, "drop [models.<m>] hosts to allow every host, or add the missing ones")
     for k, d in (("briefs", "briefs"), ("out", "out")):
         r(cfg.p(k, d).is_dir() or None, f"paths.{k} {cfg.p(k, d)}", f"mkdir {cfg.p(k, d)}")
     b = board_script(cfg)
