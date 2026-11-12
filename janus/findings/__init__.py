@@ -32,6 +32,7 @@ FAMILIES = {
     "disk": Family("a host is over its disk budget (tidy's last pass)"),
     "gate": Family("a gate failed in the last 12 h (its latest result)"),
     "gate-common": Family("the same failure in two or more gates: suspect the test or fixture"),
+    "gate-setup": Family("every step of a gate failed at once: a setup problem, not the tests"),
     "git": Family("the project's repository is dirty, unpushed or has no upstream"),
     "handoff": Family("the orchestrator notes are stale or too long, or the state folder has no HANDOFF.md"),
     "host": Family("a host is unreachable", urgent=True),
