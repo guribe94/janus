@@ -187,4 +187,20 @@ class Item8ResumeDryRun(unittest.TestCase):
         self.assertEqual(called, [], "the dry run prompted the pane")
 
 
+class Item14OldOrch(unittest.TestCase):
+    def test_old_orch_processes_are_listed_and_retired_only_with_a_yes(self):
+        """Catches: janus migrate left the old orch's standing processes (fleet loops, orch.py run waiters) running beside janus
+        with no way to see or stop them."""
+        ps = (" 101     1 /usr/bin/python3 /Users/x/orch.py run --wt /w\n"
+              " 102     1 /usr/bin/python3 /Users/x/janus.py watch\n"
+              " 103     1 /bin/sh bin/fleet-loops.sh\n")
+        self.assertEqual([p for p, _ in janus.old_orch_procs(ps)], [101])
+        out = janus.retire_old_orch(dry=False, retire=False, ps_text=ps)
+        self.assertTrue(any("101" in l for l in out)); self.assertTrue(any("not stopped" in l for l in out))
+        kills = []; real = janus.run; janus.run = lambda cmd, **k: (kills.append(list(cmd)), 0, "", "")[1:]
+        try: janus.retire_old_orch(dry=False, retire=True, ps_text=ps)
+        finally: janus.run = real
+        self.assertEqual(kills, [["kill", "-TERM", "101"]])
+
+
 if __name__ == "__main__": unittest.main()
