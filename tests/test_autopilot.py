@@ -142,8 +142,9 @@ class Autopilot(unittest.TestCase):
         self.assertIn("out/u1/changes.patch", F.get("unit:u1:relaunch", ""), F)
 
     def test_off_by_default_and_question_answered_only_from_an_exact_memory_subject(self):
-        """Catches: the autopilot acting without the owner's opt-in, and answering a question memory does not settle."""
-        d, cfg = project()
+        """Catches: the autopilot acting without the owner's opt-in in a project with no spending cap (with a cap it is on by
+        default: budget-follow item 8), and answering a question memory does not settle."""
+        d, cfg = project(); del cfg.prov["api"]["cap_usd"]
         janus.tend_autopilot(cfg, {}, [self.unit()], [], lambda m: None); self.assertEqual(self.launched, [])
         janus.memory_write(self.cfg, [("Decisions", "2026-11-11", "gate-host", "gates run on the build host", None)])
         qs = [(7, "a1", "", "which host for the [gate-host]?"), (8, "a2", "", "should I gate on another host?")]

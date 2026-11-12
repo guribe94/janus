@@ -1,4 +1,4 @@
-"""The watcher's autopilot (owner-approved; opt-in with [autopilot] enabled = true, off by default): the fixed-rule actions of
+"""The watcher's autopilot (owner-approved; on by default in a project with a spending cap, [autopilot] enabled sets it): the fixed-rule actions of
 the ending policy (docs/DESIGN.md, "Keeping work moving"), applied on each watcher pass. Each action is recorded once per cause
 (.janus/autopilot.json), as a line in .janus/autopilot.log, an ack of its finding with the reason, and a beads comment on the
 unit. Never on a unit the orchestrator paused (`janus ack <key naming the unit> hold`); launches go through `janus launch`,
@@ -17,7 +17,30 @@ from janus.units import agent_ended, api_out, report_path
 
 AP = {"enabled": False, "relaunch_max": 2, "host_down_min": 20}
 
-def apc(cfg, k): return cfg.c.get("autopilot", {}).get(k, AP[k])
+def has_cap(cfg): return any(pv.get("cap_usd") and "ledger" in pv for pv in cfg.prov.values())   # a cap janus enforces
+
+def apc(cfg, k):
+    """An [autopilot] setting. `enabled` left unset is on when a provider has a cap (budget-follow item 8: the cap bounds what
+    the unattended loop can spend, so a project with one keeps its work moving without being configured)."""
+    v = cfg.c.get("autopilot", {}).get(k)
+    return v if v is not None else has_cap(cfg) if k == "enabled" else AP[k]
+
+def fill_watcher(cfg):
+    """Whether the watcher launches ready backlog units ([fill] watcher; unset: on with a cap, like the autopilot)."""
+    v = cfg.c.get("fill", {}).get("watcher")
+    return has_cap(cfg) if v is None else bool(v)
+
+def unattended_findings(cfg, units):
+    """unattended:off: a part of the unattended loop is off while there is work it would keep moving (open units; ready backlog
+    for the fill), so the orchestrator knows that nothing recovers that work while it is away (budget-follow item 8)."""
+    backlog = bool(cfg.c.get("backlog", {}).get("file"))
+    off = [k for k, on in (("[autopilot] enabled", apc(cfg, "enabled") or not units), ("[fill] watcher", fill_watcher(cfg) or not backlog)) if not on]
+    if not off: return []
+    acts = [a for k, a in (("[autopilot] enabled", "relaunch a unit that crashed or resume one stopped by its budget"), ("[fill] watcher", "launch ready backlog units")) if k in off]
+    why = "janus.toml turns it off" if has_cap(cfg) else "it is on by default only when a provider has a cap_usd and a ledger, and none has"
+    return [("unattended:off", f"the unattended loop is off ({why}): while no orchestrator is at work the watcher will not {' or '.join(acts)}. To turn it on set "
+             f"{' = true and '.join(off)} = true in janus.toml{'' if has_cap(cfg) else ', or give the provider a cap_usd'}; if the owner wants it off, "
+             "ack this with the reason (janus ack unattended:off <reason>)")]
 
 def record(cfg, key, cause, reason, unit=None, ack=None):
     """Record one autopilot action once per (key, cause). False when it was already recorded (do not act again)."""
@@ -195,7 +218,7 @@ def archive_cards(cfg, units, log):
         if not rc and record(cfg, f"board:{c.stem}", "archive", "finished card archived (not an open unit)"): log(f"autopilot: archived the finished card {c.stem}")
 
 def tend_autopilot(cfg, hs, units, F, log):
-    """One autopilot pass (the watcher calls it after tend_parked). Off unless [autopilot] enabled = true."""
+    """One autopilot pass (the watcher calls it after tend_parked). On with a cap or [autopilot] enabled = true (apc)."""
     if not apc(cfg, "enabled") or cfg.run.dry: return
     from janus.actions.lifecycle import cmd_collect
     for u in units:

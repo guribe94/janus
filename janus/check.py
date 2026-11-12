@@ -6,7 +6,7 @@ import contextlib, json, re
 from janus.actions.jobs import slots
 from janus.actions.lifecycle import sync_remote_outputs   # item 11 addendum: sync a remote report before judging parked/orphan
 from janus.backlog import ready_work
-from janus.autopilot import autopilot_findings
+from janus.autopilot import autopilot_findings, unattended_findings
 from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
 from janus.context import DECISION_ACKS, Err, LB, note_event, LE, NOTES0, atomic_write, handoff_path, hrun, is_orchestrator, now, say, ts
@@ -63,7 +63,7 @@ def collect_findings(cfg, hs, units, ag, bd_err, bd=None):
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
     F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running)
     F += decision_findings(cfg)
-    F += spend_findings(cfg) + reserve_findings(cfg, units) + resumable_findings(cfg, units)
+    F += spend_findings(cfg) + reserve_findings(cfg, units) + resumable_findings(cfg, units) + unattended_findings(cfg, units)
     if not cfg.run.ro and not cfg.run.dry: F = enforce(cfg, F, viol)
     return [finding(k, t) for k, t in F]
 
