@@ -265,6 +265,45 @@ class Item7CallerWait(unittest.TestCase):
         self.assertEqual(rc, 0); self.assertEqual(msg, "", "a task not yet started was reported while admission said yes")
 
 
+class Item10GiveUpResidues(unittest.TestCase):
+    """Finding 10: the give-up clock residues -- a jobs job yielding to a gates job said "no reason reported", and nothing read
+    exit 121 when a unit was resumed."""
+
+    def test_a_resumed_unit_is_told_what_exit_121_means(self):
+        """Catches (finding 10): nothing read exit 121, so a resumed unit got 'exit 121' with no explanation beyond the log."""
+        d, cfg = project()
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "model": "m", "started": 0, "budget": 2.0}
+        saved = janus.job_result; janus.job_result = lambda cfg, hs, j, host: (121, "/runs/j.log")
+        try: msg = janus.resume_message(cfg, {"here": {"ok": True}}, u, ["here:9"])
+        finally: janus.job_result = saved
+        self.assertIn("never admitted", msg, msg)
+
+    def test_a_jobs_job_yielding_to_a_gates_job_says_why_and_does_not_give_up(self):
+        """Catches (finding 10): while a gates job waited, a jobs-lane job skipped the admission test -- its blocked clock ran
+        with 'no reason reported' and it gave up (exit 121) although the gate in front of it was progressing."""
+        import argparse
+        d, cfg = project('\n[capacity]\nmin_disk_gb = 0\n')
+        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
+        rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True)
+        gate = subprocess.Popen(["sleep", "30"])
+        (rd / "g.gwait").write_text(f"{gate.pid} 60 {int(time.time())} 256 1\n")
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-2")
+        p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"})
+        p.stdin.write(js); p.stdin.close()
+        try:
+            time.sleep(4.5)
+            self.assertIsNone(p.poll(), "the job gave up while a gates job waited: the yield should clear the blocked clock")
+            (rd / "g.gwait").unlink()
+            p.wait(timeout=30); out = p.stdout.read()
+        finally:
+            gate.kill(); p.kill()
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("a gates job is waiting", out, out)
+
+
 class Item8ResumeDryRun(unittest.TestCase):
     def test_dry_run_says_would_prompt(self):
         """Catches: janus resume --dry-run <herdr unit> printed '<unit>: prompted in its herdr pane' although nothing was prompted."""
