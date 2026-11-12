@@ -414,7 +414,7 @@ class Fill(unittest.TestCase):
 class Budget(unittest.TestCase):
     def test_median_of_kind_and_tier_plus_margin(self):
         d, cfg = project('\n[budget]\nmargin_pct = 50\n')
-        cfg._all_units = {f"u{i}": {"name": f"u{i}", "kind": "implement", "tier": "critical"} for i in range(4)}
+        cfg.run.all_units = {f"u{i}": {"name": f"u{i}", "kind": "implement", "tier": "critical"} for i in range(4)}
         for i, c in enumerate((1.0, 2.0, 3.0, 9.0)):
             orch.ledger_append(cfg, cfg.prov["api"], ["t", f"u{i}", "running", 5, f"r{i}"]); orch.ledger_append(cfg, cfg.prov["api"], ["t", f"u{i}", c, "done rc=0", f"r{i}"])
         b, why = orch.budget_for(cfg, cfg.models["m"], "implement", "critical")
@@ -429,7 +429,7 @@ class Land(unittest.TestCase):
         self.g("worktree", "add", "-q", "-b", "wk/u", str(self.wt))
         self.u = {"id": "x-1", "name": "u", "cwd": str(self.wt), "tier": "normal"}
         orch.Beads.units = lambda s: [self.u]; orch.Beads.comment = lambda s, *a: None
-        self.cfg._all_units = {"u": self.u}
+        self.cfg.run.all_units = {"u": self.u}
     def g(self, *a, cwd=None): return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd or self.r), *a], capture_output=True, text=True)
     def a(self, **k): return type("A", (), {"unit": "u", "no_gate": True, "no_dispatch": True, **k})()
     def test_squash_land_and_conflict_stop(self):
@@ -551,7 +551,7 @@ class Report(unittest.TestCase):
             run = orch.reserve_budget(cfg, mc, n, 5, f"{n}.1"); orch.ledger_done(cfg, pv, run, n, cost, 0)
             o = d / "out" / n; o.mkdir(); (o / "REPORT.md").write_text(rep); (o / f"api-{run}.json").write_text(json.dumps({"subtype": sub}))
         orch.reserve_budget(cfg, mc, "lost", 2, "lost.1")
-        cfg._all_units = {n: {"name": n, "run": f"{n}.1", "status": "closed"} for n in ("ok", "cap", "half", "lost")}
+        cfg.run.all_units = {n: {"name": n, "run": f"{n}.1", "status": "closed"} for n in ("ok", "cap", "half", "lost")}
         got = {x[2]: x[4] for x in orch.run_outcomes(cfg)}
         self.assertEqual(got, {"ok": "verdict", "cap": "capped-nothing", "half": "capped-partial", "lost": "unknown"})
         self.assertIn("waste pause", "refused (waste pause): " + (orch.waste_paused(cfg) or ""))   # 4 of 7 dollars capped: over 25 %
@@ -623,7 +623,7 @@ class Memory(unittest.TestCase):
 
 class Peers(unittest.TestCase):
     def test_peers_file_and_overlap(self):
-        d, cfg = project(); (d / "board").mkdir(); cfg.ro = False
+        d, cfg = project(); (d / "board").mkdir(); cfg.run.ro = False
         g = lambda *a, cwd: subprocess.run(["git", *a], cwd=cwd, capture_output=True, check=True)
         repo = d / "repo"; repo.mkdir(); g("init", "-q", "-b", "main", cwd=repo); (repo / "a.txt").write_text("a\n"); (repo / "b.txt").write_text("b\n")
         g("add", ".", cwd=repo); g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init", cwd=repo)
@@ -631,11 +631,11 @@ class Peers(unittest.TestCase):
         for i, f in (("1", "a.txt"), ("2", "a.txt"), ("3", "b.txt")):
             w = d / f"wt{i}"; g("worktree", "add", "-q", "-b", f"u{i}", str(w), cwd=repo); (w / f).write_text("changed\n")
             units.append({"id": i, "name": f"u{i}", "host": "here", "model": "m", "cwd": str(w), "state": "working"})
-        F = orch.peer_findings(cfg, units)
+        F = orch.peer_findings(cfg, units, {})
         self.assertEqual([k for k, _ in F], ["overlap:u1:u2"])
         txt = (d / "board/peers.md").read_text()
         self.assertIn("u3 | host here", txt); self.assertIn("branch u1", txt); self.assertIn("files: a.txt", txt)
-        units[1]["state"] = "done"; self.assertEqual(orch.peer_findings(cfg, units), [])   # a finished unit is no peer
+        units[1]["state"] = "done"; self.assertEqual(orch.peer_findings(cfg, units, {}), [])   # a finished unit is no peer
 
 class Transcript(unittest.TestCase):
     def test_condense_claude_and_codex_with_grep_and_tail(self):
@@ -659,7 +659,7 @@ class Transcript(unittest.TestCase):
 class Board(unittest.TestCase):
     """The shipped board: question ids that stay until answered, waiting never SILENT, broadcast, learned posts, the alert."""
     def test_questions_waiting_broadcast_learned_alert(self):
-        d, cfg = project(); cfg.ro = False
+        d, cfg = project(); cfg.run.ro = False
         orch.board_upkeep(cfg, [])   # .master, .hosts, .notify
         bd = d / "board"; self.assertTrue((bd / ".master").is_file()); self.assertIn("watch --alert", (bd / ".notify").read_text())
         (bd / ".notify").write_text("true\n")
@@ -709,7 +709,7 @@ class ReviewFixes9(unittest.TestCase):
         """#1: locked()'s local f shadowed merge()'s $f, so .merged-<host> recorded the lock path and a sending file that
         survived its rm was merged again (one question, two ids)."""
         r = Path(tempfile.mkdtemp(prefix="orch-rem-"))
-        d, cfg = project(f'\n[hosts.far]\nssh = "far"\nroot = "{r}"\n'); cfg.ro = False
+        d, cfg = project(f'\n[hosts.far]\nssh = "far"\nroot = "{r}"\n'); cfg.run.ro = False
         orch.board_upkeep(cfg, []); (orch.board_dir(cfg) / ".notify").write_text("true\n")
         (r / "board-outbox").mkdir(); (r / "board-outbox/outbox.log").write_text("2026-01-01 10:00 eve question one question\n".replace("question one", "question: one"))
         env = {"PATH": self.fake_remote(d)}
@@ -718,7 +718,7 @@ class ReviewFixes9(unittest.TestCase):
 
     def test_close_withdraws_open_questions(self):
         """#3: closing an agent's card left its open questions open: question:<id> fired forever."""
-        d, cfg = project(); cfg.ro = False; orch.board_upkeep(cfg, []); (orch.board_dir(cfg) / ".notify").write_text("true\n")
+        d, cfg = project(); cfg.run.ro = False; orch.board_upkeep(cfg, []); (orch.board_dir(cfg) / ".notify").write_text("true\n")
         orch.board(cfg, "post", "carol", "question", "still running?"); self.assertEqual(len(orch.board_questions(cfg)), 1)
         orch.board(cfg, "close", "carol"); self.assertEqual(orch.board_questions(cfg), [])
 
@@ -770,7 +770,7 @@ class GatePolicy(unittest.TestCase):
     def setUp(self):
         self.d, self.cfg = project('\n[landing]\nknown_failures = "out/known.tsv"\nquick_gate_min = 10\nscope_cmd = "sh scope.sh {unit} {tree}"\n')
         (self.d / "out/known.tsv").write_text("# id cols, cause, unit\nsuite\tflaky_a\tissue 1\tfix-a\nsuite\tstale_b\told\t-\n")
-        self.cfg.ro = False
+        self.cfg.run.ro = False
 
     def test_judge_and_default_runner(self):
         g = self.d / "out/g1"; g.mkdir()
@@ -820,7 +820,7 @@ class Thrash(unittest.TestCase):
     """fixes10 item 3: a shared host over thrash_psi for thrash_min: this project's newest admitted job is stopped and re-queued
     elsewhere; jobs not recorded by this project (or another task with the same script) are never touched."""
     def test_stop_newest_own_job_and_requeue(self):
-        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\nshared = true\nthrash_psi = 30\nthrash_min = 5\n'); cfg.ro = False
+        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\nshared = true\nthrash_psi = 30\nthrash_min = 5\n'); cfg.run.ro = False
         jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
         for jid, tid, at in (("old-1", "1", 100), ("new-2", "2", 200)):
             (jd / f"{jid}.json").write_text(json.dumps({"host": "far", "task": tid, "lane": "jobs", "unit": "u", "wt": str(d), "cmd": "make", "at": at}))
@@ -877,7 +877,7 @@ class Tidy(unittest.TestCase):
         for n in ("landed", "dirty", "unlanded", "inuse", "untracked"): g("worktree", "add", "-q", "-b", f"wk/{n}", str(w / n))
         (w / "dirty/a").write_text("2\n"); (w / "untracked/new").write_text("x\n")
         (w / "unlanded/b").write_text("b\n"); g("add", "b", cwd=w / "unlanded"); g("commit", "-qm", "b", cwd=w / "unlanded")
-        cfg._all_units = {"old": {"status": "closed"}, "live": {"status": "open"}}
+        cfg.run.all_units = {"old": {"status": "closed"}, "live": {"status": "open"}}
         ag = {"old": {"pane_id": "p1", "agent_status": "idle"}, "live": {"pane_id": "p2"}, "orchestrator": {"pane_id": "p0"}}
         rows = {"ghost": {"gone": True}, "live": {"gone": True}, "fine": {"gone": False}}
         real = orch.ws_id; orch.ws_id = lambda cfg, create=False: None
@@ -943,7 +943,7 @@ class TidyAll(unittest.TestCase):
         self.assertEqual(subprocess.run(["git", "-C", str(rem), "branch"], capture_output=True, text=True).stdout.strip(), "")
 
     def test_host_items_budget_roots_and_findings(self):
-        d, cfg = project(); cfg.ro = False; h = cfg.hosts["here"]; c = d / "cache"; c.mkdir()
+        d, cfg = project(); cfg.run.ro = False; h = cfg.hosts["here"]; c = d / "cache"; c.mkdir()
         for n, age in (("old", 9e5), ("new", 0)):
             (c / n).mkdir(); (c / n / "blob").write_bytes(b"x" * 1500000); os.utime(c / n, (time.time() - age,) * 2)
         rd = Path(h["_rd"]); rd.mkdir(parents=True); (rd / "j1.log").write_text("x"); os.utime(rd / "j1.log", (time.time() - 30 * 86400,) * 2)
@@ -973,7 +973,7 @@ class Reconcile(unittest.TestCase):
         L.write_text("".join(f"{t}\t{u}\trunning\t{b}\t{k}\n" for t, u, b, k in (
             (new, "closed", 2, "closed.r1"), (new, "live", 1, "live.r1"), (new, "live", 1, "live.r2"), (new, "ended", 3, "ended.r1"),
             (old, "ghost", 4, "ghost.r1"), (new, "fresh", 5, "fresh.r1"))))
-        cfg._all_units = {"closed": {"name": "closed", "status": "closed", "run": "closed.r1"},
+        cfg.run.all_units = {"closed": {"name": "closed", "status": "closed", "run": "closed.r1"},
                           "live": {"name": "live", "status": "in_progress", "run": "live.r2", "runs": ["live.r1", "live.r2"]},
                           "ended": {"name": "ended", "status": "in_progress", "run": "ended.r1"}}
         units = [{"name": "live", "run": "live.r2", "runs": ["live.r1", "live.r2"], "state": "working"}, {"name": "ended", "run": "ended.r1", "state": "failed"}]

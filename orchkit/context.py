@@ -1,9 +1,9 @@
 """Config, state, processes and the low-level services every other module builds on (section 7, Step 1).
 
 Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X, the registered session's process identity, the shared quoting and
-small helpers (pq/qp/secs/findkey), Locked and atomic_write. No module imports orch or a higher layer. DRY is one shared
-mutable flag object so --dry-run set by main (and the temporary disable around a read) is seen everywhere with no
-module-level `global` (section 7, seam 2)."""
+small helpers (pq/qp/secs/findkey), Locked and atomic_write. No module imports orch or a higher layer. Run is what one
+invocation is (dry, read-only, what it read once), carried as cfg.run (section 7, seam 2)."""
+from dataclasses import dataclass
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
 from orchkit.platform import herdr, ps_table, secs   # re-exported: the OS/tool adapter (owner direction 2026-11-11)
@@ -20,15 +20,17 @@ NOTES_H = "## Orchestrator notes"
 
 NOTES0 = NOTES_H + "\n(goal and scope; per unit why and what done means; decisions latest first; next steps; things to watch)\n"
 
-class _Dry:
-    """The --dry-run flag as one shared mutable object (section 7, seam 2: DRY becomes data, not a module global).
+@dataclass
+class Run:
+    """One invocation of orch (section 7, seam 2), carried as cfg.run: no module global, no attribute set on the side.
 
-    Every module holds this same object, so main setting it (and the temporary disable around a read) is seen everywhere.
-    Truthy when set, so every existing `if DRY:` / `not DRY` reads unchanged."""
-    value = False
-    def __bool__(self): return self.value
-
-DRY = _Dry()
+    dry: --dry-run, print what would change and change nothing (main sets it). ro: read-only, a check or status by anyone but
+    the registered orchestrator or the watcher changes nothing (run_check sets it; jput/touch then write nothing). all_units
+    and rates: what this invocation read once (every unit ever recorded; learned $ per weighted token), None until read."""
+    dry: bool = False
+    ro: bool = False
+    all_units: dict | None = None
+    rates: dict | None = None
 
 class Err(Exception): pass
 
@@ -46,8 +48,8 @@ def find_root(start=None):
     return Path(r).resolve() if not start and r and (Path(r) / "orch.toml").is_file() else None
 
 class Cfg:
-    def __init__(self, root):
-        self.root = root
+    def __init__(self, root, run=None):
+        self.root, self.run = root, run or Run()
         self.c = tomllib.loads((root / "orch.toml").read_text())
         pr = self.c.get("project", {})
         self.name = pr.get("name", root.name)
@@ -67,11 +69,10 @@ class Cfg:
     def jget(self, n, d=None):
         try: return json.loads(self.f(n).read_text())
         except Exception: return {} if d is None else d
-    ro = False   # read-only: check/status/capacity run by anyone but the registered orchestrator change nothing (audit M15)
-    def jput(self, n, v):
-        if not self.ro: self.f(n).write_text(json.dumps(v))
+    def jput(self, n, v):   # a read-only run changes nothing (audit M15)
+        if not self.run.ro: self.f(n).write_text(json.dumps(v))
     def touch(self, n):
-        if not self.ro: self.f(n).touch()
+        if not self.run.ro: self.f(n).touch()
     def mtime(self, n):
         try: return self.f(n).stat().st_mtime
         except OSError: return 0
@@ -103,9 +104,9 @@ def hrun(h, script, timeout=25, inp=None, env=None):
     pre = "".join(f"export {k}={shlex.quote(str(v))}; " for k, v in (env or {}).items())
     return sh([*SSH, h["ssh"], pre + script], timeout=timeout, inp=inp)
 
-def X(h, script, **k):
+def X(cfg, h, script, **k):
     """Run on a host, or print in dry-run."""
-    if DRY: say(f"+ [{h.get('ssh', 'local')}] " + "".join(f"{k}=... " for k in (k.get("env") or {})) + script); return 0, "", ""
+    if cfg.run.dry: say(f"+ [{h.get('ssh', 'local')}] " + "".join(f"{k}=... " for k in (k.get("env") or {})) + script); return 0, "", ""
     return hrun(h, script, **k)
 
 def findkey(o, sub):
@@ -207,4 +208,4 @@ ORCH_SELF = Path(__file__).resolve().parent.parent / "orch.py"   # the installed
 
 ORCH_MARK = "[orch] "   # every prompt orch itself sends starts with this, so UserPromptSubmit never files it as an instruction (M4)
 
-__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "DRY", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "SECRET_ENV", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "ORCH_SELF", "ORCH_MARK"]
+__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "SECRET_ENV", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "ORCH_SELF", "ORCH_MARK"]

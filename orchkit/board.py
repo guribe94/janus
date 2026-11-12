@@ -3,7 +3,7 @@
 board_script/board_dir/board, board_rows/board_questions/learned_posts, board_findings, board_files/board_alerts. A project
 may still override paths.board (section 9: board.sh stays a callable path); board_upkeep and cmd_learned stay with their
 callers until the memory/actions split."""
-from orchkit.context import ORCH_SELF, DRY, sh, now, herdr, atomic_write, ORCH_MARK
+from orchkit.context import ORCH_SELF, sh, now, herdr, atomic_write, ORCH_MARK
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
 
@@ -17,7 +17,7 @@ def board(cfg, *args, env=None, timeout=25):
     """Run the board script with BOARD_DIR set (the shipped board keeps its files there; a project's own script may ignore it).
     The shipped board's files (.master, .hosts, .notify) exist from the first call: posts never land in an outbox here, and a
     remote unit's rule names <root>/bin/board.sh (not this machine's path)."""
-    if not cfg.paths.get("board") and not DRY: board_files(cfg)   # .master, and .hosts before a remote unit's rule is written
+    if not cfg.paths.get("board") and not cfg.run.dry: board_files(cfg)   # .master, and .hosts before a remote unit's rule is written
     return sh([str(board_script(cfg)), *args], env={"BOARD_DIR": str(board_dir(cfg)), **(env or {})}, timeout=timeout)
 
 def board_rows(cfg):
