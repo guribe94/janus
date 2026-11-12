@@ -741,6 +741,10 @@ with what is reclaimable.
   runner's FAIL is re-judged the same way). A non-zero gate that names no failing test fails. `janus check` raises
   `known-failure:<id>` for an entry whose unit is missing or not open (failures on main are fixed at their root cause) and
   `known-failure:<id>:passes` for an entry a gate ran and passed in the last 24 h (remove it).
+- **Gate baseline (decision 0002).** `janus gate <name> --baseline <base>` records that a run of the landing branch and the
+  same host is this gate's baseline (`out/<name>/baseline.txt`; `--baseline none` clears it). `gate-judge` then treats a test
+  the baseline also failed as the branch's, not the unit's: only failures the baseline did not see (and that are not
+  `known_failures`) block. The RESULT line names the baseline and its failure count (`BASE=<base>(<n>)`).
 - `[landing] gate_timeout_min` (or `janus gate --timeout-min`): the gate's process group is stopped at the limit and a
   `EXIT_timeout=124 RESULT: FAIL` line is written. Every gate runs under `janus gate-exec`, which records its length.
 - `[landing] quick_gate_min`: a gate expected (median of its own last runs, else of its family `land-*-<suffix>`) under this
