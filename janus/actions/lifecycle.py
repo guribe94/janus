@@ -4,10 +4,11 @@ import os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import collect_job, job_of, job_state, runs_dir, save_task_log, task_rc, task_status, unit_jobs
 from janus.actions.launch import api_remote, confirm_started
+from janus.autopilot import record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
 from janus.budgets import bset
-from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, now, pq, ps_table, qp, say,
+from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
     sh, ts)
 from janus.ledger import ledger_done, reserve_budget, run_cost, settle_run
 from janus.probe import probe, probe_all, pueue
@@ -32,7 +33,7 @@ def cmd_board_close(cfg, a):
     if cfg.run.dry: say(f"+ board.sh close {a.agent}"); return
     rc, o, e = board(cfg, "close", a.agent)
     if rc: raise Err(f"board.sh close {a.agent}: {(e or o).strip()[:120]}")
-    cfg.touch("changed"); say(f"board card {a.agent} archived")
+    say(f"board card {a.agent} archived")
 
 # Every process of a unit: the tree under its task or pane, every process group in it, and any process anywhere whose
 # environment has JANUS_UNIT=<unit> (detached children: nohup, setsid, & disown). Printed as "pid pgid" lines (M12).
@@ -90,7 +91,7 @@ def cmd_stop(cfg, a):
     else: raise Err(f"{u['name']} is still alive after stop")
     if u.get("pane") and via != "herdr": herdr("pane", "close", u["pane"])
     if h.get("local"): settle_run(cfg, u, "stopped")   # remote: collect brings back the cost first, close settles the rest
-    bd.comment(u["id"], f"{ts()} stopped (every process group of the unit ended)"); cfg.touch("changed"); say("stopped: no process of the unit is left")
+    bd.comment(u["id"], f"{ts()} stopped (every process group of the unit ended)"); say("stopped: no process of the unit is left")
 
 def remote_patch(cfg, h, n, fname):
     """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>)."""
@@ -137,7 +138,7 @@ def cmd_collect(cfg, a):
     if not cfg.run.dry and u.get("report"): say(f"report -> {u['report']}")
     kv = fingerprint(cfg, u) if not cfg.run.dry else None
     if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
-    if not cfg.run.dry: bd.comment(u["id"], f"{ts()} collected from {u['host']}"); cfg.touch("changed")
+    if not cfg.run.dry: bd.comment(u["id"], f"{ts()} collected from {u['host']}")
     p = od / "changes.patch"
     say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
 
@@ -188,7 +189,7 @@ def cmd_close(cfg, a):
     X(cfg, {"local": True}, f"BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} close {u['name']} 2>/dev/null; true")
     if cfg.run.dry: return
     if u.get("run") and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"): settle_run(cfg, u, "closed")
-    bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
+    bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); note_event(cfg, "close")
     say("closed")
 
 WRAPUP = ("Your budget is used up. Do no more work: write your report now ({report}): what is done, the state it is in, what is "
@@ -291,7 +292,7 @@ def cmd_park(cfg, a):
     elif via == "herdr": herdr("pane", "send-keys", u["pane"], "Escape")
     elif via == "tmux": X(cfg, h, f"tmux send-keys -t janus-{n} Escape")
     u["parked"] = {"jobs": jobs, "since": int(now()), "by": "janus park"}; bd.save(u)
-    bd.comment(u["id"], f"{ts()} parked on {', '.join(jobs)}"); cfg.touch("changed"); say(f"parked {n}")
+    bd.comment(u["id"], f"{ts()} parked on {', '.join(jobs)}"); say(f"parked {n}")
 
 def cmd_resume(cfg, a):
     """Resume a unit's own session now: parked (its jobs' results, when they finished), or with --message."""
@@ -306,7 +307,7 @@ def cmd_resume(cfg, a):
     say(resume_unit(cfg, u, msg))
     if cfg.run.dry: return
     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
-    bd.comment(u["id"], f"{ts()} resumed"); cfg.touch("changed")
+    bd.comment(u["id"], f"{ts()} resumed")
 
 def save_output(cfg, u):
     """Bring a remote unit's output folder here (out/<unit>/: REPORT.md, api.json and each run's api-<run>.json, logs; never the
@@ -355,11 +356,11 @@ def tend_parked(cfg, hs, units, log):
                         raise
                     u.pop("resume_error", None)
                     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
-                    bd.comment(u["id"], f"{ts()} resumed: jobs {', '.join(jobs)} finished")
+                    record(cfg, f"parked:{u['name']}", f"resume:{','.join(jobs)}", f"resumed: jobs {', '.join(jobs)} finished", u)
                 continue
             if wrap_due(cfg, u):
                 log(resume_unit(cfg, u, WRAPUP.format(report=report_path(cfg, u) if cfg.hosts[u["host"]].get("local") else f"{cfg.hosts[u['host']]['root']}/out/{u['name']}/REPORT.md"), wrapup=True))
-                bd.save(u); bd.comment(u["id"], f"{ts()} ended at its budget cap without a verdict: resumed once to write its report")
+                bd.save(u); record(cfg, f"unit:{u['name']}", "wrapup", "ended at its budget cap without a verdict: resumed once to write its report", u, ack=f"unit:{u['name']}:limit")
         except Err as e: log(f"{u['name']}: {e}")
 
 def wrap_due(cfg, u):

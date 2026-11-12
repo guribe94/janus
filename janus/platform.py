@@ -61,3 +61,14 @@ def systemd_watcher_active(name="janus-watch.timer"):
 
 
 __all__ = ["run", "ps_table", "secs", "herdr", "keychain_get", "launchd_watcher_loaded", "systemd_watcher_active"]
+
+
+# The kernel's high-water mark of a job's largest process (run_sampled in templates.ADMIT): a job shorter than the 5 s sampling
+# interval, or one whose only sample lands before it allocates (a slow start under load), still records its real peak. Runs on
+# the job's host with its own python3: ru_maxrss is bytes on macOS, KiB on Linux. argv: <peak file> <command...>.
+MAXRSS_PY = ("import resource, subprocess, sys\n"
+             "try: rc = subprocess.call(sys.argv[2:])\n"
+             "except OSError: rc = 127\n"
+             "m = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss\n"
+             "open(sys.argv[1], 'w').write(str(int(m / (1048576 if sys.platform == 'darwin' else 1024))))\n"
+             "sys.exit(rc if rc >= 0 else 128 - rc)\n")

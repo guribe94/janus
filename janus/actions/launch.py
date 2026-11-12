@@ -7,7 +7,7 @@ from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_script, board_shipped
 from janus.budgets import budget_for, transcript_cost, waste_paused
 from janus.cap import build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
-from janus.context import EXCL, Err, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, now, pq, qp, say, sh, ts
+from janus.context import EXCL, Err, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, note_event, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
 from janus.memory import MEM_SECTIONS, mem_line, memory_read, mset
 from janus.platform import herdr
@@ -496,7 +496,7 @@ def cmd_launch(cfg, a):
             if u.get("tab"): herdr("tab", "close", u["tab"])
         raise
     if cfg.run.dry: return
-    bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); cfg.touch("changed")
+    bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); note_event(cfg, "launch")
     chk = f"herdr {name}" if u["via"] == "herdr" else f"pueue {hn}:{u['task']}" if u["via"] == "pueue" else f"tmux {hn}:janus-{name}"
     board(cfg, "post", name, "status", f"launched ({mname}, {hn})",
        env={"BOARD_MACHINE": hn, "BOARD_BRIEF": str(brief), "BOARD_CHECK": chk, "BOARD_REPORT": str(report_path(cfg, u))})   # row 26: a resumed unit's own report

@@ -59,7 +59,7 @@ Put a `janus.toml` in the project root (`janus` finds it from any subdirectory; 
 **`[project]`**: `name`, `beads` (the directory holding `.beads/`; run `bd init` there first), `state` (default `.janus`),
 and timings in minutes: `cycle_min` (a check/ack cycle is overdue after this, default 15), `deadline_min` (an
 unacknowledged problem blocks Stop after this, 30), `silent_min` (30), `reset_tokens` (context size that triggers a
-reset, 150000).
+reset, 120000: below the runtime's own auto-compaction).
 
 **`[paths]`**: `board` (script with `post/read/summary/rule/close`), `gate_log` (lines like
 `2026-11-11 09:00:00 name EXIT_x=0 ... RESULT: PASS|FAIL`), `briefs` (`<briefs>/<unit>.md`), `out`
@@ -291,13 +291,16 @@ A denial reads: "Orchestrators do not operate by hand (...). Use janus launch/st
    reasons (latest first), next steps, things to watch. Keep it under 150 lines (`check` flags more); move old notes to
    `.janus/history.md`, which is never injected.
 
-The notes count as stale when they have not changed since the last unit change or owner instruction, or (while work runs)
-for longer than `cycle_min`. The Stop hook then blocks.
+The notes count as stale only after a real event newer than them: a launch, a close, a landing, an owner instruction or a
+decision-class ack (`janus ack --decision-class`, or a `unit`, `landing`, `question`, `instructions`, `ledger`, `parked`,
+`provider`, `cap`, `learned` or `overlap` key; a `janus remember --decision`). Routine acks, collects, parks and the clock do
+not. The Stop hook then blocks.
 
-**Context reset.** The watcher estimates context size from the transcript file (file size / 4, a rough guess). When it is
-over `reset_tokens`, the orchestrator is idle, no problems are open and the notes are fresh, it first asks the
-orchestrator to finish its notes; on a later pass it sends `/clear`. SessionStart then reloads the handoff, rules and
-check output.
+**Context reset.** The context size is the last turn's token usage in the transcript. Over `reset_tokens`, a Stop that
+passes (nothing late, notes fresh) is the safe boundary: the hook starts `janus watch --reset`, which sends `/clear` once the
+turn has ended, then the wake prompt; SessionStart reloads the handoff, rules and check output. The watcher asks an idle
+orchestrator to finish its notes first. Every skipped reset says why in `.janus/watch.log`; `check` raises `context` while
+the context is over the threshold and no reset was asked.
 
 **Owner instructions and standing rules.** Every owner prompt becomes a beads issue labelled `instruction`. Classify it:
 close it (it was a one-off, now done) or make it a standing rule with `bd remember "..."`. Rules come back at every session
@@ -369,6 +372,15 @@ folder, the board's sync carries them to every host: the same files serve one ma
   reservation or a queue position (one queued job per running job) is free there.
 - **Fill.** `janus fill --dry-run` lists what fits now and why it stops; `janus fill` launches it; `[fill] watcher = true` lets the
   watcher do it. `check` reports `idle-with-backlog`.
+- **Autopilot (opt-in: `[autopilot] enabled = true`; off by default).** The watcher applies the ending policy's fixed rules
+  itself (docs/DESIGN.md, "Keeping work moving"): collect finished remote units; relaunch a crashed unit, or a capped one after
+  its wrap-up run, from its report as `<unit>-r<k>` (same brief, tree and report, through `janus launch`: capacity, budget and
+  the waste pause apply; at most `relaunch_max`, default 2); answer a board question that names a MEMORY.md subject exactly;
+  cancel a job past its age limit and re-queue it once on a host with room; re-queue the unstarted jobs of a host down over
+  `host_down_min` (20) elsewhere (the old copies are cancelled when it is back); archive finished cards. Always on: resume
+  parked units, the wrap-up resume, cancel orphan jobs. Each action is recorded once per cause in `.janus/autopilot.log` and
+  `autopilot.json`, as an ack of its finding with the reason, and on the unit in beads. `janus ack <key naming the unit> hold`
+  keeps the autopilot off that unit. Everything else stays with the orchestrator.
 - **Budgets from history.** A unit's default budget is the median cost of its kind and tier + `[budget] margin_pct`; `budget80:<unit>`
   warns at 80 % with a stale report.
 - **Landing.** `janus land <unit>` merges the landing branch (stops and dispatches `merge-<unit>` on a conflict), gates the merged

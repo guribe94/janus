@@ -9,6 +9,7 @@ from janus.board import board
 from janus.cap import cap_lib, cap_nums, class_mb, host_cap
 from janus.context import Err, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh
 from janus.probe import probe, probe_all, pueue
+from janus.platform import MAXRSS_PY
 from janus.templates import ADMIT
 from janus.units import agent_ended, unit_state
 
@@ -107,7 +108,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     q = shlex.quote; rd = h["_rd"]; sub = a.subdir or "."; sub_ = lambda x: str(x).replace("{name}", name).replace("{jid}", jid)
     head = f"#!/bin/bash\n# janus run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={qp(rd)}; R=\"$RD\"/{q(jid)}\nexport JANUS_WRAP={q(jid)}   # janus run inside records the jobs it queues under this (cancel follows them)\n"
     setup = h.get("job_setup", ""); log = h.get("job_log", "/dev/null")
-    adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid)}
+    adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY)}
     if h.get("local"):
         pre = ""
         if a.lane == "land":   # the local landing lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
@@ -397,6 +398,15 @@ def requeue_host(cfg, hs, units, n, spec):
         if host_cap(cfg, m, p, units)["free"] > 0 and not host_cap(cfg, m, p, units)["pause"]: return m
     return n
 
+def requeue(cfg, spec, to):
+    """Queue a recorded job (.janus/runs/jobs/<jid>.json) again on host to; returns what janus run printed last (its new id)."""
+    args = argparse.Namespace(host=to, lane=spec.get("lane", "jobs"), unit=spec.get("unit"), wt=spec["wt"], subdir=spec.get("subdir"),
+                              usb=spec.get("usb", False), priority=spec.get("priority") or 0, no_wait=True, allow_unmerged=True, command=[spec["cmd"]])
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf): cmd_run(cfg, args)
+    return (buf.getvalue().strip().splitlines()[-1:] or ["?"])[0]
+
 def tend_thrash(cfg, hs, units, log, dry=False):
     """Lines saying what was (or, dry, would be) done on each shared host over its thrash limit."""
     out = []
@@ -411,13 +421,7 @@ def tend_thrash(cfg, hs, units, log, dry=False):
         msg = f"{n} thrashing (memory PSI {psi} over {lim:g} for {mins:.0f} min): stop {ref} ({jid}, newest of {len(jobs)}), re-queue on {to}"
         if dry: out.append("would " + msg); continue
         try:
-            done = cancel_job(cfg, ref, force=True)
-            args = argparse.Namespace(host=to, lane=spec.get("lane", "jobs"), unit=spec.get("unit"), wt=spec["wt"], subdir=spec.get("subdir"),
-                                      usb=spec.get("usb", False), priority=spec.get("priority") or 0, no_wait=True, allow_unmerged=True, command=[spec["cmd"]])
-            import io, contextlib
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf): cmd_run(cfg, args)
-            new = buf.getvalue().strip().splitlines()[-1:] or ["?"]
+            done = cancel_job(cfg, ref, force=True); new = [requeue(cfg, spec, to)]
             line = f"{msg}: {'; '.join(done)}; now {new[0]}"
             rec = cfg.jget("thrash-acts.json"); rec[str(int(now()))] = line; cfg.jput("thrash-acts.json", dict(list(rec.items())[-50:]))
             if spec.get("unit"): board(cfg, "direct", spec["unit"], f"your job {ref} was stopped on {n} (host thrashing) and re-queued as {new[0]}: wait on that id")

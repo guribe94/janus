@@ -7,12 +7,20 @@ from janus.actions.launch import new_tab, wait_shell
 from janus.actions.lifecycle import tend_parked
 from janus.actions.tidy import tend_tidy
 from janus.board import board, board_alerts, board_dir, board_files
+from janus.autopilot import record, tend_autopilot
 from janus.check import run_check
-from janus.context import Err, JANUS_MARK, WAKE, handoff_stale, herdr, now, session_alive, sh, ts
+from janus.reset import orch_tokens, reset_now
+from janus.context import Err, JANUS_MARK, atomic_write, WAKE, handoff_stale, herdr, now, session_alive, sh, ts
 
 def cmd_watch(cfg, a):
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
     if getattr(a, "alert", False): board_alerts(cfg, log); return   # board.sh .notify: a new question or block, at once
+    if getattr(a, "reset", False): reset_now(cfg); return   # the Stop hook's safe-boundary context reset (janus/reset.py)
+    try:
+        with cfg.writer(wait=120): return watch_pass(cfg, log)   # the whole pass is one writer (panel problem 2)
+    except Err as e: log(f"pass skipped: {e}")
+
+def watch_pass(cfg, log):
     def sync():   # the shipped board only, when there are other hosts (or posts this machine made before it was the board)
         if cfg.paths.get("board") or cfg.run.dry: return
         board_files(cfg)
@@ -21,11 +29,12 @@ def cmd_watch(cfg, a):
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     board_alerts(cfg, log)
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (janus-fixes9)
+    tend_autopilot(cfg, hs, units, F, log)   # [autopilot] enabled: the ending policy's fixed-rule actions (janus/autopilot.py)
     tend_thrash(cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job (fixes10 item 3)
     tend_tidy(cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)
     sync()   # push what this pass wrote (peers.md, directions) to every host
     for r, why in orphan_jobs(cfg, hs, units):   # nothing whose owner is gone keeps running or waiting (item 3)
-        try: log(f"orphan {r} ({why}): " + "; ".join(cancel_job(cfg, r)))
+        try: d = "; ".join(cancel_job(cfg, r)); log(f"orphan {r} ({why}): {d}"); record(cfg, f"orphan:job:{r}", "cancel", f"{why}: {d}")
         except Err as e: log(f"orphan {r} ({why}): not cancelled: {e}")
     live = {wrap_token(t) for p in hs.values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values() if task_rc(t) is None}
     for f in (cfg.f("runs") / "wrap").glob("*") if (cfg.f("runs") / "wrap").is_dir() else []:   # finished wrappers' records, after a day
@@ -65,19 +74,19 @@ def cmd_watch(cfg, a):
         kind = (cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else "") or cfg.c.get("orchestrator", {}).get("kind", "claude")
         oc = cfg.c.get("orchestrator", {}); args = oc.get("args", []) if oc.get("kind", "claude") == kind else []
         cfg.touch("last_wake"); log(f"orchestrator gone (pane absent, process ended, transcript quiet): starting a new {kind} one")
-        cfg.f("session").write_text(f"pending:{int(now())}")   # its first hook event claims the registration
+        atomic_write(cfg.f("session"), f"pending:{int(now())}")   # its first hook event claims the registration
         pane, _ = new_tab(cfg, "orchestrator", cfg.root); wait_shell(pane, "orchestrator")
         sh(["herdr", "agent", "start", "orchestrator", "--kind", kind, "--pane", pane, "--timeout", "90000", "--", *args], timeout=100)
-        cfg.f("pane").write_text(pane); herdr("agent", "prompt", "orchestrator", JANUS_MARK + "You are the orchestrator. Run janus register, then " + WAKE); return
+        atomic_write(cfg.f("pane"), pane); herdr("agent", "prompt", "orchestrator", JANUS_MARK + "You are the orchestrator. Run janus register, then " + WAKE); return
     st = ag["agent"].get("agent_status")
     if st == "working": return
-    tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
-    big = tr and os.path.exists(tr) and os.path.getsize(tr) / 4 > cfg.reset_tokens
+    tok = orch_tokens(cfg)
     urgent = [f.key for f in F if f.urgent]   # the registry says which (findings/__init__.py); acked findings are already out of F; informational ones do not hold a reset (L4)
-    if big and not urgent and not handoff_stale(cfg, False):
-        if cfg.f("reset_asked").exists():
-            cfg.f("reset_asked").unlink(); log("context reset: /clear"); herdr("agent", "prompt", pane, "/clear"); return
-        cfg.touch("reset_asked"); log("context large: asked for final notes")
-        herdr("agent", "prompt", pane, JANUS_MARK + "Context is large: finish the Orchestrator notes in .janus/HANDOFF.md, then stop."); return
+    if tok > cfg.reset_tokens:   # the reset itself happens at the next Stop that passes (reset.stop_reset); here: ask for it, or say why not
+        why = f"urgent findings {', '.join(urgent[:3])}" if urgent else "notes stale" if handoff_stale(cfg) else "notes asked under 10 min ago" if now() - cfg.mtime("reset_prompted") < 600 else None
+        if why: log(f"context reset skipped ({tok} tokens over {cfg.reset_tokens}): {why}")
+        else:
+            cfg.touch("reset_prompted"); log(f"context large ({tok} tokens): asked for final notes")
+            herdr("agent", "prompt", pane, JANUS_MARK + "Context is large: finish the Orchestrator notes in .janus/HANDOFF.md, then end the turn (janus resets the context then)."); return
     if (overdue or late) and now() - cfg.mtime("last_wake") > 600:
         cfg.touch("last_wake"); log(f"wake: overdue={bool(overdue)} late={late[:3]}"); herdr("agent", "prompt", pane, JANUS_MARK + WAKE)

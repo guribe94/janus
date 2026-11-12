@@ -187,9 +187,13 @@ done
 rm -f "$W"; exec 7>&-; trap 'rm -f "$R.res"' EXIT
 echo "janus: admitted ($CLS, reserves $CPJ cores and $MB MB): $why"
 run_sampled() {  # run "$@", sample its memory every 5 s, then add class, peak MB, seconds and exit code to $RD/history.tsv
-  t0=$(date +%%s); "$@" & pid=$!; peak=0
+  # the peak is also the kernel's high-water mark of its largest process (platform.MAXRSS_PY), so a job that ends between two
+  # samples, or before its first sample sees it allocate (a slow start under load), still records its real peak
+  t0=$(date +%%s); pf="$R.maxrss"; rm -f "$pf"
+  if command -v python3 >/dev/null 2>&1; then python3 -c %(maxrss)s "$pf" "$@" & else "$@" & fi; pid=$!; peak=0
   while kill -0 $pid 2>/dev/null; do v=$(job_mb $pid %(jid)s); [ "${v:-0}" -gt "$peak" ] 2>/dev/null && peak=$v; sleep 5; done
-  wait $pid; rc=$?; cap_record "$CLS" "$peak" $(( $(date +%%s) - t0 )) $rc; return $rc
+  wait $pid; rc=$?; k=$(cat "$pf" 2>/dev/null); rm -f "$pf"; [ "${k:-0}" -gt "$peak" ] 2>/dev/null && peak=$k
+  cap_record "$CLS" "$peak" $(( $(date +%%s) - t0 )) $rc; return $rc
 }
 '''
 

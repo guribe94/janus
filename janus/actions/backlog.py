@@ -16,7 +16,7 @@ def cmd_backlog(cfg, a):
         if not x: raise Err(f"no backlog item {a.args[0]} in beads (janus backlog import first)")
         v = slug(a.args[1][6:]) or "agent"; labels = [l for l in (x.get("labels") or []) if not l.startswith("actor:")] + ([f"actor:{v}"] if v != "agent" else [])
         if cfg.run.dry: say(f"+ bd update {x['id']} --set-labels {','.join(labels)}"); return
-        Beads(cfg).run("update", x["id"], "--set-labels", ",".join(labels)); cfg.touch("changed"); say(f"{a.args[0]}: actor {v}"); return
+        Beads(cfg).run("update", x["id"], "--set-labels", ",".join(labels)); say(f"{a.args[0]}: actor {v}"); return
     items = backlog_items(cfg)
     if items is None: raise Err("no checklist: set [backlog] file (or paths.checklist) in janus.toml")
     if a.action == "list":
@@ -39,7 +39,7 @@ def cmd_backlog(cfg, a):
         if sorted(x.get("labels") or []) != sorted(labels) or x.get("title") != title:
             bd.run("update", x["id"], "--title", title, "--set-labels", ",".join(labels)); n["updated"] += 1
         else: n["same"] += 1
-    if not cfg.run.dry: cfg.touch("backlog_imported"); cfg.touch("changed")
+    if not cfg.run.dry: cfg.touch("backlog_imported")
     say(f"backlog: {len(items)} checklist items; " + ", ".join(f"{v} {k}" for k, v in n.items()))
 
 BRIEF_KEYS = re.compile(r"^(ITEM|KIND|TIER|TEST-HOST|PRIORITY):\s*(\S+)", re.M)

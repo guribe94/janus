@@ -342,11 +342,13 @@ class Capacity(unittest.TestCase):
             self.assertIn("ADMIT", out)
         finally: holder.kill(); holder.wait()
     def test_job_script_admits_runs_records(self):
-        """A Mac (local) jobs-lane job (register item 5): waits for admission, holds its reservation, records its peak."""
+        """A Mac (local) jobs-lane job (register item 5): waits for admission, holds its reservation, records its peak. The job
+        allocates only after 4 s and then ends, between two 5 s samples: the sampler alone recorded no peak (the flake under
+        load, when a slow start pushed the allocation past the last sample); the kernel's high-water mark records it."""
         holder = subprocess.Popen(["sleep", "60"])
         rd = self.d / "rd"; (rd / "h.res").write_text(f"{holder.pid} 8 100 1 x\n")   # all cores reserved by another job
         a = type("A", (), {"lane": "jobs", "subdir": None, "wt": str(self.d), "usb": False})()
-        cmd = sys.executable + " -c 'import os, time; b = bytearray(os.urandom(60 * 1024 * 1024)); time.sleep(6)'"   # incompressible: macOS compresses zero pages under pressure
+        cmd = sys.executable + " -c 'import os, time; time.sleep(4); b = bytearray(os.urandom(60 * 1024 * 1024))'"   # incompressible: macOS compresses zero pages under pressure
         js = janus.job_script(self.cfg, "b", self.h, a, "t", cmd, "t-1"); (rd / "t-1.sh").write_text(js)
         p = subprocess.Popen(["bash", str(rd / "t-1.sh")], env={**os.environ, "JANUS_POLL_S": "1"}, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
