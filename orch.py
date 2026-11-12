@@ -1833,6 +1833,7 @@ def cmd_collect(cfg, a):
     # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree.
     remote_patch(h, n, "changes.patch")
     if not save_output(cfg, u): raise Err(f"collect from {u['host']} failed (unreachable?)")   # out/<unit>/, the task log
+    if not DRY and not save_transcript(cfg, u): say(f"note: no transcript of {n} saved (none found on {u['host']})")   # out/<unit>/transcript.md
     st = task_status(h, u["task"]) if u.get("via") == "pueue" and u.get("task") is not None and not DRY else None
     if not (st and task_rc(st) is None): X(h, f"rm -f {qp(f'{root}/run/{n}.key')}")   # the key fifo, once no task can still read it (row 52)
     mc = cfg.models.get(u.get("model"), {})
@@ -3284,6 +3285,123 @@ def push_cmd(repo, cfg=None):
         rem = "origin" if "origin" in rs or not rs else rs[0]
     return ["git", "push", "--set-upstream", rem, "HEAD"]
 
+# ---------------------------------------------------------------- transcripts (orch-swarm item 5)
+# One condenser for Claude Code (jsonl under ~/.claude/projects) and Codex (rollout jsonl under ~/.codex/sessions) transcripts.
+# It runs where the transcript is: here, or on the agent's host as `python3 -` with this source on stdin (standard library only).
+CONDENSE = r'''
+import glob, json, os, re, sys
+mode, grep, tail, since, cwd = sys.argv[1:6]; tail = int(tail); since = float(since); pats = sys.argv[6:]
+rx = re.compile(grep, re.I) if grep else None
+def flat(x):
+    if isinstance(x, list): return " ".join(flat(y) for y in x)
+    if isinstance(x, dict): return str(x.get("text") or x.get("content") or x.get("output") or json.dumps(x))
+    return str(x or "")
+def show(tag, full, n):
+    full = re.sub(r"\s+", " ", full).strip()
+    m = rx.search(full) if rx else None
+    if m and len(full) > n: a = max(0, m.start() - n // 3); return f"{tag}{'...' if a else ''}{full[a:a + n]}{'...' if a + n < len(full) else ''}"
+    return tag + (full if len(full) <= n else full[:n] + "...")
+def tool(name, inp):
+    if isinstance(inp, str):
+        try: inp = json.loads(inp)
+        except Exception: pass
+    k = next((k for k in ("command", "cmd", "file_path", "path", "pattern", "url", "query", "description") if isinstance(inp, dict) and inp.get(k)), None)
+    return f"> {name}: ", flat(inp[k]) if k else (inp if isinstance(inp, str) else json.dumps(inp)), 160
+def items(f):
+    for l in open(f, errors="replace"):
+        try: o = json.loads(l)
+        except Exception: continue
+        t = o.get("type")
+        if t in ("user", "assistant") and isinstance(o.get("message"), dict):      # Claude Code
+            c = o["message"].get("content"); who = "USER: " if t == "user" else "AGENT: "
+            if isinstance(c, str): yield who, c, 600; continue
+            for b in c or []:
+                if not isinstance(b, dict): continue
+                if b.get("type") == "text" and b.get("text", "").strip(): yield who, b["text"], 600
+                elif b.get("type") == "tool_use": yield tool(b.get("name"), b.get("input"))
+                elif b.get("type") == "tool_result": yield ("< ERROR " if b.get("is_error") else "< "), flat(b.get("content")), 200
+        elif t == "response_item":                                                  # Codex
+            p = o.get("payload") or {}; pt = p.get("type")
+            if pt == "message" and p.get("role") in ("user", "assistant"):
+                tx = flat(p.get("content"))
+                if tx.strip() and not tx.lstrip().startswith(("<", "# AGENTS.md")): yield ("USER: " if p["role"] == "user" else "AGENT: "), tx, 600
+            elif pt in ("function_call", "custom_tool_call", "local_shell_call"): yield tool(p.get("name") or pt, p.get("arguments") or p.get("input") or p.get("action"))
+            elif pt in ("function_call_output", "custom_tool_call_output"): yield "< ", flat(p.get("output")), 200
+fs = []
+for p in pats: fs += glob.glob(os.path.expanduser(p), recursive=True)
+fs = sorted(set(fs), key=os.path.getmtime)
+if mode == "newest": fs = fs[-1:]
+if mode == "codex-cwd":   # Codex sessions of a cwd (no thread id known): their session_meta line names it
+    def meta_cwd(f):
+        try: return (json.loads(open(f, errors="replace").readline()).get("payload") or {}).get("cwd")
+        except Exception: return None
+    fs = [f for f in fs if os.path.getmtime(f) >= since and meta_cwd(f) == cwd]
+if not fs: print("(no transcript found)"); sys.exit(3)
+out = []
+for f in fs:
+    body = [show(tag, full, n) for tag, full, n in items(f) if not rx or rx.search(full)]
+    out.append((f, body))
+if tail > 0:   # the last N lines over all sessions, newest session last
+    keep, left = [], tail
+    for f, body in reversed(out):
+        if left <= 0: break
+        keep.insert(0, (f, body[-left:])); left -= len(body[-left:])
+    out = keep
+print("\n".join(f"## {f}\n" + "\n".join(b) for f, b in out))
+'''
+
+def unit_any(cfg, name):
+    """An open unit, else the latest record of a closed one."""
+    try: u = next((u for u in Beads(cfg).units() if u["name"] == name), None)
+    except Err: u = None
+    return u or all_units(cfg).get(name)
+
+def unit_sessions(cfg, u):
+    """The agent session ids of a unit's runs (api.json and each run's api-<run>.json: Claude session_id, Codex thread_id)."""
+    od = cfg.p("out", "out") / u["name"]; sids = []
+    for f in sorted(od.glob("api*.json"), key=lambda p: p.stat().st_mtime):
+        try: d = json.loads(f.read_text())
+        except Exception: continue
+        sid = d.get("session_id") or d.get("thread_id")
+        if sid and re.fullmatch(r"[A-Za-z0-9-]{8,64}", sid): sids.append(sid)
+    return list(dict.fromkeys(sids))
+
+def read_transcript(cfg, u, grep="", tail=40):
+    """(rc, condensed text) of the unit's transcript(s), read on the host that holds them."""
+    h = cfg.hosts.get(u.get("host"), {"local": True}); kind = cfg.models.get(u.get("model"), {}).get("kind")
+    sids = unit_sessions(cfg, u); cwd = u.get("rcwd") or u.get("cwd") or ""
+    esc = re.sub(r"[^A-Za-z0-9-]", "-", cwd)
+    if kind == "opencode": return 3, "(opencode keeps its sessions in its own database: not readable by orch; read the agent's report)"
+    codex = kind == "codex" or (kind == "api" and "codex" in json.dumps(cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("cmd", "")))
+    if codex:
+        mode, pats = ("ids", [f"~/.codex/sessions/**/*{s}*.jsonl" for s in sids]) if sids else ("codex-cwd", ["~/.codex/sessions/**/rollout-*.jsonl"])
+    elif sids: mode, pats = "ids", [f"~/.claude/projects/*/{s}.jsonl" for s in sids]
+    elif h.get("local"):
+        f = transcript_of(cfg, u); mode, pats = "ids", [str(f)] if f else []
+        if not f: return 3, "(no transcript found)"
+    else: mode, pats = "newest", [f"~/.claude/projects/{esc}/*.jsonl"]   # a remote Claude agent with no session id yet: its newest there
+    argv = [mode, grep, str(tail), str(u.get("started", 0) - 60), cwd, *pats]
+    if h.get("local"): rc, o, e = sh([sys.executable, "-", *argv], inp=CONDENSE, timeout=120)
+    else: rc, o, e = hrun(h, f"{h.get('agent_env', '')}\npython3 - {shlex.join(argv)}", inp=CONDENSE, timeout=120)
+    return rc, (o or e).rstrip()
+
+def cmd_transcript(cfg, a):
+    u = unit_any(cfg, a.unit)
+    saved = cfg.p("out", "out") / a.unit / "transcript.md"
+    if not u and not saved.is_file(): raise Err(f"no unit {a.unit}")
+    rc, txt = read_transcript(cfg, u, a.grep or "", a.tail) if u else (3, "")
+    if rc and saved.is_file():   # the remote copy is gone: the condensed copy orch collect saved
+        L = saved.read_text().splitlines()
+        if a.grep: L = [l for l in L if re.search(a.grep, l, re.I)]
+        txt = f"(saved copy {saved})\n" + "\n".join(L[-a.tail:] if a.tail > 0 else L); rc = 0
+    say(txt); return 0 if rc == 0 else 1
+
+def save_transcript(cfg, u):
+    """out/<unit>/transcript.md: the whole condensed transcript (collect; it outlives the remote copy)."""
+    rc, txt = read_transcript(cfg, u, "", 0)
+    if rc == 0 and txt and not DRY: atomic_write(cfg.p("out", "out") / u["name"] / "transcript.md", txt + "\n")
+    return rc == 0
+
 # ---------------------------------------------------------------- peers (orch-swarm item 4)
 def card_fields(cfg, name):
     """The board card's fields ({state, step, ...}) of an agent, {} without a card."""
@@ -4071,6 +4189,7 @@ def main():
     for k in MEM_SECTIONS: g.add_argument(f"--{k}", action="store_true")
     add("forget", A("text", help="the entry's number (orch memory), its subject, or its text"), dry=True)
     add("index", dry=True); add("peers")
+    add("transcript", A("unit"), A("--grep", help="only the lines matching this regex (case-insensitive)"), A("--tail", type=int, default=40, help="the last N lines (0: all)"))
     add("memory", A("--keep", type=int, help="re-date entry N after review (it stays)"), dry=True)
     add("init", A("--name", help="project name for a new orch.toml (default: the folder's name)"), dry=True)
     add("board-close", A("agent", help="a board card that is not an open unit"), dry=True)
