@@ -114,7 +114,7 @@ def main():
     add("decisions", cmd_decisions, A("--grep", help="only records matching this regex (case-insensitive)"))
     add("ask", cmd_ask, A("question"), A("--options", action="append", help="one option for the owner (repeatable)"),
         A("--recommend", help="what you recommend"), dry=True)
-    add("answer", cmd_answer, A("id", type=int), A("answer"), A("--decide", action="store_true", help="also write a decision record of the answer"), dry=True)
+    add("answer", cmd_answer, A("id", help="q<N>: a board question; <N>: an owner question (janus ask)"), A("answer"), A("--decide", action="store_true", help="also write a decision record of the answer"), dry=True)
     add("init", cmd_init, A("--name", help="project name for a new janus.toml (default: the folder's name)"), dry=True)
     add("migrate", migrate, A("project", nargs="?", help="a project with an old orch.toml/.orch to move to janus (default: here)"),
         A("--retire", action="store_true", help="stop the old orch's standing processes on this machine (the owner's yes)"), dry=True)

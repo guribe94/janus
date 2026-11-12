@@ -325,10 +325,10 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
 - **Decision records.** A ruling that constrains later work gets a record at once: `janus decide "<title>" --by
   owner|orchestrator --context ... --options ... --decision ... --why ... [--supersedes <n>] [--instruction <id>]`
   (`.janus/decisions/NNNN-title.md`, never edited; a reversal supersedes it). `janus decisions --grep <topic>` searches a
-  record. A question for the owner: `janus ask "<question>" --recommend ...`, then `janus answer <n> "<answer>" [--decide]`.
+  record. A question for the owner: `janus ask "<question>" --recommend ...`, then `janus answer <n> "<answer>" [--decide]`; a board question `q<N>` is answered the same way.
   Act on `owner-question:<n>` and `decision-missing:<id>`.
 - **Questions.** A `question:<id>` is answered first: check `janus memory`, `janus decisions --grep <topic>` and
-  `bd memories <word>`, then `board.sh answer <id> <text>`. If the answer holds for every agent, `janus remember` it and
+  `bd memories <word>`, then `janus answer <id> <text>` (`q<N>`; it needs no `BOARD_DIR`). If the answer holds for every agent, `janus remember` it and
   `board.sh direct all <text>`. A `learned:<agent>:<n>` is a proposal: `janus remember ... --learned <agent>:<n>` or
   `janus learned --reject <agent>:<n>`.
 - **Swarm.** `janus peers` shows who changes what; on `overlap:<a>:<b>` tell both (`board.sh direct`) or land one first.
@@ -349,7 +349,7 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
   worktree. A remote launch copies the files the brief names under the project root to the host and rewrites the brief; it
   refuses a brief naming a path the agent there cannot reach (move the file under the project root, or name it relative to the
   tree).
-- **Answer every board question** (`board.sh answer <id> <text>`) and blocker (`board.sh direct <agent> <text>`) `check`
+- **Answer every board question** (`janus answer q<N> <text>`) and blocker (`board.sh direct <agent> <text>`) `check`
   reports; archive cards that are not units with `janus board-close <agent>`.
 - **Classify owner instructions:** close the beads issue as done, or make it a standing rule with `bd remember "<rule>" --key
   <subject>`. A rule that changes an older one **replaces** it: reuse that rule's key (`bd memories <word>` finds it), never
@@ -444,7 +444,7 @@ folder, the board's sync carries them to every host: the same files serve one ma
 `paths.board_dir` (default `board/`); check writes `.master`, `.hosts` (from janus.toml) and `.notify` there.
 - Agents post **state changes only**: `status` at start, `waiting <job ids>` when parked (never SILENT or GONE; janus posts it
   when it parks a unit), `blocked`, `question`, `learned <fact and source>`, `done <VERDICT line>`. Steps go in the report.
-- A question gets an id (`q12`) and stays "needs answer" until the orchestrator answers it: `board.sh answer <id> <text>`, or
+- A question gets an id (`q12`) and stays "needs answer" until the orchestrator answers it: `janus answer q<N> <text>` (from the project; `board.sh answer` runs only with `BOARD_DIR` set), or
   `board.sh direct <agent> <text>` (answers that agent's open questions). `check` raises `question:<id>` until then. A new
   question or block runs `janus watch --alert`, which prompts the orchestrator at once (each one once).
 - `board.sh direct all <text>` broadcasts to every open card (it answers no question); remember a standing one with

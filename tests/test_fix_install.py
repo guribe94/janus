@@ -1706,3 +1706,30 @@ class Item27ParkedFinished(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+
+
+class Item35BoardAnswer(unittest.TestCase):
+    """Item 35: the answer command check prints for a board question works as printed, from the orchestrator's shell."""
+    def janus_cmd(self, d, *args):
+        env = {k: v for k, v in os.environ.items() if k not in ("BOARD_DIR", "JANUS_ROLE", "JANUS_ROOT")}
+        return subprocess.run([sys.executable, str(JANUS_PY), *args], cwd=d, env=env, capture_output=True, text=True, timeout=60)
+
+    def test_the_printed_answer_command_answers_the_question(self):
+        """Catches: check printed `board.sh answer q1 <text>`, which died 'answer runs on the coordinating machine only' without
+        BOARD_DIR, and `janus answer q1 <text>` died 'invalid int value'; the question stayed open."""
+        d, cfg = project(); cfg.run.ro = False
+        janus.board(cfg, "post", "a1", "status", "start"); janus.board(cfg, "post", "a1", "question", "which port?")
+        text = dict(janus.board_findings(cfg, {"a1"}))["question:q1"]
+        m = re.search(r"then (janus answer q1) <text>", text); self.assertTrue(m, f"the finding names no janus answer: {text}")
+        r = self.janus_cmd(d, "answer", "q1", "use 8080")      # the printed command, <text> filled in, no BOARD_DIR in the environment
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([k for k, _ in janus.board_findings(cfg, {"a1"})], [])
+        self.assertIn("use 8080", (d / "board/to/a1.md").read_text())
+        self.assertNotEqual(self.janus_cmd(d, "answer", "q9", "x").returncode, 0)   # an unknown board question is refused, not ignored
+
+    def test_an_old_project_board_script_is_flagged(self):
+        """Catches: a pre-janus bin/board.sh left in the project (no answer subcommand: it prints its help) misled the orchestrator
+        and check said nothing about it."""
+        d, cfg = project(); (d / "bin").mkdir(); (d / "bin/board.sh").write_text("#!/bin/sh\ncase $1 in post) ;; *) echo help;; esac\n")
+        self.assertEqual([k for k, _ in janus.board_findings(cfg, set())], [f"board:stale:{d / 'bin/board.sh'}"])
+        (d / "bin/board.sh").unlink(); self.assertEqual(janus.board_findings(cfg, set()), [])

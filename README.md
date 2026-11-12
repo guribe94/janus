@@ -230,7 +230,7 @@ backs off when it is under pressure. Every key is documented in `example.janus.t
 | `janus decisions --grep <topic>` | find why a decision was made |
 | `janus tidy --dry-run` | list worktrees, branches, files and caches that can go |
 | `janus report` | a status report for the owner |
-| `board.sh summary`, `board.sh answer <id> <text>` | see the board; answer a question |
+| `board.sh summary`, `janus answer q<N> <text>` | see the board; answer a question |
 | edit `[models.*]` / `[providers.*].enabled` in janus.toml, then `janus doctor` | add a model, or turn a provider off |
 | `bd remember "<rule>" --key <subject>` | add or replace a standing rule (reuse the subject key to replace) |
 | `janus launch <unit> --resume-of <unit>` | recover a crashed or capped unit from its report |
