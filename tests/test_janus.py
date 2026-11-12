@@ -337,6 +337,33 @@ class Resume(unittest.TestCase):
                                 capture_output=True, text=True).stdout.rstrip("\n")      # what pueue stores as the command
         self.assertEqual(subprocess.run(["sh", "-c", stored], capture_output=True, text=True).stdout.rstrip("\n"), odd)
 
+class ResumeBudget(unittest.TestCase):
+    def test_a_capped_unit_is_resumed_with_a_new_budget_in_its_own_tree(self):
+        """Catches (item 24): a unit capped at its budget with an unpushed commit could not be continued: janus resume refused
+        (under resume_min_usd) and told you to use launch --resume-of, which said 'already launched' for the same unit, was
+        refused by H9 for a successor with --cwd, and close said 'unpushed commits'."""
+        d, cfg = project()
+        b = d / "briefs/u1.md"; b.write_text("# Brief: u1\n")
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "model": "m", "task": 5, "budget": 2.0, "run": "u1.1",
+             "brief": str(b), "rbrief": str(b), "rcwd": str(d), "started": 0}
+        got = {}
+        saved = {k: getattr(janus, k) for k in ("get_unit", "probe_all", "session_of", "run_cost", "ledger_done", "reserve_budget",
+                                                "unit_spent", "X", "confirm_started", "save_task_log", "board")}
+        bd = type("B", (), {"save": lambda s, x: None, "comment": lambda s, *a: None})()
+        janus.get_unit = lambda cfg, n: (bd, u); janus.probe_all = lambda cfg: {}
+        janus.session_of = lambda cfg, u: "sid"; janus.run_cost = lambda *a, **k: (2.0, True); janus.ledger_done = lambda *a, **k: None
+        janus.unit_spent = lambda cfg, u, wrapup=False: 2.0                       # the whole budget is spent (capped)
+        janus.reserve_budget = lambda cfg, mc, name, budget, run=None: got.update(budget=budget) or "u1.r2.1"
+        janus.X = lambda cfg, h, cmd, **k: (0, "7", ""); janus.confirm_started = lambda cfg, h, tid: ("running", "")
+        janus.save_task_log = lambda *a, **k: None; janus.board = lambda *a, **k: None
+        a = type("A", (), {"unit": "u1", "message": "continue", "force": True, "budget": 3.0, "runtime": None, "here": False})()
+        try: janus.cmd_resume(cfg, a)
+        finally:
+            for k, v in saved.items(): setattr(janus, k, v)
+        self.assertEqual(got.get("budget"), 3.0, "the new run did not get the new budget")   # 3.0, not 2.0-2.0=0
+        self.assertEqual(u["budget"], 5.0)                                        # the unit's budget is its spend plus the new run's
+
+
 class LocaltestWords(unittest.TestCase):
     def test_a_command_that_merely_mentions_pytest_is_not_a_localtest(self):
         """Catches (item 23): localtest flagged the orchestrator's own commands that contain the word pytest (an ack quoting
