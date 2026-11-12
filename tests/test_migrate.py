@@ -39,5 +39,17 @@ class GateSetup(unittest.TestCase):
         self.assertNotIn("gate-setup:h", keys)                           # exit 1 after 3 min: a real test failure
 
 
+class ModelHosts(unittest.TestCase):
+    def test_warns_when_a_routed_model_is_limited_to_fewer_hosts(self):
+        d = Path(tempfile.mkdtemp(prefix="janus-test-"))
+        (d / "janus.toml").write_text(
+            '[project]\nname = "t"\n[hosts.a]\nlocal = true\n[hosts.b]\nssh = "x"\n[hosts.c]\nssh = "y"\n'
+            '[providers.api]\nenabled = true\n[models.m]\nprovider = "api"\nkind = "claude"\nhosts = ["a"]\n'
+            '[models.n]\nprovider = "api"\nkind = "claude"\n[routing]\nnormal = ["m", "n"]\n')
+        cfg = janus.Cfg(d)
+        self.assertTrue(any("runs on 1 of 3" in w for w in janus.model_host_warnings(cfg)))   # m limited to one host
+        self.assertFalse(any("model n" in w for w in janus.model_host_warnings(cfg)))          # n may run anywhere
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -131,6 +131,8 @@ it. Unset means qualified (inert).
 **`janus qualify <model> [--fail] "<what it did>"`**: record that a model passed (or failed) a small real task before it does
 real work. It clears the `qualified = false` skip for that model on a pass; `--fail` keeps it skipped. `janus report` shows each
 implementer model's first-review pass rate (`First review per implementer model`), the outcome data routing should read.
+`janus doctor` warns when a routed model's `hosts` is narrower than the configured hosts (decision 0004: agents run on every
+host).
 
 **`[routing]`**: ordered lists per tier: `critical`, `normal`, and `review`. The first model whose provider is enabled
 and within budget wins. A review skips models of the implementer's vendor.
