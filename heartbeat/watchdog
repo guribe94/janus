@@ -1,0 +1,99 @@
+#!/bin/sh
+# heartbeat/watchdog: run on the watchdog host by a systemd user timer every 5 minutes.
+#
+# It reads the last line of the heartbeat file (written by heartbeat/beat on the
+# coordinating machine). If the newest beat is older than HEARTBEAT_MAX_AGE it raises
+# one alert per outage: a post through the board's outbox (when one is configured and
+# present) and a configurable alert command (notify-send, ntfy, anything). When beats
+# resume it posts recovery once. It never repeats an alert for the same outage.
+#
+# Environment:
+#   HEARTBEAT_FILE        heartbeat file to read (default: $HOME/.local/state/janus/heartbeat)
+#   HEARTBEAT_MAX_AGE     seconds before a beat is stale (default: 900 = 15 min)
+#   HEARTBEAT_STATE       state file, "0" fresh / "1" alerted (default: <HEARTBEAT_FILE>.watchdog)
+#   HEARTBEAT_OUTBOX      board outbox file or its directory (default: none; e.g. <root>/board-outbox/outbox.log)
+#   HEARTBEAT_AGENT       board agent name for the posts (default: heartbeat)
+#   HEARTBEAT_ALERT_CMD   shell command run on an alert; the message is $1 and $HEARTBEAT_MESSAGE
+#   HEARTBEAT_HOST        name used in messages (default: hostname -s)
+#
+# Exit is always 0: a watchdog that fails its own timer is worse than one that is quiet.
+
+set -u
+
+file=${HEARTBEAT_FILE:-$HOME/.local/state/janus/heartbeat}
+max=${HEARTBEAT_MAX_AGE:-900}
+state=${HEARTBEAT_STATE:-$file.watchdog}
+outbox=${HEARTBEAT_OUTBOX:-}
+agent=${HEARTBEAT_AGENT:-heartbeat}
+host=${HEARTBEAT_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}
+
+now=$(date +%s 2>/dev/null || echo 0)
+
+# The newest beat: the last line's first field (epoch seconds). A missing or malformed
+# file means "never beat", which is an outage.
+last=0
+if [ -s "$file" ]; then
+  last=$(tail -n 1 "$file" 2>/dev/null | awk '{print $1}' 2>/dev/null)
+  case $last in ''|*[!0-9]*) last=0;; esac
+fi
+if [ "$last" -gt 0 ]; then
+  age=$((now - last))
+  [ "$age" -lt 0 ] && age=0
+else
+  age=999999999
+fi
+
+alerted=0
+if [ -f "$state" ]; then
+  alerted=$(cat "$state" 2>/dev/null)
+  case $alerted in 0|1) ;; *) alerted=0;; esac
+fi
+
+# A board post through the outbox, in the board's own line format:
+#   YYYY-MM-DD HH:MM <agent> <kind>: <text>
+# Only when an outbox is configured and present; otherwise the board is not on this host.
+post() {
+  kind=$1
+  text=$2
+  [ -n "$outbox" ] || return 0
+  [ -d "$outbox" ] && outbox=$outbox/outbox.log
+  [ -e "$outbox" ] || [ -d "$(dirname "$outbox")" ] || return 0
+  mkdir -p "$(dirname "$outbox")" 2>/dev/null
+  line="$(date '+%Y-%m-%d %H:%M' 2>/dev/null) $agent $kind: $text"
+  if command -v flock >/dev/null 2>&1; then
+    ( flock 9; printf '%s\n' "$line" >>"$outbox" ) 9>>"$outbox.lock" 2>/dev/null
+  else
+    printf '%s\n' "$line" >>"$outbox" 2>/dev/null
+  fi
+}
+
+# Run a configured command with the message as $1 and in HEARTBEAT_MESSAGE.
+run_cmd() {
+  cmd=$1
+  msg=$2
+  [ -n "$cmd" ] || return 0
+  HEARTBEAT_MESSAGE=$msg sh -c "$cmd" heartbeat "$msg" >/dev/null 2>&1 || true
+}
+
+if [ "$age" -gt "$max" ]; then
+  if [ "$alerted" -ne 1 ]; then
+    if [ "$last" -gt 0 ]; then
+      msg="heartbeat stale: no beat from $host for $((age / 60)) min (threshold $((max / 60)) min)"
+    else
+      msg="heartbeat stale: no beat from $host yet (threshold $((max / 60)) min)"
+    fi
+    post blocked "$msg"
+    run_cmd "${HEARTBEAT_ALERT_CMD:-}" "$msg"
+    mkdir -p "$(dirname "$state")" 2>/dev/null
+    printf '1\n' >"$state" 2>/dev/null
+  fi
+else
+  if [ "$alerted" -eq 1 ]; then
+    msg="heartbeat recovered: beats from $host resumed (last beat $((age / 60)) min ago)"
+    post status "$msg"
+    mkdir -p "$(dirname "$state")" 2>/dev/null
+    printf '0\n' >"$state" 2>/dev/null
+  fi
+fi
+
+exit 0
