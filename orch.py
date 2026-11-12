@@ -3255,7 +3255,8 @@ SECRETS[-1] = re.compile(SECRETS[-1].pattern, re.M)
 
 def cmd_commit_state(cfg, a):
     """Stage everything, scan exactly what is staged (L9), commit and push; unstage again if a secret is found."""
-    if DRY: say("+ git add -A; scan staged files; git commit; git push"); return
+    if DRY: say("+ orch index; git add -A; scan staged files; git commit; git push"); return
+    write_index(cfg)   # out/INDEX.md is committed with the state (orch-swarm item 3)
     rc, o, e = sh(["git", "add", "-A"], cwd=cfg.root, timeout=120)
     if rc: raise Err("git add failed: " + e.strip()[:80])
     rc, o, e = sh(["git", "diff", "--cached", "--name-only", "-z"], cwd=cfg.root)
@@ -3281,6 +3282,39 @@ def push_cmd(repo, cfg=None):
         rs = sh(["git", "-C", str(repo), "remote"])[1].split()
         rem = "origin" if "origin" in rs or not rs else rs[0]
     return ["git", "push", "--set-upstream", rem, "HEAD"]
+
+# ---------------------------------------------------------------- reports index (orch-swarm item 3)
+RESULT_RX = re.compile(r"^\W*(result|summary|outcome|conclusion)s?\b\W*", re.I)
+
+def report_summary(text):
+    """(verdict, one-line result) of a report: its final VERDICT line (else line 1), and a 'Result:'/'Summary:' line, else the
+    last content line before the final verdict."""
+    L = [l.rstrip() for l in text.splitlines()]
+    vi = next((i for i in range(len(L) - 1, -1, -1) if L[i].startswith("VERDICT:")), None)
+    v = L[vi][8:].strip() if vi is not None else "none"
+    res = next((RESULT_RX.sub("", l) for l in L if RESULT_RX.match(l) and len(RESULT_RX.sub("", l)) > 3), None)
+    if not res:
+        body = [l for l in L[1:vi if vi and vi > 0 else len(L)] if l.strip() and not l.lstrip().startswith(("#", "VERDICT:", "|---", "```"))]
+        res = body[-1] if body else ""
+    return (v[:24] or "none"), re.sub(r"\s+", " ", res.strip(" -*"))[:140]
+
+def write_index(cfg):
+    """out/INDEX.md, one line per unit (verdict, result, report path), newest first; a copy in the board folder (index.md) so
+    the board sync carries it to every host. Returns the number of units."""
+    od = cfg.p("out", "out"); rows = []
+    for rp in od.glob("*/REPORT.md"):
+        try: v, r = report_summary(rp.read_text(errors="replace")); rows.append((rp.stat().st_mtime, rp.parent.name, v, r, rp))
+        except OSError: continue
+    rows.sort(reverse=True)
+    text = (f"# Reports index ({ts()}; orch index, regenerated at orch commit-state)\n"
+            + "".join(f"- {n} | {v} | {r or '-'} | {rp}\n" for _, n, v, r, rp in rows))
+    if not DRY and not cfg.ro:
+        atomic_write(od / "INDEX.md", text)
+        if board_dir(cfg).is_dir(): atomic_write(board_dir(cfg) / "index.md", text)
+    return len(rows)
+
+def cmd_index(cfg, a):
+    n = write_index(cfg); say(f"{cfg.p('out', 'out') / 'INDEX.md'}: {n} unit(s)")
 
 # ---------------------------------------------------------------- session memory (orch-swarm item 1, 7)
 # .orch/MEMORY.md is the session's curated memory: Decisions / Facts / Pitfalls, one dated line per entry. Only the orchestrator
@@ -3950,6 +3984,7 @@ def main():
     g = m.add_mutually_exclusive_group(required=True)
     for k in MEM_SECTIONS: g.add_argument(f"--{k}", action="store_true")
     add("forget", A("text", help="the entry's number (orch memory), its subject, or its text"), dry=True)
+    add("index", dry=True)
     add("memory", A("--keep", type=int, help="re-date entry N after review (it stays)"), dry=True)
     add("init", A("--name", help="project name for a new orch.toml (default: the folder's name)"), dry=True)
     add("board-close", A("agent", help="a board card that is not an open unit"), dry=True)
