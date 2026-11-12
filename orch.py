@@ -1117,7 +1117,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     for n, c in cfg.caps.get("host", {}).items():
         k = sum(1 for u in units if u.get("host") == n)
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
-    F += gate_findings(cfg, hs) + known_failure_findings(cfg, names)
+    F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg)
     F += lane_findings(cfg, hs, units)
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg) + script_findings()
     for n, pv in cfg.prov.items():
@@ -2996,6 +2996,9 @@ def cmd_run(cfg, a):
     tid = o.strip()
     if not DRY:   # the tree this job uses, for orch busy (row 53): one line per job, dropped once the job has ended
         bd_ = cfg.f("runs") / "busy"; bd_.mkdir(parents=True, exist_ok=True); (bd_ / jid).write_text(f"{hn}:{tid}\t{src}\n")
+        js = cfg.f("runs") / "jobs"; js.mkdir(parents=True, exist_ok=True)   # what it ran, so a thrash stop can re-queue it (item 3)
+        (js / f"{jid}.json").write_text(json.dumps({"host": hn, "task": tid, "lane": a.lane, "unit": unit, "wt": src, "cmd": cmd,
+                                                     "subdir": a.subdir, "usb": bool(a.usb), "priority": a.priority, "at": int(now())}))
     wrap = os.environ.get("ORCH_WRAP")   # queued from inside another orch job or gate (a wrapper): record it, so cancel follows (row 49)
     if wrap and re.fullmatch(r"[\w.-]+", wrap):
         wd = cfg.f("runs") / "wrap"; wd.mkdir(parents=True, exist_ok=True)
@@ -3126,6 +3129,93 @@ def cancel_job(cfg, ref, force=False, depth=0):
             if st is None: out += cancel_job(cfg, r, force, depth + 1)
         except Err as e: out.append(f"{r}: {e}")
     return out
+
+# ---------------------------------------------------------------- shared hosts that thrash (orch-fixes10 item 3)
+# Opt-in per host: [hosts.X] shared = true, thrash_psi (memory PSI avg10, default 40), thrash_min (default 5). When the host's
+# memory pressure stays over thrash_psi for thrash_min, the newest admitted job of THIS project there (a job orch run recorded
+# in .orch/runs/jobs, running past admission) is stopped (cancel_job: its files saved, pueue kill, its container or scope by
+# name) and re-queued on another host where it may run, else on the same host (it waits for admission). Nothing else is touched.
+def thrash_cfg(h): return (float(h.get("thrash_psi", 40)), float(h.get("thrash_min", 5)))
+
+def host_psi(p):
+    v = p.get("cap_psi") or p.get("psi")
+    return fl(v) if v not in (None, "") else None
+
+def thrash_track(cfg, hs):
+    """{host: (psi, minutes over thrash_psi)} for shared hosts; the over-since times are kept in thrash.json (writer only)."""
+    st = cfg.jget("thrash.json"); out = {}
+    for n, h in cfg.hosts.items():
+        if not h.get("shared") or not (hs.get(n) or {}).get("ok"): st.pop(n, None); continue
+        psi = host_psi(hs[n]); lim, _ = thrash_cfg(h)
+        if psi is None or psi <= lim: st.pop(n, None); out[n] = (psi, 0.0); continue
+        st.setdefault(n, int(now())); out[n] = (psi, (now() - st[n]) / 60)
+    cfg.jput("thrash.json", st)
+    return out
+
+def own_admitted_jobs(cfg, hs, n):
+    """[(ref, jid, spec, started)] this project's jobs running past admission on host n, newest first."""
+    jd = cfg.f("runs") / "jobs"; p = hs.get(n) or {}; r = []
+    for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items():
+        jid = job_of(t); f = jd / f"{jid}.json" if jid else None
+        if not f or not f.is_file() or job_state(hs, f"{n}:{tid}")[0] != "running": continue
+        try: spec = json.loads(f.read_text())
+        except ValueError: continue
+        if spec.get("host") != n or str(spec.get("task")) != str(tid): continue   # recorded by this project for this very task
+        info = (t.get("status") or {}).get("Running", {}) if isinstance(t.get("status"), dict) else {}
+        try: t0 = calendar.timegm(time.strptime((info.get("start") or "")[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError: t0 = int(spec.get("at", 0))
+        r.append((f"{n}:{tid}", jid, spec, t0))
+    return sorted(r, key=lambda x: x[3], reverse=True)
+
+def requeue_host(cfg, hs, units, n, spec):
+    """Another host where the job may run now (reachable, not thrashing, room by admission; the land lane stays local), else n."""
+    for m, h in cfg.hosts.items():
+        p = hs.get(m) or {}
+        if m == n or not p.get("ok") or (spec.get("lane") == "land" and not h.get("local")): continue
+        if h.get("shared") and (host_psi(p) or 0) > thrash_cfg(h)[0]: continue
+        if host_cap(cfg, m, p, units)["free"] > 0 and not host_cap(cfg, m, p, units)["pause"]: return m
+    return n
+
+def tend_thrash(cfg, hs, units, log, dry=False):
+    """Lines saying what was (or, dry, would be) done on each shared host over its thrash limit."""
+    out = []
+    for n, (psi, mins) in thrash_track(cfg, hs).items():
+        lim, need = thrash_cfg(cfg.hosts[n])
+        if psi is None or psi <= lim or mins < need:
+            if dry: out.append(f"{n}: memory PSI {psi if psi is not None else '-'} (limit {lim:g} for {need:g} min): {'over for ' + format(mins, '.0f') + ' min' if mins else 'fine'}")
+            continue
+        jobs = own_admitted_jobs(cfg, hs, n)
+        if not jobs: out.append(f"{n}: memory PSI {psi} over {lim:g} for {mins:.0f} min, but no job of this project runs there: nothing to stop"); continue
+        ref, jid, spec, _ = jobs[0]; to = requeue_host(cfg, hs, units, n, spec)
+        msg = f"{n} thrashing (memory PSI {psi} over {lim:g} for {mins:.0f} min): stop {ref} ({jid}, newest of {len(jobs)}), re-queue on {to}"
+        if dry: out.append("would " + msg); continue
+        try:
+            done = cancel_job(cfg, ref, force=True)
+            args = argparse.Namespace(host=to, lane=spec.get("lane", "jobs"), unit=spec.get("unit"), wt=spec["wt"], subdir=spec.get("subdir"),
+                                      usb=spec.get("usb", False), priority=spec.get("priority") or 0, no_wait=True, allow_unmerged=True, command=[spec["cmd"]])
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf): cmd_run(cfg, args)
+            new = buf.getvalue().strip().splitlines()[-1:] or ["?"]
+            line = f"{msg}: {'; '.join(done)}; now {new[0]}"
+            rec = cfg.jget("thrash-acts.json"); rec[str(int(now()))] = line; cfg.jput("thrash-acts.json", dict(list(rec.items())[-50:]))
+            if spec.get("unit"): board(cfg, "direct", spec["unit"], f"your job {ref} was stopped on {n} (host thrashing) and re-queued as {new[0]}: wait on that id")
+            out.append(line)
+        except Err as e: out.append(f"{msg}: failed: {e}")
+        log(out[-1])
+    return out
+
+def thrash_findings(cfg):
+    """thrash:<when>: each stop and re-queue of the last 12 h is reported once in check (the watcher acts; check tells)."""
+    return [(f"thrash:{k}", v) for k, v in cfg.jget("thrash-acts.json").items() if now() - int(k) < 12 * 3600]
+
+def cmd_thrash(cfg, a):
+    """Shared hosts' memory pressure and what the watcher does (--dry-run: says what it would do, changes nothing)."""
+    if DRY: cfg.ro = True
+    hs = probe_all(cfg); units = Beads(cfg).units()
+    for u in units: u["state"] = unit_state(u, hs, {})
+    if not any(h.get("shared") for h in cfg.hosts.values()): say("no host has shared = true"); return
+    for l in tend_thrash(cfg, hs, units, lambda m: None, dry=DRY or cfg.ro) or ["nothing to do"]: say(l)
 
 def agent_ended(u):
     """The unit's agent is gone: an API run ended, a tmux session or herdr agent is gone (an idle herdr agent is alive)."""
@@ -4369,6 +4459,7 @@ def cmd_watch(cfg, a):
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     board_alerts(cfg, log)
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (orch-fixes9)
+    tend_thrash(cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job (fixes10 item 3)
     sync()   # push what this pass wrote (peers.md, directions) to every host
     for r, why in orphan_jobs(cfg, hs, units):   # nothing whose owner is gone keeps running or waiting (item 3)
         try: log(f"orphan {r} ({why}): " + "; ".join(cancel_job(cfg, r)))
@@ -4469,6 +4560,7 @@ def main():
     add("gate-judge", A("name"), A("rc", type=int))
     add("gate-exec", A("name"), A("--timeout-min", type=float, default=0), A("command", nargs=argparse.REMAINDER))
     add("gate-scope", A("unit"), A("--name", help="the gate's name (default land-<unit>)"), dry=True)
+    add("thrash", dry=True)
     add("busy", A("wt", help="a worktree: exit 0 while an orch job, a unit's job or a mutation run uses it, else 1"))
     add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", A("--max", type=int, help="launch at most this many"), dry=True)

@@ -98,6 +98,9 @@ min_disk_gb = 20
 # job_log = "/home/me/orch/jobs.log" # a line per job start and end
 # sync_exclude = [".git", "target", ".venv", "node_modules"]   # a leading / anchors an entry to the worktree root
 # worktrees = "/home/me/orch/worktrees"
+# shared = true            # a host shared with others: when memory PSI stays over thrash_psi for thrash_min minutes, the watcher
+# thrash_psi = 40          # stops this project's newest admitted job there and re-queues it elsewhere (never anything not ours)
+# thrash_min = 5
 # agent_env = "export PATH=$HOME/.local/bin:$PATH"   # shell run before a remote agent starts
 # pueue_config = "/data/tools/pueue/pueue.yml"        # when the host keeps pueue's files elsewhere
 # pueue_dir = "/data/tools"                           # a shared server: pueue's files and unit under this dir

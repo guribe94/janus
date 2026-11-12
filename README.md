@@ -421,6 +421,14 @@ Work belongs to the machine's own queue, not to an ssh session:
 - A unit is stopped only by `orch stop <unit>`, never because a connection dropped. Probes use ssh `BatchMode` with
   5 s connect timeouts.
 
+**Shared hosts that thrash.** A host shared with other users can set `shared = true` (with `thrash_psi`, memory PSI avg10,
+default 40, and `thrash_min`, default 5). When its memory pressure stays over `thrash_psi` for `thrash_min` minutes, the
+watcher stops this project's newest admitted job there (only a job `orch run` recorded in `.orch/runs/jobs` for that very
+task, running past admission: its files saved, `pueue kill`, its container or scope stopped by name), re-queues it on another
+host where admission has room (else on the same host, where it waits for admission), tells its unit on the board, and
+`orch check` reports `thrash:<time>`. Nothing that is not this project's is touched. `orch thrash [--dry-run]` shows each
+shared host's pressure and what would be done.
+
 During an outage `check` shows `host X unreachable since <time>` and the units there; their state is "unknown", not
 failed. When the host returns, `check` reports finished units and `orch collect <unit>` pulls the results back.
 

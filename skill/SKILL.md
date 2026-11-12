@@ -13,7 +13,7 @@ description: Use when you are the orchestrator of a multi-agent project that has
 - **Swarm.** `orch peers` shows who changes what; on `overlap:<a>:<b>` tell both (board.sh direct) or land one first. `orch transcript <unit> --grep <re>` reads what another agent met (never whole). `board.sh digest --since 1h` is the short story for the owner.
 
 **Autonomy (act, then ack, no need to ask the owner).**
-- Stop orphans, stalled agents and thrashing jobs: `orch stop <unit>`.
+- Stop orphans, stalled agents and thrashing jobs: `orch stop <unit>`. On a `shared = true` host the watcher itself stops and re-queues this project's newest job when memory pressure stays high (`thrash:<time>` says what it did; `orch thrash --dry-run` shows the hosts).
 - Re-queue failed gates; `orch collect <unit>` results of finished or returned remote units.
 - Land green units; `orch close <unit>` once committed and pushed.
 - Launch within safe capacity and any owner caps: `orch launch <unit> --kind implement|review|audit|cleanup --tier critical|normal [--host h] [--test-host h]`. `orch capacity` shows room; a full host refuses (a `cleanup` unit is exempt from the load and disk limits). Reviews use a different vendor from the implementer (`--of <unit>`). Each unit needs its own worktree.

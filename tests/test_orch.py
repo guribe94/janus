@@ -800,6 +800,34 @@ class GatePolicy(unittest.TestCase):
         (self.d / "scope.sh").write_text('echo "@nohost x: true"\n')
         with self.assertRaises(orch.Err): orch.scope_steps(self.cfg, "u1", tree)
 
+class Thrash(unittest.TestCase):
+    """fixes10 item 3: a shared host over thrash_psi for thrash_min: this project's newest admitted job is stopped and re-queued
+    elsewhere; jobs not recorded by this project (or another task with the same script) are never touched."""
+    def test_stop_newest_own_job_and_requeue(self):
+        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\nshared = true\nthrash_psi = 30\nthrash_min = 5\n'); cfg.ro = False
+        jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
+        for jid, tid, at in (("old-1", "1", 100), ("new-2", "2", 200)):
+            (jd / f"{jid}.json").write_text(json.dumps({"host": "far", "task": tid, "lane": "jobs", "unit": "u", "wt": str(d), "cmd": "make", "at": at}))
+        (jd / "copied-4.json").write_text(json.dumps({"host": "far", "task": "99", "wt": str(d), "cmd": "x", "at": 999}))   # not this task
+        run = lambda jid, start: {"status": {"Running": {"start": start}}, "command": f"bash /r/runs/{jid}.sh", "label": "unit:u", "group": "jobs"}
+        hs = {"far": {"ok": True, "psi": "55.0", "pueue": {"tasks": {"1": run("old-1", "2026-01-01T10:00:00"), "2": run("new-2", "2026-01-01T11:00:00"),
+                       "3": run("theirs-3", "2026-01-01T12:00:00"), "4": run("copied-4", "2026-01-01T13:00:00")}}},
+              "here": {"ok": True}}
+        calls = []; saved = (orch.cancel_job, orch.cmd_run, orch.host_cap, orch.board)
+        orch.cancel_job = lambda cfg, ref, force=False: calls.append(("cancel", ref)) or [f"cancelled {ref}"]
+        orch.cmd_run = lambda cfg, a: calls.append(("run", a.host, a.command, a.unit)) or print("here:9")
+        orch.host_cap = lambda *a: {"free": 1, "pause": ""}; orch.board = lambda *a, **k: (0, "", "")
+        try:
+            self.assertEqual(orch.tend_thrash(cfg, hs, [], lambda m: None), [])     # over the limit, not yet for thrash_min
+            self.assertEqual(calls, [])
+            cfg.jput("thrash.json", {"far": int(time.time()) - 600})
+            self.assertIn("would far thrashing", orch.tend_thrash(cfg, hs, [], lambda m: None, dry=True)[0]); self.assertEqual(calls, [])
+            out = orch.tend_thrash(cfg, hs, [], lambda m: None)
+            self.assertEqual(calls, [("cancel", "far:2"), ("run", "here", ["make"], "u")], out)   # the newest of ours, not theirs-3/copied-4
+            self.assertEqual([k.split(":")[0] for k, _ in orch.thrash_findings(cfg)], ["thrash"])
+            hs["far"]["psi"] = "5"; orch.tend_thrash(cfg, hs, [], lambda m: None); self.assertNotIn("far", cfg.jget("thrash.json"))
+        finally: orch.cancel_job, orch.cmd_run, orch.host_cap, orch.board = saved
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project)."""
