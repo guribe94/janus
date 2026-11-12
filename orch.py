@@ -937,7 +937,7 @@ def proc_findings(cfg, ps_text=None):
         anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "orch.py api-run" in t[q][3] or any(x in t[q][3] for x in launchers)), None)
         lane = any("pueued" in t[q][3] for q in anc)
         if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
-            F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}"))
+            F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; it is stopped after [enforce] grace_min unless it moves to a lane (orch run)"))
             cfg._viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
                               "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": env_unit(p)})
         if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc) and not lane_below(p):
@@ -1026,7 +1026,7 @@ def script_findings():
 
 def collect_findings(cfg, hs, units, ag, bd_err):
     F = []; cfg._viol = []
-    if bd_err: F.append(("beads", f"beads unavailable: {bd_err}"))
+    if bd_err: F.append(("beads", f"beads unavailable: {bd_err}; fix bd (orch doctor), units cannot be read until then"))
     ws = ws_id(cfg); names = {u["name"] for u in units}
     for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no build position (host_cap)
     un = cfg.jget("hosts.json")
@@ -1036,18 +1036,18 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     for n, p in hs.items():
         if not p["ok"]:
             qd = [u["name"] for u in units if u.get("host") == n]
-            F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); units there: {', '.join(qd) or 'none'}"))
+            F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); units there: {', '.join(qd) or 'none'}; place new work elsewhere (unstarted jobs there: cancel and re-queue on another host)"))
             continue
         r, why = room(cfg, n, p, units)
         mg = margins(cfg.hosts[n], p, cfg=cfg)
         low = r < 1 and p.get("avail_mb") and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6
         if mg or low:   # the key names the kinds (load, memory, disk), so an ack of one never hides another (H12)
             kinds = sorted({w.split()[0] for w in mg} | ({"memory"} if low else set()))
-            F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}"))
+            F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}; launch elsewhere, or free it (orch tidy for disk)"))
         elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} but {ready} unit(s) are ready: orch launch"))
         hc = host_cap(cfg, n, p, units)
         if hc["pause"]:   # back-pressure (orch-fixes8 item 2): reported, never acted on by killing
-            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits"))
+            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile"))
         # one scheduler per host (item 1): any other job-running process, or an old queue that still runs or holds work
         sch = list(p.get("sched", []))
         lg, lr = int(fl(p.get("legacy_wait"))), int(fl(p.get("legacy_run")))
@@ -1067,24 +1067,24 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             lab = t.get("label") or ""
             owned = lab in names or (lab.startswith("unit:") and lab[5:] in names) or (t.get("group") in LANES and ":" in lab and not lab.startswith("unit:"))
             if k in ("Running", "Queued") and not owned:   # a lane job labelled unit:<name> whose unit is closed is an orphan too (M3)
-                F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({lab or t.get('command', '')[:40]}) has no open unit"))
+                F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({lab or t.get('command', '')[:40]}) has no open unit: orch cancel {n}:{t.get('id')}"))
         for s in p.get("tmux", []):
-            if s.startswith("orch-") and s[5:] not in names: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit"))
+            if s.startswith("orch-") and s[5:] not in names: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: collect what it wrote, then stop it (orch stop, or relaunch its unit)"))
     orch_pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
     pane_units = {u.get("pane") for u in units}
     for k, a in ag.items():
         if ws and a.get("workspace_id") != ws: continue
         if k in names or a.get("pane_id") in pane_units or a.get("pane_id") == orch_pane or k == "orchestrator": continue
-        F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit"))
+        F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit: orch tidy closes panes of closed units; otherwise register it as a unit or close it"))
     board = board_rows(cfg); running = 0
     BF = board_findings(cfg, names); F += BF; qids = board_questions(cfg) is not None
     for card, r in board.items():   # every card, including those other launchers posted (marked "not a unit")
         tag = "" if card in names else " (not a unit)"
         if r["state"] == "blocked" or (r["state"] == "question" and not qids):
             F.append((f"board:{card}:{r['state']}", f"{card}{tag} is {r['state'].upper()} on the board: {r['text']}; answer with board.sh direct"))
-        if r["gone"]: F.append((f"board:{card}:gone", f"{card}{tag} GONE: its process ended without a done post"))
+        if r["gone"]: F.append((f"board:{card}:gone", f"{card}{tag} GONE: its process ended without a done post: relaunch its unit from its report (--resume-of), or orch board-close it"))
         elif r["silent"] and r["state"] not in ("question", "blocked"):
-            F.append((f"board:{card}:silent", f"{card}{tag} silent over {cfg.silent // 60} min on the board"))
+            F.append((f"board:{card}:silent", f"{card}{tag} silent over {cfg.silent // 60} min on the board: read its report or transcript (orch transcript), then direct it"))
     for u in units:
         st = unit_state(u, hs, ag); v = verdict(cfg, u); u["state"] = st; u["verdict"] = v
         age = now() - u.get("started", now())
@@ -1103,7 +1103,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if st in ("working", "queued", "parked"): running += 1
         if st == "blocked":
             r = herdr("agent", "read", u["name"], "--source", "detection") or {}
-            F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}"))
+            F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}; answer it (board.sh direct) or relaunch with what it needs"))
         elif st in ("done", "failed", "gone", "idle"):
             F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
             aj = api_out(cfg, u)   # issue 32: another limit than the budget (turns) before the report; the budget cap is waste:<unit>
@@ -1111,7 +1111,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
                 F.append((f"unit:{u['name']}:limit", f"{u['name']} stopped by its limit ({aj.get('subtype')}, ${aj.get('total_cost_usd', '?')}) without a final verdict: "
                           "resume it (orch resume --message, or --resume-of keeps its report)"))
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
-            F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}"))
+            F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}: stop it, or relaunch it on an enabled model"))
     cfg._hs = hs; F += peer_findings(cfg, units)   # peers.md, overlap:<a>:<b> (orch-swarm item 4)
     board_upkeep(cfg, units)
     seen = {k for k, _ in F}
@@ -1119,7 +1119,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         k = f"orphan:job:{r}"
         if k not in seen: F.append((k, f"orphan job {r}: {why}; the watcher cancels it (orch cancel {r})"))
     cfg.jput("running.json", {"n": running})
-    if cfg.caps.get("total") is not None and len(units) > cfg.caps["total"]: F.append(("cap:total", f"{len(units)} agents over total cap {cfg.caps['total']}"))
+    if cfg.caps.get("total") is not None and len(units) > cfg.caps["total"]: F.append(("cap:total", f"{len(units)} agents over total cap {cfg.caps['total']}: launch nothing more; close finished units"))
     for n, c in cfg.caps.get("host", {}).items():
         k = sum(1 for u in units if u.get("host") == n)
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
@@ -1146,7 +1146,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     for s in handoff_stale(cfg, running): F.append(("handoff", s))
     if sys.platform == "darwin" and sh(["launchctl", "list", "com.orch.watch"])[0]: F.append(("watcher", "watcher com.orch.watch is not running: run install"))
     for n, pv in cfg.prov.items():
-        if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap"))
+        if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap: launch on another provider, or ask the owner to raise the cap"))
     if not cfg.ro and not DRY: F = enforce(cfg, F)
     return F
 
@@ -1164,9 +1164,9 @@ def git_findings(cfg):
         if hp and any(l[3:].strip() == str(hp) for l in dirty):   # check's own rewrite of the Live block is not a change (row 50)
             rc2, old, _ = sh(["git", "show", f"HEAD:{hp}"], cwd=cfg.root)
             if rc2 == 0 and old.split(LE, 1)[-1] == handoff_path(cfg).read_text().split(LE, 1)[-1]: dirty = [l for l in dirty if l[3:].strip() != str(hp)]
-        if dirty: F.append(("git:dirty", f"{len(dirty)} uncommitted path(s) in {cfg.root.name}"))
+        if dirty: F.append(("git:dirty", f"{len(dirty)} uncommitted path(s) in {cfg.root.name}: orch commit-state"))
         rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=cfg.root)
-        if rc == 0 and o.strip() != "0": F.append(("git:unpushed", f"{o.strip()} unpushed commit(s)"))
+        if rc == 0 and o.strip() != "0": F.append(("git:unpushed", f"{o.strip()} unpushed commit(s): orch commit-state pushes them"))
         elif rc: F.append(("git:noupstream", "git has no upstream: add a remote, then orch commit-state (it pushes with --set-upstream)"))
     return F
 
@@ -2474,7 +2474,7 @@ def parked_findings(cfg, hs, u, pk):
     """parked:<unit>: a job it waits on can never finish; parked:<unit>:resume: its jobs finished but the resume failed."""
     js = {j: job_state(hs, j)[0] for j in pk}; F = []
     if any(x in ("paused", "stashed", "locked") for x in js.values()):
-        F.append((f"parked:{u['name']}", f"{u['name']} is parked on {', '.join(f'{j} {x}' for j, x in js.items())}: a job that is not queued or running never resumes it"))
+        F.append((f"parked:{u['name']}", f"{u['name']} is parked on {', '.join(f'{j} {x}' for j, x in js.items())}: a job that is not queued or running never resumes it: start or re-queue that job, or orch resume --force"))
     re_ = u.get("resume_error") or {}
     if re_ and all(x in ("done", "gone") for x in js.values()):
         F.append((f"parked:{u['name']}:resume", f"{u['name']}'s jobs finished but it cannot be resumed ({re_.get('why', '')[:160]}): "
@@ -3729,12 +3729,12 @@ def lane_findings(cfg, hs, units=()):
             q = [x for x in mine if st(x) == "Queued"]; r = [x for x in mine if st(x) == "Running"]; par = g.get("parallel_tasks", 1)
             wt = int(p.get(f"wait_{lane}", 0) or 0)   # running tasks still waiting in orch's own admission
             if q and (g.get("status") != "Running" or len(r) < par):
-                F.append((f"stalled:{n}:{lane}", f"{n} {lane} STALLED: {len(q)} queued, {len(r)} of {par} slots running, group {g.get('status')}"))
+                F.append((f"stalled:{n}:{lane}", f"{n} {lane} STALLED: {len(q)} queued, {len(r)} of {par} slots running, group {g.get('status')}: orch check retunes the group; a paused group needs its cause fixed"))
             elif q and not wt and lane != "land" and len(r) < (h.get("gate_slots", slots(h, cfg)) if lane == "gates" else 1 if lane == "gates-quick" else slots(h, cfg)) and \
                     (p["cap_admit"].strip() == "yes" if "cap_admit" in p else host_cap(cfg, n, p, list(units))["free"] > 0):
                 # idle by the admission's own verdict (row 48): work queued in pueue, none held by admission, and admission would
                 # take one more now; jobs waiting inside their scripts are held by admission, never idle
-                F.append((f"idle:{n}:{lane}", f"{n} {lane} IDLE: {len(q)} queued in pueue, {len(r)} running, and admission would admit one now"))
+                F.append((f"idle:{n}:{lane}", f"{n} {lane} IDLE: {len(q)} queued in pueue, {len(r)} running, and admission would admit one now: orch queue {n} to see why pueue holds it"))
             if q: backlog.setdefault(lane, []).append(n)
             elif len(r) < par and not wt and p.get("cap_admit", "yes").strip() == "yes": free.setdefault(lane, []).append(n)   # free by admission (row 48)
             for x in mine:
@@ -3742,17 +3742,17 @@ def lane_findings(cfg, hs, units=()):
                 try: since = time.mktime(time.strptime(info.get("enqueued_at", "")[:19], "%Y-%m-%dT%H:%M:%S"))
                 except ValueError: continue
                 if st(x) in ("Queued", "Running") and now() - since > lane_age(cfg, lane) * 60:
-                    F.append((f"age:{n}:{x['id']}", f"{n}:{x['id']} {lane} {x.get('label')} {st(x).lower()} {int((now() - since) / 60)} min, over the {lane_age(cfg, lane)} min limit"))
+                    F.append((f"age:{n}:{x['id']}", f"{n}:{x['id']} {lane} {x.get('label')} {st(x).lower()} {int((now() - since) / 60)} min, over the {lane_age(cfg, lane)} min limit: orch cancel {n}:{x['id']} and re-queue it, or ack with why it is right"))
         if int(p.get("old_rule", 0) or 0):
             F.append((f"old-rule:{n}", f"{n}: {p['old_rule']} job(s) still wait under the old cap rule ({p.get('old_rule_jobs', '').strip()[:120]}): "
                                         "re-queue them with orch run, then stop the old tasks"))
         lg, lr = int(p.get("legacy_wait", 0) or 0), int(p.get("legacy_run", 0) or 0)
         if lg and lr < h.get("legacy_slots", 3):
-            F.append((f"stalled:{n}:legacy", f"{n} old-script queue STALLED: {lg} waiting, {lr} of {h.get('legacy_slots', 3)} running (its own admission holds them)"))
+            F.append((f"stalled:{n}:legacy", f"{n} old-script queue STALLED: {lg} waiting, {lr} of {h.get('legacy_slots', 3)} running (its own admission holds them): move them to orch run"))
     for lane, ns in backlog.items():
         for f in free.get(lane, []):
             if cfg.hosts[f].get("local") == cfg.hosts[ns[0]].get("local") and not (lane == "land"):
-                F.append((f"idle:{f}:{lane}:vs", f"{f} has free {lane} slots while {', '.join(ns)} has a backlog"))
+                F.append((f"idle:{f}:{lane}:vs", f"{f} has free {lane} slots while {', '.join(ns)} has a backlog: re-queue waiting jobs on {f} (orch cancel, orch run --host {f})"))
     return F
 
 # ---------------------------------------------------------------- land: merge main, gate the merged tree, squash-land (register item 41)
