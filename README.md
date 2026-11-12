@@ -15,7 +15,7 @@ times (the full story is in `docs/PLAN.md`). Reminders in a prompt did not fix i
 `orch` makes the role enforced by hooks and scripts instead of reminders:
 
 - hooks deny hand operations (`rm -r`, `kill`, in-place edits) and refuse to let the orchestrator go idle with open problems;
-- a watcher wakes the orchestrator, and restarts it if its pane is gone;
+- a watcher wakes the orchestrator, and starts a new one only when the registered one is really gone;
 - `orch check` reads the real state (hosts, jobs, panes, gates, git) and prints one line per problem;
 - `orch launch` measures free room and refuses when a machine is full;
 - owner instructions are filed in beads and stay open until classified, so they are not lost.
@@ -43,14 +43,15 @@ The board script (`paths.board`) and your briefs belong to your project; they ar
 ```
 
 Options: `--dry-run`, `--project DIR`, `--no-hosts` (skip the remote machines), `--hosts-only` (only set up pueue on the
-hosts in orch.toml).
+hosts in orch.toml), `--pin-only` (only pin the current `orch.py` and switch `~/.local/bin/orch` to it: the way to deploy an
+edit). On Linux, install writes a systemd user timer `orch-watch.timer` (every 5 min) instead of the launchd agent.
 
 What `install` changes:
 
 | Where | Change |
 |---|---|
 | `~/.claude/skills/orchestrating`, `~/.codex/skills/orchestrating` | symlinks to this repo's `skill/` |
-| `~/.local/bin/orch` | symlink to `orch.py` (make sure `~/.local/bin` is on PATH) |
+| `~/.local/bin/orch` | symlink to a **pinned copy** `~/.local/share/orch/<hash>/orch.py`, never to the working copy: install parses it and smoke-tests `--help` and a hook call first, then switches the link with one atomic rename. Editing `orch.py` changes nothing live until `./install --pin-only` (make sure `~/.local/bin` is on PATH). Project shims call `~/.local/bin/orch` |
 | `~/.claude/settings.json`, `~/.codex/hooks.json` | adds `~/.local/bin/orch hook <event>` for SessionStart, UserPromptSubmit, PreToolUse (matcher `Bash\|Edit\|Write\|MultiEdit\|NotebookEdit\|apply_patch`) and Stop. Existing keys and hooks are kept; a backup `*.bak-orch-<time>` is written first |
 | `~/Library/LaunchAgents/com.orch.watch.plist` | copied (not linked) and loaded with `launchctl`; runs every 300 s |
 | `~/.config/orch/projects` | the project directory is added; the watcher runs `orch watch` in each listed project |
@@ -82,10 +83,18 @@ reset, 150000).
 
 **`[paths]`**: `board` (script with `post/read/summary/rule/close`), `gate_log` (lines like
 `2026-11-11 09:00:00 name EXIT_x=0 ... RESULT: PASS|FAIL`), `briefs` (`<briefs>/<unit>.md`), `out`
-(`<out>/<unit>/REPORT.md`), `worktrees` (`<worktrees>/<unit>` is the unit's working directory if it exists).
+(`<out>/<unit>/REPORT.md`), `worktrees` (`<worktrees>/<unit>` is the unit's working directory if it exists; collection-rig:
+`../../worktrees`), `checklist` (the project's status checklist, editable by the orchestrator), `state_docs` (old state docs
+for `orch init`). **`[placement]`**: optional `"<regex>" = "<host>"` rules matched against a unit's name and brief: the host
+where its tests run, where launch places it. Per host, `job_ws_gb` is the working set assumed before one is measured.
 
 **`[herdr]`** `workspace` and **`[orchestrator]`** `kind`/`args`: the herdr workspace label, and what the watcher starts
-when the orchestrator pane is gone.
+when the registered orchestrator is gone. It must match the registered session's kind (`check` reports a mismatch; the
+watcher starts the registered kind, with `args` only when the kinds match). The watcher starts one only when all of these
+hold: `herdr pane list` answered and the registered pane is not in it, the registered session's process (pid and start time,
+recorded at register) is not running, and its transcript has not changed for 20 min. A herdr error or timeout starts nothing.
+It then marks the registration pending, so the new session's first hook event claims it. Every prompt the watcher sends
+starts with `[orch] `.
 
 **`[hosts.<name>]`**: one per machine. `local = true` for this one; others have `ssh`, `arch`, `root` (where synced
 worktrees, briefs and outputs live) and `bin`. Capacity figures: `ram_gb`, `cores`, `reserve_gb` (kept free),
@@ -126,89 +135,135 @@ it (within 10 minutes). Hooks act only for the registered session; any other ses
 
 The cycle is **check, act, ack, notes**. Do it every few minutes and whenever woken.
 
-**`orch check`**: silent when all is well; otherwise one `[key] problem` line each. It also rewrites the Live state part of
-`.orch/HANDOFF.md`.
+**`orch check`**: silent when all is well; otherwise one `[key] problem` line each. Run by the registered orchestrator
+session (its session id, or its process among the caller's ancestors), it rewrites the Live state part of `.orch/HANDOFF.md`,
+saves acks and open problems, sets the pueue limits and stamps the cycle (`last_cycle`). Run by anyone else (an agent, an
+auditor, a shell), `check`, `status` and `capacity` only read: no file is written, no pueue limit changes, no cycle stamp, and
+`check` ends with a "(read-only: ...)" line. The watcher is the other writer.
 ```
 $ orch check
 [unit:parser:finished] parser finished (done; VERDICT: DONE); collect/close or relaunch
 [gate:nightly@09:12:44] gate nightly FAILED at 09:12:44 (x y); re-queue or classify
-[idle:server] host server has room for 2 but 3 unit(s) are ready: orch launch
+[board:u7:question] u7 is QUESTION on the board: which baseline? ...; answer with board.sh direct
 ```
 Options: `--brief` (at most 8 lines), `--escalate` (only problems open longer than `deadline_min`).
 What it reports: per host and lane (`gates`, `jobs`, `land`), queued work with free slots or a paused group ("STALLED"),
 queued or admission-waiting work while the host has room for another job ("IDLE"), a host with free slots in a lane while
 another host has a backlog there, lane jobs older than their class age limit (enqueue to now: gates 240, jobs 120, land 240
 min), and an old-script queue (midgard `run.sh`, asgard `heavy.sh`) with waiters while it runs fewer than `legacy_slots`;
-unreachable hosts and what was on them; hosts over their margins; idle room with ready units; orphan
-pueue jobs, tmux sessions (`orch-*`) and herdr agents that belong to no open unit; blocked, finished or silent units;
+unreachable hosts and what was on them; hosts over their margins (key `margin:<host>:<kinds>`, kinds load, memory, disk);
+idle room while beads has ready work (units, `orch-log` and instructions are not work: `orch launch` marks every unit
+`in_progress`); orphan pueue jobs (including lane jobs labelled `unit:<name>` whose unit is closed), tmux sessions (`orch-*`)
+and herdr agents that belong to no open unit; blocked or finished units; every board card in state question or blocked, or
+SILENT (over `silent_min`) or GONE, including cards orch did not launch (marked "not a unit"); jobs still waiting under the
+old cap rule (`old-rule:<host>`); on the Mac, CPU burners an agent started (over 80 % CPU for 10 min, under an agent or
+orphaned) and test or build runs outside the pueue lanes (`localtest:<pid>`); an orchestrator kind in orch.toml that differs
+from the registered session's;
 disabled providers in use; caps exceeded; spend at a provider's cap; failed gates (last 12 hours) and the same test failing
 in two or more gates; uncommitted or unpushed git work; unclassified owner instructions; a stale handoff; the watcher not
 running (macOS).
 
-**`orch capacity`**: room per host, measured live.
+**`orch capacity`**: room per host, measured live (read-only).
 ```
 $ orch capacity
 laptop room=2 avail=9.4G load=2.10 psi=- disk=80G agents=1
 server room=0 avail=3.1G load=1.20 psi=0.00 disk=60G agents=2 FULL: memory 3.1G free, reserve 3G
 ```
 
-**`orch launch <unit> --kind implement|review|audit|cleanup [--tier critical|normal] [--host h] [--model m] [--brief f] [--cwd d] [--budget usd] [--of unit] [--dry-run]`**
+**`orch launch <unit> --kind implement|review|audit|cleanup [--tier critical|normal] [--host h] [--test-host h] [--model m] [--brief f] [--cwd d] [--allow-main] [--budget usd] [--of unit] [--dry-run]`**
 ```
 $ orch launch parser --kind implement --tier normal
 launch parser: model=codex host=laptop cwd=/proj/worktrees/parser
 launched parser on laptop via herdr
 ```
-A `cleanup` unit frees disk, so `min_disk_gb` does not refuse it; every other limit (load, memory, caps) still applies.
-It picks the model from `[routing]`, the host with the most room (or `--host`), syncs the worktree and brief to a remote
-host with rsync, starts the agent, records the unit as a beads issue and posts to the board. It refuses with
-`orch: refused, no host has room (...)` when nothing fits. The unit name must match `[a-z][a-z0-9_-]{0,31}` and the brief
-`<briefs>/<unit>.md` must exist. For a review, `--of <unit>` makes it avoid the implementer's vendor.
+A `cleanup` unit frees disk and load, so neither `min_disk_gb` nor the load limit refuses it; memory and caps still apply.
+- **Model:** from `[routing]`, or `--model`, which passes the same checks (provider enabled, budget left). Every API launch
+  checks `committed + budget <= cap_usd` under the ledger's lock (`<ledger>.lock`, the same lock `fable-api.sh` takes); a
+  remote launch writes its "running" row under that lock before the task starts.
+- **Host:** `--host`; else where the unit's builds and tests run (`--test-host`, a `TEST-HOST: <h>` line in the brief, the
+  first matching `[placement]` regex in orch.toml, or the sticky host in `out/linux-host/<unit>`) when the model may run
+  there; else the allowed host with the most room.
+- **cwd:** `<worktrees>/<unit>` if it exists, else `--cwd`, else the project root. It refuses a cwd another open unit uses
+  (a local review or audit may share it) and a main checkout that has linked worktrees (unless `--allow-main`).
+- **Order:** the beads issue is created and marked `in_progress` first; a failed start closes it with "launch failed".
+- **Environment:** every agent gets `ORCH_ROLE=agent`, `ORCH_UNIT`, `ORCH_REPORT` and `ORCH_ROOT`. `pueue add` always runs with
+  an allow-listed environment (PATH, HOME, USER, LANG, TMPDIR, SSH_AUTH_SOCK ...) plus those, never the caller's: pueue stores a
+  task's whole environment in its state file, so a caller's `ANTHROPIC_API_KEY` or session token would land on disk.
+- **Remote:** the worktree goes to `<root>/worktrees/<unit>` (and a copy to `<root>/base/<unit>` for collect); the brief gets a
+  header naming the host-local test command `<root>/run/<unit>.lane '<cmd>'`, which runs the command through that host's
+  pueue `jobs` lane with orch's admission and `MemoryMax`, waits and exits with its code. The key is sent from a detached
+  ssh with no time limit, so a full `agents` group queues the task instead of failing the launch. Remote tmux agents run under
+  `systemd-run MemoryMax` too.
+- **herdr:** each unit gets a tab `<unit> · <model> · <host>`; for a pueue unit it follows `pueue follow <task>` (over ssh for a
+  remote one). For a herdr agent, launch answers startup dialogs (Claude folder trust, Codex update and trust prompts) and
+  reports any it cannot pass.
+- **Board:** the first card's check is `herdr <unit>`, `pueue <host>:<task>` or `tmux <host>:orch-<unit>`.
+It refuses with `orch: refused, no host has room (...)` when nothing fits. The unit name must match `[a-z][a-z0-9_-]{0,31}`
+and the brief `<briefs>/<unit>.md` must exist. For a review, `--of <unit>` makes it avoid the implementer's vendor.
 
-**`orch stop <unit>`**: ends that unit's recorded agent (pueue kill, tmux kill-session, or its pid) and waits until it is
-gone.
+**`orch stop <unit>`**: ends the unit's whole process tree: `pueue kill` or `tmux kill-session`, its lane jobs (label
+`unit:<name>`), then TERM (and after 5 s KILL) to every process group of every process under its task or pane and of every
+process whose environment holds `ORCH_UNIT=<unit>` (detached children: `nohup`, `setsid`, `& disown`). It confirms none is
+left, else exits 1.
 ```
 $ orch stop parser
-stop parser (herdr on laptop)
-stopped
+stop parser (pueue on laptop)
+stopped: no process of the unit is left
 ```
 
-**`orch collect <unit>`**: for a remote unit, rsyncs back the worktree and the outputs, and records API cost in the ledger.
-Prints `collected` (or `local unit: nothing to collect`).
+**`orch collect <unit>`**: for a remote unit, makes `out/<unit>/changes.patch` on the host (the agent's tree against the copy
+it was sent), brings back `out/<unit>/` (patch, REPORT, logs) and records API cost in the ledger. It never writes over the
+Mac checkout; apply the patch in the unit's worktree with `git apply --3way`. Local units: nothing to collect.
 
-**`orch close <unit> [--force] [--reason text]`**: refuses if the worktree has uncommitted or unpushed work (unless
-`--force`); then closes the pane, removes the remote copy, closes the board card and the beads issue.
+**`orch close <unit> [--force] [--reason text]`**: for a unit with a worktree of its own, refuses on uncommitted or unpushed
+work (unless `--force`). A unit without one (cwd is the project root, or shared with another open unit) skips the git checks
+and needs a final VERDICT line in its REPORT instead; `--force` is refused there. Then it closes the unit's tab, removes the
+remote copy unless another open unit on that host uses it, removes only its own pueue task, and closes the board card and
+the beads issue.
+
+**`orch board-close <agent>`**: archives a board card that is not an open unit (cards from other launchers); `board.sh close`
+by hand is denied.
+
+**`orch init`**: turns the old state docs in `paths.state_docs` into a one-line pointer to `.orch/HANDOFF.md`, keeping their
+text in `.orch/history-<name>`.
 ```
 $ orch close parser
 close parser
 closed
 ```
 
-**`orch commit-state [-m msg] [--dry-run]`**: scans the files git would add (modified and untracked, minus ignored) for
-secrets: Anthropic, OpenRouter, GitHub and Slack token prefixes followed by a realistic token length (20+ characters of
-`[A-Za-z0-9_-]` for `sk-` and `ghp_`, 10+ for `xox`), and private-key headers. A bare prefix mention passes. On a hit it refuses and lists
-the paths, never the values. Otherwise it runs `git add -A`, `git commit` and `git push`.
+**`orch commit-state [-m msg] [--dry-run]`**: runs `git add -A`, then scans exactly the staged files for secrets: Anthropic,
+OpenRouter, OpenAI (`sk-proj-`), hex `sk-` keys, AWS access key ids, GitHub and Slack tokens with a realistic length, and
+private-key blocks. A bare prefix mention passes. On a hit it unstages again, refuses and lists the paths, never the values.
+Otherwise it commits and pushes.
 
-**`orch ack <key> "<decision>"`**: acknowledges a problem for 4 hours and records the decision as a beads comment (on the
+**`orch ack <key> "<decision>"`**: acknowledges a problem for 4 hours (margin problems 30 min), until the problem clears
+(a cleared problem's ack is dropped, so it comes back if it recurs), and records the decision as a beads comment (on the
 unit's issue for `unit:<name>:...` keys, otherwise on an `orch: decisions` issue).
 ```
 $ orch ack unit:parser:finished "collected and closed, gate re-queued"
 acked unit:parser:finished
 ```
 
-**`orch status`**: prints the Live state (hosts, units, queue, spend, problems) without counting as a cycle.
+**`orch status`**: prints the Live state (hosts, units, ready work, spend, problems) without counting as a cycle.
 
 **Notes.** After each decision, update the *Orchestrator notes* part of `.orch/HANDOFF.md` (see section 6).
 
 ## 5. What the hooks enforce, and why
 
 One handler, `orch hook <event>`, serves both Claude Code and Codex (same event names and JSON). It only acts for the
-registered orchestrator session; agents started by `orch launch` run with `ORCH_ROLE=agent` and get only the agent rule.
+registered orchestrator session, and finds the project from that session id (the project in `~/.config/orch/projects` whose
+`.orch/session` holds it), never from the session's current directory, so `cd` elsewhere changes nothing. Only `orch register`
+changes the registration (it records the session's process and kind, claude or codex); a pending registration (`orch
+register` with no session id, or the watcher's new orchestrator) is claimed by the first hook event from that project's
+directory within 10 min. No environment variable takes a registration over. Agents started by `orch launch` run with
+`ORCH_ROLE=agent` and get only the agent rule.
 
 | Event | Orchestrator | Why |
 |---|---|---|
-| SessionStart | injects HANDOFF.md, `bd prime` (standing rules), and the `orch check` output | a fresh or cleared session resumes without being re-told |
-| UserPromptSubmit | files the prompt as a beads issue labelled `instruction` (except the scheduled `orch cycle:` prompt, the watcher's wake text, and background-task notifications containing `<task-notification>` or `[SYSTEM NOTIFICATION`) | nothing the owner says is lost; `check` lists it until closed or turned into a rule |
-| PreToolUse | denies shell commands matching: `rm -r`, `kill`/`pkill`/`killall`, `sed -i`/`perl -i`, `sparse-checkout`, `for`/`while` loops over worktrees that change things (`rm`, `mv`, `cp`, in-place `sed`/`perl`, `git add/commit/push/reset/checkout`, `kill`, or redirection into the target; read-only loops such as `du`, `ls`, `head`, `cat`, `rg`, `git status/log` pass), `ssh` with a destructive command. The `sed -i` rule ignores those words when they are only text in a heredoc written to a file under `briefs/` or `out/`. Commands starting with `orch`, `bd`, `pueue`, `herdr` or `board.sh` pass. File edits are allowed only under the state dir, the briefs dir and `orch.toml`; `apply_patch` is always denied | the orchestrator orchestrates; changes go through `orch` or an agent |
+| SessionStart | injects HANDOFF.md (the Live state of the last check) and `bd prime` (standing rules), and tells the session to run `orch check` first; it does not probe hosts (the hook has 60 s) | a fresh or cleared session resumes without being re-told |
+| UserPromptSubmit | files the prompt as a beads issue labelled `instruction` (except prompts orch sends, which start with `[orch] `, the scheduled `orch cycle:` prompt, slash commands such as `/clear`, and background-task notifications containing `<task-notification>` or `[SYSTEM NOTIFICATION`) | nothing the owner says is lost; `check` lists it until closed or turned into a rule |
+| PreToolUse | parses each shell command and judges every part of it: heredoc bodies are data unless fed to a shell or `ssh`; `$( )`, backticks and `<( )` are judged as commands; the rest is split on `;` `&&` `\|\|` `\|` `&` and newlines; each part is judged by its command word after wrappers (`sudo`, `env`, `timeout`, `nice`, `nohup`, `xargs`, `command`, `exec`, ...) and any path are stripped, and `bash/sh -c`, `eval` and `ssh <host> <cmd>` are judged recursively. Denied: `rm -r` (any spelling), `kill`/`pkill`/`killall`, `sed -i`/`perl -i`, `git reset --hard`, `git clean`, `git push --force`/`+ref`/`--delete`, `git checkout -- .`, `git restore`, branch/stash/worktree deletion, `sparse-checkout`, `find -delete`/`-exec rm`, `rsync --delete`, `truncate`/`dd`/`mkfs`/`reboot`, `tmux kill-*`, `podman/docker rm/kill/stop`, `launchctl bootout`, `systemctl stop/restart`, interpreter one-liners that delete or kill (`shutil.rmtree`, `os.kill`, ...), `pueue` other than `status/log/follow/wait/group`, `bd` other than its read and issue-tracking commands (`bd delete`, `purge`, `compact`, `sql` ... are denied), `herdr pane/tab/workspace close`, `herdr pane run/send-text/send-keys`, `board.sh close` (use `orch board-close`), `orch close --force`, loops over worktrees that change files, and shell redirections that write into the project or the worktrees outside the allowed paths. Nothing passes because it starts with `orch`, `bd`, `pueue`, `herdr` or `board.sh`. File edits (Edit/Write/MultiEdit/NotebookEdit, and `apply_patch` by the paths in the patch) are allowed only under the state dir, the briefs dir, `orch.toml`, `paths.checklist` and `paths.state_docs` | the orchestrator orchestrates; changes go through `orch` or an agent |
 | Stop | blocks going idle while a problem is unacknowledged past `deadline_min`, or the handoff notes are stale | keeps it working and the notes current. After 3 blocks in a row it lets go, so it cannot loop forever |
 
 Agents: their Stop is blocked until `REPORT.md` (path in `ORCH_REPORT`) has line 1 no longer `VERDICT: PENDING`, a final
@@ -236,19 +291,19 @@ check output.
 close it (it was a one-off, now done) or make it a standing rule with `bd remember "..."`. Rules come back at every session
 start through `bd prime`, so the owner never has to repeat them.
 
-**The message board.** `paths.board` is your script. orch calls `summary` (a line containing `SILENT` or `GONE` marks a
-silent agent), `rule <unit> <machine>` (text added to every agent prompt), `post` (on launch) and `close` (on close).
+**The message board.** `paths.board` is your script. orch calls `summary` with `BOARD_SILENT_MIN` (each row: name, machine,
+state; `SILENT` or `GONE` flags; `check` reports question and blocked states and both flags for every card), `rule <unit> <machine>` (text added to every agent prompt), `post` (on launch) and `close` (on close).
 Agents post their progress to it; the orchestrator reads `orch` output rather than the board or panes directly.
 
 ## 7. Multiple machines, capacity and network outages
 
 Every host in `orch.toml` can run agents. `launch` picks the host with the most room. Room is measured live: free memory
 minus `reserve_gb`, divided by `agent_gb`; a host is full when load exceeds 1.5 x `cores`, memory pressure (`psi`, Linux)
-is 5 or more, or disk is under `min_disk_gb` (not for a `cleanup` unit). Caps reduce it further. `check` reports "host over its margins" for low disk or high load even when no units are ready. On macOS the probe reads available memory from `memory_pressure` (free percentage x `hw.memsize`, falling back to `vm_stat` free + inactive + speculative pages) and load from `sysctl -n vm.loadavg`. An unreachable host has room 0.
+is 5 or more, or disk is under `min_disk_gb` (load and disk do not hold back a `cleanup` unit). Caps reduce it further. `check` reports "host over its margins" for low disk or high load even when no units are ready. On macOS the probe takes the larger of two readings, `kern.memorystatus_level` (memory_pressure's free percentage, read with sysctl) x `hw.memsize`, and `vm_stat` free + inactive + speculative + purgeable pages, so one reading of 0 under load no longer makes the Mac look full; with no reading at all the memory limit is skipped for that probe and load from `sysctl -n vm.loadavg`. An unreachable host has room 0.
 
 Work belongs to the machine's own queue, not to an ssh session:
 - **pueue** runs on each machine (launchd/brew on the Mac, a user systemd service on Linux hosts). API agents run as
-  tasks in the `agents` group and keep running if ssh drops. `orch check` also adjusts the `jobs` group's parallel limit
+  tasks in the `agents` group and keep running if ssh drops. The watcher and the orchestrator's own `orch check` also adjust the `jobs` group's parallel limit
   from measured room (at least 1, at most `cores`), and the `agents` group's from (avail - reserve) / `agent_gb` plus running
   agents, capped by `[caps]`.
 - **tmux** holds interactive remote agents (session `orch-<unit>`); the herdr tab only attaches to it with
@@ -262,7 +317,9 @@ During an outage `check` shows `host X unreachable since <time>` and the units t
 failed. When the host returns, `check` reports finished units and `orch collect <unit>` pulls the results back.
 
 Remote API agents read the key from the macOS keychain item `orch-anthropic-api` and pass it over ssh stdin into a
-private fifo; it is never written to a file or command line. Remote API agents need `claude` on the host.
+private fifo, which the task removes after reading; it is never written to a file or command line. No `pueue add` gets the
+caller's environment (see launch), so the key never reaches pueue's state file, even when an agent that holds it in its
+environment queues a job. Remote API agents need `claude` on the host.
 
 ## 7a. Build and test jobs: `orch run`, `orch gate`, `orch collect <host>:<task>`
 
@@ -276,8 +333,10 @@ One way to run a build or test job on any machine: that machine's pueue, never a
 - writes the job as `<root>/runs/<jid>.sh` and queues it in the host's pueue group: `gates` (priority 10) or `jobs`; `land`
   is the Mac's landing lane (parallel 1). Groups are created on first use (`jobs` and `gates` with one slot per job cap).
 - Linux admission is by measured room (board 2026-11-11 14:44): the job waits in its pueue task, one job at a time under
-  `runs/admit.lock`, until MemAvailable >= `job_gb + reserve_gb`, memory PSI some avg10 < 5, load1 < `cores` and disk >=
-  `min_disk_gb`; an admitted job keeps the lock 60 s more so its memory shows before the next is judged. The rule lives in
+  `runs/admit.lock`, until MemAvailable >= `reserve_gb` + the measured per-job working set (the largest anonymous memory,
+  `memory.stat anon`, of the orch jobs running now, or on podman hosts of the orch-run/slurp-run containers; remembered in
+  `runs/ws_mb`; `job_ws_gb`, default half of `job_gb`, before anything was measured; at most `job_gb`), memory PSI some
+  avg10 < 5, load1 < 1.5 x `cores` (the same rule as capacity) and disk >= `min_disk_gb`; an admitted job keeps the lock 60 s more so its memory shows before the next is judged. The rule lives in
   `<root>/runs/admit.sh`, rewritten on every `orch run` and re-read by waiting jobs every 15 s, so a rule change reaches jobs
   already waiting. `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Mac
   land: 5 GB internal-disk floor, agent-capacity's memory check, and no old `heavy.land` lane still running.
@@ -320,7 +379,11 @@ The fleet scripts are shims over these (collection-rig `gate-logs/orch-20261031/
 | `beads unavailable: ...` | `bd` is missing or `[project] beads` has no `.beads/`; run `bd init` there |
 | `watcher com.orch.watch is not running: run install` | the launchd agent is not loaded |
 | `git has no upstream: set the bare repo on asgard and push` | the project repo has no upstream branch (the text names asgard from the original project) |
-| `orch: waiting for admission (orch jobs A MB + old jobs B MB + this C MB > D MB ...)` (in a job log) | the job's memory cap does not fit beside the running jobs yet; it starts by itself when one ends |
+| `orch: waiting for admission: MemAvailable A MB (need B = reserve R + working set W), PSI P, load L (limit 1.5 x C cores), disk D GB` (in a job log) | the host has not got that much room yet; it starts by itself when it has |
+| `[old-rule:<host>] N job(s) still wait under the old cap rule` | jobs queued before the measured rule; re-queue them with `orch run`, then stop the old tasks |
+| `(read-only: not the registered orchestrator session ...)` after `orch check` | expected for anyone but the orchestrator: nothing was saved, tuned or stamped |
+| `refused: <dir> is the cwd of open unit(s) ...` / `is a main checkout` | give the unit its own worktree |
+| `pane ... not found, but the registered session is still running` (watch.log) | the watcher will not start a second orchestrator while the registered one's process lives |
 | `orch collect`: `<host>:<id> is Running, not finished` (exit 3) | collect again later; the job is still on the host |
 | `orchestrator gone; no provider enabled` (in `.orch/watch.log`) | the watcher will not start a new orchestrator unless a provider is enabled |
 
@@ -329,16 +392,15 @@ the action through.
 
 ## Known gaps
 
-`install` has now been run (links, hooks, launchd); the Codex `/hooks` trust step is still manual.
+`install` has been run (links, hooks, launchd); the Codex `/hooks` trust step is still manual.
 
-Not yet verified (from the toolkit's own test report, `out/api-orch-toolkit2/REPORT.md`):
-- A remote API agent on asgard (only midgard ran it; same code path).
-- `watch`: waking, restarting the orchestrator, and the context reset.
-- A full herdr-backed agent via `orch launch`, and `orch stop` of a live remote task (`pueue kill` was only tried by hand
-  on the Mac).
-- A Mac-local API launch under pueue through the launcher script.
-- `orch close` on a remote unit with a real git worktree.
+Not yet verified (see `out/orch-fixes6/REPORT.md` in the collection-rig gate log for what was):
+- A remote API agent on asgard end to end with the new lane runner and patch collect (dry-run only).
+- `watch` starting a new orchestrator (the conditions are tested in code review only), and the context reset.
+- A full herdr-backed agent via `orch launch`, including the startup-dialog answers.
+- Codex's PreToolUse tool names (the handler accepts `Bash`, `shell`, `local_shell` and any tool input with `command`/`cmd`).
 
-Described in `docs/PLAN.md` but not in the code: moving unstarted jobs to another host after `unreachable_min`
-(the setting is read but unused), pushing state to a bare repo, wrapping tmux or herdr agents in `MemoryMax` (only remote API
-agents get it), and the Linux systemd timer for the watcher (the watcher is launchd, so macOS only).
+Described in `docs/PLAN.md` or asked for but not in the code: moving unstarted jobs to another host after `unreachable_min`
+(the setting is read but unused), pushing state to a bare repo, `MemoryMax` for herdr agents (they run on the Mac, which has
+no systemd), host roles (target/build/agents/dev) with parallel gates per host, and the remote agent's git (a remote copy has
+no `.git`; its work comes back as a patch).

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Install orch: links, hooks, watcher, tools. `install --dry-run` prints every change and changes nothing.
-Usage: install [--dry-run] [--project DIR] [--no-hosts] [--hosts-only]   (DIR holds orch.toml; default: current directory or a parent)"""
-import argparse, json, os, shlex, subprocess, sys, time, tomllib
+Usage: install [--dry-run] [--project DIR] [--no-hosts] [--hosts-only] [--pin-only]   (DIR holds orch.toml; default: current directory or a parent)"""
+import argparse, ast, hashlib, json, os, shlex, shutil, subprocess, sys, time, tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent; HOME = Path.home()
 ap = argparse.ArgumentParser(); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--project"); ap.add_argument("--no-hosts", action="store_true"); ap.add_argument("--hosts-only", action="store_true")
+ap.add_argument("--pin-only", action="store_true", help="only install a pinned copy of orch.py and switch ~/.local/bin/orch to it")
 A = ap.parse_args(); DRY = A.dry_run
 EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch", "Stop": None}
 ORCH = HOME / ".local/bin/orch"
@@ -21,6 +22,38 @@ def link(dst, src):
     if dst.exists() or dst.is_symlink(): say(f"SKIP {dst} exists and is not our link"); return
     say(f"link {dst} -> {src}")
     if not DRY: dst.parent.mkdir(parents=True, exist_ok=True); dst.symlink_to(src)
+
+def pin():
+    """~/.local/bin/orch points at a pinned copy, ~/.local/share/orch/<hash>/orch.py, never at the working copy: hooks, the
+    watcher and the shims run only a version that parsed and passed a smoke test, and an edit in progress is never live (H11).
+    The switch is one atomic rename of the symlink."""
+    src = (HERE / "orch.py").read_bytes(); h = hashlib.sha256(src).hexdigest()[:12]
+    ast.parse(src)
+    d = HOME / ".local/share/orch" / h; dst = d / "orch.py"
+    say(f"pin orch.py {h} -> {dst}")
+    if DRY: return
+    d.mkdir(parents=True, exist_ok=True)
+    if not dst.exists(): tmp = d / ".orch.py.tmp"; tmp.write_bytes(src); tmp.chmod(0o755); tmp.rename(dst)
+    r = subprocess.run([sys.executable, str(dst), "--help"], capture_output=True, text=True)
+    if r.returncode: sys.exit(f"pinned orch.py failed its smoke test: {r.stderr.strip()[-200:]}")
+    r = subprocess.run([sys.executable, str(dst), "hook", "PreToolUse"], input="{}", capture_output=True, text=True)
+    if r.returncode: sys.exit(f"pinned orch.py hook failed its smoke test: {r.stderr.strip()[-200:]}")
+    if ORCH.exists() and not ORCH.is_symlink(): sys.exit(f"{ORCH} exists and is not a symlink: not replaced")
+    ORCH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ORCH.with_name(".orch.tmp"); tmp.unlink(missing_ok=True); tmp.symlink_to(dst); os.replace(tmp, ORCH)
+    say(f"{ORCH} -> {dst}")
+
+def linux_watcher(project):
+    """Linux: a systemd user timer runs `orch watch` in each project every 5 min (the launchd agent's counterpart)."""
+    u = HOME / ".config/systemd/user"
+    svc = ("[Unit]\nDescription=orch watch\n[Service]\nType=oneshot\nExecStart=/bin/sh -c '[ -f %h/.config/orch/projects ] || exit 0; "
+           "while read -r p; do [ -d \"$p\" ] && (cd \"$p\" && %h/.local/bin/orch watch); done < %h/.config/orch/projects'\n")
+    tmr = "[Unit]\nDescription=orch watch every 5 min\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n[Install]\nWantedBy=timers.target\n"
+    say(f"write {u}/orch-watch.service and .timer; enable the timer")
+    if not DRY: u.mkdir(parents=True, exist_ok=True); (u / "orch-watch.service").write_text(svc); (u / "orch-watch.timer").write_text(tmr)
+    pl = HOME / ".config/orch/projects"; have = pl.read_text().split() if pl.exists() else []
+    if project and str(project) not in have and not DRY: pl.parent.mkdir(parents=True, exist_ok=True); pl.write_text("\n".join([*have, str(project)]) + "\n")
+    run(["systemctl", "--user", "daemon-reload"]); run(["systemctl", "--user", "enable", "--now", "orch-watch.timer"])
 
 def merge_hooks(path):
     path = Path(path).expanduser()
@@ -82,18 +115,20 @@ def main():
     p = Path(A.project or os.getcwd()).resolve()
     for d in [p, *p.parents]:
         if (d / "orch.toml").is_file(): root = d; break
+    if A.pin_only: pin(); return
     if A.hosts_only:
         for n, h in tomllib.loads((root / "orch.toml").read_text()).get("hosts", {}).items(): host_tools(n, h)
         return
     say("== links ==")
-    link("~/.claude/skills/orchestrating", HERE / "skill"); link("~/.codex/skills/orchestrating", HERE / "skill"); link(ORCH, HERE / "orch.py")
+    link("~/.claude/skills/orchestrating", HERE / "skill"); link("~/.codex/skills/orchestrating", HERE / "skill"); pin()
     say("== hooks ==")
     merge_hooks("~/.claude/settings.json"); merge_hooks("~/.codex/hooks.json")
     say("   (Codex: trust the hooks once with /hooks)")
     say("== watcher ==")
-    watcher(root)
+    if sys.platform == "darwin": watcher(root)
+    else: linux_watcher(root)
     say("== tools ==")
-    run(["brew", "install", "beads", "pueue"]); run(["brew", "services", "start", "pueue"])
+    if sys.platform == "darwin": run(["brew", "install", "beads", "pueue"]); run(["brew", "services", "start", "pueue"])
     if root and not A.no_hosts:
         for n, h in tomllib.loads((root / "orch.toml").read_text()).get("hosts", {}).items(): host_tools(n, h)
     elif not root: say("no orch.toml found: host tools skipped")

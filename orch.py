@@ -45,28 +45,45 @@ class Cfg:
     def jget(self, n, d=None):
         try: return json.loads(self.f(n).read_text())
         except Exception: return {} if d is None else d
-    def jput(self, n, v): self.f(n).write_text(json.dumps(v))
-    def touch(self, n): self.f(n).touch()
+    ro = False   # read-only: check/status/capacity run by anyone but the registered orchestrator change nothing (audit M15)
+    def jput(self, n, v):
+        if not self.ro: self.f(n).write_text(json.dumps(v))
+    def touch(self, n):
+        if not self.ro: self.f(n).touch()
     def mtime(self, n):
         try: return self.f(n).stat().st_mtime
         except OSError: return 0
 
-def sh(cmd, cwd=None, inp=None, timeout=25, env=None):
+# Every process orch queues (pueue add) or starts on the Mac gets this allow-listed environment plus explicit ORCH_* values,
+# never the caller's: pueue stores a task's whole environment in its state file, so a caller's ANTHROPIC_API_KEY, messaging
+# token or HERDR_PANE_ID would be written to disk (audit H1, M2).
+ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SSH_AUTH_SOCK", "TZ", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME")
+SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.I)
+
+def clean_env(extra=None):
+    e = {k: os.environ[k] for k in ENV_KEEP if k in os.environ}
+    e["PATH"] = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:/usr/local/bin:" + e.get("PATH", "/usr/bin:/bin")
+    return {**e, **{k: str(v) for k, v in (extra or {}).items()}}
+
+def sh(cmd, cwd=None, inp=None, timeout=25, env=None, clean=False):
+    """Run a command. clean=True: an allow-listed environment plus env (see clean_env), never the caller's."""
     try:
         r = subprocess.run(cmd, cwd=cwd, input=inp, capture_output=True, text=True, timeout=timeout,
-                           env={**os.environ, **env} if env else None)
+                           env=clean_env(env) if clean else ({**os.environ, **env} if env else None))
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError: return 127, "", f"{cmd[0]}: not installed"
     except subprocess.TimeoutExpired: return 124, "", f"{cmd[0]}: timeout"
 
-def hrun(h, script, timeout=25, inp=None):
-    """Run a shell script on host h (local or over ssh)."""
-    if h.get("local"): return sh(["sh", "-c", script], timeout=timeout, inp=inp)
-    return sh([*SSH, h["ssh"], script], timeout=timeout, inp=inp)
+def hrun(h, script, timeout=25, inp=None, env=None):
+    """Run a shell script on host h (local or over ssh). Locally it gets a clean environment (clean_env) plus env; over ssh only
+    the remote login environment (ssh forwards no variables here), with env exported in the script."""
+    if h.get("local"): return sh(["sh", "-c", script], timeout=timeout, inp=inp, env=env, clean=True)
+    pre = "".join(f"export {k}={shlex.quote(str(v))}; " for k, v in (env or {}).items())
+    return sh([*SSH, h["ssh"], pre + script], timeout=timeout, inp=inp)
 
 def X(h, script, **k):
     """Run on a host, or print in dry-run."""
-    if DRY: say(f"+ [{h.get('ssh', 'local')}] {script}"); return 0, "", ""
+    if DRY: say(f"+ [{h.get('ssh', 'local')}] " + "".join(f"{k}=... " for k in (k.get("env") or {})) + script); return 0, "", ""
     return hrun(h, script, **k)
 
 def herdr(*a, timeout=20):
@@ -85,6 +102,64 @@ def findkey(o, sub):
             r = findkey(v, sub)
             if r: return r
 
+# ---------------------------------------------------------------- processes and the registered session
+def ps_table():
+    """{pid: (ppid, pgid, started, command)} for every process (one ps call)."""
+    rc, o, e = sh(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,lstart=,command="], timeout=10)
+    t = {}
+    for l in o.splitlines():
+        f = l.split(None, 8)   # pid ppid pgid + lstart is 5 words (Wed Nov 11 15:31:02 2026) + command
+        if len(f) >= 8 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), int(f[2]), " ".join(f[3:8]), f[8] if len(f) > 8 else "")
+    return t
+
+def ancestors(t, pid):
+    out = []
+    while pid in t and pid not in out and pid > 1: out.append(pid); pid = t[pid][0]
+    return out
+
+AGENT_RX = re.compile(r"(^|/)(claude|codex)(\s|$)|/(claude|codex)(-code)?/|\bnode\b.*\b(claude|codex)\b")
+
+def session_proc(t=None):
+    """(pid, start) of the Claude Code or Codex process this process runs under (hooks and Bash commands are its children)."""
+    t = t or ps_table()
+    for p in ancestors(t, os.getpid())[1:]:
+        if AGENT_RX.search(t[p][3]): return p, t[p][2]
+    p = int(os.environ.get("CLAUDE_PID", "0") or 0)
+    return (p, t[p][2]) if p in t else (None, None)
+
+def record_session_proc(cfg, t=None):
+    p, st = session_proc(t)
+    if p: cfg.f("session_pid").write_text(f"{p}\t{st}\n")
+
+def session_alive(cfg, t=None):
+    """True while the registered session's process still runs (same pid and start time). None when nothing is recorded."""
+    try: p, st = cfg.f("session_pid").read_text().rstrip("\n").split("\t")
+    except (OSError, ValueError): return None
+    t = t or ps_table(); x = t.get(int(p))
+    return bool(x and x[2] == st)
+
+def is_orchestrator(cfg):
+    """The caller is the registered orchestrator session: its session id is the registered one, or the registered session's
+    process is among the caller's ancestors. Only then do check and status change state (audit M15)."""
+    reg = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
+    if reg and reg in (os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CLAUDE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID"), os.environ.get("ORCH_SESSION")):
+        return True
+    try: p, st = cfg.f("session_pid").read_text().rstrip("\n").split("\t")
+    except (OSError, ValueError): return False
+    t = ps_table(); return int(p) in ancestors(t, os.getpid()) and t[int(p)][2] == st
+
+def projects():
+    pl = Path.home() / ".config/orch/projects"
+    return [Path(x) for x in (pl.read_text().split() if pl.exists() else []) if (Path(x) / "orch.toml").is_file()]
+
+def session_root(sid):
+    """The project whose registered session is sid (audit H3: hooks never depend on the session's current directory)."""
+    for r in projects():
+        try: st = r / tomllib.loads((r / "orch.toml").read_text()).get("project", {}).get("state", ".orch")
+        except Exception: continue
+        if (st / "session").exists() and (st / "session").read_text().strip() == sid: return r
+    return None
+
 # ---------------------------------------------------------------- beads
 class Beads:
     def __init__(self, cfg): self.cfg = cfg
@@ -97,8 +172,9 @@ class Beads:
         r = self.run("list", "--label", label, "--status", status)
         return r.get("issues", r) if isinstance(r, dict) else r
     def units(self):
+        """Open units: launch marks each in_progress (so `bd ready` never lists a running unit); older ones are still open."""
         out = []
-        for i in self.issues("unit"):
+        for i in self.issues("unit", "open,in_progress"):
             t = i.get("title", "")
             if not t.startswith("unit:"): continue
             try: m = json.loads(i.get("notes") or i.get("description") or "{}")
@@ -116,9 +192,14 @@ class Beads:
 # ---------------------------------------------------------------- hosts: one probe per host
 PROBE = r'''PATH="$HOME/.local/bin:%(bin)s:$PATH"
 if [ "$(uname)" = Darwin ]; then
- mem=$(sysctl -n hw.memsize); fp=$(memory_pressure 2>/dev/null | awk '/free percentage/{gsub(/%%/,"",$NF);print int($NF)}')
- if [ -n "$fp" ]; then mb=$((mem/1048576*fp/100)); else
-  mb=$(vm_stat | awk '/page size of/{ps=$(NF-1)} /^Pages (free|inactive|speculative):/{gsub(/\./,"",$NF);n+=$NF} END{print int(n*ps/1048576)}'); fi
+ # Two readings, the larger wins: the kernel's free level (memory_pressure's "free percentage", read straight from sysctl, no
+ # tool run under load) and vm_stat's free + inactive + speculative + purgeable pages. Under load one of them can read 0
+ # (memory_pressure timing out or the level lagging), which made the Mac look full; an empty reading is reported as empty.
+ mem=$(sysctl -n hw.memsize 2>/dev/null); fp=$(sysctl -n kern.memorystatus_level 2>/dev/null)
+ [ -n "$fp" ] || fp=$(memory_pressure 2>/dev/null | awk '/free percentage/{gsub(/%%/,"",$NF);print int($NF)}')
+ a=0; [ -n "$fp" ] && [ -n "$mem" ] && a=$((mem/1048576*fp/100))
+ b=$(vm_stat 2>/dev/null | awk '/page size of/{ps=$(NF-1)} /^Pages (free|inactive|speculative|purgeable):/{gsub(/\./,"",$NF);n+=$NF} END{if (ps) print int(n*ps/1048576)}')
+ mb=${b:-0}; [ "$a" -gt "$mb" ] && mb=$a; [ "$mb" -gt 0 ] || mb=
  echo "avail_mb=$mb"; echo "load=$(sysctl -n vm.loadavg | tr -d '{}' | awk '{print $1}')"; echo "os=mac"
 else
  echo "avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"; echo "load=$(cut -d' ' -f1 /proc/loadavg)"
@@ -138,8 +219,10 @@ PROBE_LEGACY = {   # jobs of the old scripts: waiting and running, so a jammed o
 def probe_extra(h):
     """Running orch jobs still waiting in their admission (per lane), and the old scripts' queue."""
     rd = "$HOME/.orch-none" if h.get("local") else f"{h.get('root', '/tmp')}/runs"
-    w = (f'g=0; j=0; for f in {rd}/*.gwait {rd}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
-         f'case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; done; echo "wait_gates=$g"; echo "wait_jobs=$j"')
+    # old_rule: waiting jobs whose script does not source runs/admit.sh (queued before the measured rule; audit H5)
+    w = (f'g=0; j=0; o=0; ol=; for f in {rd}/*.gwait {rd}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
+         f'case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -q admit.sh "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
+         f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"')
     return w + "\n" + PROBE_LEGACY.get(h.get("legacy", ""), "")
 
 def pueue(h):
@@ -174,9 +257,10 @@ def fl(x, d=0.0):
     except Exception: return d
 
 def margins(h, p, cleanup=False):
-    """Why the host is over its load, memory-pressure or disk margins (a cleanup unit ignores the disk floor)."""
+    """Why the host is over its load, memory-pressure or disk margins. A cleanup unit is exempt from the load limit and the disk
+    floor (it is what frees them); memory pressure still counts."""
     why = []
-    if fl(p.get("load")) > h.get("cores", 4) * 1.5: why.append(f"load {p.get('load')} over {h.get('cores', 4) * 1.5:g}")
+    if not cleanup and fl(p.get("load")) > h.get("cores", 4) * 1.5: why.append(f"load {p.get('load')} over {h.get('cores', 4) * 1.5:g}")
     if p.get("psi") and fl(p["psi"]) >= 5: why.append(f"memory pressure {p['psi']}")
     if not cleanup and p.get("disk_gb") and fl(p["disk_gb"]) < h.get("min_disk_gb", 10): why.append(f"disk {p['disk_gb']}G")
     return why
@@ -185,10 +269,12 @@ def room(cfg, name, p, units, cleanup=False):
     """(number of agents that fit now, why not). Measured live against the host's margins."""
     h = cfg.hosts[name]
     if not p["ok"]: return 0, "unreachable"
-    avail = fl(p.get("avail_mb")) / 1024
     why = margins(h, p, cleanup)
-    n = int((avail - h.get("reserve_gb", 2)) // h.get("agent_gb", 1.0))
-    if n < 1: why.append(f"memory {avail:.1f}G free, reserve {h.get('reserve_gb', 2)}G")
+    if p.get("avail_mb"):
+        avail = fl(p.get("avail_mb")) / 1024
+        n = int((avail - h.get("reserve_gb", 2)) // h.get("agent_gb", 1.0))
+        if n < 1: why.append(f"memory {avail:.1f}G free, reserve {h.get('reserve_gb', 2)}G")
+    else: n = 1   # no memory reading this time (probe under load): one agent, judged by the other margins
     caps = cfg.caps
     if caps.get("host", {}).get(name) is not None:
         n = min(n, caps["host"][name] - sum(1 for u in units if u.get("host") == name))
@@ -261,8 +347,15 @@ def ws_id(cfg, create=False):
 
 # ---------------------------------------------------------------- check
 def board_rows(cfg):
-    rc, o, e = sh([str(cfg.p("board", "bin/board.sh")), "summary"])
-    return [l.split()[0] for l in o.splitlines()[1:] if l.strip() and ("SILENT" in l or "GONE" in l)] if rc == 0 else []
+    """Every open card on the board: {name: {"state", "silent", "gone", "text"}} (audit H8: all cards, not only orch's units)."""
+    rc, o, e = sh([str(cfg.p("board", "bin/board.sh")), "summary"], env={"BOARD_SILENT_MIN": str(cfg.silent // 60)})
+    rows = {}
+    for l in (o.splitlines()[1:] if rc == 0 else []):
+        f = l.split()
+        if len(f) < 3: continue
+        rows[f[0]] = {"state": f[2], "silent": bool(re.search(r"\bSILENT \d+m", l)), "gone": "GONE" in l,
+                      "text": re.sub(r"\s+", " ", l.split(None, 4)[-1] if len(f) > 4 else "")[:140]}
+    return rows
 
 def gate_findings(cfg):
     try: lines = cfg.p("gate_log").read_text().splitlines()[-60:]
@@ -290,7 +383,7 @@ def notes_state(cfg):
     t = handoff_path(cfg).read_text() if handoff_path(cfg).exists() else ""
     notes = t.split(LE, 1)[-1] if LE in t else NOTES0
     h = hashlib.md5(notes.encode()).hexdigest(); s = cfg.jget("notes.json")
-    if s.get("hash") != h: s = {"hash": h, "ts": now()}; cfg.jput("notes.json", s)
+    if s.get("hash") != h: s = {"hash": h, "ts": now() if not cfg.ro else s.get("ts", now())}; cfg.jput("notes.json", s)
     return s["ts"], notes.count("\n")
 
 def handoff_stale(cfg, running):
@@ -299,13 +392,48 @@ def handoff_stale(cfg, running):
     if lines > 150: r.append(f"handoff notes are {lines} lines; move old ones to .orch/history.md")
     return r
 
+def ready_work(cfg):
+    """Ready work items in beads: not units (launched work), not orch's decision log, not owner instructions (audit H7)."""
+    skip = {"unit", "orch-log", "instruction"}
+    return [i for i in Beads(cfg).run("ready") if not skip & set(i.get("labels") or [])
+            and not str(i.get("title", "")).startswith(("unit:", "orch:", "instr:"))]
+
+TEST_RX = re.compile(r"\bcargo(-\w+)? (test|nextest|build|clippy|bench)\b|\bpytest\b|\b(npm|pnpm) (run )?test\b|\bxcodebuild\b.*\btest\b")
+
+VIA_LANE = re.compile(r"orch(\.py)? (run|gate)\b|(linux|midgard)-test\.sh|heavy\.sh|run-handoff\.sh|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")
+
+def secs(et):
+    d, _, r = et.rpartition("-"); p = [int(x) for x in r.split(":")]
+    while len(p) < 3: p.insert(0, 0)
+    return (int(d) if d else 0) * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+
+def proc_findings(cfg):
+    """On this machine (the Mac): CPU burners an agent started (busy over 10 min, under an agent or orphaned from one), and test
+    or build runs outside the pueue lanes (orch run / orch gate put them in a lane)."""
+    rc, o, e = sh(["ps", "-Aww", "-o", "pid=,ppid=,pcpu=,etime=,command="], timeout=10)
+    t = {}
+    for l in o.splitlines():
+        f = l.split(None, 4)
+        if len(f) == 5 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), fl(f[2]), f[3], f[4])
+    up = lambda p: [q for q in ancestors({k: (v[0],) for k, v in t.items()}, p)[1:]]
+    F = []
+    for p, (pp, cpu, et, c) in t.items():
+        if AGENT_RX.search(c) or "pueued" in c: continue
+        anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "fable-api.sh" in t[q][3]), None)
+        lane = any("pueued" in t[q][3] for q in anc)
+        if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
+            F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; stop its unit with orch stop"))
+        if TEST_RX.search(c) and not lane and not VIA_LANE.search(c) and not any(TEST_RX.search(t[q][3]) or VIA_LANE.search(t[q][3]) for q in anc):
+            F.append((f"localtest:{p}", f"test/build run on the Mac outside the pueue lanes (pid {p}, {et}): {c[:70]}; use orch run / heavy.sh"))
+    return F
+
 def collect_findings(cfg, hs, units, ag, bd_err):
     F = []
     if bd_err: F.append(("beads", f"beads unavailable: {bd_err}"))
     ws = ws_id(cfg); names = {u["name"] for u in units}
     un = cfg.jget("hosts.json")
     ready = 0
-    try: ready = len([i for i in Beads(cfg).run("ready", "--label", "unit") if "orch-log" not in (i.get("labels") or [])])
+    try: ready = len(ready_work(cfg))
     except Err: pass
     for n, p in hs.items():
         if not p["ok"]:
@@ -314,13 +442,17 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             continue
         r, why = room(cfg, n, p, units)
         mg = margins(cfg.hosts[n], p)
-        if mg or (r < 1 and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6):
-            F.append((f"margin:{n}", f"host {n} over its margins: {'; '.join(mg) or why}"))
+        low = r < 1 and p.get("avail_mb") and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6
+        if mg or low:   # the key names the kinds (load, memory, disk), so an ack of one never hides another (H12)
+            kinds = sorted({w.split()[0] for w in mg} | ({"memory"} if low else set()))
+            F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}"))
         elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} but {ready} unit(s) are ready: orch launch"))
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
-            if k in ("Running", "Queued") and t.get("label") not in names and not (t.get("group") in LANES and ":" in (t.get("label") or "")):
-                F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({t.get('label') or t.get('command', '')[:40]}) has no open unit"))
+            lab = t.get("label") or ""
+            owned = lab in names or (lab.startswith("unit:") and lab[5:] in names) or (t.get("group") in LANES and ":" in lab and not lab.startswith("unit:"))
+            if k in ("Running", "Queued") and not owned:   # a lane job labelled unit:<name> whose unit is closed is an orphan too (M3)
+                F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({lab or t.get('command', '')[:40]}) has no open unit"))
         for s in p.get("tmux", []):
             if s.startswith("orch-") and s[5:] not in names: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit"))
     orch_pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
@@ -329,7 +461,14 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if ws and a.get("workspace_id") != ws: continue
         if k in names or a.get("pane_id") in pane_units or a.get("pane_id") == orch_pane or k == "orchestrator": continue
         F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit"))
-    stale = set(board_rows(cfg)); running = 0
+    board = board_rows(cfg); running = 0
+    for card, r in board.items():   # every card, including those other launchers posted (marked "not a unit")
+        tag = "" if card in names else " (not a unit)"
+        if r["state"] in ("question", "blocked"):
+            F.append((f"board:{card}:{r['state']}", f"{card}{tag} is {r['state'].upper()} on the board: {r['text']}; answer with board.sh direct"))
+        if r["gone"]: F.append((f"board:{card}:gone", f"{card}{tag} GONE: its process ended without a done post"))
+        elif r["silent"] and r["state"] not in ("question", "blocked"):
+            F.append((f"board:{card}:silent", f"{card}{tag} silent over {cfg.silent // 60} min on the board"))
     for u in units:
         st = unit_state(u, hs, ag); v = verdict(cfg, u); u["state"] = st; u["verdict"] = v
         age = now() - u.get("started", now())
@@ -339,9 +478,6 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}"))
         elif st in ("done", "failed", "gone", "idle"):
             F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
-        elif st == "unknown": pass
-        elif u["name"] in stale and st == "working":
-            F.append((f"unit:{u['name']}:silent", f"{u['name']} silent over {cfg.silent // 60} min on the board"))
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}"))
     cfg.jput("running.json", {"n": running})
@@ -351,6 +487,10 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
     F += gate_findings(cfg)
     F += lane_findings(cfg, hs)
+    if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg)
+    sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
+    if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
+        F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
     rc, o, e = sh(["git", "status", "--porcelain"], cwd=cfg.root)
     if rc == 0:
         if o.strip(): F.append(("git:dirty", f"{len(o.splitlines())} uncommitted path(s) in {cfg.root.name}"))
@@ -391,7 +531,7 @@ def live_state(cfg, hs, units, F):
     for u in units:
         L.append(f"- {u['name']} | {u.get('host')} | {u.get('model')} | {u.get('state', '?')} | {int((now() - u.get('started', now())) / 60)}m | {u.get('verdict') or 'no verdict'}")
     if not units: L.append("- none")
-    try: rd = Beads(cfg).run("ready"); L.append("Queue: " + (", ".join(i.get("title", "")[:40] for i in rd[:8]) or "empty"))
+    try: rd = ready_work(cfg); L.append("Queue: " + (", ".join(i.get("title", "")[:40] for i in rd[:8]) or "empty"))
     except Err as e: L.append(f"Queue: unavailable ({e})")
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv: L.append(f"Spend {n}: ${committed(cfg, pv):.2f} of ${pv['cap_usd']}")
@@ -402,18 +542,27 @@ def write_handoff(cfg, live):
     p = handoff_path(cfg); t = p.read_text() if p.exists() else ""
     notes = t.split(LE, 1)[1] if LE in t else "\n" + NOTES0
     new = f"# HANDOFF: {cfg.name}\n{LB}\n{live}\n{LE}{notes}"
-    if new != t: p.write_text(new)
+    if new != t and not cfg.ro: p.write_text(new)
 
-def run_check(cfg, cycle=True):
-    """Returns (findings not acknowledged, live text). Regenerates the Live part of HANDOFF.md."""
+ACK_TTL = {"margin": 30 * 60}   # margin acks last 30 min, others 4 h, and every ack ends when its finding clears (audit H12)
+
+def live_acks(cfg, keys=None):
+    """Acks still in force. keys: the findings seen now; an ack whose finding is gone is dropped (only a writer saves that)."""
+    acks = {k: (v if isinstance(v, dict) else {"t": v}) for k, v in cfg.jget("acks.json").items()}
+    return {k: v for k, v in acks.items() if now() - v["t"] < ACK_TTL.get(k.split(":")[0], 4 * 3600) and (keys is None or k in keys)}
+
+def run_check(cfg, cycle=True, writer=None):
+    """Returns (findings not acknowledged, live text, probes, units). writer (default: the caller is the registered orchestrator,
+    or the watcher) regenerates the Live part of HANDOFF.md, saves acks and open problems and sets pueue limits; anyone else
+    only reads. The cycle stamp (last_cycle) is touched only for the orchestrator's own check."""
+    cfg.ro = not (writer if writer is not None else is_orchestrator(cfg))
     hs = probe_all(cfg); bd_err = None; units = []
     try: units = Beads(cfg).units()
     except Err as e: bd_err = str(e)
     ag = herdr_agents(cfg)
     F = collect_findings(cfg, hs, units, ag, bd_err)
-    tune_pueue(cfg, hs, units)
-    acks = {k: t for k, t in cfg.jget("acks.json").items() if now() - t < 4 * 3600}
-    cfg.jput("acks.json", acks)
+    if not cfg.ro: tune_pueue(cfg, hs, units)
+    acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
     F = [(k, t) for k, t in F if k not in acks]
     op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
     live = live_state(cfg, hs, units, F); write_handoff(cfg, live)
@@ -426,9 +575,10 @@ def cmd_check(cfg, a):
     if a.escalate: F = [(k, t) for k, t in F if now() - op.get(k, now()) > cfg.deadline]
     if a.brief and len(F) > 8: F = F[:8] + [("more", f"+{len(F) - 8} more: run orch check")]
     for k, t in F: say(f"[{k}] {t}")
+    if cfg.ro: say("(read-only: not the registered orchestrator session, so nothing was saved, tuned or stamped)")
 
 def cmd_capacity(cfg, a):
-    hs = probe_all(cfg)
+    cfg.ro = True; hs = probe_all(cfg)
     try: units = Beads(cfg).units()
     except Err: units = []
     for n, p in hs.items(): say(cap_line(cfg, n, p, units))
@@ -436,9 +586,32 @@ def cmd_capacity(cfg, a):
 def cmd_status(cfg, a):
     F, live, *_ = run_check(cfg, cycle=False); say(live)
 
+def cmd_board_close(cfg, a):
+    """Archive a board card that is not an open unit (cards from other launchers); an open unit is closed with orch close."""
+    try: open_units = {u["name"] for u in Beads(cfg).units()}
+    except Err as e: raise Err(f"beads unavailable, so it cannot tell whether {a.agent} is an open unit: {e}")
+    if a.agent in open_units: raise Err(f"{a.agent} is an open unit: use orch close {a.agent}")
+    if DRY: say(f"+ board.sh close {a.agent}"); return
+    rc, o, e = sh([str(cfg.p("board", "bin/board.sh")), "close", a.agent])
+    if rc: raise Err(f"board.sh close {a.agent}: {(e or o).strip()[:120]}")
+    cfg.touch("changed"); say(f"board card {a.agent} archived")
+
+def cmd_init(cfg, a):
+    """Turn the old state docs named in paths.state_docs into a one-line pointer to .orch/HANDOFF.md (fixes5 item 6). The old
+    text is kept in .orch/history-<name> first."""
+    for x in cfg.paths.get("state_docs", []):
+        p = cfg.root / x
+        if not p.is_file(): continue
+        t = p.read_text(); ptr = f"Moved: the current state and handoff are in {cfg.state.name}/HANDOFF.md (orch check regenerates it). Old text: {cfg.state.name}/history-{p.name}\n"
+        if t == ptr: say(f"{x}: already a pointer"); continue
+        if DRY: say(f"+ keep {x} in {cfg.state.name}/history-{p.name}; write the pointer"); continue
+        k = cfg.f(f"history-{p.name}")
+        k.write_text((k.read_text() if k.exists() else "") + f"\n\n<!-- {ts()} moved from {x} -->\n" + t)
+        p.write_text(ptr); say(f"{x}: now a pointer (old text in {k})")
+
 def cmd_ack(cfg, a):
     k, d = a.problem, a.decision
-    acks = cfg.jget("acks.json"); acks[k] = now(); cfg.jput("acks.json", acks); cfg.touch("last_ack")
+    acks = live_acks(cfg); acks[k] = {"t": now()}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
     try:
         bd = Beads(cfg); m = re.match(r"unit:([^:]+)", k)
         u = next((u for u in bd.units() if m and u["name"] == m.group(1)), None)
@@ -450,19 +623,28 @@ def cmd_ack(cfg, a):
     say(f"acked {k}")
 
 def cmd_register(cfg, a):
-    sid = a.session or os.environ.get("ORCH_SESSION") or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")
-    cfg.f("session").write_text(sid or f"pending:{int(now())}")
+    """The only way to change the registered orchestrator session (with the watcher's pending claim for a new one it started)."""
+    sid = a.session or next((os.environ[k] for k in ("ORCH_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID") if os.environ.get(k)), None)
+    kind = "codex" if os.environ.get("CODEX_THREAD_ID") and not os.environ.get("CLAUDECODE") else "claude"
+    old = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
+    if old and sid and old != sid and session_alive(cfg): say(f"note: replacing registered session {old}, whose process is still alive")
+    if DRY: say(f"+ register {sid or 'pending'} ({kind})"); return
+    cfg.f("session").write_text(sid or f"pending:{int(now())}"); cfg.f("session_kind").write_text(kind + "\n")
+    if sid: record_session_proc(cfg)
     pid = os.environ.get("HERDR_PANE_ID") or (herdr("pane", "current") or {}).get("pane", {}).get("pane_id")
     if pid: cfg.f("pane").write_text(pid)
     cfg.touch("last_cycle"); cfg.touch("last_ack")
-    say("registered " + (sid or "(pending: the next hook event from this session claims it)"))
+    say("registered " + (sid or "(pending: the next hook event from this session claims it)") + f" ({kind})")
+    if cfg.c.get("orchestrator", {}).get("kind", "claude") != kind:
+        say(f"warning: orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}, but this session is {kind}: set it to {kind}")
     ws = ws_id(cfg, create=True)
-    if ws and not DRY:
+    if ws:   # plain shell loops: `watch` is not installed on the Mac (M10)
         have = {t.get("label") for t in (herdr("tab", "list", "--workspace", ws) or {}).get("tabs", [])}
-        for lab, cmd in (("status", f"watch -n 60 orch status"), ("board", f"watch -n 60 {shlex.quote(str(cfg.p('board', 'bin/board.sh')))} summary"),
+        for lab, cmd in (("status", "while :; do clear; orch status; sleep 60; done"),
+                         ("board", f"while :; do clear; {shlex.quote(str(cfg.p('board', 'bin/board.sh')))} summary; sleep 60; done"),
                          ("watcher", f"tail -f {shlex.quote(str(cfg.f('watch.log')))}")):
             if lab in have: continue
-            r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root))
+            r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root), "--no-focus")
             if r: herdr("pane", "run", r["root_pane"]["pane_id"], cmd)
 
 # ---------------------------------------------------------------- launch / stop / collect / close
@@ -495,30 +677,139 @@ def new_tab(cfg, label, cwd):
     if not r: raise Err("herdr tab create failed")
     return r["root_pane"]["pane_id"], r["tab"].get("tab_id")
 
-def wrap(h, cmd, unit_mem=None):
-    mm = h.get("memory_max")
-    return f"systemd-run --user --scope -q -p MemoryMax={mm} -- {cmd}" if mm and not h.get("local") else cmd
-
 def ledger(cfg, mc, run, state, amount, name):
     with open(cfg.root / cfg.prov[mc["provider"]]["ledger"], "a") as f: f.write(f"{ts()}\t{name}\t{state}\t{amount}\t{run}\n")
 
-def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt):
+def reserve_budget(cfg, mc, name, budget, write):
+    """Check (and with write, reserve) an API unit's budget under the ledger's lock, the same fcntl lock fable-api.sh takes
+    (audit M1): every API launch, local or remote, with an explicit --model or --budget too. Returns the run id."""
+    import fcntl
+    pv = cfg.prov[mc["provider"]]; lp = cfg.root / pv["ledger"]
+    with open(str(lp) + ".lock", "a") as lk:
+        fcntl.lockf(lk, fcntl.LOCK_EX)
+        if "cap_usd" in pv:
+            c = committed(cfg, pv)
+            if c + budget > pv["cap_usd"]: raise Err(f"refused: ${c:.2f} committed + ${budget} would pass the ${pv['cap_usd']} cap of {mc['provider']}")
+        run = f"{name}.{os.getpid()}.{int(now())}"
+        if write and not DRY: ledger(cfg, mc, run, "running", budget, name)
+        return run
+
+def deliver_key(h, fifo):
+    """Send the key into the task's fifo from a detached ssh with no time limit, so a full agents group queues the task instead
+    of failing the launch (M13). The key goes over the pipe only: never a file or argv."""
+    k = sh(["security", "find-generic-password", "-s", "orch-anthropic-api", "-w"])
+    if k[0] or not k[1].strip(): return "no key in keychain item orch-anthropic-api"
+    p = subprocess.Popen([*SSH, h["ssh"], f"cat > {fifo}"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, env=clean_env())
+    p.stdin.write(k[1].strip().encode() + b"\n"); p.stdin.close()
+    return None
+
+def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env):
     """Headless claude as a pueue task on host h. The key goes over ssh stdin into a fifo that only that task reads: never a file or argv."""
     root = h["root"]; fifo = f"{root}/run/{name}.key"; od = f"{root}/out/{name}"; q = shlex.quote
     mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p MemoryMax={mm} -- " if mm else ""
-    script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nread -r K < {fifo}; export ANTHROPIC_API_KEY=$K; unset K\n"
-              f"export ORCH_ROLE=agent\ncd {q(rcwd)} || exit 1\nexec {sd}claude --bare -p --model {mc['api_id']} --max-budget-usd {budget} "
+    ex = "".join(f"export {k}={q(v)}\n" for k, v in env.items())
+    script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export ANTHROPIC_API_KEY=$K; unset K\n"
+              f"cd {q(rcwd)} || exit 1\nexec {sd}claude --bare -p --model {mc['api_id']} --max-budget-usd {budget} "
               f"--output-format json --dangerously-skip-permissions {q(prompt)} < /dev/null > {od}/api.json 2> {od}/api.err\n")
     if DRY: return X(h, f"mkfifo {fifo}; cat > {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {rcwd} --print-task-id -- sh {root}/run/{name}.sh; key | ssh cat > {fifo}")
-    rc, o, e = hrun(h, f"mkdir -p {root}/run {od} && rm -f {fifo} && mkfifo -m 600 {fifo} && cat > {root}/run/{name}.sh", inp=script)
+    rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo} && cat > {root}/run/{name}.sh", inp=script)
+    if rc: return rc, o, e
+    rc, o, e = hrun(h, f"cat > {root}/run/bin/.pueue.$$ && chmod 755 {root}/run/bin/.pueue.$$ && mv {root}/run/bin/.pueue.$$ {root}/run/bin/pueue", inp=clean_pueue_script(h))
     if rc: return rc, o, e
     rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {q(rcwd)} --print-task-id -- sh {root}/run/{name}.sh")
     if rc: return rc, o, e
-    k = sh(["security", "find-generic-password", "-s", "orch-anthropic-api", "-w"])
-    if k[0] or not k[1].strip(): hrun(h, f"{pueue(h)} kill {o.strip()}; rm -f {fifo}"); return 1, "", "no key in keychain item orch-anthropic-api"
-    rc2, _, e2 = hrun(h, f"cat > {fifo}", inp=k[1].strip() + "\n", timeout=30)
-    if rc2: hrun(h, f"{pueue(h)} kill {o.strip()}; rm -f {fifo}"); return 1, "", "key delivery failed: " + e2.strip()[:80]
+    err = deliver_key(h, fifo)
+    if err: hrun(h, f"{pueue(h)} kill {o.strip()}; rm -f {fifo}"); return 1, "", err
     return 0, o, ""
+
+# A pueue that never stores the caller's environment: an agent holds ANTHROPIC_API_KEY in its own environment (claude passes
+# it to every tool command), and pueue stores a task's whole environment in its state file. The lane runner uses it, and
+# remote API agents get it first on PATH as `pueue` (orch-fixes6: found when a remote agent's lane job stored the key).
+CLEAN_PUEUE = r'''#!/bin/sh
+# pueue with an allow-listed environment (written by orch): a task never stores the caller's ANTHROPIC_API_KEY or tokens
+real=%(real)s
+exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" PATH="$PATH" LANG="${LANG:-C.UTF-8}" SHELL="${SHELL:-/bin/sh}" \
+  TMPDIR="${TMPDIR:-/tmp}" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} ${XDG_CONFIG_HOME:+XDG_CONFIG_HOME="$XDG_CONFIG_HOME"} ${ORCH_UNIT:+ORCH_UNIT="$ORCH_UNIT"} ${ORCH_ROLE:+ORCH_ROLE="$ORCH_ROLE"} "$real" "$@"
+'''
+
+def clean_pueue_script(h):
+    real = f"{h['bin']}/pueue" if h.get("bin") else "$HOME/.local/bin/pueue"
+    return CLEAN_PUEUE % {"real": real}
+
+def lane_runner(cfg, hn, h, name, rcwd):
+    """<root>/run/<unit>.lane on host h: `lane <command>` runs the command in the agent's tree through this host's pueue jobs lane,
+    with orch's admission (runs/admit.sh) and MemoryMax, waits, prints the log and exits with its code (M9; fixes5 item 2)."""
+    a = argparse.Namespace(lane="jobs", subdir=None, usb=False, wt=rcwd)
+    rd = runs_dir(cfg, h); q = shlex.quote; F = h.get("fleet", "/srv/slurp-fleet")
+    crd = "/f" + rd[len(F):] if h.get("runner") == "podman" and rd.startswith(F + "/") else rd   # the runs dir as the job sees it
+    js = job_script(cfg, hn, h, a, name, f"bash {crd}/__JID__.cmd", "__JID__", wd=rcwd)
+    return ("#!/bin/bash\n# orch lane runner for unit " + name + f" on {hn}: lane <command>\nRD={q(rd)}; mkdir -p $RD\n"
+            f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=$RD/$jid\nprintf '%s\\n' \"$*\" > $R.cmd\n"
+            f"cat > $R.sh <<'ORCH_JOB_EOF'\n{js}ORCH_JOB_EOF\nsed -i \"s/__JID__/$jid/g\" $R.sh\n"
+            f"{pueue(h)} group add -p 1 jobs >/dev/null 2>&1\n"
+            f"tid=$(env -i HOME=\"$HOME\" USER=\"$USER\" PATH=\"$PATH\" ${{XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"}} LANG=\"${{LANG:-C.UTF-8}}\" {pueue(h)} add -g jobs -l unit:{name} -w $RD --print-task-id -- bash $R.sh) || exit 125\n"
+            f"echo \"lane: queued {hn}:$tid ($jid)\" >&2\n{pueue(h)} wait -q $tid; cat $R.log; exit $(cat $R.rc 2>/dev/null || echo 255)\n")
+
+def brief_header(cfg, hn, h, name, rcwd, local):
+    if local: return ""
+    lane = f"{h['root']}/run/{name}.lane"
+    return (f"<!-- orch: unit {name} runs on {hn} -->\n**Where you run (orch):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `orch collect` "
+            f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
+            f"`{lane} '<command>'` (for example `{lane} 'cargo test -p <crate>'`). It waits for admission, runs, prints the log and exits "
+            f"with the command's code. Do not run cargo, pytest or other heavy commands directly, and do not use linux-test.sh "
+            f"(that is the Mac's script).\n\n")
+
+def place(cfg, a, brief, mc, units, hs):
+    """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
+    first matching [placement] rule of orch.toml (regex over unit name and brief text = host), or the worktree's sticky host in
+    out/linux-host/<unit>), when the model may run there; else the allowed host with the most measured room."""
+    allowed = [n for n in cfg.hosts if n in mc.get("hosts", list(cfg.hosts))]
+    if a.host: return [a.host], "--host"
+    txt = brief.read_text() if brief.is_file() else ""
+    want = a.test_host
+    if not want:
+        m = re.search(r"^TEST-HOST:\s*(\S+)", txt, re.M); want = m.group(1) if m else None
+    if not want:
+        for rx, hn in cfg.c.get("placement", {}).items():
+            if re.search(rx, a.unit + "\n" + txt): want = hn; break
+    if not want:
+        st = cfg.p("out", "out") / "linux-host" / a.unit
+        want = st.read_text().strip() if st.is_file() else None
+    if want and want in allowed: return [want], f"tests run on {want}"
+    return allowed, ("tests run on " + want + ", but " + a.unit + "'s model is not allowed there; " if want else "") + "most room"
+
+def main_checkout(cwd):
+    """True when cwd is the main working tree of a repository that has linked worktrees (agents get a worktree, H9)."""
+    rc, o, e = sh(["git", "-C", str(cwd), "rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"])
+    if rc: return False
+    top, gd, cd = o.split("\n")[:3]
+    if Path(top).resolve() != Path(cwd).resolve() or Path(cwd, gd).resolve() != Path(cwd, cd).resolve(): return False
+    rc, o, e = sh(["git", "-C", str(cwd), "worktree", "list", "--porcelain"])
+    return rc == 0 and o.count("\nworktree ") + o.startswith("worktree ") > 1
+
+DIALOGS = [   # startup dialogs orch gets past (fixes5 item 10): (text in the pane, keys to send)
+    (r"trust the (files|contents) (in|of) this (folder|directory)|Do you trust", ["Enter"]),
+    (r"Update available|new version of Codex|Skip until next version", ["Down", "Enter"]),
+    (r"Press Enter to continue", ["Enter"])]
+
+def past_dialogs(name, pane):
+    for _ in range(6):
+        r = herdr("pane", "read", pane, "--source", "visible", "--lines", "40") or {}
+        txt = json.dumps(r)
+        hit = next((k for rx, k in DIALOGS if re.search(rx, txt, re.I)), None)
+        st = ((herdr("agent", "get", name) or {}).get("agent") or {}).get("agent_status")
+        if not hit: return None if st in ("idle", "working", "done", None) else f"agent {st} at start: {txt[-200:]}"
+        herdr("pane", "send-keys", pane, *hit); time.sleep(2)
+    return "startup dialog still shown after 6 tries"
+
+def unit_tab(cfg, u, mname, hn, h):
+    """One labelled tab per running unit (<unit> · <model> · <host>) that follows its pueue log (fixes5 item 3)."""
+    if u.get("via") != "pueue" or DRY: return
+    try: pane, tab = new_tab(cfg, f"{u['name']} · {mname} · {hn}", cfg.root)
+    except Err: return
+    f = f"{pueue(h)} follow {u['task']}"
+    herdr("pane", "run", pane, f if h.get("local") else f"ssh -t {h['ssh']} {shlex.quote(f)}"); u.update(pane=pane, tab=tab)
 
 def cmd_launch(cfg, a):
     name = a.unit
@@ -528,9 +819,13 @@ def cmd_launch(cfg, a):
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
     of = next((u for u in units if u["name"] == (a.of or name)), None)
+    if a.model:   # an explicit model passes the same enabled and budget checks as a routed one (M1)
+        if a.model not in cfg.models: raise Err(f"unknown model {a.model}")
+        ok, w = model_ok(cfg, a.model)
+        if not ok: raise Err(f"model {a.model}: {w}")
     mname = a.model or pick_model(cfg, a.tier, a.kind, of.get("vendor") if of else None, a.host)
     mc = cfg.models[mname]
-    hs = probe_all(cfg); hosts = [a.host] if a.host else [n for n in cfg.hosts if n in mc.get("hosts", list(cfg.hosts))]
+    hs = probe_all(cfg); hosts, why_place = place(cfg, a, brief, mc, units, hs)
     best, bn, notes = None, 0, []
     for n in hosts:
         r, why = room(cfg, n, hs[n], units, a.kind == "cleanup")
@@ -539,120 +834,219 @@ def cmd_launch(cfg, a):
     if not best: raise Err("refused, no host has room (" + "; ".join(notes) + ")")
     hn = best; h = cfg.hosts[hn]; local = h.get("local", False)
     cwd = cfg.p("worktrees", "worktrees") / name
-    cwd = cwd if cwd.is_dir() else (Path(a.cwd) if a.cwd else cfg.root)
+    cwd = (Path(a.cwd) if a.cwd else cwd if cwd.is_dir() else cfg.root).resolve()
+    shared = [u["name"] for u in units if u.get("cwd") and Path(u["cwd"]).resolve() == cwd and u["name"] != name and cwd != cfg.root.resolve()]
+    if shared and not (local and a.kind in ("review", "audit")):
+        raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}; give the unit its own worktree (H9)")
+    if main_checkout(cwd) and not a.allow_main: raise Err(f"refused: {cwd} is a main checkout with linked worktrees; use a worktree (or --allow-main)")
     outd = cfg.p("out", "out") / name; outd.mkdir(parents=True, exist_ok=True)
     rbrief, rcwd = str(brief), str(cwd)
-    say(f"launch {name}: model={mname} host={hn} cwd={cwd}")
-    if not local:
-        root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
-        X(h, f"mkdir -p {rcwd} {root}/briefs {root}/out/{name}")
-        for src, dst in ((f"{cwd}/", f"{h['ssh']}:{rcwd}/"), (str(brief), f"{h['ssh']}:{rbrief}")):
-            cmd = ["rsync", "-a", "-e", " ".join(SSH), *EXCL, src, dst]
-            if DRY: say("+ " + shlex.join(cmd))
-            elif sh(cmd, timeout=600)[0]: raise Err("rsync to " + hn + " failed")
-    env = {"ORCH_ROLE": "agent", "ORCH_REPORT": str(outd / "REPORT.md")}
-    rep = outd / "REPORT.md"
-    if not rep.exists() and not DRY: rep.write_text("VERDICT: PENDING\n")
-    prompt = agent_prompt(cfg, name, rbrief, hn)
-    u = {"host": hn, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
-         "cwd": str(cwd), "rcwd": rcwd, "started": int(now())}
+    say(f"launch {name}: model={mname} host={hn} ({why_place}) cwd={cwd}")
+    budget = None
     if mc["kind"] == "api":
         budget = a.budget if a.budget is not None else cfg.prov[mc["provider"]].get("budget_per_unit", 15)
-        X(h, ensure_lanes(h))
-        if local:
-            cmd = shlex.join([str(cfg.root / mc["launcher"]), name, rbrief, rcwd, str(budget), mc["model"]])
-            rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {cmd}")
-        else: rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt)
-        if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
-        u.update(via="pueue", task=int(o.strip() or 0))
-        if not local and not DRY: ledger(cfg, mc, f"{name}.{u['task']}", "running", budget, name)
-    elif local:
-        pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd) if not DRY else ("pane", "tab")
-        if not DRY:
-            wait_shell(pane, name)
-            envs = {**env, **({"OPENCODE_CONFIG_CONTENT": json.dumps({"model": mc["model"]})} if mc["kind"] == "opencode" else {})}
-            herdr("pane", "run", pane, "; ".join(f"export {k}={shlex.quote(v)}" for k, v in envs.items()) + f"; echo env-'{name}'")
-            sh(["herdr", "pane", "wait-output", pane, "--match", f"env-{name}", "--timeout", "10000"], timeout=15)
-            r = sh(["herdr", "agent", "start", name, "--kind", mc["kind"], "--pane", pane, "--timeout", "90000", "--", *mc.get("args", [])], timeout=100)
-            if r[0]: raise Err("herdr agent start failed: " + r[2][:120])
-            herdr("agent", "prompt", name, prompt)
-            u.update(via="herdr", pane=pane, tab=tab, pid=findkey(herdr("pane", "process-info", "--pane", pane), "pid"))
-        else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
+        run = reserve_budget(cfg, mc, name, budget, write=False)   # local: fable-api.sh reserves under the same lock; remote: below
+    # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
+    u = {"host": hn, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
+         "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting"}
+    if DRY: say(f"+ bd create unit:{name}; bd update --status in_progress")
     else:
-        cli = {"claude": "claude", "codex": "codex", "opencode": "opencode run"}[mc["kind"]]
-        e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-        if mc["kind"] == "opencode": e += " OPENCODE_CONFIG_CONTENT=" + shlex.quote(json.dumps({"model": mc["model"]}))
-        inner = f"cd {shlex.quote(rcwd)} && env {e} {cli} {' '.join(mc.get('args', []))} {shlex.quote(prompt)}"
-        pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
-        rc, o, er = X(h, pre + f"tmux new -d -s orch-{name} {shlex.quote(inner)} && tmux display -p -t orch-{name} '#{{pane_pid}}'")
-        if rc: raise Err("tmux start failed: " + er.strip()[:100])
-        u.update(via="tmux", pid=int(o.strip() or 0))
+        u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
+        bd.run("update", u["id"], "--status", "in_progress"); bd.save(u)
+    env = {"ORCH_ROLE": "agent", "ORCH_REPORT": str(outd / "REPORT.md"), "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root)}
+    try:
+        if not local:
+            root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
+            env["ORCH_REPORT"] = f"{root}/out/{name}/REPORT.md"
+            X(h, f"mkdir -p {rcwd} {root}/briefs {root}/out/{name} {root}/run {root}/base")
+            cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
+            if DRY: say("+ " + shlex.join(cmd))
+            elif sh(cmd, timeout=900)[0]: raise Err("rsync to " + hn + " failed")
+            # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
+            X(h, f"rm -rf {root}/base/{name} && cp -a {rcwd} {root}/base/{name}", timeout=300)
+            X(h, f"cat > {root}/run/{name}.lane && chmod +x {root}/run/{name}.lane", inp=lane_runner(cfg, hn, h, name, rcwd))
+            X(h, f"cat > {rbrief}", inp=brief_header(cfg, hn, h, name, rcwd, local) + brief.read_text())
+            X(h, f"[ -s {root}/out/{name}/REPORT.md ] || echo 'VERDICT: PENDING' > {root}/out/{name}/REPORT.md")
+        rep = outd / "REPORT.md"
+        if not rep.exists() and not DRY: rep.write_text("VERDICT: PENDING\n")
+        prompt = agent_prompt(cfg, name, rbrief, hn)
+        u["rcwd"] = rcwd
+        if mc["kind"] == "api":
+            X(h, ensure_lanes(h))
+            if local:
+                cmd = shlex.join([str(cfg.root / mc["launcher"]), name, rbrief, rcwd, str(budget), mc["model"]])
+                rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {cmd}", env=env)
+            else:
+                run = reserve_budget(cfg, mc, name, budget, write=True); u["run"] = run
+                rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env)
+                if rc and not DRY: ledger(cfg, mc, run, "0", "done rc=launch-failed", name)
+            if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
+            u.update(via="pueue", task=int(o.strip() or 0))
+            unit_tab(cfg, u, mname, hn, h)
+        elif local:
+            pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd) if not DRY else ("pane", "tab")
+            u.update(pane=pane, tab=tab)
+            if not DRY:
+                wait_shell(pane, name)
+                envs = {**env, **({"OPENCODE_CONFIG_CONTENT": json.dumps({"model": mc["model"]})} if mc["kind"] == "opencode" else {})}
+                # the pane's shell inherited herdr's environment: drop what must not reach an agent, then set the unit's own
+                herdr("pane", "run", pane, "unset ANTHROPIC_API_KEY CLAUDE_CODE_MESSAGING_TOKEN HERDR_PANE_ID CLAUDE_CODE_SESSION_ID; "
+                      + "; ".join(f"export {k}={shlex.quote(v)}" for k, v in envs.items()) + f"; echo env-'{name}'")
+                sh(["herdr", "pane", "wait-output", pane, "--match", f"env-{name}", "--timeout", "10000"], timeout=15)
+                r = sh(["herdr", "agent", "start", name, "--kind", mc["kind"], "--pane", pane, "--timeout", "90000", "--", *mc.get("args", [])], timeout=100)
+                d = past_dialogs(name, pane)
+                if r[0] and d: raise Err("herdr agent start failed: " + (r[2] or d)[:160])
+                if d: raise Err(f"{name}: {d}")
+                herdr("agent", "prompt", name, prompt)
+                u.update(via="herdr", pid=findkey(herdr("pane", "process-info", "--pane", pane), "pid"))
+            else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
+        else:
+            cli = {"claude": "claude", "codex": "codex", "opencode": "opencode run"}[mc["kind"]]
+            e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+            if mc["kind"] == "opencode": e += " OPENCODE_CONFIG_CONTENT=" + shlex.quote(json.dumps({"model": mc["model"]}))
+            mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p MemoryMax={mm} -- " if mm else ""   # fixes5 item 7
+            inner = f"cd {shlex.quote(rcwd)} && exec env {e} {sd}{cli} {' '.join(mc.get('args', []))} {shlex.quote(prompt)}"
+            pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
+            rc, o, er = X(h, pre + f"tmux new -d -s orch-{name} {shlex.quote(inner)} && tmux display -p -t orch-{name} '#{{pane_pid}}'")
+            if rc: raise Err("tmux start failed: " + er.strip()[:100])
+            u.update(via="tmux", pid=int(o.strip() or 0))
+            if not DRY:
+                pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd)
+                herdr("pane", "run", pane, f"ssh -t {h['ssh']} tmux attach -t orch-{name}"); u.update(pane=pane, tab=tab)
+    except Err as ex:
         if not DRY:
-            pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd)
-            herdr("pane", "run", pane, f"ssh -t {h['ssh']} tmux attach -t orch-{name}"); u.update(pane=pane, tab=tab)
+            u["via"] = "failed"; bd.save(u); bd.comment(u["id"], f"{ts()} launch failed: {ex}")
+            bd.run("close", u["id"], "--reason", "launch failed")
+            if u.get("tab"): herdr("tab", "close", u["tab"])
+        raise
     if DRY: return
-    i = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["id"] = i; u["name"] = name
-    bd.save(u); bd.comment(i, f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); cfg.touch("changed")
-    chk = f"herdr {name}" if u["via"] == "herdr" else f"pid {u.get('pid') or 0}"
+    bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); cfg.touch("changed")
+    chk = f"herdr {name}" if u["via"] == "herdr" else f"pueue {hn}:{u['task']}" if u["via"] == "pueue" else f"tmux {hn}:orch-{name}"
     sh([str(cfg.p("board", "bin/board.sh")), "post", name, "status", f"launched ({mname}, {hn})"],
        env={"BOARD_MACHINE": hn, "BOARD_BRIEF": str(brief), "BOARD_CHECK": chk})
-    say(f"launched {name} on {hn} via {u['via']}")
+    say(f"launched {name} on {hn} via {u['via']}" + (f" (task {u['task']})" if u.get("task") is not None else ""))
 
 def get_unit(cfg, name):
     bd = Beads(cfg); u = next((u for u in bd.units() if u["name"] == name), None)
     if not u: raise Err(f"no open unit {name}")
     return bd, u
 
+# Every process of a unit: the tree under its task or pane, every process group in it, and any process anywhere whose
+# environment has ORCH_UNIT=<unit> (detached children: nohup, setsid, & disown). Printed as "pid pgid" lines (M12).
+UNIT_PROCS = r'''u=%(unit)s; me=$$; roots="%(roots)s"
+if [ -d /proc/1 ]; then
+  env_pids=$(grep -lsaz "^ORCH_UNIT=$u\$" /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3)
+fi   # macOS: the caller passes those pids in roots (mac_env_pids)
+ps -A -o pid=,ppid=,pgid= | awk -v seeds="$env_pids $roots" -v me=$me '
+  {p[$1] = $2; g[$1] = $3; kids[$2] = kids[$2] " " $1}
+  END {n = split(seeds, s, " "); for (i = 1; i <= n; i++) if (s[i] in p) q[s[i]] = 1
+       do {ch = 0; for (x in q) {m = split(kids[x], k, " "); for (j = 1; j <= m; j++) if (!(k[j] in q)) {q[k[j]] = 1; ch = 1}}} while (ch)
+       for (x in q) if (x != me && x > 1) print x, g[x]}'
+'''
+
+def mac_env_pids(unit):
+    """pids whose environment has ORCH_UNIT=<unit>. macOS ps -E appends the environment to the command line, so the command
+    (from plain ps) is cut off first: a command line that merely mentions the variable never matches."""
+    tab = lambda *f: {int(l.split(None, 1)[0]): (l.split(None, 1) + [""])[1] for l in sh(["ps", "-Aww", *f, "-o", "pid=,command="], timeout=10)[1].splitlines() if l.strip()}
+    P, E = tab(), tab("-E")
+    return [p for p, c in E.items() if p in P and c.startswith(P[p]) and f"ORCH_UNIT={unit}" in c[len(P[p]):].split()]
+
+def unit_procs(h, unit, roots=""):
+    if h.get("local"): roots = " ".join([roots, *map(str, mac_env_pids(unit))])
+    rc, o, e = hrun(h, UNIT_PROCS % {"unit": shlex.quote(unit), "roots": roots}, timeout=30)
+    return [tuple(map(int, l.split())) for l in o.splitlines() if re.fullmatch(r"\d+ \d+", l.strip())]
+
+def kill_unit(h, unit, roots=""):
+    """TERM every process group of the unit, then KILL what is left after 5 s. Never the caller's or pueued's group."""
+    ps = unit_procs(h, unit, roots)
+    if not ps: return 0
+    t = ps_table() if h.get("local") else {}
+    safe = {os.getpgid(0)} | {g for p, (pp, g, s, c) in t.items() if "pueued" in c}
+    groups = sorted({g for p, g in ps if g > 1 and g not in safe}); pids = sorted({p for p, g in ps})
+    for sig in ("TERM", "KILL"):
+        hrun(h, f"kill -{sig} {' '.join('-' + str(g) for g in groups)} {' '.join(map(str, pids))} 2>/dev/null; sleep {5 if sig == 'TERM' else 1}; true", timeout=30)
+        ps = unit_procs(h, unit, roots)
+        if not ps: return 0
+        pids = sorted({p for p, g in ps}); groups = sorted({g for p, g in ps if g > 1 and g not in safe})
+    return len(ps)
+
+def task_pid_roots(h, u):
+    """Root processes of a unit started before ORCH_UNIT was set: its pueue task's process (children of pueued whose command
+    names the unit), or its tmux/herdr pane process."""
+    if u.get("via") in ("herdr", "tmux") and u.get("pid"): return str(u["pid"])
+    rc, o, e = hrun(h, "ps -A -o pid=,ppid=,command= | awk -v u=" + shlex.quote(u["name"]) + " '$3 ~ /pueued$/ {d[$1]} {p[$1] = $2; for (i = 3; i <= NF; i++) if ($i == u) m[$1]} "
+                       "END {for (x in m) if (p[x] in d) print x}'")
+    return " ".join(o.split())
+
 def cmd_stop(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; via = u.get("via"); p = pueue(h)
     say(f"stop {u['name']} ({via} on {u['host']})")
-    if via == "pueue": X(h, f"{p} kill {u['task']}")
-    elif via == "tmux": X(h, f"tmux kill-session -t orch-{u['name']}")
-    elif u.get("pid"):
-        if DRY: say(f"+ kill {u['pid']}")
-        else:
-            try: os.kill(u["pid"], 15)
-            except OSError: pass
-    if DRY: return
+    roots = task_pid_roots(h, u) if not DRY else ""
+    if DRY: say(f"+ pueue kill / tmux kill-session; TERM then KILL every process group of {u['name']} (roots {roots or '-'}, env ORCH_UNIT)"); return
+    if via == "pueue": hrun(h, f"{p} kill {u['task']}")
+    elif via == "tmux": hrun(h, f"tmux kill-session -t orch-{u['name']}")
+    # its lane jobs (label unit:<name>) belong to it too
+    hrun(h, f"{p} status --json | python3 -c \"import json,sys; [print(i) for i, t in json.load(sys.stdin)['tasks'].items() if t.get('label') == 'unit:{u['name']}' and ('Running' in str(t['status']) or 'Queued' in str(t['status']))]\" | xargs -r {p} kill 2>/dev/null; true")
+    left = kill_unit(h, u["name"], roots)
+    if left: raise Err(f"{u['name']}: {left} process(es) still alive after TERM and KILL")
     for _ in range(10):
         ps = probe(u["host"], h)
-        if ps["ok"] and unit_state(u, {u["host"]: ps}, herdr_agents(cfg)) in ("gone", "done", "failed", "idle"): break
+        if ps["ok"] and unit_state(u, {u["host"]: ps}, herdr_agents(cfg)) in ("gone", "done", "failed", "idle", "unknown"): break
         time.sleep(1)
     else: raise Err(f"{u['name']} is still alive after stop")
     if u.get("pane") and via != "herdr": herdr("pane", "close", u["pane"])
-    bd.comment(u["id"], f"{ts()} stopped"); cfg.touch("changed"); say("stopped")
+    bd.comment(u["id"], f"{ts()} stopped (every process group of the unit ended)"); cfg.touch("changed"); say("stopped: no process of the unit is left")
 
 def cmd_collect(cfg, a):
     if ":" in a.unit: return collect_job(cfg, a.unit)
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]
     if h.get("local"): say("local unit: nothing to collect"); return
-    root = h["root"]; rsh = " ".join(SSH)
-    for src, dst in ((f"{h['ssh']}:{u['rcwd']}/", u["cwd"] + "/"), (f"{h['ssh']}:{root}/out/{u['name']}/", str(cfg.p("out", "out") / u["name"]) + "/")):
-        cmd = ["rsync", "-a", "-e", rsh, *EXCL, src, dst]
-        if DRY: say("+ " + shlex.join(cmd))
-        elif sh(cmd, timeout=600)[0]: raise Err(f"collect from {u['host']} failed (unreachable?)")
+    root = h["root"]; rsh = " ".join(SSH); n = u["name"]; od = cfg.p("out", "out") / n
+    # The agent's changes come back as a patch against the tree it was sent (base/<unit>), never as an rsync over the Mac
+    # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree.
+    ex = " ".join(f"-x {x}" for x in ("target", ".venv", "node_modules", "__pycache__", ".git"))
+    X(h, f"cd {shlex.quote(root)} && [ -d base/{n} ] && {{ diff -ruN {ex} base/{n} worktrees/{n} | sed -e 's#^--- base/{n}/#--- a/#' -e 's#^+++ worktrees/{n}/#+++ b/#' "
+         f"-e 's#^diff -ruN .* base/{n}/\\(.*\\) worktrees/{n}/.*#diff --git a/\\1 b/\\1#' > out/{n}/changes.patch; true; }}", timeout=300)
+    cmd = ["rsync", "-a", "-e", rsh, f"{h['ssh']}:{root}/out/{n}/", str(od) + "/"]
+    if DRY: say("+ " + shlex.join(cmd))
+    elif sh(cmd, timeout=600)[0]: raise Err(f"collect from {u['host']} failed (unreachable?)")
     mc = cfg.models.get(u.get("model"), {})
     if not DRY and u.get("via") == "pueue" and mc.get("kind") == "api" and not u.get("spent"):
-        try: cost = json.loads((cfg.p("out", "out") / u["name"] / "api.json").read_text()).get("total_cost_usd")
+        try: cost = json.loads((od / "api.json").read_text()).get("total_cost_usd")
         except Exception: cost = None
-        if cost is not None: ledger(cfg, mc, f"{u['name']}.{u['task']}", f"{cost}", f"done rc=0", u["name"]); u["spent"] = cost; bd.save(u)
+        if cost is not None: ledger(cfg, mc, u.get("run") or f"{n}.{u['task']}", f"{cost}", "done rc=0", n); u["spent"] = cost; bd.save(u)
     if not DRY: bd.comment(u["id"], f"{ts()} collected from {u['host']}"); cfg.touch("changed")
-    say("collected")
+    p = od / "changes.patch"
+    say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
+
+def own_tree(cfg, u, units):
+    """The unit has a worktree of its own: not the project root, not shared with another open unit."""
+    c = Path(u["cwd"]).resolve()
+    return c != cfg.root.resolve() and not any(Path(x.get("cwd", "/")).resolve() == c for x in units if x["id"] != u["id"])
 
 def cmd_close(cfg, a):
-    bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]
-    rc, o, e = sh(["git", "status", "--porcelain"], cwd=u["cwd"])
-    if rc == 0 and o.strip() and not a.force: raise Err(f"{u['cwd']} has uncommitted changes; commit and push, or --force")
-    rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=u["cwd"])
-    if rc == 0 and o.strip() != "0" and not a.force: raise Err("unpushed commits; push first, or --force")
-    say(f"close {u['name']}")
-    if u.get("pane"):
-        if DRY: say(f"+ herdr pane close {u['pane']}")
+    bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
+    mine = own_tree(cfg, u, units)
+    if a.force and not mine: raise Err(f"--force refused: {u['cwd']} is shared (project root or another open unit's cwd)")
+    if mine:
+        rc, o, e = sh(["git", "status", "--porcelain"], cwd=u["cwd"])
+        if rc == 0 and o.strip() and not a.force: raise Err(f"{u['cwd']} has uncommitted changes; commit and push, or --force")
+        rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=u["cwd"])
+        if rc == 0 and o.strip() != "0" and not a.force: raise Err("unpushed commits; push first, or --force")
+    elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
+        raise Err(f"{u['name']} has no final VERDICT line in out/{u['name']}/REPORT.md")
+    say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
+    if u.get("tab") or u.get("pane"):
+        if DRY: say(f"+ herdr tab close {u.get('tab') or u.get('pane')}")
+        elif u.get("tab"): herdr("tab", "close", u["tab"])
         else: herdr("pane", "close", u["pane"])
     if not h.get("local"):
-        root = h["root"]; X(h, f"cd {shlex.quote(root)} && rm -rf worktrees/{u['name']} briefs/{u['name']}.md out/{u['name']} run/{u['name']}.* && rmdir worktrees briefs out run 2>/dev/null; true")
-    if u.get("via") == "pueue": X(h, f"{pueue(h)} clean -g agents")
-    X({"local": True}, f"{shlex.quote(str(cfg.p('board', 'bin/board.sh')))} close {u['name']}")
+        root = h["root"]; n = u["name"]
+        others = [x["name"] for x in units if x["id"] != u["id"] and x.get("host") == u["host"] and x.get("rcwd") == u.get("rcwd")]
+        if others: say(f"keeping {u.get('rcwd')} on {u['host']}: open unit(s) {', '.join(others)} use it")
+        else: X(h, f"cd {shlex.quote(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
+    if u.get("via") == "pueue": X(h, f"{pueue(h)} remove {u['task']} 2>/dev/null; true")
+    X({"local": True}, f"{shlex.quote(str(cfg.p('board', 'bin/board.sh')))} close {u['name']} 2>/dev/null; true")
     if DRY: return
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
     say("closed")
@@ -677,26 +1071,46 @@ def ensure_lanes(h):
 
 def runs_dir(cfg, h): return str(cfg.f("runs")) if h.get("local") else f"{h['root']}/runs"
 
-ADMIT_LIB = r'''# orch admission (written by orch run on every call; each waiting job re-reads it every 15 s, so a rule change reaches
-# jobs already waiting). Admit while measured MemAvailable >= job_gb + reserve_gb, memory PSI some avg10 < 5, load1 < cores and
-# disk >= min_disk_gb (board 2026-11-11 14:44: measured room, not reservations; MemoryMax per job is only the runaway guard).
+def admit_lib(h):
+    """runs/admit.sh for host h, written by every orch run; each waiting job re-reads it every 15 s, so a rule change reaches jobs
+    already waiting, including those queued under older rules (they source it too). Admit while measured MemAvailable >=
+    reserve_gb + the measured per-job working set, memory PSI some avg10 < 5, load1 < 1.5 x cores (the same load rule as
+    orch capacity) and disk >= min_disk_gb. The working set is the largest anonymous memory (memory.stat anon: page cache is
+    reclaimable and not counted, it filled memory.peak up to the cap) of the orch jobs running now (podman hosts: of the
+    orch-run/slurp-run containers), remembered in runs/ws_mb; with nothing measured yet, job_ws_gb (default half
+    of job_gb). It is clamped to job_gb, which stays each job's MemoryMax: the runaway guard, not the admission rule (audit H6)."""
+    cap = int(h.get("job_gb", 2) * 1024); ws0 = int(h.get("job_ws_gb", h.get("job_gb", 2) / 2) * 1024)
+    pod = h.get("runner") == "podman"
+    return (ADMIT_LIB % {"reserve": int(h.get("reserve_gb", 2) * 1024), "cap": cap, "ws0": ws0, "load10": int(h.get("cores", 4) * 15),
+                         "cores": h.get("cores", 4), "disk": h.get("min_disk_gb", 10),
+                         "peaks": ('for i in $(podman ps -q --no-trunc --filter name=orch-run- --filter name=slurp-run- 2>/dev/null); do '
+                                   'awk \'/^anon /{print $2}\' $US/libpod-$i.scope/memory.stat 2>/dev/null; done' if pod else
+                                   'for s in $AS/orch-*.scope; do awk \'/^anon /{print $2}\' $s/memory.stat 2>/dev/null; done')})
+
+ADMIT_LIB = r'''# orch admission for this host (written by orch run; see admit_lib in orch.py). Re-read by every waiting job each poll.
+U=$(id -u); AS=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/app.slice; US=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/user.slice
 admit_ok() {
   avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
   psi=$(awk '/^some/{sub("avg10=","",$2); print int($2)}' /proc/pressure/memory 2>/dev/null); psi=${psi:-0}
-  load=$(cut -d. -f1 /proc/loadavg)
+  load=$(awk '{print $1}' /proc/loadavg); load10=$(awk '{printf "%%d", $1 * 10}' /proc/loadavg)
   d=$(df -Pk $RD | awk 'NR==2{print int($4/1048576)}')
-  why="MemAvailable ${avail} MB (need ${need_mb}), PSI ${psi}, load ${load} (cores ${cores}), disk ${d} GB (floor ${mindisk})"
-  [ "$avail" -ge "$need_mb" ] && [ "$psi" -lt 5 ] && [ "$load" -lt "$cores" ] && [ "$d" -ge "$mindisk" ]
+  pk=$( { %(peaks)s; } | awk '{v = int($1 / 1048576); if (v > m) m = v} END {print m + 0}')
+  if [ "$pk" -gt 0 ]; then echo $pk > $RD/ws_mb.$$ && mv $RD/ws_mb.$$ $RD/ws_mb; ws=$pk; else ws=$(cat $RD/ws_mb 2>/dev/null); fi
+  ws=${ws:-%(ws0)d}; [ "$ws" -gt %(cap)d ] && ws=%(cap)d; [ "$ws" -lt 256 ] && ws=256
+  need_mb=$((%(reserve)d + ws))
+  why="MemAvailable ${avail} MB (need ${need_mb} = reserve %(reserve)d + working set ${ws}), PSI ${psi}, load ${load} (limit 1.5 x %(cores)s cores), disk ${d} GB (floor %(disk)d)"
+  [ "$avail" -ge "$need_mb" ] && [ "$psi" -lt 5 ] && [ "$load10" -lt %(load10)d ] && [ "$d" -ge %(disk)d ]
 }
 '''
 
-ADMIT_LINUX = r'''# Admission: one job at a time under admit.lock, by the rule in runs/admit.sh (re-read each poll). An admitted job keeps the lock
+ADMIT_LINUX = r'''# Admission: one job at a time under admit.lock, by the host's rule in runs/admit.sh (re-read each poll; admit_lib). An admitted job keeps the lock
 # for 60 s after its scope exists, so its memory shows in MemAvailable before the next job is judged. A jobs-lane job yields
 # while a gates-lane job waits.
 need_mb=%(need)d cores=%(cores)d lane=%(lane)s mindisk=%(disk)d
 AS=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice
 gates_waiting() { for f in $RD/*.gwait; do [ -e "$f" ] && kill -0 "$(cat $f)" 2>/dev/null && return 0; done; return 1; }
 W=$R.wait; [ $lane = gates ] && W=$R.gwait; echo $$ > $W
+trap 'rm -f $W' EXIT; trap 'rm -f $W; exit 143' TERM INT HUP   # a job killed while waiting leaves no waiter file (L1)
 exec 7>>$RD/admit.lock
 while :; do
   if [ $lane = gates ] || ! gates_waiting; then
@@ -708,14 +1122,15 @@ while :; do
   fi
   sleep 15
 done
-rm -f $W
+rm -f $W; trap - EXIT TERM INT HUP
 echo "orch: admitted: $why"
 started() { for i in $(seq 20); do [ -d $AS/orch-%(jid)s.scope ] && break; kill -0 $1 2>/dev/null || break; sleep 1; done
   sleep 60 </dev/null >/dev/null 2>&1 & exec 7>&-; }
 '''
 
-def job_script(cfg, hn, h, a, name, cmd, jid):
-    """The bash script pueue runs on the host. Output is tee'd to <runs>/<jid>.log, the exit code written to <jid>.rc."""
+def job_script(cfg, hn, h, a, name, cmd, jid, wd=None):
+    """The bash script pueue runs on the host. Output is tee'd to <runs>/<jid>.log, the exit code written to <jid>.rc.
+    wd: the tree on the host (a remote agent's copy); default the synced worktree of that name."""
     q = shlex.quote; rd = runs_dir(cfg, h); sub = a.subdir or "."
     head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={q(rd)}; R=$RD/{jid}\n"
     if h.get("local"):
@@ -735,18 +1150,19 @@ def job_script(cfg, hn, h, a, name, cmd, jid):
         if h.get("runner") == "podman":   # midgard: run.sh's container settings, the job capped at job_gb (run.sh is not used)
             F = h.get("fleet", "/srv/slurp-fleet"); inner = f"(cd processing && uv sync --locked -q) && cd {sub} && {cmd}"
             hw = ("--device /dev/bus/usb --group-add keep-groups --mount type=tmpfs,destination=/run/slurp,tmpfs-mode=0700,chown=true " if a.usb else "")
-            body = (f"[ -d {F}/worktrees/{name} ] || {{ echo 'orch: no worktree {name} on {hn}'; exit 2; }}\nmkdir -p {F}/tmp/{name}\n"
+            hw_ = wd or f"{F}/worktrees/{name}"; cw = "/f" + hw_[len(F):] if hw_.startswith(F + "/") else f"/f/worktrees/{name}"
+            body = (f"[ -d {hw_} ] || {{ echo 'orch: no worktree {hw_} on {hn}'; exit 2; }}\nmkdir -p {F}/tmp/{name}\n"
                     + (f"exec 8>{F}/run.usb.lock; flock 8\n" if a.usb else "") + adm +
                     f"printf '%s orch-run start [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {F}/log/fleet.log\n"
                     f"{scope} nice -n 15 ionice -c 3 podman run --rm --init --name orch-run-{jid} {hw}"
                     f"--memory={cap}m --memory-swap={cap}m --cpus=2 --pids-limit=4096 --cpu-shares=256 --userns=keep-id --security-opt label=disable "
-                    f"--tmpfs /dev/shm:rw,exec,nosuid,nodev,size=2g -v {F}:/f -w /f/worktrees/{name} -e CARGO_HOME=/f/cache/cargo -e RUSTC_WRAPPER=sccache "
+                    f"--tmpfs /dev/shm:rw,exec,nosuid,nodev,size=2g -v {F}:/f -w {cw} -e CARGO_HOME=/f/cache/cargo -e RUSTC_WRAPPER=sccache "
                     f"-e SCCACHE_DIR=/f/cache/sccache -e SCCACHE_CACHE_SIZE=8G -e CARGO_BUILD_JOBS=2 -e UV_CACHE_DIR=/f/cache/uv -e npm_config_store_dir=/f/cache/pnpm "
                     f"-e TMPDIR=/f/tmp/{name} -e SLURP_SCENE_CACHE=/f/cache/scenes -e PATH=/f/cache/cargo/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin "
                     f"{h.get('image', 'localhost/slurp-build:2')} bash -c {q(inner)} 7>&- &\npid=$!; started $pid; wait $pid; rc=$?\n"
                     f"printf '%s orch-run end [%s] {jid} exit %s\\n' \"$(date '+%F %T')\" {name} $rc >> {F}/log/fleet.log\nexit $rc\n")
         else:   # asgard: build-env.sh (sccache, SLURP_ARAVIS_TEST_ADDRS, TMPDIR, scene cache) and the processing venv, as linux-test.sh did
-            wd = f"{h.get('worktrees', '$HOME/slurp-fleet/worktrees')}/{name}"
+            wd = wd or f"{h.get('worktrees', '$HOME/slurp-fleet/worktrees')}/{name}"
             body = (f"{h.get('run_env', '')}\ncd {wd} && (cd processing && uv sync --locked -q) && cd {q(sub)} || exit $?\n" + adm +
                     f"printf '%s orch-run [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {h.get('fleet_log', '/dev/null')}\n"
                     f"{scope} nice -n 10 bash -c {q(cmd)} 7>&- &\npid=$!; started $pid; wait $pid\n")
@@ -787,11 +1203,17 @@ def task_rc(t):
 
 def finish_job(cfg, hn, h, tid, jid, quiet=False):
     """Wait for the task (retrying through ssh drops), print its log, return its exit code."""
+    miss = 0
     while True:
         if h.get("local"): rc = subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {tid}"]).returncode
         else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h)} wait -q {tid}"], stdin=subprocess.DEVNULL).returncode
         t = task_status(h, tid)
         if task_rc(t) is not None: break
+        miss = miss + 1 if t is None and rc != 255 else 0
+        if miss >= 5:   # the task is gone (removed or cleaned): its rc file, else give up (M16)
+            r2, o2, _ = hrun(h, f"cat {runs_dir(cfg, h)}/{jid}.rc 2>/dev/null")
+            if o2.strip().lstrip("-").isdigit(): return int(o2.strip())
+            print(f"orch: {hn} task {tid} is gone and left no exit code", file=sys.stderr); return 255
         print(f"orch: {hn} task {tid} not done yet (wait exit {rc}); retrying", file=sys.stderr); time.sleep(30 if rc == 255 or t is None else 5)
     rd = runs_dir(cfg, h)
     if not quiet:
@@ -819,9 +1241,9 @@ def cmd_run(cfg, a):
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True)
     rc, o, e = hrun(h, f"mkdir -p {rd} && cat > {rd}/{jid}.sh && {ensure_lanes(h)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
     if not rc and not h.get("local"):
-        rc, o, e = hrun(h, f"cat > {rd}/.admit.sh.$$ && mv {rd}/.admit.sh.$$ {rd}/admit.sh", inp=ADMIT_LIB)
+        rc, o, e = hrun(h, f"cat > {rd}/.admit.sh.$$ && mv {rd}/.admit.sh.$$ {rd}/admit.sh", inp=admit_lib(h))
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
-    label = unit or f"run:{name}"
+    label = f"unit:{unit}" if unit else f"run:{name}"   # unit:<name>: check reports it once that unit is closed (M3)
     rc, o, e = hrun(h, f"{pueue(h)} add -g {a.lane} -l {shlex.quote(label)} -w {rd} --print-task-id"
                        + (f" -o {a.priority}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- bash {rd}/{jid}.sh")
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
@@ -900,6 +1322,9 @@ def lane_findings(cfg, hs):
                 except ValueError: continue
                 if st(x) in ("Queued", "Running") and now() - since > lane_age(cfg, lane) * 60:
                     F.append((f"age:{n}:{x['id']}", f"{n}:{x['id']} {lane} {x.get('label')} {st(x).lower()} {int((now() - since) / 60)} min, over the {lane_age(cfg, lane)} min limit"))
+        if int(p.get("old_rule", 0) or 0):
+            F.append((f"old-rule:{n}", f"{n}: {p['old_rule']} job(s) still wait under the old cap rule ({p.get('old_rule_jobs', '').strip()[:120]}): "
+                                        "re-queue them with orch run, then stop the old tasks"))
         lg, lr = int(p.get("legacy_wait", 0) or 0), int(p.get("legacy_run", 0) or 0)
         if lg and lr < h.get("legacy_slots", 3):
             F.append((f"stalled:{n}:legacy", f"{n} old-script queue STALLED: {lg} waiting, {lr} of {h.get('legacy_slots', 3)} running (its own admission holds them)"))
@@ -909,39 +1334,282 @@ def lane_findings(cfg, hs):
                 F.append((f"idle:{f}:{lane}:vs", f"{f} has free {lane} slots while {', '.join(ns)} has a backlog"))
     return F
 
-SECRETS = [re.compile(x.encode()) for x in ("sk" + "-ant-[A-Za-z0-9_-]{20,}", "sk" + "-or-[A-Za-z0-9_-]{20,}", "gh" + "p_[A-Za-z0-9_-]{20,}", "xo" + "x[A-Za-z0-9_-]{10,}",
+SECRETS = [re.compile(x.encode()) for x in ("sk" + "-ant-[A-Za-z0-9_-]{20,}", "sk" + "-or-[A-Za-z0-9_-]{20,}", "sk" + "-proj-[A-Za-z0-9_-]{20,}",
+    "\\bsk" + "-[a-f0-9]{32,}\\b", "AK" + "IA[0-9A-Z]{16}", "gh" + "p_[A-Za-z0-9_-]{20,}", "xo" + "x[A-Za-z0-9_-]{10,}",
     # a real PEM block only: the dashed BEGIN line, then a base64 line (a mention of the words in prose is not a key)
     "-----" + "BEGIN( [A-Z0-9]+)* PRIV" + "ATE KEY-----\\r?\\n[A-Za-z0-9+/=]{16,}\\r?$")]
 SECRETS[-1] = re.compile(SECRETS[-1].pattern, re.M)
 
 def cmd_commit_state(cfg, a):
-    rc, o, e = sh(["git", "ls-files", "-m", "-o", "--exclude-standard", "-z"], cwd=cfg.root)
-    if rc: raise Err("git ls-files failed: " + e.strip()[:80])
+    """Stage everything, scan exactly what is staged (L9), commit and push; unstage again if a secret is found."""
+    if DRY: say("+ git add -A; scan staged files; git commit; git push"); return
+    rc, o, e = sh(["git", "add", "-A"], cwd=cfg.root, timeout=120)
+    if rc: raise Err("git add failed: " + e.strip()[:80])
+    rc, o, e = sh(["git", "diff", "--cached", "--name-only", "-z"], cwd=cfg.root)
     paths = [x for x in o.split("\0") if x]
     hit = []
     for x in paths:
         try: b = (cfg.root / x).read_bytes()
         except OSError: continue
         if any(r.search(b) for r in SECRETS): hit.append(x)
-    if hit: raise Err("refused, possible secrets in: " + ", ".join(hit))
+    if hit: sh(["git", "reset", "-q"], cwd=cfg.root); raise Err("refused (unstaged again), possible secrets in: " + ", ".join(hit))
     if not paths: say("nothing to commit"); return
-    for cmd in (["git", "add", "-A"], ["git", "commit", "-m", a.message], ["git", "push"]):
-        if DRY: say("+ " + shlex.join(cmd)); continue
+    for cmd in (["git", "commit", "-m", a.message], ["git", "push"]):
         rc, o, e = sh(cmd, cwd=cfg.root, timeout=120)
         if rc: raise Err(f"{shlex.join(cmd[:2])} failed: {(e or o).strip()[-200:]}")
-    say(f"committed {len(paths)} path(s)" + ("" if DRY else " and pushed"))
+    say(f"committed {len(paths)} path(s) and pushed")
 
 # ---------------------------------------------------------------- hooks (Claude Code and Codex share one format)
-MUT = r"(\b(rm|mv|cp|kill|pkill|killall)\b|\bsed\s+(-\S*i|--in-place)|\bperl\s+-\S*i|\bgit\b[^;|&\n]*?\b(add|commit|push|reset|checkout)\b|(?<![0-9&>])>>?\s*(?!/dev/null)[\"']?[$/.\w])"
-DENY = [(r"\brm\s+(-\S*[rR]|--recursive)", "rm -r by hand"), (r"(^|[;&|(]\s*)(sudo\s+)?(kill|pkill|killall)\b", "kill by hand: use orch stop"),
-        (r"\bsed\s+(-\S*i|--in-place)|\bperl\s+-\S*i", "in-place edit"), (r"sparse-checkout", "sparse-checkout"),
-        (r"(?s)\b(for|while)\b.*\bworktrees?\b.*" + MUT + r"|git worktree list.*\|\s*(xargs|while)\b.*" + MUT, "loop that changes worktrees"),
-        (r"\bssh\b.*\b(rm|kill|pkill|mv|reboot|shutdown|mkfs|dd|systemctl\s+(stop|restart)|git\s+(reset|clean|checkout))\b", "destructive ssh")]
+# PreToolUse shell rules (audit H2, M5). The command is parsed, not pattern-matched: heredoc bodies are data unless fed to a
+# shell or ssh; $( ), backticks and <( ) are judged as commands of their own; the rest is split on ; && || | & ( ) and newlines,
+# and every segment is judged by its command word after wrappers (sudo, env, timeout, nice, nohup, xargs, command, exec, ...)
+# and an absolute path are stripped. bash/sh/zsh -c, eval and ssh <host> <cmd> are judged recursively. Nothing passes because
+# it starts with orch, bd, pueue, herdr or board.sh: those tools have their own allow-lists below.
+BD_OK = set("list show ready create update close reopen comment comments note label tag assign q query search find-duplicates duplicates count "
+            "status statuses types stale history diff lint dep graph children blocked epic remember recall memories forget prime info where "
+            "context help version heartbeat defer undefer priority promote set-state state unclaim reclaim todo kv".split())
+PUEUE_OK = {"status", "log", "follow", "wait", "help", "group"}
+HERDR_NO = {("pane", "close"), ("pane", "run"), ("pane", "send-text"), ("pane", "send-keys"), ("agent", "send-keys"), ("tab", "close"),
+            ("workspace", "close"), ("worktree", "remove"), ("server", "stop")}
+WRAP = {"sudo": "-u -g -h -p -C", "doas": "-u", "env": "-u -C -S", "timeout": "-s -k --signal --kill-after", "nice": "-n", "nohup": "",
+        "command": "", "exec": "-a", "builtin": "", "time": "", "caffeinate": "-t -w", "stdbuf": "-i -o -e", "setsid": "", "ionice": "-c -n -p",
+        "xargs": "-n -P -I -L -s -E -d -a --max-args --max-procs --replace --delimiter --arg-file", "chronic": "", "unbuffer": ""}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+INTERP = re.compile(r"^(python[\d.]*|perl|ruby|node|osascript)$")
+INTERP_BAD = re.compile(r"rmtree|os\.(remove|unlink|rmdir|kill|killpg)|\.unlink\(|unlink\s*\(|\bsignal\.SIG|subprocess.*\b(rm|kill|pkill)\b|system\s*\(.*\b(rm|kill)\b|do shell script.*\b(rm|kill)\b")
+DESTRUCT = {"kill": "kill by hand: use orch stop", "pkill": "kill by hand: use orch stop", "killall": "kill by hand: use orch stop",
+            "truncate": "truncating files", "shred": "shred", "dd": "dd", "reboot": "reboot", "shutdown": "shutdown", "halt": "halt",
+            "diskutil": "diskutil", "srm": "srm"}
+LOOP_RX = re.compile(r"(?s)\b(for|while|until)\b|\bxargs\b|\bparallel\b")
 
-def strip_heredocs(c):
-    """Drop heredoc bodies written to a file under briefs/ or out/: their words are text, not commands."""
-    return re.sub(r"(?ms)^([^\n]*<<-?\s*['\"]?(\w+)['\"]?[^\n]*)\n.*?^\s*\2\s*$",
-                  lambda m: m.group(1) if re.search(r">>?\s*\S*\b(briefs|out)/", m.group(1)) else m.group(0), c)
+def scan_subst(c):
+    """Replace $( ), backticks, <( ) and >( ) outside single quotes by a placeholder; turn unquoted newlines into ';' and drop
+    comments. Returns (text, [inner texts])."""
+    out, inner, i, q = [], [], 0, None
+    while i < len(c):
+        ch = c[i]
+        if q == "'":
+            out.append(ch); q = None if ch == "'" else q; i += 1; continue
+        if ch == "\\" and i + 1 < len(c): out.append(c[i:i + 2]); i += 2; continue
+        if ch == "'" and q is None: q = "'"; out.append(ch); i += 1; continue
+        if ch == '"': q = None if q == '"' else ('"' if q is None else q); out.append(ch); i += 1; continue
+        if q is None and ch == "#" and (i == 0 or c[i - 1] in " \t\n;&|("):
+            while i < len(c) and c[i] != "\n": i += 1
+            continue
+        if q is None and ch == "\n": out.append(" ; "); i += 1; continue
+        if (ch == "$" or (ch in "<>" and q is None)) and c[i + 1:i + 2] == "(" and c[i + 2:i + 3] != "(":
+            d, j, qq = 1, i + 2, None
+            while j < len(c) and d:
+                x = c[j]
+                if qq: qq = None if x == qq else qq
+                elif x in "'\"": qq = x
+                elif x == "(": d += 1
+                elif x == ")": d -= 1
+                j += 1
+            inner.append(c[i + 2:j - 1]); out.append(" __SUBST__ "); i = j; continue
+        if ch == "`":
+            j = c.find("`", i + 1); j = len(c) if j < 0 else j
+            inner.append(c[i + 1:j]); out.append(" __SUBST__ "); i = j + 1; continue
+        out.append(ch); i += 1
+    return "".join(out), inner
+
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w.-]*)\1")
+
+def split_heredocs(c):
+    """(command text without heredoc bodies, [(line that opened it, body)])."""
+    lines, out, docs, i = c.split("\n"), [], [], 0
+    while i < len(lines):
+        l = lines[i]; out.append(l); i += 1
+        for m in HEREDOC.finditer(l):
+            body = []
+            while i < len(lines) and lines[i].strip() != m.group(2): body.append(lines[i]); i += 1
+            i += 1; docs.append((l, "\n".join(body)))
+    return "\n".join(out), docs
+
+def words_of(text):
+    lx = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>"); lx.whitespace_split = True; lx.commenters = ""
+    try: return list(lx)
+    except ValueError: return text.split()
+
+def strip_wrappers(w):
+    """Drop keywords, assignments and wrapper commands in front of the real command word."""
+    while w:
+        b = os.path.basename(w[0])
+        if w[0] in ("do", "then", "else", "elif", "if", "while", "until", "!", "{", "}", "time", "done", "fi", "esac"): w = w[1:]; continue
+        if re.match(r"^[A-Za-z_]\w*=", w[0]): w = w[1:]; continue
+        if b in WRAP:
+            val = set(WRAP[b].split()); w = w[1:]
+            while w and (w[0].startswith("-") or (b == "env" and "=" in w[0]) or (b == "timeout" and re.match(r"^[\d.]+[smhd]?$", w[0]))):
+                o = w.pop(0)
+                if o in val and w: w.pop(0)
+                if b == "timeout" and re.match(r"^[\d.]+[smhd]?$", o): break
+            continue
+        break
+    return w
+
+def segments(text):
+    """Split parsed words into command segments, with the redirection targets of each."""
+    segs, cur, redir, w = [], [], [], words_of(text)
+    i = 0
+    while i < len(w):
+        t = w[i]
+        if t in (";", "&&", "||", "|", "&", "(", ")", ";;", "|&", "&;"):
+            if cur or redir: segs.append((cur, redir))
+            cur, redir = [], []; i += 1; continue
+        if re.fullmatch(r"\d*(>|>>|>\||&>|&>>)", t) or (t.endswith(">") and set(t) <= set("0123456789&>|")):
+            if i + 1 < len(w) and not w[i + 1] in ("&",):
+                tgt = w[i + 1]
+                if tgt == "&" and i + 2 < len(w): i += 3; continue   # 2>&1 style
+                redir.append(tgt); i += 2; continue
+            i += 1; continue
+        if t in (">&", "<&", "<", "<<", "<<<", "<<-", "<>"): i += 2; continue
+        if re.fullmatch(r"\d*>&\d*-?|\d*<&\d*-?", t): i += 1; continue
+        cur.append(t); i += 1
+    if cur or redir: segs.append((cur, redir))
+    return segs
+
+def write_ok(cfg, cwd, tgt, ok_dirs):
+    """A redirection target the orchestrator may write: outside the project and the worktrees, or inside an allowed path."""
+    if tgt.startswith("/dev/") or tgt in ("__SUBST__", "-") or tgt.startswith("$"): return True
+    p = Path(os.path.expanduser(tgt)); p = (p if p.is_absolute() else Path(cwd) / p).resolve()
+    guarded = [cfg.root.resolve(), cfg.p("worktrees", "worktrees").resolve()]
+    if not any(p == g or g in p.parents for g in guarded): return True
+    return any(p == o or o in p.parents for o in ok_dirs)
+
+def judge_words(cfg, w, cwd, ok_dirs, remote, depth):
+    w = strip_wrappers(w)
+    if not w: return None
+    b = os.path.basename(w[0]); args = w[1:]
+    if b in SHELLS:
+        for i, x in enumerate(args):
+            if x == "-c" or (x.startswith("-") and not x.startswith("--") and "c" in x[1:]):
+                return judge(cfg, args[i + 1] if i + 1 < len(args) else "", cwd, ok_dirs, remote, depth + 1)
+        return None
+    if b == "eval": return judge(cfg, " ".join(args), cwd, ok_dirs, remote, depth + 1)
+    if b in ("ssh", "mosh"):
+        i = 0
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if re.fullmatch(r"-[bcDEeFIiJLlmOoPpQRSWw]", args[i]) else 1
+        rest = args[i + 1:]
+        return judge(cfg, " ".join(rest), cwd, ok_dirs, True, depth + 1) if rest else None
+    if b in DESTRUCT: return DESTRUCT[b]
+    if b in ("mkfs",) or b.startswith("mkfs."): return "mkfs"
+    if b == "rm" and any(x in ("-r", "-R", "--recursive") or (re.fullmatch(r"-[A-Za-z]+", x) and re.search(r"[rR]", x)) for x in args if x != "--"):
+        return "rm -r by hand"
+    if b == "sed" and any(x.startswith("--in-place") or re.fullmatch(r"-[A-Za-z]*i\S*", x) for x in args): return "in-place edit"
+    if b == "perl" and any(re.fullmatch(r"-\w*i\S*", x) for x in args): return "in-place edit"
+    if INTERP.match(b):
+        code = " ".join(args[i + 1] for i, x in enumerate(args[:-1]) if x in ("-c", "-e", "-E"))
+        if INTERP_BAD.search(code): return f"destructive {b} one-liner"
+    if b == "find" and any(x in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for x in args):
+        if "-delete" in args: return "find -delete"
+        k = next(i for i, x in enumerate(args) if x in ("-exec", "-execdir", "-ok", "-okdir"))
+        if k + 1 < len(args) and os.path.basename(args[k + 1]) in ("rm", "mv", "unlink", "shred", "truncate", "rmdir"): return f"find -exec {os.path.basename(args[k + 1])}"
+        why = judge_words(cfg, [x for x in args[k + 1:] if x not in (";", "+", "{}")], cwd, ok_dirs, remote, depth + 1)
+        if why: return "find -exec: " + why
+    if b == "rsync" and any(x.startswith(("--delete", "--remove-source-files")) for x in args): return "rsync --delete by hand"
+    if b == "git":
+        i = 0
+        while i < len(args) and args[i].startswith("-"): i += 2 if args[i] in ("-C", "-c", "--git-dir", "--work-tree") else 1
+        sub, ga = (args[i], args[i + 1:]) if i < len(args) else ("", [])
+        if sub == "reset" and any(x in ("--hard", "--merge", "--keep") for x in ga): return "git reset --hard"
+        if sub == "clean": return "git clean"
+        if sub == "push" and any(x in ("-f", "--force", "--mirror", "--delete", "-d", "--prune") or x.startswith(("--force", "+")) or (x.startswith(":") and len(x) > 1) for x in ga): return "git push --force/--delete"
+        if sub in ("checkout", "switch") and any(x in ("--", ".", "-f", "--force", "--discard-changes") for x in ga): return f"git {sub} that discards changes"
+        if sub == "restore": return "git restore"
+        if sub == "branch" and any(x in ("-D", "--delete", "-d", "-f", "--force") for x in ga): return "git branch delete"
+        if sub == "stash" and ga[:1] and ga[0] in ("drop", "clear"): return "git stash drop"
+        if sub == "worktree" and ga[:1] and ga[0] in ("remove", "prune"): return "git worktree remove"
+        if sub == "sparse-checkout": return "sparse-checkout"
+        if sub in ("filter-branch", "filter-repo", "update-ref", "gc", "prune"): return f"git {sub}"
+        if sub == "reflog" and ga[:1] and ga[0] in ("expire", "delete"): return "git reflog expire"
+    if b == "pueue":
+        i = 0
+        while i < len(args) and args[i].startswith("-"): i += 2 if args[i] in ("-c", "--config", "-p", "--profile") else 1
+        sub = args[i] if i < len(args) else "status"
+        if sub not in PUEUE_OK or (sub == "group" and len(args) > i + 1 and not args[i + 1].startswith("-")):
+            return f"pueue {sub} by hand: use orch run/stop/close (pueue limits are orch's)"
+    if b == "bd":
+        sub = next((x for x in args if not x.startswith("-")), "")
+        if sub and sub not in BD_OK: return f"bd {sub} by hand"
+    if b == "herdr":
+        a2 = [x for x in args if not x.startswith("-")][:2]
+        if tuple(a2) in HERDR_NO: return f"herdr {' '.join(a2)} by hand: orch launch/stop/close manage panes"
+    if b == "board.sh" and args[:1] == ["close"]: return "board.sh close by hand: orch close does it"
+    if b == "orch" and args[:1] == ["close"] and "--force" in args: return "orch close --force (owner: never on shared repos)"
+    if b == "launchctl" and args[:1] and args[0] in ("bootout", "remove", "unload", "kill", "disable"): return f"launchctl {args[0]}"
+    if b == "systemctl" and any(x in ("stop", "restart", "kill", "disable", "mask", "reboot", "poweroff") for x in args): return "systemctl stop/restart"
+    if b in ("podman", "docker") and args[:1] and args[0] in ("rm", "kill", "stop", "rmi", "prune", "system", "volume", "restart"): return f"{b} {args[0]} by hand"
+    if b == "tmux" and any(x.startswith("kill-") for x in args): return "tmux kill by hand: use orch stop"
+    return None
+
+GIT_MUT = {"add", "commit", "push", "reset", "checkout", "switch", "clean", "stash", "merge", "rebase", "pull", "am", "apply", "cherry-pick", "revert", "rm", "mv"}
+
+def git_sub(args):
+    i = 0
+    while i < len(args) and args[i].startswith("-"): i += 2 if args[i] in ("-C", "-c", "--git-dir", "--work-tree") else 1
+    return args[i] if i < len(args) else ""
+
+MUTATORS = {"rm", "mv", "cp", "ln", "rsync", "touch", "chmod", "chown", "install", "rmdir", "unlink", "tee"}
+
+def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
+    """Why the shell command c is refused, or None."""
+    if depth > 6: return "command nested too deeply to judge"
+    text, docs = split_heredocs(c)
+    for line, body in docs:   # a heredoc fed to a shell or ssh is commands; any other is data
+        lw = strip_wrappers(words_of(scan_subst(line.split("<<")[0])[0]))
+        if lw and (os.path.basename(lw[0]) in SHELLS or os.path.basename(lw[0]) in ("ssh", "eval")) and not any(x == "-c" for x in lw):
+            why = judge(cfg, body, cwd, ok_dirs, remote or os.path.basename(lw[0]) == "ssh", depth + 1)
+            if why: return why
+        elif lw and INTERP.match(os.path.basename(lw[0])) and INTERP_BAD.search(body): return f"destructive {os.path.basename(lw[0])} script"
+    text, inner = scan_subst(text)
+    for x in inner:
+        why = judge(cfg, x, cwd, ok_dirs, remote, depth + 1)
+        if why: return why
+    loop = bool(LOOP_RX.search(text)) and re.search(r"\bworktrees?\b", text)
+    for w, redir in segments(text):
+        if w and w[0] == "cd" and len(w) > 1 and not remote: cwd = str((Path(cwd) / os.path.expanduser(w[1])).resolve())
+        if w and w[0] in ("for", "case", "select", "function", "in"): continue
+        why = judge_words(cfg, w, cwd, ok_dirs, remote, depth)
+        if why: return why
+        if not remote:
+            for t in redir:
+                if not write_ok(cfg, cwd, t, ok_dirs): return f"writing {t} by hand"
+        sw = strip_wrappers(w)
+        if loop and sw and (os.path.basename(sw[0]) in MUTATORS or (sw[0] == "git" and git_sub(sw[1:]) in GIT_MUT)):
+            return "loop that changes worktrees"
+    return None
+
+def edit_ok_dirs(cfg):
+    """Paths the orchestrator may write: its state dir, briefs, orch.toml, and the project's status checklist and old state docs
+    (paths.checklist, paths.state_docs) (audit M7)."""
+    ok = [cfg.state, cfg.p("briefs", "briefs"), cfg.root / "orch.toml"]
+    if cfg.paths.get("checklist"): ok.append(cfg.p("checklist"))
+    ok += [cfg.root / x for x in cfg.paths.get("state_docs", [])]
+    return [p.resolve() for p in ok]
+
+def patch_paths(ti):
+    """Target paths of an apply_patch call (Codex): '*** Add|Update|Delete File: <path>' and '*** Move to: <path>'."""
+    txt = "\n".join(v for v in (ti.values() if isinstance(ti, dict) else [ti]) if isinstance(v, str))
+    return re.findall(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", txt, re.M)
+
+def pretool_why(cfg, d):
+    """Why a PreToolUse call of the orchestrator is refused, or None."""
+    tool, ti = d.get("tool_name", ""), d.get("tool_input") or {}
+    cwd = d.get("cwd") or str(cfg.root); ok = edit_ok_dirs(cfg)
+    inside = lambda fp: any(fp == o or o in fp.parents for o in ok)
+    if tool == "apply_patch" or (isinstance(ti, dict) and any(isinstance(v, str) and "*** Begin Patch" in v for v in ti.values())):
+        ps = patch_paths(ti)
+        bad = [p for p in ps if not inside((Path(p) if Path(p).is_absolute() else Path(cwd) / p).resolve())]
+        return "editing files by hand" if bad or not ps else None
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        fp = Path(ti.get("file_path") or ti.get("notebook_path") or "/x")
+        return None if inside((fp if fp.is_absolute() else Path(cwd) / fp).resolve()) else "editing files by hand"
+    c = ti.get("command") if isinstance(ti, dict) else None
+    if c is None and isinstance(ti, dict): c = ti.get("cmd")
+    if c is None: return None
+    c = shlex.join(c) if isinstance(c, list) and not (len(c) >= 3 and c[0] in SHELLS and c[1] in ("-c", "-lc")) else (c[2] if isinstance(c, list) else c)
+    return judge(cfg, c, cwd, ok)
 
 def out(o): print(json.dumps(o))
 
@@ -958,44 +1626,44 @@ def agent_hook(ev, d):
     ok = re.search(r"^VERDICT: (DONE|BLOCKED|FAILED)\b", t, re.M) and "PENDING" not in first and re.search(r"exit(\s+code)?s?\b", t, re.I)
     if not ok: block(f"Not finished: {rp} must hold the real results and exit codes and end with a final 'VERDICT: DONE' line (line 1 is no longer PENDING).")
 
+ORCH_MARK = "[orch] "   # every prompt orch itself sends starts with this, so UserPromptSubmit never files it as an instruction (M4)
+
 def cmd_hook(ev):
     try: d = json.loads(sys.stdin.read() or "{}")
     except Exception: d = {}
     if os.environ.get("ORCH_ROLE") == "agent": return agent_hook(ev, d)
-    root = find_root(d.get("cwd"))
-    if not root: return
-    cfg = Cfg(root); sid = d.get("session_id")
+    sid = d.get("session_id")
     if not sid: return
-    reg = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
-    if (reg.startswith("pending:") and now() - int(reg[8:] or 0) < 600) or (os.environ.get("ORCH_ROLE") == "orchestrator" and reg != sid):
-        cfg.f("session").write_text(sid); reg = sid
-    if reg != sid: return
+    # The project is the one whose registered session this is, wherever the session's shell is (H3). Only a pending
+    # registration (orch register without a session id, or the watcher's new orchestrator) is claimed from the cwd, within
+    # 10 min. No variable (ORCH_ROLE) takes a registration over (H4).
+    root = session_root(sid)
+    if not root:
+        root = find_root(d.get("cwd"))
+        if not root: return
+        cfg = Cfg(root); reg = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
+        if not (reg.startswith("pending:") and now() - int(reg[8:] or 0) < 600): return
+        cfg.f("session").write_text(sid); cfg.f("session_kind").write_text(hook_kind(d) + "\n")
+        record_session_proc(cfg)
+    else: cfg = Cfg(root)
+    if session_alive(cfg) is not True: record_session_proc(cfg)
     if d.get("transcript_path"): cfg.f("transcript").write_text(d["transcript_path"])
-    if ev == "SessionStart":
+    if ev == "SessionStart":   # cached state only: the hook has a 60 s limit, and the check runs as the session's first act (M14)
         parts = [handoff_path(cfg).read_text() if handoff_path(cfg).exists() else ""]
-        rc, o, e = sh(["bd", "prime"], cwd=cfg.beads); parts.append(o if rc == 0 else f"(bd prime unavailable: {e.strip()[:80]})")
-        F, live, *_ = run_check(cfg); parts.append("orch check:\n" + ("\n".join(f"[{k}] {t}" for k, t in F) or "all clear"))
-        parts.append("You are the orchestrator: dispatch, monitor, verify, land, clean up, report. Cycle: orch check, act on each line, orch ack. See the orchestrating skill.")
+        rc, o, e = sh(["bd", "prime"], cwd=cfg.beads, timeout=20); parts.append(o if rc == 0 else f"(bd prime unavailable: {e.strip()[:80]})")
+        parts.append("The Live state above is from the last check. You are the orchestrator: dispatch, monitor, verify, land, clean up, report. "
+                     "First run orch check, act on each line, orch ack. See the orchestrating skill.")
         ctx(ev, "\n\n".join(parts)[:30000])
     elif ev == "UserPromptSubmit":
         pr = (d.get("prompt") or "").strip()
-        if pr and not pr.startswith(("orch cycle:", WAKE, "You are the orchestrator. " + WAKE)) and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
+        orchs = pr.startswith((ORCH_MARK, "orch cycle:", WAKE, "You are the orchestrator. " + WAKE)) or pr in ("/clear", "/compact") or pr.startswith("/")
+        if pr and not orchs and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
             try:
                 i = Beads(cfg).create("instr: " + re.sub(r"\s+", " ", pr)[:70], "instruction", pr[:4000]); cfg.touch("changed")
                 ctx(ev, f"Filed as instruction {i}: close it as done, or make it a standing rule with bd remember.")
             except Err: pass
     elif ev == "PreToolUse":
-        tool, ti = d.get("tool_name", ""), d.get("tool_input") or {}
-        why = None
-        if tool in ("Bash", "shell", "local_shell"):
-            c = ti.get("command", ""); c = " ".join(c) if isinstance(c, list) else c
-            if not re.match(r"\s*(orch|\S*board\.sh|bd|pueue|herdr)\b", c):
-                sc = strip_heredocs(c)
-                why = next((w for rx, w in DENY if re.search(rx, sc if w == "in-place edit" else c)), None)
-        elif tool in ("Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"):
-            fp = Path(ti.get("file_path") or ti.get("notebook_path") or "/x").resolve()
-            ok = [cfg.state.resolve(), cfg.p("briefs", "briefs").resolve(), (root / "orch.toml").resolve()]
-            if tool == "apply_patch" or not any(fp == o or o in fp.parents for o in ok): why = "editing files by hand"
+        why = pretool_why(cfg, d)
         if why: out({"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny",
                      "permissionDecisionReason": f"Orchestrators do not operate by hand ({why}). Use orch launch/stop/collect/close, or brief an agent."}})
     elif ev == "Stop":
@@ -1006,36 +1674,56 @@ def cmd_hook(ev):
         if late or stale:
             block("Do not go idle: " + ("unacknowledged past deadline: " + ", ".join(late[:6]) + ". Run orch check, act, orch ack. " if late else "") + " ".join(stale))
 
+def hook_kind(d):
+    tp = d.get("transcript_path") or ""
+    return "codex" if ("codex" in tp or os.environ.get("CODEX_THREAD_ID")) else "claude"
+
 # ---------------------------------------------------------------- watch (launchd, one pass)
+URGENT = ("unit:", "board:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:")
+
 def cmd_watch(cfg, a):
-    F, live, hs, units = run_check(cfg, cycle=False)
+    F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
     running = any(u.get("state") in ("working", "queued") for u in units)
     op = cfg.jget("open.json"); late = [k for k, t in op.items() if now() - t > cfg.deadline]
     overdue = (running or F) and now() - cfg.mtime("last_cycle") > cfg.cycle
     pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
-    ag = herdr("agent", "get", pane) if pane else None
-    st = (ag or {}).get("agent", {}).get("agent_status")
-    if not ag:
+    pl = herdr("pane", "list")
+    if pl is None: log("herdr did not answer (error or timeout): nothing started or woken"); return
+    present = pane in {p.get("pane_id") for p in pl.get("panes", [])}
+    ag = herdr("agent", "get", pane) if pane and present else None
+    if present and ag is None: log(f"herdr agent get {pane} failed: nothing started"); return
+    if not present or not (ag or {}).get("agent"):
+        # A new orchestrator only when every sign says the registered one is gone (H4, fixes5 item 1): its pane is absent from
+        # a successful pane list, its process (pid and start time recorded at register) is not running, and its transcript has
+        # not changed for 20 min.
+        alive = session_alive(cfg)
+        tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
+        quiet = now() - (os.path.getmtime(tr) if tr and os.path.exists(tr) else 0) > 20 * 60
+        if alive or not quiet:
+            log(f"pane {pane or '-'} not found, but the registered session is {'still running' if alive else 'writing its transcript'}: nothing started"); return
         if not (F or running): return
         if not any(p.get("enabled") for p in cfg.prov.values()): log("orchestrator gone; no provider enabled"); return
         if now() - cfg.mtime("last_wake") < 600: return
-        oc = cfg.c.get("orchestrator", {"kind": "claude"})
-        cfg.touch("last_wake"); log("orchestrator pane gone: starting a new one")
+        kind = (cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else "") or cfg.c.get("orchestrator", {}).get("kind", "claude")
+        oc = cfg.c.get("orchestrator", {}); args = oc.get("args", []) if oc.get("kind", "claude") == kind else []
+        cfg.touch("last_wake"); log(f"orchestrator gone (pane absent, process ended, transcript quiet): starting a new {kind} one")
+        cfg.f("session").write_text(f"pending:{int(now())}")   # its first hook event claims the registration
         pane, _ = new_tab(cfg, "orchestrator", cfg.root); wait_shell(pane, "orchestrator")
-        herdr("pane", "run", pane, "export ORCH_ROLE=orchestrator; echo env-orchestrator"); time.sleep(2)
-        sh(["herdr", "agent", "start", "orchestrator", "--kind", oc["kind"], "--pane", pane, "--timeout", "90000", "--", *oc.get("args", [])], timeout=100)
-        cfg.f("pane").write_text(pane); herdr("agent", "prompt", "orchestrator", "You are the orchestrator. " + WAKE); return
+        sh(["herdr", "agent", "start", "orchestrator", "--kind", kind, "--pane", pane, "--timeout", "90000", "--", *args], timeout=100)
+        cfg.f("pane").write_text(pane); herdr("agent", "prompt", "orchestrator", ORCH_MARK + "You are the orchestrator. Run orch register, then " + WAKE); return
+    st = ag["agent"].get("agent_status")
     if st == "working": return
     tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
     big = tr and os.path.exists(tr) and os.path.getsize(tr) / 4 > cfg.reset_tokens
-    if big and not F and now() - cfg.mtime("changed") > 0 and not handoff_stale(cfg, False):
+    urgent = [k for k, _ in F if k.startswith(URGENT)]   # acked findings are already out of F; informational ones do not hold a reset (L4)
+    if big and not urgent and not handoff_stale(cfg, False):
         if cfg.f("reset_asked").exists():
             cfg.f("reset_asked").unlink(); log("context reset: /clear"); herdr("agent", "prompt", pane, "/clear"); return
         cfg.touch("reset_asked"); log("context large: asked for final notes")
-        herdr("agent", "prompt", pane, "Context is large: finish the Orchestrator notes in .orch/HANDOFF.md, then stop."); return
+        herdr("agent", "prompt", pane, ORCH_MARK + "Context is large: finish the Orchestrator notes in .orch/HANDOFF.md, then stop."); return
     if (overdue or late) and now() - cfg.mtime("last_wake") > 600:
-        cfg.touch("last_wake"); log(f"wake: overdue={bool(overdue)} late={late[:3]}"); herdr("agent", "prompt", pane, WAKE)
+        cfg.touch("last_wake"); log(f"wake: overdue={bool(overdue)} late={late[:3]}"); herdr("agent", "prompt", pane, ORCH_MARK + WAKE)
 
 # ---------------------------------------------------------------- main
 def main():
@@ -1050,7 +1738,8 @@ def main():
     add("check", A("--brief", action="store_true"), A("--escalate", action="store_true"))
     add("capacity"); add("status"); add("watch")
     add("launch", A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
-        A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"), A("--of", help="unit whose implementer's vendor a review must avoid"), dry=True)
+        A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
+        A("--test-host", help="host where the unit's builds and tests run; the agent is placed there"), A("--allow-main", action="store_true", help="allow a main checkout as cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"), dry=True)
     add("stop", A("unit"), dry=True)
     add("collect", A("unit", help="a unit, or <host>:<task id> for an orch run job"), dry=True)
     add("run", A("--host", required=True), A("--lane", choices=LANES, default="jobs"), A("--unit"), A("--wt", required=True),
@@ -1062,6 +1751,8 @@ def main():
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
     add("commit-state", A("-m", "--message", default="orch: state"), dry=True)
     add("ack", A("problem"), A("decision"))
+    add("init", dry=True)
+    add("board-close", A("agent", help="a board card that is not an open unit"), dry=True)
     add("register", A("session", nargs="?"), dry=True)
     add("hook", A("event", choices=["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"]))
     a = ap.parse_args()
