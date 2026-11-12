@@ -589,6 +589,8 @@ class Budget(unittest.TestCase):
     def test_median_of_kind_and_tier_plus_margin(self):
         d, cfg = project('\n[budget]\nmargin_pct = 50\n')
         cfg.run.all_units = {f"u{i}": {"name": f"u{i}", "kind": "implement", "tier": "critical"} for i in range(4)}
+        for i in range(4):   # item 16c: a run counts only when its unit ended with a verdict
+            o = d / "out" / f"u{i}"; o.mkdir(); (o / "REPORT.md").write_text("VERDICT: DONE\ndone\n")
         for i, c in enumerate((1.0, 2.0, 3.0, 9.0)):
             janus.ledger_append(cfg, cfg.prov["api"], ["t", f"u{i}", "running", 5, f"r{i}"]); janus.ledger_append(cfg, cfg.prov["api"], ["t", f"u{i}", c, "done rc=0", f"r{i}"])
         b, why = janus.budget_for(cfg, cfg.models["m"], "implement", "critical")

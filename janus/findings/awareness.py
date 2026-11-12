@@ -31,6 +31,15 @@ def module_of(rel):
     return HERE if d in (".", "") else d
 
 
+def repo_of(cwd):
+    """The repository a unit's tree belongs to (its git common dir), or '' when it cannot be told. Item 16a: two units in
+    different repositories are never 'related' by a shared module or file name (two projects that both change a `docs` module). The
+    common dir, not the worktree toplevel, so two worktrees of one repository still count as one."""
+    if not cwd or not Path(cwd).is_dir(): return ""
+    o = sh(["git", "-C", str(cwd), "rev-parse", "--git-common-dir"])[1].strip()
+    return str(Path(cwd, o).resolve()) if o else ""
+
+
 def unit_of_gate(name, names):
     """The unit a gate name belongs to: the name itself, 'land-<unit>', or '<unit>-...'; None when it names no unit."""
     for s in (name, name[5:] if name.startswith("land-") else name):
@@ -47,10 +56,20 @@ def related_cases(cfg, units, hs=None):
     with cf.ThreadPoolExecutor(8) as ex: ch = list(ex.map(lambda u: unit_changes(cfg, u, units), live))
     info = {}
     for u, (br, files) in zip(live, ch):
-        info[u["name"]] = {"branch": br, "files": files,
+        info[u["name"]] = {"branch": br, "files": files, "repo": repo_of(u.get("cwd")),
                            "mods": {m for m in (module_of(f) for f in files) if m != HERE}}
     umap = {u["name"]: u for u in units}
     cases = {}
+    au = all_units(cfg)
+
+    def repo_for(n):
+        if n in info: return info[n]["repo"]
+        return repo_of((au.get(n) or umap.get(n) or {}).get("cwd"))
+
+    def same_repo(a, b):
+        """Item 16a: compare only units in the same repository (an unknown repo on either side compares as before)."""
+        ra, rb = repo_for(a), repo_for(b)
+        return not (ra and rb) or ra == rb
 
     def add(a, b, reason, kind, topic=None):
         if not a or not b or a == b: return
@@ -74,12 +93,12 @@ def related_cases(cfg, units, hs=None):
     names = sorted(info)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
+            if not same_repo(a, b): continue   # item 16a: different repositories never collide
             both = sorted(set(info[a]["files"]) & set(info[b]["files"]))
             if both: add(a, b, f"both change {', '.join(both[:3])}", "file", both[0])
             shared = sorted(info[a]["mods"] & info[b]["mods"])
             if shared: add(a, b, f"both change the module {', '.join(shared[:3])}", "module", shared[0])
             if branch_related(a, b): add(a, b, f"{a} and {b} are on branches one of which contains the other", "branch")
-    au = all_units(cfg)
     allnames = set(names) | set(au) | set(umap)
     for gn, (_t, res) in sorted(gate_results(cfg).items()):
         if res != "FAIL": continue
@@ -89,12 +108,13 @@ def related_cases(cfg, units, hs=None):
         if not rec: continue
         mods = {m for m in (module_of(f) for f in unit_changes(cfg, rec, units)[1]) if m != HERE}
         for v in names:
+            if not same_repo(v, un): continue
             shared = sorted(mods & info[v]["mods"])
             if shared: add(v, un, f"gate {gn} failed in the module {', '.join(shared[:3])} that {un} owns", "gate", shared[0])
     for lid, text in learned_posts(cfg):
         poster = lid.rsplit(":", 1)[0]
         for v in names:
-            if v == poster: continue
+            if v == poster or not same_repo(poster, v): continue
             area = [*info[v]["mods"], *info[v]["files"]]
             if re.search(rf"(?<![\w.-]){re.escape(v)}(?![\w-])", text) or any(x and x in text for x in area):
                 add(poster, v, f"learned post {lid} names {v}'s area", "learned")
@@ -122,4 +142,4 @@ def note_findings(cfg):
     return F
 
 
-__all__ = ["module_of", "unit_of_gate", "introduced_recently", "related_cases", "related_findings", "note_findings"]
+__all__ = ["module_of", "repo_of", "unit_of_gate", "introduced_recently", "related_cases", "related_findings", "note_findings"]
