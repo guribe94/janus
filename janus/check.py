@@ -4,6 +4,7 @@ collect_findings returns registered Findings (findings/__init__.py); run_check f
 the Live part of HANDOFF.md (a writer only: the registered orchestrator or the watcher)."""
 import contextlib, json, re
 from janus.actions.jobs import slots
+from janus.actions.lifecycle import sync_remote_outputs   # item 11 addendum: sync a remote report before judging parked/orphan
 from janus.backlog import ready_work
 from janus.autopilot import autopilot_findings
 from janus.beads import Beads
@@ -37,12 +38,13 @@ def board_upkeep(cfg, units):
     for c in (board_dir(cfg) / "agents").glob("*.md") if (board_dir(cfg) / "agents").is_dir() else []:
         if c.stem not in names and au.get(c.stem, {}).get("status") == "closed" and own_card(cfg, card_fields(cfg, c.stem)): board(cfg, "close", c.stem)
 
-def collect_findings(cfg, hs, units, ag, bd_err):
+def collect_findings(cfg, hs, units, ag, bd_err, bd=None):
     """Every finding of one pass, as registered Findings, in the order check prints them (findings/*.py hold the families)."""
     F = []; viol = []   # viol: the processes enforce may stop (burner, direct), found on the way
     if bd_err: F.append(("beads", f"beads unavailable: {bd_err}; fix bd (janus doctor), units cannot be read until then"))
     names = {u["name"] for u in units}
     for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no build position (host_cap)
+    if bd is not None: sync_remote_outputs(cfg, units, bd)   # item 11 addendum: judge a remote unit on its synced report
     F += host_findings(cfg, hs, units, viol) + pane_findings(cfg, units, ag)
     F += board_findings(cfg, names) + card_findings(cfg, names) + note_findings(cfg)
     UF, running = unit_findings(cfg, hs, units, ag); F += UF
@@ -104,11 +106,11 @@ def run_check(cfg, cycle=True, writer=None):
     only reads. The cycle stamp (last_cycle) is touched only for the orchestrator's own check."""
     cfg.run.ro = not (writer if writer is not None else is_orchestrator(cfg))
     with cfg.writer() if not cfg.run.ro else contextlib.nullcontext():   # one writer at a time (panel problem 2); readers lock nothing
-        hs = probe_all(cfg); bd_err = None; units = []
-        try: units = Beads(cfg).units()
+        hs = probe_all(cfg); bd_err = None; units = []; bd = None
+        try: bd = Beads(cfg); units = bd.units()
         except Err as e: bd_err = str(e)
         ag = herdr_agents(cfg)
-        F = collect_findings(cfg, hs, units, ag, bd_err)
+        F = collect_findings(cfg, hs, units, ag, bd_err, bd)
         if not cfg.run.ro: tune_pueue(cfg, hs, units)
         acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
         F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)

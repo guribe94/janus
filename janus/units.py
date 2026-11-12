@@ -34,7 +34,7 @@ def verdict(cfg, u):
     """The unit's final VERDICT line: report.json's verdict when it states one (preferred over the prose), else the last
     'VERDICT:' line of its report (a resumed unit: its original report, report_path). A resumed report still holds the earlier
     run's verdict, so only a verdict written after the resume started counts, and a line 1 that is still PENDING means not
-    finished."""
+    finished. PENDING and WAITING are never a final verdict (item 11): a report that ends 'WAITING <jobs>' is parked, not done."""
     p = report_path(cfg, u); j = report_json(cfg, u)
     try: t = p.read_text().splitlines()
     except OSError: t = []
@@ -46,7 +46,7 @@ def verdict(cfg, u):
         if mt < u.get("started", 0) or (t and "PENDING" in t[0]): return None
     v, present = verdict_line(j)
     if present: return v
-    return next((l for l in reversed(t) if l.startswith("VERDICT:") and "PENDING" not in l), None)   # PENDING is not a verdict
+    return next((l for l in reversed(t) if l.startswith("VERDICT:") and not NONFINAL.search(l)), None)   # PENDING and WAITING are not verdicts
 
 def herdr_agents(cfg):
     r = herdr("agent", "list")
@@ -72,11 +72,14 @@ def report_json(cfg, u):
     return d if isinstance(d, dict) else {}
 
 def verdict_line(j):
-    """('VERDICT: <V>' | None, present): the verdict a report.json states, and whether the file stated one at all. PENDING is
-    not a verdict."""
+    """('VERDICT: <V>' | None, present): the verdict a report.json states, and whether the file stated one at all. PENDING and
+    WAITING are never a final verdict (item 11)."""
     if not j or "verdict" not in j: return None, False
     v = str(j.get("verdict") or "").strip().upper()
-    return (f"VERDICT: {v}" if v and v != "PENDING" else None), True
+    return (f"VERDICT: {v}" if v and v not in NONFINAL_WORDS else None), True
+
+NONFINAL = re.compile(r"VERDICT:\s*(PENDING|WAITING)\b")   # a report that ends WAITING is parked, not finished (item 11)
+NONFINAL_WORDS = ("PENDING", "WAITING")
 
 RESULT_RX = re.compile(r"^\W*(result|summary|outcome|conclusion)s?\b\W*", re.I)
 
@@ -84,7 +87,7 @@ def report_summary(text, j=None):
     """(verdict, one-line result) of a unit's report: report.json (j) wins over the prose; its verdict, and a
     'Result:'/'Summary:' line, else the report.json 'left', else the last content line before the final verdict."""
     L = [l.rstrip() for l in text.splitlines()]
-    vi = next((i for i in range(len(L) - 1, -1, -1) if L[i].startswith("VERDICT:")), None)
+    vi = next((i for i in range(len(L) - 1, -1, -1) if L[i].startswith("VERDICT:") and not NONFINAL.search(L[i])), None)
     v = (str(j.get("verdict") or "").strip() if isinstance(j, dict) and j.get("verdict") else "") or (L[vi][8:].strip() if vi is not None else "none")
     res = next((RESULT_RX.sub("", l) for l in L if RESULT_RX.match(l) and len(RESULT_RX.sub("", l)) > 3), None)
     if not res and isinstance(j, dict) and j.get("left"): res = str(j["left"])

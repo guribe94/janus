@@ -283,8 +283,9 @@ session start, so the record chain is in front of the orchestrator before it dec
   with `[autopilot] enabled` the watcher does this for a local unit.
 - *Finished with a verdict*: `janus collect <u>` for a remote unit, then `janus close <u>`.
 - *Done but not landed* (`landing:<u>:unlanded`): `janus gate <name>`, then `janus land <u>`.
-- *Parked, not failed* (`VERDICT: WAITING`): its jobs are still running; the watcher resumes it when they finish (`janus
-  resume <u>` resumes it by hand).
+- *Parked, not failed* (a `WAITING <jobs>` line, no final verdict): its jobs are still running; the watcher resumes it when they
+  finish (`janus resume <u>` resumes it by hand). `VERDICT: WAITING` and `VERDICT: PENDING` are never a final verdict (item 11),
+  and a recorded park wins over one.
 - *A stuck lane job*: `janus cancel <host>:<task>`.
 
 ## 4. What the hooks enforce, and why
