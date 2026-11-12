@@ -5,6 +5,12 @@ from pathlib import Path
 
 ORCH_PY = Path(os.environ.get("ORCH_PY") or Path(__file__).resolve().parent.parent / "orch.py")
 spec = importlib.util.spec_from_file_location("orch", ORCH_PY); orch = importlib.util.module_from_spec(spec); spec.loader.exec_module(orch)
+# Every fixture (temp project, script, daemon) lives under one root named with orch's fixture mark, so a live orch check running
+# meanwhile skips the processes started here (fixes10 item 6); ORCH_IN_TESTS lets the suite itself see them.
+import atexit, shutil
+FIX_ROOT = Path(tempfile.mkdtemp(prefix=orch.FIXTURE_MARK + "-", dir="/tmp")); tempfile.tempdir = str(FIX_ROOT)
+os.environ["ORCH_IN_TESTS"] = "1"
+atexit.register(shutil.rmtree, FIX_ROOT, True)
 
 def project(extra=""):
     d = Path(tempfile.mkdtemp(prefix="orch-test-"))
@@ -156,7 +162,7 @@ class LaunchQuoting(unittest.TestCase):
     def setUp(self):
         import shutil
         if not shutil.which("pueued") or not shutil.which("pueue"): self.skipTest("pueue not installed")
-        self.pd = Path(tempfile.mkdtemp(prefix="oq", dir="/tmp"))   # short: a unix socket path has a length limit
+        self.pd = Path(tempfile.mkdtemp(prefix="oq"))   # short: a unix socket path has a length limit
         (self.pd / "p.yml").write_text(f"shared:\n  pueue_directory: {self.pd}/d\n  runtime_directory: {self.pd}/r\n"
                                        f"  use_unix_socket: true\n  unix_socket_path: {self.pd}/s.sock\n")
         (self.pd / "d").mkdir(); (self.pd / "r").mkdir()
@@ -884,6 +890,26 @@ class Tidy(unittest.TestCase):
             units.append({"id": "x-3", "name": "w", "cwd": str(wt)}); self.assertIsNotNone(j("orch close u --force"))   # shared tree
             self.assertIsNotNone(j("orch close nosuch --force"))
         finally: orch.Beads.units = real
+
+class Fixtures(unittest.TestCase):
+    """fixes10 item 6: a live check skips the suite's process fixtures (marked by their root); the suite still sees them."""
+    def test_marked_processes_are_skipped_live(self):
+        d, cfg = project(); cfg._viol = []
+        self.assertIn(orch.FIXTURE_MARK, str(d))                          # every fixture root carries the mark
+        ps = (f"501 1 501 0.0 01:00 cargo test -p x --manifest-path {d}/Cargo.toml\n"
+              "502 1 502 0.0 01:00 cargo test -p y --manifest-path /w/real/Cargo.toml\n")
+        self.assertEqual(len(orch.proc_findings(cfg, ps)), 2)              # the suite sees its own fixtures
+        os.environ.pop("ORCH_IN_TESTS")
+        try:
+            self.assertEqual([k for k, _ in orch.proc_findings(cfg, ps)], ["localtest:502"])   # a live check does not
+            s = d / "loop.sh"; s.write_text("#!/bin/bash\nsleep 30\n"); p = subprocess.Popen(["/bin/bash", str(s)]); time.sleep(1.5)
+            try:
+                with open(s, "a") as f: f.write("echo x\n")
+                time.sleep(1.1); self.assertFalse([k for k, _ in orch.script_findings() if k.startswith(f"script:{p.pid}:")])
+                self.assertNotIn(f"{orch.FIXTURE_MARK}", orch.probe_extra({"_rd": "/x", "local": True, "schedulers": ["sleep"]}).split("grep -v")[0])
+                self.assertIn(f"-e {orch.FIXTURE_MARK}", orch.probe_extra({"_rd": "/x", "local": True, "schedulers": ["sleep"]}))
+            finally: p.kill(); p.wait()
+        finally: os.environ["ORCH_IN_TESTS"] = "1"
 
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):

@@ -230,7 +230,7 @@ def probe_extra(h):
     # schedulers (orch.toml, per host): extended regexes for the command lines of other job-running processes (an old queue); each
     # running one prints sched=<pid> <command>. legacy_lanes (the Mac): pid-file folders of an old lane; a live pid is one too.
     for rx in h.get("schedulers", []):
-        w += f"\nps -A -o pid=,command= | grep -E {shlex.quote(rx)} | grep -v -e grep -e pueued -e 'cap_report' | head -5 | sed 's/^ */sched=/'"
+        w += f"\nps -A -o pid=,command= | grep -E {shlex.quote(rx)} | grep -v -e grep -e pueued -e 'cap_report' -e {FIXTURE_MARK} | head -5 | sed 's/^ */sched=/'"
     for s in h.get("legacy_lanes", "").split():
         w += f'\no=$(cat {shlex.quote(s)}/pid 2>/dev/null); [ -n "$o" ] && kill -0 "$o" 2>/dev/null && echo "sched=$o old lane {s}"'
     if not h.get("local"): w += "\n" + DIRECT_PROBE % {"rx": shlex.quote(BUILD_ERE)}
@@ -245,7 +245,7 @@ BUILD_ERE = "(^|[ /])cargo(-[a-z]+)? (test|nextest|build|clippy|bench)( |$)|(^|[
 DIRECT_PROBE = r'''if [ -d /proc/1 ]; then
  for f in /proc/[0-9]*/environ; do u=$(tr '\0' '\n' < $f 2>/dev/null | sed -n 's/^ORCH_UNIT=//p'); [ -n "$u" ] && echo "${f#/proc/} $u"; done 2>/dev/null | sed 's#/environ##' > /tmp/.orch-units.$$
  ps -A -o pid=,ppid=,pgid=,etimes=,args= | awk -v rx=%(rx)s 'NR == FNR {u[$1] = $2; next} {pp[$1] = $2; pg[$1] = $3; et[$1] = $4; c = $0; sub(/^ *[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+ +/, "", c); cmd[$1] = c}
-   END {for (p in u) {if (!(p in cmd) || cmd[p] !~ rx || cmd[p] ~ /\.lane( |$)|orch(\.py)? (run|gate) /) continue; q = pp[p]; lane = 0; n = 0
+   END {for (p in u) {if (!(p in cmd) || cmd[p] !~ rx || cmd[p] ~ /\.lane( |$)|orch(\.py)? (run|gate) |orch-test-fixture/) continue; q = pp[p]; lane = 0; n = 0
           while (q > 1 && n++ < 50) {if (cmd[q] ~ /pueued/ || cmd[q] ~ /cmd\.sh|\/runs\/[^ ]*\.sh/) {lane = 1; break}; if (u[q] != "" && cmd[q] ~ rx) {lane = 1; break}; q = pp[q]}
           if (!lane) print "direct=" p, pg[p], u[p], et[p], substr(cmd[p], 1, 100)}}' /tmp/.orch-units.$$ - 2>/dev/null
  rm -f /tmp/.orch-units.$$
@@ -899,6 +899,12 @@ def ready_work(cfg):
     return [i for i in Beads(cfg).run("ready") if not skip & set(i.get("labels") or [])
             and not str(i.get("title", "")).startswith(("unit:", "orch:", "instr:"))]
 
+# Test fixtures never trip live findings (orch-fixes10 item 6): the test suite runs every process fixture under a temporary root
+# whose name holds FIXTURE_MARK (and sets ORCH_IN_TESTS for itself); the live checks skip a process whose command line holds the
+# mark, unless the checker is the test suite (which must see its own fixtures).
+FIXTURE_MARK = "orch-test-fixture"
+def fixture_proc(cmd): return FIXTURE_MARK in (cmd or "") and not os.environ.get("ORCH_IN_TESTS")
+
 TEST_RX = re.compile(r"\bcargo(-\w+)? (test|nextest|build|clippy|bench)\b|\bpytest\b|\b(npm|pnpm) (run )?test\b|\bxcodebuild\b.*\btest\b")
 
 VIA_LANE = re.compile(r"orch(\.py)? (run|gate)\b|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")   # plus paths.lane_scripts (project wrappers)
@@ -927,7 +933,7 @@ def proc_findings(cfg, ps_text=None):
     launchers = {os.path.basename(m["launcher"]) for m in cfg.models.values() if m.get("launcher")}   # older project launchers
     F = []
     for p, (pp, cpu, et, c) in t.items():
-        if AGENT_RX.search(c) or "pueued" in c: continue
+        if AGENT_RX.search(c) or "pueued" in c or fixture_proc(c): continue
         anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "orch.py api-run" in t[q][3] or any(x in t[q][3] for x in launchers)), None)
         lane = any("pueued" in t[q][3] for q in anc)
         if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
@@ -1007,7 +1013,7 @@ def script_findings():
         f = l.split(None, 6)
         if len(f) < 7 or not f[0].isdigit(): continue
         m = SCRIPT_RX.match(f[6])
-        if not m: continue
+        if not m or fixture_proc(f[6]): continue
         try: start = time.mktime(time.strptime(" ".join(f[1:6]), "%a %b %d %H:%M:%S %Y")); st = os.stat(m.group(1))
         except (ValueError, OSError): continue
         if st.st_mtime <= start + 1: continue
