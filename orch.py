@@ -1048,7 +1048,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
-    F += git_findings(cfg)
+    F += git_findings(cfg) + memory_findings(cfg)
     try:
         ins = Beads(cfg).issues("instruction")
         if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done or bd remember): " + "; ".join(i['title'][:50] for i in ins[:3])))
@@ -3242,6 +3242,111 @@ def push_cmd(repo, cfg=None):
         rem = "origin" if "origin" in rs or not rs else rs[0]
     return ["git", "push", "--set-upstream", rem, "HEAD"]
 
+# ---------------------------------------------------------------- session memory (orch-swarm item 1, 7)
+# .orch/MEMORY.md is the session's curated memory: Decisions / Facts / Pitfalls, one dated line per entry. Only the orchestrator
+# writes it (orch remember / forget); every agent's brief starts with it (brief_header) and the orchestrator's SessionStart hook
+# injects it. An entry may carry a subject ([key]): a newer entry on the same subject replaces the older one, never sits beside it.
+MEM_SECTIONS = {"decision": "Decisions", "fact": "Facts", "pitfall": "Pitfalls"}
+MEMORY_DEFAULTS = {"cap_lines": 30, "review_days": 14, "agent_docs": ["AGENTS.md"]}
+MEM_RX = re.compile(r"^- (\d{4}-\d{2}-\d{2}) (?:\[([^\]]+)\] )?(.*?)(?: \(source: (.+)\))?$")
+
+def mset(cfg, k): return cfg.c.get("memory", {}).get(k, MEMORY_DEFAULTS[k])
+def memory_path(cfg): return cfg.f("MEMORY.md")
+
+def memory_read(cfg):
+    """[(section, date, key or None, text, source or None)] in file order."""
+    try: lines = memory_path(cfg).read_text().splitlines()
+    except OSError: return []
+    sec, out = None, []
+    for l in lines:
+        if l.startswith("## "): sec = l[3:].strip(); continue
+        m = MEM_RX.match(l)
+        if m and sec: out.append((sec, m.group(1), m.group(2), m.group(3), m.group(4)))
+    return out
+
+def mem_line(e):
+    sec, d, k, t, s = e
+    return f"- {d} " + (f"[{k}] " if k else "") + t + (f" (source: {s})" if s else "")
+
+def memory_write(cfg, entries):
+    L = ["# Session memory", "(curated by the orchestrator with orch remember / orch forget; one dated line per entry)"]
+    for sec in MEM_SECTIONS.values():
+        L += ["", f"## {sec}"] + [mem_line(e) for e in entries if e[0] == sec]
+    atomic_write(memory_path(cfg), "\n".join(L) + "\n")
+
+def memory_text(cfg):
+    """MEMORY.md for a brief or the SessionStart context, or "" when it holds no entry."""
+    return memory_path(cfg).read_text().strip() if memory_read(cfg) else ""
+
+def memory_history(cfg, e, why):
+    with cfg.f("memory-history.md").open("a") as f: f.write(f"{ts()} {why} ({e[0]}): {mem_line(e)[2:]}\n")
+
+def refuse_agent(what):
+    if os.environ.get("ORCH_ROLE") == "agent": raise Err(f"refused: {what} is the orchestrator's (an agent proposes with board.sh post <you> learned <text>)")
+
+def cmd_remember(cfg, a):
+    refuse_agent("orch remember")
+    kind = next(k for k in MEM_SECTIONS if getattr(a, k))
+    text = re.sub(r"\s+", " ", a.text).strip()
+    if not text: raise Err("nothing to remember")
+    if kind == "fact" and not a.source: raise Err("a fact needs --source <path|sha|job> (where it can be checked)")
+    es = memory_read(cfg)
+    if any(e[3] == text for e in es): raise Err("already remembered (exact duplicate)")
+    key = slug(a.key) if a.key else None
+    old = [e for e in es if key and e[2] == key]
+    new = (MEM_SECTIONS[kind], time.strftime("%Y-%m-%d"), key, text, a.source)
+    if DRY: say(f"+ remember {mem_line(new)}" + (f" (replaces {len(old)} on [{key}])" if old else "")); return
+    for e in old: memory_history(cfg, e, "replaced")
+    memory_write(cfg, [e for e in es if e not in old] + [new])
+    if a.learned: learned_mark(cfg, a.learned, "remembered")
+    cfg.touch("changed"); say(f"remembered ({MEM_SECTIONS[kind]})" + (f", replacing the older entry on [{key}]" if old else "") + f": {text}")
+
+def cmd_forget(cfg, a):
+    refuse_agent("orch forget")
+    es = memory_read(cfg); q = a.text.strip()
+    hit = [es[int(q) - 1]] if q.isdigit() and 0 < int(q) <= len(es) else [e for e in es if e[3] == q] or [e for e in es if q in e[3] or q == e[2]]
+    if len(hit) != 1: raise Err(f"{'no' if not hit else len(hit)} entries match {q!r}" + ("; give its number (orch memory) or more text" if hit else ""))
+    if DRY: say(f"+ forget {mem_line(hit[0])}"); return
+    memory_history(cfg, hit[0], "forgotten"); memory_write(cfg, [e for e in es if e != hit[0]])
+    cfg.touch("changed"); say(f"forgotten (moved to {cfg.f('memory-history.md').name}): {hit[0][3]}")
+
+def cmd_memory(cfg, a):
+    es = memory_read(cfg)
+    if a.keep:
+        refuse_agent("orch memory --keep")
+        if not (0 < a.keep <= len(es)): raise Err(f"no entry {a.keep}")
+        e = es[a.keep - 1]; es[a.keep - 1] = (e[0], time.strftime("%Y-%m-%d"), *e[2:])
+        if not DRY: memory_write(cfg, es)
+        say(f"kept (re-dated): {e[3]}"); return
+    for i, e in enumerate(es, 1): say(f"{i:3} {e[0][:-1].lower():8} {mem_line(e)[2:]}")
+    if not es: say(f"(no entries in {memory_path(cfg)})")
+
+def mem_source_gone(cfg, s):
+    """True when a cited source is a path that no longer exists (a sha or a job id is not checked here)."""
+    if not s or re.fullmatch(r"[0-9a-f]{7,40}", s) or JOBREF.fullmatch(s) or not ("/" in s or s.endswith((".md", ".py", ".toml", ".log", ".json"))): return False
+    p = Path(os.path.expanduser(s.split(":")[0] if re.match(r"^[^/]+:\d+$", s) else s))
+    return not (p if p.is_absolute() else cfg.root / p).exists()
+
+def learned_mark(cfg, lid, how):
+    """Record that learned post <agent>:<n> was remembered or rejected (check then stops listing it)."""
+    lid = lid.removeprefix("learned:"); d = cfg.jget("learned.json"); d[lid] = {"how": how, "t": int(now())}
+    if not DRY: cfg.f("learned.json").write_text(json.dumps(d))
+
+def memory_findings(cfg):
+    es = memory_read(cfg); F = []
+    if len(es) > mset(cfg, "cap_lines"):
+        F.append(("memory-long", f"MEMORY.md holds {len(es)} entries, over [memory] cap_lines {mset(cfg, 'cap_lines')}: orch forget what no longer guides the agents"))
+    cut = now() - mset(cfg, "review_days") * 86400
+    seen = {}
+    for i, (sec, d, k, t, s) in enumerate(es, 1):
+        if mem_source_gone(cfg, s): F.append((f"memory-source:{i}", f"memory entry {i} cites {s}, which is gone: check it, then orch forget {i} or remember it again with a live source"))
+        try:
+            if time.mktime(time.strptime(d, "%Y-%m-%d")) < cut: F.append((f"memory-review:{i}", f"memory entry {i} is from {d} (over {mset(cfg, 'review_days')} days): still true? orch memory --keep {i} (re-dates it), or orch forget {i}"))
+        except ValueError: pass
+        if k: seen.setdefault(k, []).append(i)
+    F += [(f"memory-subject:{k}", f"memory entries {', '.join(map(str, v))} are on the same subject [{k}]: keep one (orch forget the other)") for k, v in seen.items() if len(v) > 1]
+    return F
+
 # ---------------------------------------------------------------- init, doctor, queue (orch-fixes7: shareable setup)
 def init_project(root, a):
     """A new project: write a commented starter orch.toml (from example.orch.toml next to orch.py), create the state, briefs and
@@ -3800,6 +3905,12 @@ def main():
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
     add("commit-state", A("-m", "--message", default="orch: state"), dry=True)
     add("ack", A("problem"), A("decision"))
+    m = add("remember", A("text"), A("--source", help="where it can be checked: a path, a commit sha or a job (a fact needs one)"),
+            A("--key", help="its subject: a newer entry on the same subject replaces the older one"), A("--learned", help="the learned post it accepts (<agent>:<n>)"), dry=True)
+    g = m.add_mutually_exclusive_group(required=True)
+    for k in MEM_SECTIONS: g.add_argument(f"--{k}", action="store_true")
+    add("forget", A("text", help="the entry's number (orch memory), its subject, or its text"), dry=True)
+    add("memory", A("--keep", type=int, help="re-date entry N after review (it stays)"), dry=True)
     add("init", A("--name", help="project name for a new orch.toml (default: the folder's name)"), dry=True)
     add("board-close", A("agent", help="a board card that is not an open unit"), dry=True)
     add("register", A("session", nargs="?"), dry=True)

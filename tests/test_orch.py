@@ -570,6 +570,26 @@ class FalseFindings(unittest.TestCase):
         p["pueue"]["groups"]["jobs"]["parallel_tasks"] = 1
         self.assertIn("idle:here:jobs", [k for k, _ in orch.lane_findings(cfg, {"here": p})])
 
+class Memory(unittest.TestCase):
+    def test_remember_forget_and_findings(self):
+        import argparse
+        d, cfg = project('\n[memory]\ncap_lines = 2\n')
+        R = lambda text, kind="decision", **k: orch.cmd_remember(cfg, argparse.Namespace(text=text, source=k.get("source"), key=k.get("key"), learned=None,
+                                                                                     **{x: x == kind for x in orch.MEM_SECTIONS}))
+        with self.assertRaises(orch.Err): R("the cache lives on the build host", "fact")          # a fact needs a source
+        (d / "docs").mkdir(); (d / "docs/n.md").write_text("x")
+        R("the cache lives on the build host", "fact", source="docs/n.md")
+        with self.assertRaises(orch.Err): R("the cache lives on the build host", "fact", source="docs/n.md")   # exact duplicate
+        R("tests run on the mac", "pitfall", key="tests where"); R("tests run on linux only", "pitfall", key="tests where")
+        es = orch.memory_read(cfg)
+        self.assertEqual([e[3] for e in es if e[2] == "tests-where"], ["tests run on linux only"])   # replaced, not beside
+        self.assertIn("tests run on the mac", cfg.f("memory-history.md").read_text())
+        self.assertEqual(orch.memory_findings(cfg), [])
+        R("a third one"); (d / "docs/n.md").unlink()
+        keys = {k for k, _ in orch.memory_findings(cfg)}
+        self.assertIn("memory-long", keys); self.assertTrue(any(k.startswith("memory-source:") for k in keys))
+        orch.cmd_forget(cfg, argparse.Namespace(text="a third")); self.assertEqual(len(orch.memory_read(cfg)), 2)
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         import re
