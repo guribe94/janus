@@ -611,6 +611,25 @@ class Peers(unittest.TestCase):
         self.assertIn("u3 | host here", txt); self.assertIn("branch u1", txt); self.assertIn("files: a.txt", txt)
         units[1]["state"] = "done"; self.assertEqual(orch.peer_findings(cfg, units), [])   # a finished unit is no peer
 
+class Transcript(unittest.TestCase):
+    def test_condense_claude_and_codex_with_grep_and_tail(self):
+        d = Path(tempfile.mkdtemp())
+        cl = [{"type": "user", "message": {"role": "user", "content": "do the task"}},
+              {"type": "assistant", "message": {"content": [{"type": "text", "text": "running it"}, {"type": "tool_use", "name": "Bash", "input": {"command": "make test"}}]}},
+              {"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": [{"type": "text", "text": "linker error: undefined symbol foo"}]}]}},
+              {"type": "assistant", "message": {"content": [{"type": "text", "text": "fixed by adding the lib"}]}}]
+        cx = [{"type": "session_meta", "payload": {"cwd": "/w/x"}},
+              {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "codex says hi"}]}},
+              {"type": "response_item", "payload": {"type": "function_call", "name": "shell", "arguments": json.dumps({"command": ["ls", "-l"]})}}]
+        (d / "c.jsonl").write_text("".join(json.dumps(x) + "\n" for x in cl)); (d / "x.jsonl").write_text("".join(json.dumps(x) + "\n" for x in cx))
+        run = lambda *a: subprocess.run([sys.executable, "-", *a], input=orch.CONDENSE, capture_output=True, text=True).stdout
+        o = run("ids", "", "0", "0", "", str(d / "c.jsonl"))
+        for x in ("USER: do the task", "AGENT: running it", "> Bash: make test", "< ERROR linker error", "AGENT: fixed by"): self.assertIn(x, o)
+        self.assertEqual(run("ids", "undefined symbol", "0", "0", "", str(d / "c.jsonl")).strip().splitlines()[1:], ["< ERROR linker error: undefined symbol foo"])
+        self.assertEqual(run("ids", "", "1", "0", "", str(d / "c.jsonl")).strip().splitlines()[1:], ["AGENT: fixed by adding the lib"])
+        o = run("codex-cwd", "", "0", "0", "/w/x", str(d / "*.jsonl"))
+        self.assertIn("AGENT: codex says hi", o); self.assertIn("> shell: ls -l", o); self.assertNotIn("do the task", o)
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         import re
