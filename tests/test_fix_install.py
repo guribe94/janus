@@ -822,6 +822,14 @@ class Item1ParkedAfterDone(unittest.TestCase):
             self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), repr(tail))
             self.assertEqual(janus.waiting_line_jobs(cfg, {"name": "u1", "host": "here", "started": 0}), want, repr(tail))
 
+    def test_a_bullet_list_of_job_ids_parks_on_all_of_them(self):
+        """Catches (finding B residue 2): a bullet list of ids parked on the first id only, so the rest of the jobs were
+        never waited for and the unit was resumed while they still ran."""
+        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
+        p.write_text("VERDICT: PENDING\nVERDICT: DONE - items 1-6\nWAITING\n- here:9\n- here:10\n")
+        self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
+        self.assertEqual(janus.waiting_line_jobs(cfg, {"name": "u1", "host": "here", "started": 0}), ["here:9", "here:10"])
+
 
 class Item2ResumeGuard(unittest.TestCase):
     """Finding 2 (medium-high): `janus resume <u> --message ...` had no guard: it started a second agent beside a running one
