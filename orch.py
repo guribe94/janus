@@ -1104,6 +1104,8 @@ def cmd_capacity(cfg, a):
     cfg.ro = True; hs = probe_all(cfg)
     try: units = Beads(cfg).units()
     except Err: units = []
+    ag = herdr_agents(cfg)
+    for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no agent or build position
     for n, p in hs.items(): say(cap_line(cfg, n, p, units))
 
 def cmd_status(cfg, a):
@@ -1771,7 +1773,9 @@ def backlog_findings(cfg, hs, units):
                   + ", ".join(x[0] for x in plan[:6]) + ("..." if len(plan) > 6 else "") + "; run orch fill (orch fill --dry-run shows why it stops there)"))
     briefed = {x[2] for x in fill_candidates(cfg, units)}
     nob = [(i, t) for i, t in todo if i not in briefed]
-    if nob and any(room(cfg, n, p, units)[0] > 0 for n, p in hs.items() if p.get("ok")):
+    if nob and not plan and any("budget" in s for s in stops):
+        F.append(("idle-backlog:budget", f"budget-limited: {'; '.join(s for s in stops if 'budget' in s)[:160]}; {len(nob)} ready item(s) wait"))
+    elif nob and any(room(cfg, n, p, units)[0] > 0 for n, p in hs.items() if p.get("ok")):
         F.append(("idle-backlog:nobrief", f"{len(nob)} ready backlog item(s) have no unlaunched brief while hosts have room: write briefs (ITEM: <id> line) for: "
                   + "; ".join(t[:50] for _, t in nob[:6]) + ("..." if len(nob) > 6 else "")))
     return F
@@ -1963,8 +1967,8 @@ def brief_index(cfg):
 def fill_candidates(cfg, units):
     """Ready backlog items with a brief and no unit, highest priority first: [(priority, order, item, brief path, unit name,
     kind, tier)]. Items: the beads backlog (open, backlog-ready; priority from beads), else the checklist (its order). A brief
-    is for an item when its ITEM: line names it (else its first 6 lines name the item id); a brief whose unit name was ever
-    launched, or that already has a report, is spent. Without ITEM: lines the newest such brief of an item is taken."""
+    is for an item when its ITEM: line names it (an explicit mark: a brief that merely mentions an item may be old or a
+    review); a brief whose unit name was ever launched, or that has an out/<name> folder, is spent. The newest brief wins."""
     try: iss = backlog_issues(cfg)
     except Err: iss = {}
     if iss: items = [(int(i.get("priority", 2) if i.get("priority") is not None else 2), n, r[8:], i.get("title", "")[9:]) for n, (r, i) in enumerate(iss.items())
@@ -1973,12 +1977,9 @@ def fill_candidates(cfg, units):
     cov = unit_items(cfg, units); ever = all_units(cfg); out = []; idx = brief_index(cfg); taken = set()
     for pr, order, item, title in sorted(items):
         if item in cov: continue
-        rx = re.compile(r"(?<![A-Za-z0-9])" + re.escape(item) + r"(?![A-Za-z0-9])", re.I)
-        for f, name, keys, head in sorted(idx, key=lambda x: "ITEM" not in x[2]):
-            if keys.get("ITEM"):
-                if keys["ITEM"].lower() != item.lower(): continue
-            elif not rx.search("\n".join(head.splitlines()[:6])): continue
-            if name in ever or name in taken or (cfg.p("out", "out") / name / "REPORT.md").exists(): continue
+        for f, name, keys, head in idx:
+            if keys.get("ITEM", "").lower() != item.lower(): continue
+            if name in ever or name in taken or (cfg.p("out", "out") / name).exists(): continue
             if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): continue
             tier = "critical" if keys.get("TIER", "").upper() in ("CRITICAL", "HIGH") else "normal"
             kind = keys.get("KIND", "implement").lower()
@@ -1993,7 +1994,7 @@ def fill_plan(cfg, hs, units, limit=None):
     reservations or the provider budgets are used."""
     plan, stops, virt, spent = [], [], [dict(u) for u in units], {}
     cands = fill_candidates(cfg, units)
-    if not cands: return plan, ["no ready backlog item has an unlaunched brief (write briefs with an ITEM: <id> line)"]
+    if not cands: return plan, ["no ready backlog item has an unlaunched brief (a brief is for an item when it has an ITEM: <id> line)"]
     for pr, order, item, f, name, kind, tier in cands:
         if limit and len(plan) >= limit: stops.append(f"--max {limit} reached; {len(cands) - len(plan)} more candidate(s)"); break
         a = argparse.Namespace(unit=name, host=None, test_host=None, kind=kind, tier=tier)
@@ -2005,16 +2006,21 @@ def fill_plan(cfg, hs, units, limit=None):
             left = pv["cap_usd"] - committed(cfg, pv) - spent.get(mc["provider"], 0)
             if left < budget: stops.append(f"budget: {mc['provider']} has ${left:.2f} left, {name} needs ${budget:g}"); break
         try: hn, b, why = choose(cfg, a, f, mc, virt, hs)
-        except Err as e: stops.append(f"{name} ({item}): {str(e).removeprefix('refused, ')}"); continue
+        except Err as e: stops.append((name, str(e).removeprefix("refused, "))); continue
         if budget is not None: spent[mc["provider"]] = spent.get(mc["provider"], 0) + budget
         plan.append((name, item, m, hn, b, budget, f"{why}; priority {pr}", kind, tier, f))
         virt.append({"name": name, "host": hn, "build": b, "state": "working", "item": item})
     if not stops: stops.append("every ready candidate is planned")
-    return plan, stops
+    grp = {}   # one line per reason: the candidates it holds back
+    for s in stops:
+        n, w = s if isinstance(s, tuple) else (None, s)
+        grp.setdefault(w, []).append(n)
+    return plan, [(f"{len(ns)} candidate(s) ({', '.join(ns[:5])}{'...' if len(ns) > 5 else ''}): " if ns[0] else "") + w for w, ns in grp.items()]
 
 def cmd_fill(cfg, a):
     """Launch ready backlog units that have briefs, highest priority first, until every host's reservations or the budget are
     used, and no further. --dry-run lists what it would launch now and why it stops there."""
+    if DRY: cfg.ro = True   # a dry run changes nothing anywhere (the probe leaves the hosts' reservation files alone)
     hs = probe_all(cfg); units = Beads(cfg).units(); ag = herdr_agents(cfg)
     for u in units: u["state"] = unit_state(u, hs, ag)
     plan, stops = fill_plan(cfg, hs, units, a.max)
