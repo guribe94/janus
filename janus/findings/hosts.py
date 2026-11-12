@@ -73,6 +73,11 @@ def _after_opts(w, i):
         break
     return i
 
+# A shell keyword at the start of a segment (after a paren was dropped: `then (pytest -q)` -> `then pytest -q`) is not the
+# command; the command follows it (finding I). Only a leading keyword is skipped, like the wrappers below.
+SHELL_KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "done", "fi", "!", "{", "}"}
+
+
 def _test_argv(w, depth):
     """True when the words w (one command, quotes already removed) are a test or build run (finding 4: the review's cases;
     finding 3: uv/poetry/pdm `run`'s OWN options, hatch's `env:cmd`, cargo's own options before its subcommand, and the joined
@@ -116,6 +121,7 @@ def _test_argv(w, depth):
             if j < len(w) and w[j] == "run": j += 1
             i = j + 1 if j < len(w) else j; continue   # the toolchain name
         if b == "flock": i = _after_opts(w, i) + 1; continue   # the lock file
+        if b in SHELL_KEYWORDS: i += 1; continue   # finding I: a shell keyword does not hide the command after it
         if b in TEST_WRAP: i = _after_opts(w, i); continue
         if b == "cargo" or b.startswith("cargo-"):
             rest = w[i + 1:]   # cargo's own options and a `+toolchain` come before its subcommand (finding 3: `cargo -q test`)
@@ -133,11 +139,20 @@ def test_command(c, depth=0):
     line that merely *mentions* pytest (an orchestrator's `janus ack ... "pytest"`, a commit message) is not a test run.
     Finding 4: a word inside a quoted argument never starts a command, and a real run behind uv/poetry/rustup/xargs/arch/flock/
     node/a shell shim is judged one. Finding 8 (fix-install6): a ps line that lost its quotes (`janus ack ... "gate failed;
-    pytest ..."`, `git commit -m "run (pytest -q) ..."`) is not judged -- when the line's FIRST command is janus/git, the rest is
-    that tool's arguments, not a command (a real run goes through `janus run`, already excluded by via_lane)."""
+    pytest ..."`) is not judged. Finding I: only a janus command that carries a free-text MESSAGE (`janus ack`, `janus post`,
+    ...) hides the rest of its line; every other line -- a `git pull && cargo test`, a `janus status && cargo test`, a subshell
+    run whose paren the tokenizer dropped (`if true; then (pytest -q); fi`) -- is judged on its own commands."""
     segs = _segments(c)
-    if segs and os.path.basename(segs[0][0]) in ("janus", "janus.py", "git"): return False
+    if segs and _janus_message(segs[0]): return False
     return any(_test_argv(w, depth) for w in segs)
+
+# finding I: a janus subcommand whose trailing argument is free text (an ack/post/note); its unquoted ps rendering can look like a
+# chain of commands, so only THIS shape hides the rest of the line (a `git commit -m run (pytest -q)` line is judged normally and
+# never matches a test command because its first word is `git`).
+JANUS_MSG_SUB = {"ack", "post", "question", "learned", "note", "board", "comment", "ask", "answer"}
+
+def _janus_message(w):
+    return bool(w) and os.path.basename(w[0]) in ("janus", "janus.py") and len(w) > 1 and w[1] in JANUS_MSG_SUB
 
 VIA_LANE = re.compile(r"janus(\.py)? (run|gate)\b|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")   # plus paths.lane_scripts (project wrappers)
 

@@ -1062,6 +1062,22 @@ class Item4Localtest(unittest.TestCase):
         false_pos = [c for c in not_test if janus.test_command(c)]
         self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
 
+    def test_a_real_run_after_git_or_janus_is_judged_but_a_message_is_not(self):
+        """Catches (finding I): every line whose first command was git/janus was never judged, hiding a real run after it
+        (`git pull && cargo test`, `janus status && cargo test`), and a paren after a word hid a subshell run
+        (`if true; then (pytest -q); fi`); a janus message command (`janus ack ...`) and a `git commit -m` message are still
+        not judged."""
+        caught = ["git pull && cargo test -p a", "git stash; cargo test", "git commit -m wip; pytest -q",
+                  "sh -c 'git pull; pytest -q'", "bash -lc 'git checkout x && cargo test'", "janus status && cargo test",
+                  "if true; then (pytest -q); fi", "while (pytest -x); do :; done", "! (pytest -q)", "{ (cargo test); }",
+                  "bash -c 'if x; then (cargo test); fi'"]
+        missed = [c for c in caught if not janus.test_command(c)]
+        self.assertEqual(missed, [], f"a real run was not judged one: {missed}")
+        not_test = ["janus ack unit:x gate failed; pytest tests/a exit 1", "git commit -m run (pytest -q) before push",
+                    "git commit -m 'run (pytest -q) before push'"]
+        false_pos = [c for c in not_test if janus.test_command(c)]
+        self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
+
 
 class Item5HandoverOrder(unittest.TestCase):
     def test_a_handover_is_refused_before_the_successor_starts(self):
