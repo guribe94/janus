@@ -398,20 +398,22 @@ class LaunchQuoting(unittest.TestCase):
         self.assertIn("died at once", str(e.exception)); self.assertNotIn("launched dead", out.getvalue())
         self.assertEqual(saved["dead"]["via"], "failed")
         self.assertIn("died-at-start", (d / "out/ledger-bad.tsv").read_text())
-        # janus run in the same odd tree (job script, admission, runs dir under the odd root): the job runs and its code returns
+        # janus run in the same odd tree: the job script it would queue parses and quotes the odd paths, and the busy record it
+        # writes (row 53) holds the tree while the job is queued or running -- no real pueue or admission (item 22: the lane's
+        # admission disk floor made this test wait forever on a full root volume)
         wt = d / "wt (`q) x"; wt.mkdir(); (wt / "f it's").write_text("hi\n")
-        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(wt), subdir=None, usb=False, priority=0, no_wait=False,
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(wt), subdir=None, usb=False, priority=0, no_wait=True,
                                allow_unmerged=False, command=["--", "cat", "f it's"])
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()): rc = janus.cmd_run(cfg, r)
-        self.assertEqual(rc, 0)
-        self.assertEqual(janus.busy_reasons(cfg, wt, ps=""), [])                  # row 53: its job ended, the tree is free
-        r.no_wait = True; r.command = ["--", "sleep", "20"]
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()): janus.cmd_run(cfg, r)
-        why = janus.busy_reasons(cfg, wt, ps="")
-        self.assertEqual(len(why), 1, why); self.assertRegex(why[0], "is (running|queued)")
-        self.assertEqual(janus.busy_reasons(cfg, d / "briefs", ps=""), [])         # another tree is not busy
-        subprocess.run(["pueue", "-c", str(self.pd / "p.yml"), "reset", "--force"], capture_output=True, timeout=20); time.sleep(1)
-        self.assertEqual(janus.busy_reasons(cfg, wt, ps=""), [])
+        js = janus.job_script(cfg, "here", cfg.hosts["here"], r, "wt (`q) x", "cat f it's", "j-1")
+        self.assertEqual(subprocess.run(["bash", "-n"], input=js, text=True, capture_output=True).returncode, 0, js)
+        self.assertIn("bash -c 'cat f it'", js, "the command with a quote is not shell-quoted in the job script")
+        bdir = cfg.f("runs") / "busy"; bdir.mkdir(parents=True, exist_ok=True); rec = bdir / "j-1"; rec.write_text(f"here:7\t{wt}\n")
+        hs = {"here": {"ok": True, "pueue": {"tasks": {"7": {"status": {"Running": {}}, "label": "run:wt___q__x@t"}}}}}
+        why = janus.busy_reasons(cfg, wt, hs=hs, ps="")
+        self.assertEqual(len(why), 1, why); self.assertRegex(why[0], "is running")
+        self.assertEqual(janus.busy_reasons(cfg, d / "briefs", hs=hs, ps=""), [])   # another tree is not busy
+        rec.unlink()
+        self.assertEqual(janus.busy_reasons(cfg, wt, hs=hs, ps=""), [])
         # a remote host whose root has the same characters: every generated script parses
         cfg.hosts["far"] = {"ssh": "nowhere", "root": "$HOME/o (`r) it's", "_rd": "$HOME/o (`r) it's/runs"}
         for txt in (janus.lane_runner(cfg, "far", cfg.hosts["far"], "u", "$HOME/o (`r) it's/worktrees/u"),
