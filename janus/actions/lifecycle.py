@@ -330,20 +330,28 @@ def cmd_resume(cfg, a):
     elif jobs: msg = resume_message(cfg, hs, u, jobs)
     else: raise Err(f"{u['name']} is not parked: give --message")
     # finding 2: the tree is another open unit's cwd: never put a unit back into the tree its successor now works in (H9). A
-    # review/audit unit may share a tree with the unit it reviews, exactly as launch allows (launch.py H9 exception).
+    # review/audit unit may share a tree with the unit it reviews, exactly as launch allows (launch.py H9 exception); finding 6
+    # (fix-install6): a review/audit unit in `shared` is by design (it reviews that tree), so it is ignored -- a unit may resume in
+    # a tree whose only other open unit is its reviewer.
     cwd = Path(u["cwd"]).resolve() if u.get("cwd") else None
-    shared, _ = cwd_taken(cfg, bd.units(), cwd, u["name"]) if cwd else ([], None)
+    shared = []
+    if cwd:
+        units = bd.units()
+        shared, _ = cwd_taken(cfg, units, cwd, u["name"])
+        shared = [n for n in shared if next((x for x in units if x["name"] == n), {}).get("kind") not in ("review", "audit")]
     local = cfg.hosts.get(u.get("host"), {}).get("local")
     if shared and not (local and u.get("kind") in ("review", "audit")):
         raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}: resume {u['name']} in a tree of its own (H9)")
     # finding 2: never a second agent beside a running one. A pueue API run's resume queues a NEW task, so a still-running agent
     # task is refused even with --force (the old guard sat inside `not --force`, and --force then started the second agent). A
     # tmux/herdr resume only types into the agent's own pane (it cannot double-start), and a herdr unit blocked on a question is
-    # answerable, so those are never refused on their state.
+    # answerable, so those are never refused on their state. Finding 6 (fix-install6): refuse unless the agent task is KNOWN
+    # ended -- Paused/Stashed/Locked (a live agent janus never pauses) and an unknown state (a failed probe) are refused too.
     if u.get("via") == "pueue":
         st = unit_state(u, hs, herdr_agents(cfg))
-        if st in ("working", "queued"):
-            raise Err(f"{u['name']}'s agent is still {st}: a resume would start a second agent beside it (janus stop {u['name']} first)")
+        if st not in ENDED:
+            why = "its agent's state cannot be told (unknown)" if st == "unknown" else f"its agent is still {st}"
+            raise Err(f"{u['name']}: {why}: a resume would start a second agent beside it (janus stop {u['name']} first)")
     if not a.force:
         left = [j for j in jobs if job_state(hs, j)[0] not in ("done", "gone")]
         if left: raise Err(f"{u['name']} waits on {', '.join(left)}, not finished (--force to resume now)")

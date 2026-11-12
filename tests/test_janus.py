@@ -350,7 +350,7 @@ class ResumeBudget(unittest.TestCase):
         saved = {k: getattr(janus, k) for k in ("get_unit", "probe_all", "session_of", "run_cost", "ledger_done", "reserve_budget",
                                                 "unit_spent", "X", "confirm_started", "save_task_log", "board")}
         bd = type("B", (), {"save": lambda s, x: None, "comment": lambda s, *a: None})()
-        janus.get_unit = lambda cfg, n: (bd, u); janus.probe_all = lambda cfg: {}
+        janus.get_unit = lambda cfg, n: (bd, u); janus.probe_all = lambda cfg: {"here": {"ok": True, "pueue": {"tasks": {"5": {"status": {"Done": {"result": "Success"}}}}}}}
         janus.session_of = lambda cfg, u: "sid"; janus.run_cost = lambda *a, **k: (2.0, True); janus.ledger_done = lambda *a, **k: None
         janus.unit_spent = lambda cfg, u, wrapup=False: 2.0                       # the whole budget is spent (capped)
         janus.reserve_budget = lambda cfg, mc, name, budget, run=None: got.update(budget=budget) or "u1.r2.1"
