@@ -5,7 +5,7 @@ from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, in_container, job_script, runs_dir, task_rc, task_status, write_cap
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_script, board_shipped
-from janus.budgets import budget_for, finish_refusal, transcript_cost, waste_block
+from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost, waste_block
 from janus.cap import build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
 from janus.context import EXCL, Err, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, note_event, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
@@ -30,17 +30,18 @@ def pick_model(cfg, tier, kind, of_vendor, host=None):
         why.append(f"{m}: {w}")
     raise Err("no model available for " + tier + "/" + kind + " (" + "; ".join(why) + ")")
 
-def agent_prompt(cfg, unit, brief, hn, report=None):
+def agent_prompt(cfg, unit, brief, hn, report=None, budget=None):
     """The first prompt of a unit. It names the report path the unit must keep (row 26: a resumed unit continues its original
     report, which janus reads; the agent must not guess it from the brief) and the one instruction that matters (keep it
     current; the VERDICT line). The report.json contract lives in the brief header (quality_block) and is not repeated here
-    (F11: the prompt keeps the report-current rule, the header keeps report.json)."""
+    (F11: the prompt keeps the report-current rule, the header keeps report.json). An API run is told its budget and the
+    checkpoint rule (budget_note, budget-follow item 6)."""
     rc, o, e = board(cfg, "rule", unit, *([] if cfg.hosts[hn].get("local") else [hn]))
     rp = report or "REPORT.md (the path in the brief)"
     board_rule = f" {o.strip()}" if o.strip() else ""
     return (f"Read {brief} (absolute path) and carry out every instruction exactly. Keep {rp} current after every step so a run "
             f"stopped by its budget leaves its state: line 1 'VERDICT: PENDING' until done, then end with 'VERDICT: DONE' or "
-            f"'VERDICT: BLOCKED' and the real exit codes.{board_rule}")
+            f"'VERDICT: BLOCKED' and the real exit codes.{board_rule}" + (f" {budget_note(cfg, budget)}" if budget else ""))
 
 def wait_shell(pane, unit):
     for _ in range(30):
@@ -140,7 +141,7 @@ def cmd_api_run(cfg, a):
     shim = cfg.f("bin"); put_script(cfg, {"local": True}, str(shim / "pueue"), clean_pueue_script({"local": True}))
     env = clean_env({"JANUS_ROLE": "agent", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root), "JANUS_REPORT": a.report or str(od / "REPORT.md"), "BOARD_DIR": str(board_dir(cfg)), var: key})
     env["PATH"] = f"{shim}:{env['PATH']}"   # the agent's own `pueue add` never stores the key in pueue's state file
-    prompt = Path(a.prompt_file).read_text() if a.prompt_file else agent_prompt(cfg, name, a.brief, hn, a.report or str(od / "REPORT.md"))
+    prompt = Path(a.prompt_file).read_text() if a.prompt_file else agent_prompt(cfg, name, a.brief, hn, a.report or str(od / "REPORT.md"), budget=a.budget)
     argv = api_argv(pv, mc, a.budget, prompt, a.resume_session)
     say(f"janus api-run {name}: run {run}, model {mc.get('api_id', a.model)}, budget ${a.budget}, cwd {a.cwd}" + (f", resuming session {a.resume_session}" if a.resume_session else ""))
     import signal
@@ -471,7 +472,7 @@ def cmd_launch(cfg, a):
             rbrief = str(outd / (brief.name if (outd / brief.name).resolve() != brief.resolve() else "janus-" + brief.name))
             if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + brief.read_text())
         u["rbrief"] = rbrief
-        prompt = agent_prompt(cfg, name, rbrief, hn, env["JANUS_REPORT"])
+        prompt = agent_prompt(cfg, name, rbrief, hn, env["JANUS_REPORT"], budget=budget)
         u["rcwd"] = rcwd
         if mc["kind"] == "api":
             X(cfg, h, ensure_lanes(h, cfg))

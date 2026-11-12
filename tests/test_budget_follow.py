@@ -79,11 +79,13 @@ class Item1RunCost(unittest.TestCase):
         with mock.patch.object(janus, "refuse_agent", lambda *a, **k: None): rc, out = said(janus.cmd_ledger, cfg, ns(action="recost", provider=None))
         self.assertIn("nothing to correct", out); self.assertAlmostEqual(janus.committed(cfg, pv), 2.9)
 
-def transcript(home, cwd, sid, ctx, model="test-model", n=1):
-    """A session transcript under a fake home: n assistant messages, the last one with a context of ctx tokens."""
+def transcript(home, cwd, sid, ctx, model="test-model", n=1, first=None):
+    """A session transcript under a fake home: n assistant messages, the last one with a context of ctx tokens (first: the
+    text of its first prompt)."""
     d = Path(home) / ".claude/projects" / re.sub(r"[^A-Za-z0-9-]", "-", str(cwd)); d.mkdir(parents=True, exist_ok=True)
     L = [json.dumps({"type": "assistant", "timestamp": "2026-01-01T00:00:00Z", "message": {"id": f"m{i}", "model": model, "usage": {
         "input_tokens": 0, "output_tokens": 1000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": ctx - 1000}}}) for i in range(n)]
+    if first: L.insert(0, json.dumps({"type": "user", "message": {"content": first}}))
     (d / f"{sid}.jsonl").write_text("\n".join(L) + "\n")
 
 def rates(d, per_token=4e-6, model="test-model"):
@@ -303,5 +305,59 @@ class Item5UnitHistory(unittest.TestCase):
         """Catches (item 5): summing by name alone would add an earlier unit of the same name to the later one."""
         self.unit("u1", (0.6,)); self.unit("u1", (1.0, 0.5), t0=500)
         self.assertEqual(janus.cost_history(self.cfg, "api"), {("implement", "normal"): [0.6, 1.5]})
+
+class Item6Checkpoint(unittest.TestCase):
+    """Every API run is told its budget and what the unit has used, and is ordered to checkpoint before the cap stops it."""
+    def setUp(self):
+        self.d, self.cfg = project(); self.pv = self.cfg.prov["api"]; self.mc = self.cfg.models["m"]; rates(self.d, 4e-5)
+        self.cfg.hosts["far"] = {"ssh": "far", "root": "/srv/p", "_rd": "/srv/p/runs"}
+        self.u = api_unit(self.d, state="working", run=janus.reserve_budget(self.cfg, self.mc, "u1", 4, "u1.1.100"), runs=["u1.1.100"])
+        self.posts = []; self.log = []
+    def tend(self, u):
+        def board(cfg, *a, **k): self.posts.append(a); return 0, "", ""
+        with mock.patch.object(janus, "board", board), mock.patch.object(janus.Beads, "comment", lambda *a: None): janus.tend_checkpoint(self.cfg, {}, [u], self.log.append)
+        return [a for a in self.posts if a[0] == "direct"]
+
+    def test_the_first_prompt_states_the_budget_and_the_checkpoint_rule(self):
+        """Catches (item 6): the agent was never told its budget, so a run stopped at its cap mid-step with uncommitted work and
+        a report that did not say where it was."""
+        got = {}
+        def argv(pv, mc, budget, prompt, resume=None): got["prompt"] = prompt; return ["true"]
+        a = ns(unit="u1", run=self.u["run"], model="m", budget=4.0, brief=self.u["brief"], cwd=str(self.d), report=None, prompt_file=None, resume_session=None)
+        with mock.patch.object(janus, "api_argv", argv), mock.patch.object(janus, "read_secret", lambda pv: ("K", "x")), \
+             mock.patch.object(janus, "board", lambda *a, **k: (0, "", "")): said(janus.cmd_api_run, self.cfg, a)
+        for want in ("stopped without warning once it has spent $4.00", "commit your work", "budget checkpoint"): self.assertIn(want, got["prompt"])
+        with mock.patch.object(janus, "board", lambda *a, **k: (0, "", "")): p = janus.agent_prompt(self.cfg, "u1", "/b.md", "far", "/r.md", budget=2.5)
+        self.assertIn("$2.50", p)                                         # the prompt a remote unit is launched with
+
+    def test_a_resumed_run_is_told_this_runs_budget_and_what_the_unit_used(self):
+        """Catches (item 6): a resumed agent was not told what this run may spend, nor that part of it pays for its context."""
+        janus.ledger_done(self.cfg, self.pv, "u1.1.100", "u1", 1.0, 0)
+        with FakeHome(self.d) as home:
+            transcript(home, self.d, "sid", 5000); run_resume(self.cfg, self.u)
+        text = (self.d / "out/u1/resume-2.md").read_text()
+        self.assertIn("stopped without warning once it has spent $3.00", text); self.assertIn("used $1.00 of its $4", text)
+        self.assertIn("loading your context again", text)
+
+    def test_a_run_near_its_budget_is_ordered_to_checkpoint_once(self):
+        """Catches (item 6): nothing told a running agent that its run was at 85 % of its budget; it was stopped at the cap."""
+        with FakeHome(self.d) as home:
+            transcript(home, self.d, "S", 36000, n=5, first=f"Read {self.u['brief']}")           # $1.70 of $4: nothing yet
+            self.assertEqual(self.tend(self.u), [])
+            transcript(home, self.d, "S", 36000, n=10, first=f"Read {self.u['brief']}")          # $3.40 of $4: 85 %
+            d = self.tend(self.u)
+            self.assertEqual(len(d), 1, self.log); self.assertEqual(d[0][1], "u1")
+            for want in ("$3.40 of its $4", "commit", "report", "park"): self.assertIn(want, d[0][2])
+            self.assertEqual(len(self.tend(self.u)), 1, "the same run was ordered twice")
+
+    def test_a_remote_run_is_measured_on_its_host(self):
+        """Catches (item 6): a remote unit's spend could not be told here ('remote'), so it was never warned."""
+        u = {**self.u, "host": "far", "rcwd": "/srv/p/w/u1"}; calls = []
+        use = {"ctx": 36000, "model": "test-model", "use": {"test-model": {"input_tokens": 0, "output_tokens": 10000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 400000}}}
+        def hrun(h, script, **k): calls.append(script); return 0, json.dumps(use) + "\n", ""
+        with mock.patch.object(janus, "hrun", hrun): d = self.tend(u)
+        self.assertEqual(len(d), 1, self.log); self.assertIn("$3.60 of its $4", d[0][2])   # (50000 + 40000) weighted tokens at $4e-5
+        self.assertIn(" 100", calls[0].splitlines()[-1])                  # only this run's messages (since its start)
+        self.assertIn("ls -t", calls[0])                                  # a first run has no session id here yet: the tree's newest transcript
 
 if __name__ == "__main__": unittest.main()
