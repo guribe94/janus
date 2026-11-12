@@ -746,9 +746,13 @@ class Item3AdmitClock(unittest.TestCase):
         self.assertNotEqual(p.returncode, 124, "a queued job was dropped as if its command had timed out: " + p.stdout + p.stderr)
         self.assertEqual(p.returncode, 121, p.stdout + p.stderr)
         self.assertGreaterEqual(time.time() - t0, 2.0, "it was dropped before its blocked clock ran out: " + p.stdout)
-        self.assertIn("not admitted after 3s blocked", p.stdout, p.stdout)
+        # finding 7: assert the BEHAVIOUR (clock ran out, exit 121), not a wall-clock string. The script's clock is whole
+        # seconds and one poll can straddle a second, so the count is 3, 4, ... -- never the queued 7300 s.
+        m = re.search(r"not admitted after (\d+)s blocked \(limit 3s", p.stdout)
+        self.assertIsNotNone(m, "the give-up message did not say it was not admitted after Ns blocked: " + p.stdout)
+        self.assertGreaterEqual(int(m.group(1)), 3, p.stdout)
+        self.assertLess(int(m.group(1)), 60, "the clock counted the 7300 s queue wait, not the time blocked: " + p.stdout)
         self.assertNotIn("after 73", p.stdout, "the clock started at enqueue, not at the first blocked poll: " + p.stdout)
-        self.assertIn("blocked (limit 3s", p.stdout, p.stdout)
 
 
 class Item4Localtest(unittest.TestCase):
