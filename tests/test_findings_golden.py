@@ -20,7 +20,7 @@ GOLDEN = [
 ]
 
 # the watcher's urgent prefixes before the registry (janus.py URGENT): the registry must keep the same findings urgent
-URGENT_BEFORE = ("unit:", "board:", "question:", "overlap:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads",
+URGENT_BEFORE = ("unit:", "board:", "question:", "related:", "overlap:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads",
                  "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:", "idle-with-backlog", "scheduler:", "pressure:",
                  "direct:", "budget80:", "waiting:", "waste", "report-due", "parked:", "decision-missing:", "owner-question:")
 

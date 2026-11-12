@@ -13,7 +13,7 @@ from janus.memory import MEM_SECTIONS, mem_line, memory_read, mset
 from janus.platform import herdr
 from janus.probe import probe_all, pueue, room
 from janus.templates import CLEAN_PUEUE
-from janus.transcripts import transcript_of
+from janus.transcripts import predecessor_name, related_pointers, transcript_of
 from janus.units import herdr_agents, main_checkout, report_path, unit_state, ws_id
 
 def pick_model(cfg, tier, kind, of_vendor, host=None):
@@ -205,9 +205,10 @@ BOARD_RULE = ("**Board:** post only state changes (status when you start, `waiti
               "stuck, `learned <fact, with its source>` when you found something every agent should know, `done <VERDICT line>` at the end); "
               "your steps go in your report, not on the board.")
 
-def swarm_header(cfg, hn, h, name, rcwd, local):
+def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
     """What every agent gets at start besides its brief (janus-swarm item 2): the session memory, then pointers (never content)
-    to the project's agent instructions, the reports index, the peers file and how to read another agent's transcript."""
+    to the project's agent instructions, the reports index, the peers file and how to read another agent's transcript; then the
+    RELATED: names and the predecessor's report path and transcript command (imp-awareness)."""
     es = memory_read(cfg); L = []
     if es:
         L.append("## Session memory (curated by the orchestrator; your brief wins on conflict)")
@@ -228,22 +229,24 @@ def swarm_header(cfg, hn, h, name, rcwd, local):
           "- Rule: read peers.md and the index when your task touches another unit's area; read a transcript only to solve a problem "
           "another unit met, by grep or tail, never whole.",
           "- " + BOARD_RULE, "", ""]
+    rel = related_pointers(cfg, name, brief_text, pred)
+    if rel: L += [rel, ""]
     return "\n".join(L)
 
-def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None):
+def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None):
     """The header every unit's brief gets: where it runs, how it submits builds and tests (detached, then WAITING), its report,
     then the session memory and the swarm pointers (swarm_header)."""
     if local:
         b = build or hn
         return (f"<!-- janus: unit {name} runs on {hn} -->\n" + PARK_RULE.format(
             submit=f"janus run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=report or "REPORT.md")
-            + swarm_header(cfg, hn, h, name, rcwd, True))
+            + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
     return (f"<!-- janus: unit {name} runs on {hn} -->\n**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
             f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
             f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=report or "REPORT.md")
-            + swarm_header(cfg, hn, h, name, rcwd, False))
+            + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
 
 def place(cfg, a, brief, mc, units, hs):
     """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
@@ -368,6 +371,7 @@ def cmd_launch(cfg, a):
         t = report.read_text().split("\n", 1)
         if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not cfg.run.dry: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
+    pred = predecessor_name(cfg, name, a.resume_of)   # RELATED: names and the predecessor reach the brief (imp-awareness)
     u = {"v": UNIT_V, "host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
     if report: u["report"] = str(report); u["resume"] = True
@@ -396,7 +400,7 @@ def cmd_launch(cfg, a):
                 for n, t in board_shipped(cfg): put_script(cfg, h, f"{root}/bin/{n}", t)   # the shipped board there (outbox)
             if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
             ship_context(cfg, h, name, bcopy)
-            put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"]) + btext, "644")
+            put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + btext, "644")
             if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
                 put_script(cfg, h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
             else: X(cfg, h, f"[ -s {qp(env['JANUS_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['JANUS_REPORT'])}")
@@ -404,7 +408,7 @@ def cmd_launch(cfg, a):
         if not report and not rep.exists() and not cfg.run.dry: rep.write_text("VERDICT: PENDING\n")
         if local:   # the brief with janus's header (the park rule) as the agent reads it: out/<unit>/<brief name>
             rbrief = str(outd / (brief.name if (outd / brief.name).resolve() != brief.resolve() else "janus-" + brief.name))
-            if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["JANUS_REPORT"]) + brief.read_text())
+            if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + brief.read_text())
         u["rbrief"] = rbrief
         prompt = agent_prompt(cfg, name, rbrief, hn, env["JANUS_REPORT"])
         u["rcwd"] = rcwd

@@ -21,6 +21,10 @@ Usage:
                                         proposal for the session memory (janus check lists it until remembered or rejected).
                                         A launcher sets the card's fixed fields on its first post: BOARD_MACHINE, BOARD_BRIEF,
                                         BOARD_REPORT, BOARD_CHECK ("pid <n>", "herdr <agent>", "pueue <host>:<task>", "tab <label>").
+  board.sh note <agent> "<file>: <what>"
+                                        an agent leaves a note on ANOTHER agent's card (the one exception to hub-and-spoke:
+                                        a file both touch); janus check lists it (note:<agent>) until acked. The author is
+                                        the agent running this (its JANUS_UNIT).
   board.sh direct <agent|all> <text>    orchestrator to an agent (or every open card); answers that agent's open questions
   board.sh answer <question id> <text>  orchestrator: answer one question (a direction to its agent)
   board.sh read <agent>                 the agent's directions
@@ -33,9 +37,10 @@ Usage:
   board.sh sync                         pull every host's outbox, then push the board copy to every host
 Every write on the coordinating machine takes one flock (.lock)."""
 
-KINDS = ("status", "step", "blocked", "question", "waiting", "learned", "done")
-FIELDS = ("task", "brief", "machine", "state", "step", "blockers", "report", "check", "updated")
+KINDS = ("status", "step", "blocked", "question", "waiting", "learned", "done", "note")
+FIELDS = ("task", "brief", "machine", "state", "step", "blockers", "report", "check", "notes", "updated")
 GROUP = {"question": 1, "blocked": 2, "working": 3, "waiting": 4, "done": 5}
+NOTE_SEP = " || "   # notes on one card are one field value, notes separated (a card is rewritten from FIELDS alone)
 SSH = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 RSYNC_SSH = "ssh -o BatchMode=yes -o ConnectTimeout=8"
 
@@ -84,6 +89,18 @@ def field(p, name):
     return m.group(1) if m else ""
 
 
+NOTE_RX = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) ([A-Za-z0-9._-]+): (.*)$")
+
+
+def notes_of(p):
+    """[(time, author, text)] of the notes on a card, oldest first (a note is a shared-file note another agent left there)."""
+    out = []
+    for n in field(p, "notes").split(NOTE_SEP):
+        m = NOTE_RX.match(n.strip())
+        if m: out.append((m.group(1), m.group(2), m.group(3)))
+    return out
+
+
 def run(cmd, timeout=60):
     try: r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired): return 1, ""
@@ -129,6 +146,16 @@ class Board:
     def apply(self, t, a, k, x, brief="", report="", machine="", check="", host=""):
         """One post: its log line, a question's record, the card rewritten."""
         os.makedirs(self.p("agents"), exist_ok=True); os.makedirs(self.p("to"), exist_ok=True)
+        if k == "note":   # a shared-file note onto another agent's card (the one exception to hub-and-spoke)
+            target, sep, text = x.partition(" ")
+            if not goodname(target): raise Die(f"bad agent name '{target}'")
+            if not sep or not text.strip(): raise Die("usage: note <other-agent> \"<file>: <what>\"")
+            c = self.p("agents", f"{target}.md"); card = {n: field(c, n) for n in FIELDS}
+            note = f"{t} {a}: {oneline([text])}"
+            card["notes"] = NOTE_SEP.join([e for e in [card["notes"]] if e] + [note]); card["updated"] = t
+            write(c, f"# {target}\n" + "".join(f"- {n}: {card[n]}\n" for n in FIELDS))
+            with open(self.p("log.md"), "a") as f: f.write(f"{t} {a} note -> {target}: {oneline([text])}\n")
+            return
         if k == "question":   # a question gets an id; it needs an answer until the orchestrator gives one
             os.makedirs(self.p("questions"), exist_ok=True)
             n = int(read(self.p(".qseq")).strip() or 0) + 1
@@ -214,8 +241,9 @@ class Board:
                 if age > int(os.environ.get("BOARD_SILENT_MIN") or 30): flag = f"SILENT {age}m"
                 if self.master and self.gone(field(c, "check")): flag = (flag + ", " if flag else "") + "GONE (no done post)"
             b = field(c, "blockers")
+            nt = notes_of(c)
             rows.append((GROUP.get(st, 3), f"{a:<24} {field(c, 'machine'):<8} {st:<9} {str(age) + 'm':<6} {field(c, 'step')[:40]:<40} "
-                                          f"{b}{'; ' if b and flag else ''}{flag}"))
+                                          f"{b}{'; ' if b and flag else ''}{flag}" + (f"; note: {nt[-1][2][:60]}" if nt else "")))
         return rows
 
     # ---- commands
@@ -234,6 +262,22 @@ class Board:
 
     def need_master(self, what):
         if not self.master: raise Die(f"{what} runs on the coordinating machine only")
+
+    def cmd_note(self, other="", *words):
+        """An agent leaves a shared-file note on another agent's card (the one exception to hub-and-spoke: normally only the
+        orchestrator writes to a card). The author is the agent running this (JANUS_UNIT, else BOARD_AGENT)."""
+        a = os.environ.get("JANUS_UNIT") or os.environ.get("BOARD_AGENT") or ""
+        x = oneline(words)
+        if not goodname(a): raise Die('usage: note <other-agent> "<file>: <what>" (the author is the agent running this: JANUS_UNIT)')
+        okname(other)
+        if not x: raise Die('usage: note <other-agent> "<file>: <what>"')
+        t = now()
+        if self.master:
+            os.makedirs(self.p("agents"), exist_ok=True)
+            with Locked(self.p(".lock")): self.apply(t, a, "note", f"{other} {x}", host=self.localname())
+        else:
+            os.makedirs(self.out, exist_ok=True)
+            with Locked(os.path.join(self.out, ".lock")), open(os.path.join(self.out, "outbox.log"), "a") as f: f.write(f"{t} {a} note: {other} {x}\n")
 
     def cmd_direct(self, a="", *words):
         self.need_master("direct"); x = oneline(words)
@@ -321,8 +365,9 @@ class Board:
         # No quote characters: launchers embed this in quoted prompts and remote command lines.
         print(f"Message board: run {p} post {a} status <one line> when you start; {p} post {a} waiting <job ids> when you park on jobs; "
               f"{p} post {a} blocked <what blocks you> or {p} post {a} question <your question> when stuck; {p} post {a} learned <a fact "
-              f"every agent should know, with its source> when you find one; {p} post {a} done <your VERDICT line> at the end. Post only "
-              f"these state changes: your steps go in your report. Before each step run {p} read {a} and follow any new direction.")
+              f"every agent should know, with its source> when you find one; {p} post {a} done <your VERDICT line> at the end. If another "
+              f"unit touches a file you change too, leave it a note on its card: {p} note <agent> <file>: <what>. Post only these state "
+              f"changes: your steps go in your report. Before each step run {p} read {a} and follow any new direction.")
 
     def merge(self, lines, host):
         """Apply outbox lines (<date> <time> <agent> <kind>: <text>) in order; bad lines are skipped."""
@@ -331,7 +376,8 @@ class Board:
             if len(f) < 4: continue
             d, tm, a, r = f; k = r.split(":", 1)[0]; x = r.split(": ", 1)[1] if ": " in r else r
             if k not in KINDS or not goodname(a): continue
-            self.apply(f"{d} {tm}", a, k, x, host=host)
+            try: self.apply(f"{d} {tm}", a, k, x, host=host)
+            except Die: continue   # e.g. a note naming a bad target: one bad line never breaks the merge
 
     def cmd_sync(self, *_):
         self.need_master("sync")

@@ -3,14 +3,15 @@ report, and janus ledger (check, repair, reconcile)."""
 import os, re, time
 from janus.backlog import backlog_items, item_actors, unit_items
 from janus.beads import Beads
-from janus.board import board_dir, learned_posts
+from janus.board import board, board_dir, learned_posts
 from janus.budgets import OUTCOMES, rset, run_outcomes, waste_paused, waste_state
-from janus.context import Err, Locked, NUM, atomic_write, refuse_agent, say, slug, ts
+from janus.context import Err, Locked, NUM, atomic_write, now, refuse_agent, say, slug, ts
+from janus.findings.awareness import introduced_recently, related_cases
 from janus.findings.units import peer_rows, peers_text, unreconciled
 from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, spend
 from janus.memory import MEM_SECTIONS, learned_mark, mem_line, memory_history, memory_path, memory_read, memory_write
 from janus.probe import probe_all
-from janus.transcripts import read_transcript
+from janus.transcripts import pointer_text, read_transcript
 from janus.units import ENDED, herdr_agents, unit_any, unit_state, verdict, waiting_line_jobs
 
 def cmd_ledger(cfg, a):
@@ -195,3 +196,51 @@ def cmd_memory(cfg, a):
         if not cfg.run.dry: memory_write(cfg, es)
         return 0, [f"kept (re-dated): {e[3]}"]
     return 0, [f"{i:3} {e[0][:-1].lower():8} {mem_line(e)[2:]}" for i, e in enumerate(es, 1)] or [f"(no entries in {memory_path(cfg)})"]
+
+
+def introduce_topic(why, other=""):
+    """The grep topic for a transcript pointer: a path the reason names, else the other unit's name."""
+    m = re.search(r"[\w.-]+/[\w./-]+", why or "")
+    return m.group(0) if m else (other or (why or "").strip()[:40])
+
+
+def introduce(cfg, na, nb, why, topic=None):
+    """Make two units aware of each other: a direction on both cards, each naming the other, what it is doing, its report path
+    and the exact `janus transcript <unit> --grep <topic>` command. Recorded so related:<a>:<b> stays quiet for a while."""
+    ua, ub = unit_any(cfg, na), unit_any(cfg, nb)
+    if not ua: raise Err(f"no unit {na}")
+    if not ub: raise Err(f"no unit {nb}")
+    why = re.sub(r"\s+", " ", why or "").strip()
+    ta, tb = topic or introduce_topic(why, nb), topic or introduce_topic(why, na)   # each reads the OTHER's transcript
+    to_a = f"{why + '. ' if why else ''}{pointer_text(cfg, ub, ta, 'work with it')}"
+    to_b = f"{why + '. ' if why else ''}{pointer_text(cfg, ua, tb, 'work with it')}"
+    if cfg.run.dry: return [f"+ board.sh direct {na}: {to_a}", f"+ board.sh direct {nb}: {to_b}"]
+    for who, text in ((na, to_a), (nb, to_b)):
+        rc, o, e = board(cfg, "direct", who, text)
+        if rc: raise Err(f"board.sh direct {who}: {(e or o).strip()[:120]}")
+    d = cfg.jget("related.json"); d[f"{na}:{nb}" if na < nb else f"{nb}:{na}"] = {"t": int(now()), "reasons": [why], "topic": ta}
+    cfg.jput("related.json", d); cfg.touch("changed")
+    return [f"-> {na}: {to_a}", f"-> {nb}: {to_b}"]
+
+
+def cmd_introduce(cfg, a):
+    """janus introduce <a> <b> --why "<reason>": a direction on both agents' cards naming the other unit (imp-awareness item 1)."""
+    refuse_agent("janus introduce")
+    for n in (a.a, a.b):
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", n): raise Err(f"not a unit name: {n!r}")
+    if a.a == a.b: raise Err("janus introduce: a and b are the same unit")
+    why = re.sub(r"\s+", " ", a.why or "").strip()
+    if not why: raise Err('janus introduce needs --why "<why they should know each other>"')
+    return 0, introduce(cfg, a.a, a.b, why, a.topic)
+
+
+def tend_related(cfg, hs, units, log):
+    """The watcher's autopilot (exposed for watch.py, not called here): introduce two running units whose changes collide in the
+    same file or the same module (the two cases it may perform itself), once. Returns the pairs it introduced."""
+    out = []
+    for (x, y), d in sorted(related_cases(cfg, units, hs).items()):
+        if not (d["kinds"] & {"file", "module"}) or introduced_recently(cfg, x, y): continue
+        try: log("related " + " | ".join(introduce(cfg, x, y, "; ".join(d["reasons"])[:200], (d["topics"] or [None])[0])))
+        except Err as e: log(f"related {x}:{y}: {e}"); continue
+        out.append(f"{x}:{y}")
+    return out
