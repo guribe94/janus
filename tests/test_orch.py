@@ -158,6 +158,11 @@ class Register(unittest.TestCase):
         self.assertIsNone(orch.tree_guard(cfg, d))
         (d / "a").write_text("<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")
         self.assertIn("conflict markers", orch.tree_guard(cfg, d))
+        (d / "a").write_text("x\n"); g("checkout", "-q", "-b", "wk"); g("checkout", "-q", "main")
+        for i in range(11): (d / "a").write_text(f"{i}\n"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", str(i))
+        g("checkout", "-q", "wk")
+        self.assertIn("11 commits behind", orch.tree_guard(cfg, d))       # gates and land: refused
+        self.assertIsNone(orch.tree_guard(cfg, d, behind=False))            # an agent's own jobs: never for being behind (item 5)
     def test_shim_labels_agent_jobs(self):
         self.assertIn('add -l "unit:$ORCH_UNIT"', orch.clean_pueue_script({"local": True}))
     def test_rg_patterns_are_data(self):
