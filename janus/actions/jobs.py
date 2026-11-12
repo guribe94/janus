@@ -584,7 +584,8 @@ def orphan_jobs(cfg, hs, units):
             if task_rc(t) is not None or not lab.startswith("unit:"): continue
             u = names.get(lab[5:])
             if not u: out.append((f"{hn}:{tid}", f"its unit {lab[5:]} is closed"))
-            elif agent_ended(u) and not u.get("_park") and not u.get("parked"): out.append((f"{hn}:{tid}", f"its unit {u['name']}'s agent ended ({u['state']}) and is not parked"))
+            elif agent_ended(u) and not u.get("_park") and not u.get("parked") and not u.get("_sync_failed"):
+                out.append((f"{hn}:{tid}", f"its unit {u['name']}'s agent ended ({u['state']}) and is not parked"))
     live = {wrap_token(t) for p in hs.values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values() if task_rc(t) is None}
     try: recs = list((cfg.f("runs") / "wrap").iterdir())
     except OSError: recs = []

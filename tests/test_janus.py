@@ -1242,6 +1242,42 @@ class Migrate(unittest.TestCase):
         self.assertIn("# where the state lives", t, "the comment was rewritten")   # comments are left as written
         self.assertNotIn(".orch", t)
 
+    def test_values_that_must_stay_are_not_rewritten_and_continuation_lines_are(self):
+        """Catches (finding 1): rewrite_config replaced a bare `orch` token in any value (a path, host, keychain name or word),
+        and left a multi-line array's continuation lines alone."""
+        d = Path(tempfile.mkdtemp(prefix="janus-mig-"))
+        (d / "orch.toml").write_text(
+            '[project]\nname = "t"\nstate = ".orch"\n'
+            '[hosts.alpha]\nroot = "/home/dev/orch"\n'
+            '[hosts.beta]\nroot = "/srv/fleet/orch"\n'
+            '[paths]\ngate_log = ".orch/gates.log"\n'
+            'scripts = [\n  ".orch/bin/lane.sh",\n  "bin/orch.py",\n]\n'
+            '[misc]\nssh = "me@orch"\nkey_keychain = "orch"\nenv = "ORCH_API"\npy = "scripts/torch.py"\ndoc = "docs/research.orchard.md"\n')
+        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("old notes\n")
+        home = Path(tempfile.mkdtemp(prefix="janus-home-"))
+        old_home = os.environ.get("HOME"); os.environ["HOME"] = str(home)
+        real_run, real_sh = janus.run, janus.sh
+        janus.run = lambda *a, **k: (0, "", ""); janus.sh = lambda *a, **k: (1, "", "")
+        try: self.assertEqual(janus.migrate(str(d)), 0)
+        finally:
+            janus.run, janus.sh = real_run, real_sh
+            if old_home is None: os.environ.pop("HOME", None)
+            else: os.environ["HOME"] = old_home
+        t = (d / "janus.toml").read_text()
+        self.assertIn('state = ".janus"', t); self.assertIn('gate_log = ".janus/gates.log"', t)
+        self.assertIn('".janus/bin/lane.sh"', t); self.assertIn('"bin/janus.py"', t)   # continuation lines of a multi-line array
+        for keep in ('root = "/home/dev/orch"', 'root = "/srv/fleet/orch"', 'ssh = "me@orch"',
+                     'key_keychain = "orch"', 'env = "ORCH_API"', 'py = "scripts/torch.py"', 'doc = "docs/research.orchard.md"'):
+            self.assertIn(keep, t, f"a value that must stay was rewritten: {keep}")
+        # idempotent: a second migrate rewrites nothing
+        os.environ["HOME"] = str(home); janus.run = lambda *a, **k: (0, "", ""); janus.sh = lambda *a, **k: (1, "", "")
+        try: self.assertEqual(janus.migrate(str(d)), 0)
+        finally:
+            janus.run, janus.sh = real_run, real_sh
+            if old_home is None: os.environ.pop("HOME", None)
+            else: os.environ["HOME"] = old_home
+        self.assertEqual(t, (d / "janus.toml").read_text())
+
     def test_dry_run_changes_nothing(self):
         """Catches (item 3): migrate had no --dry-run, so a project could not see what the state-changing command would do."""
         d = Path(tempfile.mkdtemp(prefix="janus-mig-"))
@@ -1273,12 +1309,17 @@ class Migrate(unittest.TestCase):
         (d / "board/agents").mkdir(parents=True)
         (d / "board/agents/u1.md").write_text("# u1\n- task: t\n- state: working\n- project: \n")
         (d / "board/agents/zzz.md").write_text("# zzz\n- task: t\n- state: working\n- project: \n")
-        tasks = {"7": {"label": "unit:u1", "status": "Queued"}, "8": {"label": "unit:u9", "status": "Running"},
-                 "9": {"label": "gate:g@proj", "status": "Running"}}
+        tasks = {"7": {"label": "unit:u1", "status": "Queued", "path": str(d)},
+                 "8": {"label": "unit:u9", "status": "Running", "path": str(d)},
+                 "9": {"label": "gate:g@proj", "status": "Running", "path": str(d)},
+                 "10": {"label": "unit:u1", "status": "Queued", "path": "/tmp/another-project"}}
         calls = []
         def fake_sh(cmd, **k):
             calls.append(list(cmd))
-            if cmd[:2] == ["pueue", "status"]: return 0, json.dumps({"tasks": tasks}), ""
+            b = os.path.basename(cmd[0])
+            if b == "pueue" and cmd[1:2] == ["status"]: return 0, json.dumps({"tasks": tasks}), ""
+            if b == "pueue" and cmd[1:2] == ["edit"]:   # pueue applies the label the editor wrote
+                tasks[cmd[2]]["label"] += "@proj"; return 0, "", ""
             if cmd[:2] == ["tmux", "list-sessions"]: return 0, "janus-u2\norch-u1\njanus-zzz\n", ""
             return 0, "", ""
         real_sh, real_units = janus.sh, janus.all_units
@@ -1298,7 +1339,8 @@ class Migrate(unittest.TestCase):
         self.assertEqual(sorted(tuple(c) for c in calls if c[:2] == ["tmux", "rename-session"]),
                          [("tmux", "rename-session", "-t", "janus-u2", "janus-u2@proj"),
                           ("tmux", "rename-session", "-t", "orch-u1", "janus-u1@proj")])
-        self.assertEqual([c for c in calls if c[:2] == ["pueue", "edit"]], [["pueue", "edit", "7"]], "another project's job was touched")
+        edits = [c[1:] for c in calls if os.path.basename(c[0]) == "pueue" and c[1:2] == ["edit"]]
+        self.assertEqual(edits, [["edit", "7"]], "another project's job was touched")
 
     def test_adopt_dry_run_changes_nothing(self):
         d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "janus.toml").write_text('[project]\nname = "t"\nid = "proj"\n')
@@ -1306,7 +1348,8 @@ class Migrate(unittest.TestCase):
         calls = []
         def fake_sh(cmd, **k):
             calls.append(list(cmd))
-            if cmd[:2] == ["pueue", "status"]: return 0, json.dumps({"tasks": {"7": {"label": "unit:u1", "status": "Queued"}}}), ""
+            b = os.path.basename(cmd[0])
+            if b == "pueue" and cmd[1:2] == ["status"]: return 0, json.dumps({"tasks": {"7": {"label": "unit:u1", "status": "Queued", "path": str(d)}}}), ""
             if cmd[:2] == ["tmux", "list-sessions"]: return 0, "janus-u1\n", ""
             return 0, "", ""
         real_sh, real_units = janus.sh, janus.all_units
@@ -1367,22 +1410,38 @@ class DoctorProjectListed(unittest.TestCase):
 
 
 class SkillPointers(unittest.TestCase):
-    def test_every_path_skill_names_is_in_the_shipped_set(self):
-        """Catches (item 5): install shipped no docs/, so the path SKILL.md sends the orchestrator to (docs/REFERENCE.md) was
-        absent from the release (the shipped set is install's PARTS; in a release copy, the copy itself)."""
-        import ast
+    def test_a_release_copy_missing_a_pointed_path_is_caught(self):
+        """Catches (finding 15): SkillPointers passed in a release copy missing docs/REFERENCE.md, because without `install` it
+        had nothing to compare (PARTS) and a missing path was skipped."""
+        import ast, shutil
         root = JANUS_PY.parent; skill = root / "skill/SKILL.md"
         self.assertTrue(skill.is_file(), skill)
-        inst = root / "install"; parts = None
-        if inst.is_file():
+        state = (".janus", ".orch", "out", "briefs", "worktrees", "board", ".beads", "ctx", "run", "base")
+        def missing_in(base):
+            """Paths SKILL.md names that a copy at `base` does not hold (a project's own state paths are not shipped files)."""
+            inst = base / "install"; parts = None
+            if inst.is_file():
+                parts = next(ast.literal_eval(n.value) for n in ast.parse(inst.read_text()).body
+                             if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "PARTS")
+            out = set()
+            for m in re.finditer(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*[A-Za-z0-9]", (base / "skill/SKILL.md").read_text()):
+                r = m.group(0).rstrip(".,;:)")
+                if r.split("/", 1)[0] in state: continue
+                if parts is not None and not any(r == p or r.startswith(p + "/") for p in parts): out.add(r); continue
+                if not (base / r).exists(): out.add(r)
+            return out
+        self.assertEqual(sorted(missing_in(root)), [], "SKILL.md names paths the tree does not hold")
+        inst = root / "install"
+        if inst.is_file():   # build the release copy install would ship and drop a pointed path from it
             parts = next(ast.literal_eval(n.value) for n in ast.parse(inst.read_text()).body
                          if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "PARTS")
-        missing = set()
-        for m in re.finditer(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*[A-Za-z0-9]", skill.read_text()):
-            r = m.group(0).rstrip(".,;:)")
-            if not (root / r).exists(): continue            # a project's own state path (.janus/...), not a shipped file
-            if parts is not None and not any(r == p or r.startswith(p + "/") for p in parts): missing.add(r)
-        self.assertEqual(sorted(missing), [], "SKILL.md names paths install does not ship")
+            rel = Path(tempfile.mkdtemp(prefix="janus-release-"))
+            for p in parts:
+                src, dst = root / p, rel / p
+                if src.is_dir(): shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                elif src.is_file(): shutil.copy2(src, dst)
+            (rel / "docs/REFERENCE.md").unlink()
+            self.assertEqual(sorted(missing_in(rel)), ["docs/REFERENCE.md"], "a release copy missing a pointed path passed")
 
 
 if __name__ == "__main__": unittest.main()

@@ -29,17 +29,20 @@ BUDGET_DEFAULTS = {"margin_pct": 30, "min_runs": 3, "min_usd": 0.5, "max_usd": N
 def bset(cfg, k): return cfg.c.get("budget", {}).get(k, BUDGET_DEFAULTS[k])
 
 def cost_history(cfg, provider):
-    """{(kind, tier): [cost of each finished run]} of a provider, oldest first. Item 16c: a run under [budget] min_usd, or one
-    whose unit ended without a verdict, is left out -- 23 tiny capped runs skewed the median to $0.09 and every real unit started
-    at a $0.50 cap (the waste cause)."""
+    """{(kind, tier): [cost of each finished run]} of a provider, oldest first. A done run counts when its unit ended with a
+    verdict, when it ended at its budget cap (a capped run shows the budget was too small, so it raises it), or when it cost at
+    least [budget] min_usd (a real run whose report was tidied still counts, finding 9); only a tiny run without a verdict is
+    dropped (the 23 tiny runs that skewed the median to $0.09, item 16c)."""
     pv = cfg.prov[provider]
     if "ledger" not in pv: return {}
     runs = ledger_read(cfg, pv)[0]; us = all_units(cfg); byrun = {u.get("run"): u for u in us.values() if u.get("run")}
     out = {}
     for k, r in runs.items():
-        if not r["done"] or r["cost"] is None or r["cost"] < bset(cfg, "min_usd"): continue
+        if not r["done"] or r["cost"] is None: continue
         u = byrun.get(k) or us.get(r["unit"])
-        if not u or not u.get("kind") or not verdict(cfg, {**u, "resume": False}): continue
+        if not u or not u.get("kind"): continue
+        capped = api_out(cfg, u).get("subtype") == "error_max_budget_usd"
+        if not (verdict(cfg, {**u, "resume": False}) or capped or r["cost"] >= bset(cfg, "min_usd")): continue
         out.setdefault((u["kind"], u.get("tier") or "normal"), []).append(r["cost"])
     return out
 

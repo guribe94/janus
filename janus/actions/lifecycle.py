@@ -163,7 +163,8 @@ def unit_dirty(cfg, cwd):
 
 def cmd_close(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
-    mine = own_tree(cfg, u, units) or getattr(a, "handover", False)   # item 13: a successor took its tree, so --force is right
+    handover = bool(getattr(a, "handover", False))
+    mine = own_tree(cfg, u, units) or handover   # item 13: a successor took its tree, so --force is right
     if a.force and not mine: raise Err(f"--force refused: {u['cwd']} is shared (project root or another open unit's cwd)")
     if mine:
         dirty, state_repo = unit_dirty(cfg, u["cwd"])
@@ -172,8 +173,14 @@ def cmd_close(cfg, a):
         if rc == 0 and o.strip() != "0" and not a.force and not state_repo: raise Err("unpushed commits; push first, or --force")
     elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
         raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
-    why = None if a.force or cfg.run.dry else uncollected(cfg, u)
+    # A handover is never a reason to skip the uncollected guard (finding 3): a remote predecessor's dirty tree is its copy on
+    # the host, so removing it without collect loses work. Only a plain --force skips the guard.
+    why = None if (a.force and not handover) or cfg.run.dry else uncollected(cfg, u)
     if why: raise Err(f"refused: {u['name']}: {why}")
+    if handover and not cfg.run.dry:   # never close a predecessor whose agent is still running (finding 3)
+        st = unit_state(u, probe_all(cfg), herdr_agents(cfg))
+        if st in ("working", "queued", "blocked"):
+            raise Err(f"{u['name']}'s agent is still {st}: stop it first (janus stop {u['name']}), then hand its tree over")
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
     if u.get("tab") or u.get("pane"):
         if cfg.run.dry: say(f"+ herdr tab close {u.get('tab') or u.get('pane')}")
@@ -328,16 +335,21 @@ def save_output(cfg, u):
     if u.get("report") and (od / "REPORT.md").is_file(): atomic_write(Path(u["report"]), (od / "REPORT.md").read_text())
     return True
 
+def saved_marker(u):
+    """What `saved` records when a remote unit's output was brought here: its pueue task, else 'tmux' (a tmux unit has no task,
+    finding 5, so `saved == task` is never None == None)."""
+    return u.get("task") if u.get("task") is not None else "tmux"
+
 def refresh_remote(cfg, u, bd, log):
     """A remote unit's output is read here: saved once when its agent's turn ended (then its verdict, WAITING line and api.json
     are judged here), and every [collect] backup_min while it runs (item 4)."""
     if cfg.hosts[u["host"]].get("local") or u.get("via") in ("failed", "starting"): return
     fin = u.get("state") in ENDED
-    if not ((fin and u.get("saved") != u.get("task")) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60): return
+    if not ((fin and u.get("saved") != saved_marker(u)) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60): return
     remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
     if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed"); return
     u["saved_at"] = int(now())
-    if fin: u["saved"] = u.get("task")
+    if fin: u["saved"] = saved_marker(u)
     bd.save(u)
     u["verdict"] = v = verdict(cfg, u)
     if not v and not u.get("_park") and (fin or u.get("via") == "tmux"):
@@ -345,17 +357,21 @@ def refresh_remote(cfg, u, bd, log):
         if pk: u["_park"] = pk; u["state"] = "parked"
 
 def sync_remote_outputs(cfg, units, bd):
-    """Item 11 addendum: before check judges a remote unit parked vs orphan, bring its report here once its agent ended (the local
-    report has no WAITING line until janus collect, so its jobs looked orphaned). A writer only; the save is recorded so the next
-    pass does not repeat it."""
+    """Item 11 addendum (finding 5): before check judges a remote unit parked vs orphan, bring its report and the end-of-turn
+    backup patch here once its agent ended (the local report has no WAITING line until janus collect, so its jobs looked
+    orphaned). Remote tmux units (no pueue task) are synced too, and a failed sync fails closed: the unit is marked so its jobs
+    are never cancelled on the stale local report."""
     if cfg.run.ro: return
     for u in units:
         if cfg.hosts.get(u.get("host"), {}).get("local") or u.get("via") in ("failed", "starting"): continue
-        if u.get("state") not in ENDED or u.get("saved") == u.get("task"): continue
+        if u.get("state") not in ENDED or u.get("saved") == saved_marker(u): continue
         try:
-            if not save_output(cfg, u): continue
-        except Err: continue
-        u["saved"] = u.get("task"); u["saved_at"] = int(now())
+            remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")
+            if not save_output(cfg, u):
+                u["_sync_failed"] = True; continue
+        except Err:
+            u["_sync_failed"] = True; continue
+        u["saved"] = saved_marker(u); u["saved_at"] = int(now())
         try: bd.save(u)
         except Err: pass
 

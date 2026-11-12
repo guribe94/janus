@@ -34,7 +34,8 @@ def verdict(cfg, u):
     """The unit's final VERDICT line: report.json's verdict when it states one (preferred over the prose), else the last
     'VERDICT:' line of its report (a resumed unit: its original report, report_path). A resumed report still holds the earlier
     run's verdict, so only a verdict written after the resume started counts, and a line 1 that is still PENDING means not
-    finished. PENDING and WAITING are never a final verdict (item 11): a report that ends 'WAITING <jobs>' is parked, not done."""
+    finished. A report whose LAST VERDICT line is PENDING or WAITING is not finished (item 11, finding 2): whatever earlier
+    DONE lines or a stale report.json say, it is parked, not done."""
     p = report_path(cfg, u); j = report_json(cfg, u)
     try: t = p.read_text().splitlines()
     except OSError: t = []
@@ -44,9 +45,11 @@ def verdict(cfg, u):
         jp = p.with_name("report.json")
         if jp.exists(): mt = max(mt, jp.stat().st_mtime)
         if mt < u.get("started", 0) or (t and "PENDING" in t[0]): return None
+    last = next((l for l in reversed(t) if l.startswith("VERDICT:")), None)   # the report's last VERDICT line decides
+    if last is not None and NONFINAL.search(last): return None                # ends parked/pending: not finished
     v, present = verdict_line(j)
     if present: return v
-    return next((l for l in reversed(t) if l.startswith("VERDICT:") and not NONFINAL.search(l)), None)   # PENDING and WAITING are not verdicts
+    return last
 
 def herdr_agents(cfg):
     r = herdr("agent", "list")
