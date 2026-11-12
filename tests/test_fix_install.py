@@ -717,11 +717,17 @@ class Item4Localtest(unittest.TestCase):
             "cargo-nextest nextest run", "rustup run stable cargo test", "bash -lc 'cargo test'", "xargs -n1 pytest",
             "arch -arm64 pytest", "flock /tmp/l cargo build", "zsh -c -l source ~/.zshrc && eval 'pytest -q tests'",
             "pytest -q", "npm test", "cargo +nightly test", "time cargo build", "nice -n 10 /usr/bin/pytest tests/",
+            # finding 3: the runner's own options, hatch's env:cmd, cargo's own options, and the joined python -mpytest
+            "uv run --frozen pytest -q", "uv run --with pytest-xdist pytest", "uv run -q pytest", "uv run --project p pytest tests",
+            "poetry run -q pytest", "hatch run test:pytest", "cargo -q test", "cargo --locked test -p x", "cargo --offline build",
+            "python3 -mpytest",
         ]
         missed = [c for c in caught if not janus.test_command(c)]
         self.assertEqual(missed, [], f"a real test/build run was not judged one: {missed}")
         not_test = ["git commit -m 'run (pytest -q) before push'", "janus ack unit:x 'gate failed; pytest tests/a exit 1'",
-                    "cargo run --bin build", "janus ack unit:x 'cargo test failed'"]
+                    "cargo run --bin build", "janus ack unit:x 'cargo test failed'",
+                    # finding 3: a later word naming pytest after a Python interpreter is not a run
+                    "python3 -m pip install pytest", "python3 -m venv pytest", "python3 tool.py --runner pytest"]
         false_pos = [c for c in not_test if janus.test_command(c)]
         self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
 
