@@ -1,12 +1,14 @@
-"""janus init, doctor, queue and register: a shareable project setup and the one registered orchestrator session."""
+"""janus init, doctor, queue, register and install-host: a shareable project setup, new machines, and the one registered
+orchestrator session."""
 import concurrent.futures as cf, json, os, re, shlex, sys
 from pathlib import Path
+from janus.actions.jobs import remote_wt
 from janus.board import board_dir, board_script
-from janus.context import (Err, JANUS_SELF, atomic_write, clean_env, herdr, hrun, now, projects, record_session_proc, say,
+from janus.context import (Err, JANUS_SELF, SSH, atomic_write, clean_env, herdr, hrun, now, projects, qp, record_session_proc, say,
     session_alive, sh, slug, ts)
 from janus.ledger import ledger_read, read_secret, spend
-from janus.platform import launchd_watcher_loaded, run, systemd_watcher_active
-from janus.probe import probe, pueue
+from janus.platform import run, watcher_loaded, watcher_service
+from janus.probe import discover, probe, pueue
 from janus.units import ws_id
 
 def cmd_register(cfg, a):
@@ -163,8 +165,7 @@ def doctor(cfg, a):
     except Exception: hk = {}
     miss = [ev for ev in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop") if not any("janus hook " + ev in h.get("command", "") for e in hk.get(ev, []) for h in e.get("hooks", []))]
     r(not miss, "Claude Code hooks " + ("installed" if not miss else "missing: " + ", ".join(miss)), "run ./install")
-    if sys.platform == "darwin": r(launchd_watcher_loaded() or None, "watcher com.janus.watch loaded", "run ./install")
-    else: r(systemd_watcher_active() or None, "watcher janus-watch.timer active", "run ./install")
+    r(watcher_loaded() or None, f"watcher {watcher_service()[1]} ({watcher_service()[0]}) loaded", "run ./install")
     if cfg is None:
         r(False, f"no janus.toml in {Path.cwd()} or a parent", "janus init"); return 1
     say(f"-- project {cfg.name} ({cfg.root})")
@@ -215,3 +216,87 @@ def cmd_queue(cfg, a):
         rc, o, e = hrun(h, f"{pueue(h)} " + (f"log {int(a.log)}" if a.log is not None else "status"), timeout=30)
         L += [f"== {n}" + ("" if rc == 0 else f" (exit {rc}: {(e or o).strip()[-100:]})"), o.rstrip()]
     return 0, L
+
+# janus install-host <host> (imp-sched item 4): set up a machine named in janus.toml, after discovering it (nothing assumed): its
+# folders, the queue daemon (pueued) as a user service, a copy of janus for read-only commands (<root>/janus), and the heartbeat
+# watchdog when [heartbeat] watchdog names this host. Idempotent; --dry-run prints the steps. No sudo.
+PUEUE_URL = "https://github.com/Nukesor/pueue/releases/latest/download"
+PUEUED_UNIT = "[Unit]\nDescription=pueued\n[Service]\nExecStart={bin}/pueued {cfg}\nRestart=always\n[Install]\nWantedBy=default.target\n"
+
+def heartbeat_files():
+    """The heartbeat scripts shipped next to janus.py (heartbeat/beat, heartbeat/install-watchdog), or None until they are."""
+    d = JANUS_SELF.parent / "heartbeat"
+    return d if (d / "beat").is_file() and (d / "install-watchdog").is_file() else None
+
+def heartbeat_env(cfg):
+    """The heartbeat settings ([heartbeat] watchdog = <host>, max_age_min, alert_cmd) as the scripts' environment, or None."""
+    hb = cfg.c.get("heartbeat", {}); w = hb.get("watchdog")
+    if not w: return None
+    if w not in cfg.hosts or cfg.hosts[w].get("local"): raise Err(f"[heartbeat] watchdog = {w!r}: name another host of janus.toml")
+    root = cfg.hosts[w].get("root", "$HOME/janus")
+    return {"host": w, "file": f"{root}/heartbeat", "outbox": f"{root}/board-outbox/outbox.log", "max_age": int(hb.get("max_age_min", 15) * 60),
+            "alert_cmd": hb.get("alert_cmd", "")}
+
+def heartbeat_beat(cfg, rc=0):
+    """The watcher's beat (one line per pass, copied to the watchdog host). Inert until heartbeat/ ships and [heartbeat] is set."""
+    d, e = heartbeat_files(), heartbeat_env(cfg)
+    if not d or not e or cfg.run.dry: return
+    w = cfg.hosts[e["host"]]
+    sh(["sh", str(d / "beat"), str(int(rc))], timeout=60, clean=True,
+       env={"HEARTBEAT_FILE": str(cfg.f("heartbeat")), "HEARTBEAT_REMOTE": w["ssh"], "HEARTBEAT_REMOTE_PATH": e["file"].replace("$HOME/", ""),
+            "HEARTBEAT_SSH_OPTS": "-o BatchMode=yes -o ConnectTimeout=5"})
+
+def install_steps(cfg, n, h, f):
+    """[(what, shell)] that set up host n, given its discovered facts f."""
+    root = h.get("_rd", "").rsplit("/runs", 1)[0] if h.get("local") else h.get("root")
+    if not root: raise Err(f"[hosts.{n}] has no root (the folder janus uses there)")
+    dirs = [f"{root}/runs"] if h.get("local") else [f"{root}/runs", f"{root}/run", remote_wt(h, "").rstrip("/"), f"{root}/board-outbox"]
+    steps = [("folders", "mkdir -p " + " ".join(qp(x) for x in dirs))]
+    have = set(f["tools"])
+    if f["os"] == "mac":
+        if "pueued" not in have: steps.append(("pueue", "command -v brew >/dev/null && brew install pueue || { echo 'install pueue (brew install pueue)'; exit 1; }"))
+        steps.append(("pueued service", "brew services start pueue >/dev/null 2>&1 || pueue status >/dev/null"))
+    else:
+        b = h.get("bin", "$HOME/.local/bin"); cfgf = h.get("pueue_config"); shared = h.get("pueue_dir")
+        if "pueued" not in have:
+            if f["arch"] not in ("x86_64", "aarch64"): raise Err(f"{n}: no pueue build for {f['arch']}: install pueue there, then run install-host again")
+            steps.append(("pueue", f"mkdir -p {qp(b)} && for x in pueue pueued; do curl -fsSL -o {qp(b)}/$x.new {PUEUE_URL}/$x-{f['arch']}-unknown-linux-musl && chmod +x {qp(b)}/$x.new && mv -f {qp(b)}/$x.new {qp(b)}/$x || exit 1; done"))
+        if "systemd-user" not in f["features"]: raise Err(f"{n}: no systemd user manager: start pueued there by hand (pueued -d)")
+        unit = shlex.quote(PUEUED_UNIT.format(bin=b, cfg=f"--config {cfgf}" if cfgf else ""))
+        if shared:   # a shared server: pueue's files in pueue_dir, the unit linked from there (nothing in a shared home)
+            steps.append(("pueued service", f"mkdir -p {qp(shared)}/pueue.d/data {qp(shared)}/pueue.d/run && "
+                          + (f"{{ [ -f {qp(cfgf)} ] || printf 'shared:\\n  pueue_directory: {shared}/pueue.d/data\\n  runtime_directory: {shared}/pueue.d/run\\n' > {qp(cfgf)}; }} && " if cfgf else "")   # an existing config is kept
+                          + f"printf %s {unit} > {qp(shared)}/pueued.service && systemctl --user link {qp(shared)}/pueued.service && systemctl --user enable --now pueued.service"))
+        else:
+            steps.append(("pueued service", f"mkdir -p ~/.config/systemd/user && printf %s {unit} > ~/.config/systemd/user/pueued.service && "
+                          "systemctl --user daemon-reload && systemctl --user enable --now pueued.service"))
+        steps.append(("linger", 'loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q yes || loginctl enable-linger "$USER" 2>/dev/null || '
+                      'echo "note: user services stop at logout until linger is on (loginctl enable-linger $USER, may need an admin)"'))
+    return steps
+
+def cmd_install_host(cfg, a):
+    """janus install-host <host>: discover it, then run install_steps there, copy janus to <root>/janus (read-only commands) and
+    install the heartbeat watchdog when [heartbeat] watchdog is this host."""
+    n = a.host
+    if n not in cfg.hosts: raise Err(f"unknown host {n} (add [hosts.{n}] to janus.toml first: ssh, root)")
+    h = cfg.hosts[n]; f = discover(n, h)
+    if not f: raise Err(f"{n} is unreachable (ssh {h.get('ssh', '')} must work with keys, BatchMode)")
+    if not cfg.run.dry: cfg.jput("hosts-facts.json", {**cfg.jget("hosts-facts.json"), n: f})
+    say(f"{n}: {f['os']} {f['arch']}, {f['cores']} cores, {(f['mem_mb'] or 0) / 1024:.1f} GB; tools {' '.join(f['tools'])}")
+    steps = install_steps(cfg, n, h, f); rc = 0
+    if not h.get("local"):
+        root = h["root"]; dst = f"{h['ssh']}:{root.replace('$HOME/', '')}/janus/"
+        steps.append(("janus copy", ["rsync", "-a", "--delete", "--exclude", "__pycache__", "-e", " ".join(SSH), str(JANUS_SELF), str(JANUS_SELF.parent / "janus"), dst]))
+        e, d = heartbeat_env(cfg), heartbeat_files()
+        if e and e["host"] == n:
+            if d:
+                steps.append(("heartbeat files", ["rsync", "-a", "-e", " ".join(SSH), str(d), dst]))
+                env = {"HEARTBEAT_FILE": e["file"], "HEARTBEAT_MAX_AGE": e["max_age"], "HEARTBEAT_OUTBOX": e["outbox"], "HEARTBEAT_AGENT": "janus-heartbeat", "HEARTBEAT_ALERT_CMD": e["alert_cmd"]}
+                steps.append(("heartbeat watchdog", "".join(f"{k}={shlex.quote(str(v))} " for k, v in env.items()) + f"sh {qp(root)}/janus/heartbeat/install-watchdog"))
+            else: say(f"note: [heartbeat] watchdog = {n}, but this janus has no heartbeat/ scripts yet: run install-host again once it does")
+    for what, x in steps:
+        if cfg.run.dry: say(f"+ [{n}] {what}: " + (shlex.join(x) if isinstance(x, list) else x)); continue
+        r, o, e = sh(x, timeout=600) if isinstance(x, list) else hrun(h, x, timeout=600)
+        say(f"{'ok  ' if r == 0 else 'FAIL'} {what}" + ("" if r == 0 else f": {(e or o).strip()[-160:]}") + (f" ({o.strip()[-120:]})" if r == 0 and o.strip() else ""))
+        rc = rc or r
+    return 1 if rc else 0

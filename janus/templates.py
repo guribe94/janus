@@ -39,6 +39,7 @@ fi'''
 CAP_LIB = r'''# janus capacity library for host %(name)s (written by janus, see cap_lib in janus.py; do not edit: the next janus run rewrites it).
 # Sourced by every waiting job each poll and sent inline with every probe. Needs RD (the runs dir).
 CORES=%(cores)d CPJ=%(cpj)d MEMCAP=%(memcap)d CAPMB=%(capmb)d AGMB=%(agmb)d PSIP=%(psip)s LOADX=%(loadx)s HOLD=%(hold)d DISK=%(disk)d HN=%(hn)d MARGIN=%(margin)d
+AGEW=%(agew)s EXPS=%(exps)d
 U=$(id -u); AS=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/app.slice; US=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/user.slice
 cap_mb() {  # $1 class, $2 default MB, $3 cap MB (0: none): the max of the class's last HN recorded peaks + MARGIN %%, at least
   # 256 (class agent: the median of its last 3 x HN peaks, at least 128: many light agents seldom peak together)
@@ -48,6 +49,30 @@ cap_mb() {  # $1 class, $2 default MB, $3 cap MB (0: none): the max of the class
          for (a = 2; a <= j; a++) {x = v_[a]; b = a - 1; while (b > 0 && v_[b] > x) {v_[b + 1] = v_[b]; b--}; v_[b + 1] = x}
          mx = (c == "agent") ? v_[int((j + 1) / 2)] : v_[j]; lo = (c == "agent") ? 128 : 256
          v = int(mx * (100 + m) / 100); if (v < lo) v = lo; if (cap > 0 && v > cap) v = cap; print v}' "$RD/history.tsv"
+}
+cap_cores() {  # $1 class: the cores it reserves and is capped at: its last HN runs' CPU seconds / run time, the largest, rounded,
+  # 1 to CPJ (CPJ, the host's cores_per_job, until the class has runs with a measured CPU figure: column 6 of history.tsv)
+  [ -f "$RD/history.tsv" ] || { echo "$CPJ"; return; }
+  awk -F'\t' -v c="$1" -v n=$HN -v d=$CPJ '$2 == c && $4 > 0 && $6 > 0 {r[k++ %% n] = $6 / $4}
+    END {if (!k) {print d; exit}; mx = 0; for (i in r) if (r[i] > mx) mx = r[i]; v = int(mx + 0.5); if (v < 1) v = 1; if (v > d) v = d; print v}' "$RD/history.tsv"
+}
+cap_secs() {  # $1 class: its expected run time (s), the median of its recorded runs; empty without history
+  [ -f "$RD/history.tsv" ] || return 0
+  awk -F'\t' -v c="$1" '$2 == c && $4 ~ /^[0-9]+$/ {v_[++j] = $4 + 0}
+    END {if (!j) exit; for (a = 2; a <= j; a++) {x = v_[a]; b = a - 1; while (b > 0 && v_[b] > x) {v_[b + 1] = v_[b]; b--}; v_[b + 1] = x}; print v_[int(j / 2) + 1]}' "$RD/history.tsv"
+}
+ahead() {  # $1 this job's wait file ("pid expected-s since MB cores"): NB jobs waiting here that go first, holding BCC cores, BMB MB.
+  # First: the lower expected run time minus AGEW x seconds waited (short jobs first, a waiting job ages), among the same wait
+  # kind (.wait or .gwait). A job is admitted only when it fits together with every job ahead of it, so it never takes their room.
+  NB=0 BCC=0 BMB=0; nowt=$(date +%%s); me_e= me_t=; { read -r _ me_e me_t _ _ < "$1"; } 2>/dev/null
+  case $1 in *.gwait) pat='*.gwait';; *) pat='*.wait';; esac
+  for f in "$RD"/$pat; do
+    [ "$f" = "$1" ] || [ ! -e "$f" ] && continue
+    p= e= t= m= c=; { read -r p e t m c < "$f"; } 2>/dev/null
+    [ -n "$c" ] && kill -0 "$p" 2>/dev/null || continue
+    awk -v a="$e" -v ta="$t" -v b="$me_e" -v tb="$me_t" -v n="$nowt" -v w="$AGEW" 'BEGIN {sa = a - w * (n - ta); sb = b - w * (n - tb); exit !(sa < sb || (sa == sb && ta < tb))}' || continue
+    NB=$((NB + 1)); BCC=$((BCC + c)); BMB=$((BMB + m))
+  done
 }
 cap_class() {  # the job class of a command: the first [capacity.classes] pattern it matches, else its first command words
   c=$1
@@ -87,7 +112,8 @@ cap_measure() {  # PSI (macOS: the kernel's pressure level, warn = 50, critical 
   else
     PSI=$(awk '/^some/{sub("avg10=", "", $2); print $2}' /proc/pressure/memory 2>/dev/null); LOAD=$(awk '{print $1}' /proc/loadavg)
   fi
-  PSI=${PSI:-0}; LOAD=${LOAD:-0}; DF=$(df -Pk "$RD" 2>/dev/null | awk 'NR==2{print int($4/1048576)}'); DF=${DF:-0}
+  d=$RD; while [ ! -d "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done   # a runs dir not made yet: its disk all the same
+  PSI=${PSI:-0}; LOAD=${LOAD:-0}; DF=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}'); DF=${DF:-0}
 }
 cap_paused() {  # back-pressure: PAUSE is why admission waits (memory PSI over PSIP; load over LOADX x CORES for HOLD s, tracked in RD/overload)
   PAUSE=; nowt=$(date +%%s)
@@ -99,12 +125,17 @@ cap_paused() {  # back-pressure: PAUSE is why admission waits (memory PSI over P
     [ $((nowt - since)) -ge "$HOLD" ] && PAUSE="${PAUSE:+$PAUSE; }load $LOAD over $LOADX x $CORES cores for $((nowt - since)) s"
   else [ -n "$CAP_RO" ] || rm -f "$RD/overload"; fi
 }
-admit_ok() {  # $1 the job's class. Sets MB (its reservation) and why; true when it may start now
-  MB=$(cap_mb "${1:-job}" $CAPMB $CAPMB); res_sum; cap_measure; cap_paused
-  why="reserved $RJ job(s): $RC of $CORES cores, $RM MB + agents $RAM MB + this ${1:-job} $MB MB of $MEMCAP MB (RAM - services); PSI $PSI, load $LOAD, disk $DF GB (floor $DISK)${PAUSE:+; PAUSED: $PAUSE}"
+admit_ok() {  # $1 the job's class. Sets MB and CC (its reservation) and why; true when it may start now
+  MB=$(cap_mb "${1:-job}" $CAPMB $CAPMB); CC=$(cap_cores "${1:-job}"); res_sum; cap_measure; cap_paused
+  why="reserved $RJ job(s): $RC of $CORES cores, $RM MB + agents $RAM MB + this ${1:-job} $CC cores $MB MB of $MEMCAP MB (RAM - services); PSI $PSI, load $LOAD, disk $DF GB (floor $DISK)${PAUSE:+; PAUSED: $PAUSE}"
   BLK=; [ -n "$PAUSE" ] && BLK="paused"; [ "$DF" -ge "$DISK" ] || BLK="$BLK disk"
-  if [ "$RJ" -gt 0 ]; then [ $((RC + CPJ)) -le "$CORES" ] || BLK="$BLK cores"; [ $((RM + RAM + MB)) -le "$MEMCAP" ] || BLK="$BLK memory"; fi
+  if [ "$RJ" -gt 0 ]; then [ $((RC + CC)) -le "$CORES" ] || BLK="$BLK cores"; [ $((RM + RAM + MB)) -le "$MEMCAP" ] || BLK="$BLK memory"; fi
   [ -z "$BLK" ]
+}
+job_cpu() {  # $1 job id: CPU seconds its cgroup used so far (a container or scope; empty where the job is a plain process tree)
+  v=
+%(cpusample)s
+  echo "$v"
 }
 job_mb() {  # $1 pid, $2 job id: the job's resident memory now, in MB (empty when it cannot be read)
   v=
@@ -114,9 +145,9 @@ job_mb() {  # $1 pid, $2 job id: the job's resident memory now, in MB (empty whe
 tree_mb() {  # resident memory of process $1 and all its descendants, MB
   ps -A -o pid=,ppid=,rss= | awk -v r="$1" '{pp[$1] = $2; rs[$1] = $3} END {q[r] = 1; do {ch = 0; for (x in pp) if (!(x in q) && (pp[x] in q)) {q[x] = 1; ch = 1}} while (ch); for (x in q) s += rs[x]; print int(s / 1024)}'
 }
-cap_record() {  # $1 class $2 peak MB $3 seconds $4 exit code: one line of RD/history.tsv (its last 2000 lines are kept)
-  [ "${2:-0}" -gt 0 ] 2>/dev/null || return 0
-  printf '%%s\t%%s\t%%s\t%%s\t%%s\n' "$(date +%%s)" "$1" "$2" "$3" "$4" >> "$RD/history.tsv"
+cap_record() {  # $1 class $2 peak MB $3 seconds $4 exit code $5 CPU seconds $6 queue wait (s): one line of RD/history.tsv (last 2000 kept)
+  { [ "${2:-0}" -gt 0 ] || [ "${5:-0}" -gt 0 ]; } 2>/dev/null || return 0   # nothing measured: no line
+  printf '%%s\t%%s\t%%s\t%%s\t%%s\t%%s\t%%s\n' "$(date +%%s)" "$1" "$2" "$3" "$4" "${5:-0}" "${6:-0}" >> "$RD/history.tsv"
   [ "$(wc -l < "$RD/history.tsv")" -gt 2400 ] && tail -n 2000 "$RD/history.tsv" > "$RD/history.tsv.$$" && mv -f "$RD/history.tsv.$$" "$RD/history.tsv"
   return 0
 }
@@ -167,33 +198,50 @@ echo "fp=$d|$o"; echo "n=$n"; echo "p=${p:-0}"'''
 ADMIT = r'''# Admission (janus-fixes8): by reservations, rule in $RD/cap.sh (re-read each poll). One job is judged at a time under the lock;
 # an admitted job writes its reservation ($R.res) before the lock is released. A jobs-lane job yields while a gates job waits.
 [ -f "$RD/cap.sh" ] || { echo "janus: no $RD/cap.sh on this host (janus run or janus launch writes it)"; exit 125; }
-lane=%(lane)s; . "$RD/cap.sh"; CLS=$(cap_class %(clsrc)s)
+lane=%(lane)s; BROAD=%(broad)s; . "$RD/cap.sh"; CLS=$(cap_class %(clsrc)s)
+EXP=$(cap_secs "$CLS"); EXP=${EXP:-$EXPS}; [ -n "$BROAD" ] && EXP=$((EXP * 2))   # expected run time; a broad run counts double (goes later)
 if command -v flock >/dev/null 2>&1; then exec 7>>"$RD/admit.lock"; lk() { flock 7; }; ulk() { flock -u 7; }
 else   # no flock: a lock dir holding its owner's pid; a dead owner's dir is taken over (a SIGKILL never leaves the host stuck)
   lk() { until mkdir "$RD/admit.d" 2>/dev/null; do o=$(cat "$RD/admit.d/pid" 2>/dev/null); [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null && rm -rf "$RD/admit.d"; sleep 1; done; echo $$ > "$RD/admit.d/pid"; HELD=1; }
   ulk() { rm -rf "$RD/admit.d"; HELD=; }; fi
-gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && return 0; done; return 1; }
-W="$R.wait"; [ "$lane" = gates ] && W="$R.gwait"; echo $$ > "$W"
+gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cut -d' ' -f1 "$f")" 2>/dev/null && return 0; done; return 1; }
+W="$R.wait"; [ "$lane" = gates ] && W="$R.gwait"; echo "$$ $EXP $(date +%%s) $(cap_mb "$CLS" $CAPMB $CAPMB) $(cap_cores "$CLS")" > "$W"
 HELD=; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
 said=
 while :; do
   if [ "$lane" = gates ] || ! gates_waiting; then
     lk; CAP_RO=; . "$RD/cap.sh"
-    if admit_ok "$CLS"; then echo "$$ $CPJ $MB $(date +%%s) $CLS" > "$R.res.$$" && mv -f "$R.res.$$" "$R.res"; ulk; break; fi
+    if admit_ok "$CLS"; then
+      ahead "$W"   # shorter or older jobs waiting here go first unless this one fits beside them
+      if [ "$NB" -gt 0 ] && { [ $((RC + CC + BCC)) -gt "$CORES" ] || [ $((RM + RAM + MB + BMB)) -gt "$MEMCAP" ]; }; then BLK="yield to $NB shorter or older job(s)"
+      else echo "$$ $CC $MB $(date +%%s) $CLS" > "$R.res.$$" && mv -f "$R.res.$$" "$R.res"; ulk; break; fi
+    fi
     ulk; [ "$said" = "$BLK" ] || { echo "janus: waiting for admission ($CLS; $BLK): $why"; said=$BLK; }
   fi
   sleep ${JANUS_POLL_S:-15}
 done
 rm -f "$W"; exec 7>&-; trap 'rm -f "$R.res"' EXIT
-echo "janus: admitted ($CLS, reserves $CPJ cores and $MB MB): $why"
-run_sampled() {  # run "$@", sample its memory every 5 s, then add class, peak MB, seconds and exit code to $RD/history.tsv
-  # the peak is also the kernel's high-water mark of its largest process (platform.MAXRSS_PY), so a job that ends between two
-  # samples, or before its first sample sees it allocate (a slow start under load), still records its real peak
-  t0=$(date +%%s); pf="$R.maxrss"; rm -f "$pf"
-  if command -v python3 >/dev/null 2>&1; then python3 -c %(maxrss)s "$pf" "$@" & else "$@" & fi; pid=$!; peak=0
-  while kill -0 $pid 2>/dev/null; do v=$(job_mb $pid %(jid)s); [ "${v:-0}" -gt "$peak" ] 2>/dev/null && peak=$v; sleep 5; done
-  wait $pid; rc=$?; k=$(cat "$pf" 2>/dev/null); rm -f "$pf"; [ "${k:-0}" -gt "$peak" ] 2>/dev/null && peak=$k
-  cap_record "$CLS" "$peak" $(( $(date +%%s) - t0 )) $rc; return $rc
+WAITED=$(( $(date +%%s) - ${TQ:-$(date +%%s)} ))
+echo "janus: admitted ($CLS, reserves $CC cores and $MB MB, expected ${EXP}s, waited ${WAITED}s): $why"
+# The job's CPU is capped at its reservation: build and test parallelism (the job's own setting wins), and on Linux the scope's
+# CPUQuota or the container's --cpus (job_script).
+export JANUS_CORES=$CC MAKEFLAGS="${MAKEFLAGS:--j$CC}" CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$CC} RUST_TEST_THREADS=${RUST_TEST_THREADS:-$CC} \
+  NEXTEST_TEST_THREADS=${NEXTEST_TEST_THREADS:-$CC} PYTEST_XDIST_AUTO_NUM_WORKERS=${PYTEST_XDIST_AUTO_NUM_WORKERS:-$CC} OMP_NUM_THREADS=${OMP_NUM_THREADS:-$CC}
+cpu_s() { awk 'NR == 2 {s = 0; for (i = 1; i <= 2; i++) {x = $i; sub(/s$/, "", x); split(x, y, "m"); s += y[1] * 60 + y[2]}; print s}' "$1"; }
+run_sampled() {  # run "$@", sample its memory (and a cgroup's CPU) every 5 s, then record class, peak MB, seconds, exit code,
+  # CPU seconds (the waited-for children's, from the shell's times; a container's from its cgroup) and queue wait in history.tsv.
+  # The peak is also the kernel's high-water mark of its largest process (platform.MAXRSS_PY), so a job that ends between two
+  # samples, or before its first sample sees it allocate (a slow start under load), still records its real peak.
+  t0=$(date +%%s); pf="$R.maxrss"; rm -f "$pf"; times > "$R.t0"
+  if command -v python3 >/dev/null 2>&1; then python3 -c %(maxrss)s "$pf" "$@" & else "$@" & fi; pid=$!; peak=0; cpu=0
+  while kill -0 $pid 2>/dev/null; do
+    v=$(job_mb $pid %(jid)s); [ "${v:-0}" -gt "$peak" ] 2>/dev/null && peak=$v
+    v=$(job_cpu %(jid)s); [ "${v:-0}" -gt "$cpu" ] 2>/dev/null && cpu=$v; sleep 5
+  done
+  wait $pid; rc=$?; times > "$R.t1"; k=$(cat "$pf" 2>/dev/null); rm -f "$pf"; [ "${k:-0}" -gt "$peak" ] 2>/dev/null && peak=$k
+  v=$(awk -v a="$(cpu_s "$R.t0")" -v b="$(cpu_s "$R.t1")" 'BEGIN {print int(b - a + 0.5)}'); rm -f "$R.t0" "$R.t1"
+  [ "${v:-0}" -gt "$cpu" ] 2>/dev/null && cpu=$v
+  cap_record "$CLS" "$peak" $(( $(date +%%s) - t0 )) $rc $cpu $WAITED; return $rc
 }
 '''
 

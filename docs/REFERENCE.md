@@ -10,8 +10,8 @@ landing and troubleshooting. The design is in [DESIGN.md](DESIGN.md); the issue 
 ./install                  # run from a directory with a janus.toml (or pass --project DIR)
 ```
 
-Options: `--dry-run`, `--project DIR`, `--no-hosts` (skip the remote machines), `--hosts-only` (only set up pueue on the
-hosts in janus.toml), `--release-only` (only build, test and switch to a new release: the way to make an edit live),
+Options: `--dry-run`, `--project DIR`, `--no-hosts` (skip the remote machines), `--hosts-only` (only run `janus install-host`
+for each remote host in janus.toml), `--release-only` (only build, test and switch to a new release: the way to make an edit live),
 `--rollback` (switch back to the previous release), `--skip-tests`. On Linux, install writes a systemd user timer
 `janus-watch.timer` (every 5 min) instead of the launchd agent.
 
@@ -426,6 +426,23 @@ environment queues a job. Remote API agents need `claude` on the host.
 
 One way to run a build or test job on any machine: that machine's pueue, never an ssh connection.
 
+**Hosts are discovered, not assumed.** `janus hosts [--refresh] [--json]` shows what each host is: OS, arch, cores, memory, disk,
+tools (pueue, podman, docker, systemd, launchd, sandbox tool, agent CLIs), agent logins and devices (usb, video, gpu, kvm),
+cached in `.janus/hosts-facts.json` and refreshed by `janus check` after `[capacity] discover_h`; a host's `cores` and `ram_gb`
+default to what was found. Per job class it also shows runs, expected run time, learned cores, CPU and queue wait (p50/p95).
+**`janus install-host <host> [--dry-run]`** sets up a machine named in janus.toml: folders under its `root`, pueued as a user
+service (systemd, linked from `pueue_dir` on a shared server; brew services on macOS), a copy of janus in `<root>/janus` for
+read-only commands, and the heartbeat watchdog when `[heartbeat] watchdog` names it. The coordinator may be macOS or Linux
+(launchd agent or systemd user timer; keychain, secret-tool or pass; herdr or tmux): those choices live in `janus/platform.py`.
+
+**`janus run --needs <requirements>`** instead of `--host`: `linux,x86_64`, `os=linux`, `arch=aarch64`, `feature=podman+cargo`,
+`device=usb`, `mem=4G` (bare words are features or devices; `[hosts.X] features`/`devices` add what discovery cannot see). The
+job goes to a host that meets them and has room by its own admission (the coordinator too); when none has room, a placement
+task waits in the coordinator's `place` group and dispatches it to the first host with room (`janus cancel` of it follows the
+job). `--dry-run` prints each host's verdict. A job given `--host` stays there (a thrash stop re-queues it on the same host).
+**`--broad <reason>`**: a jobs-lane run that matches `[capacity] broad_patterns` or whose class takes `broad_min` minutes is
+refused without it; with it, the run gets nice 19, pueue priority -5 and goes after shorter jobs.
+
 **`janus run --host <h> --lane gates|jobs|land [--unit <u>] --wt <worktree> [--subdir <d>] [--usb] [--priority N] [--detach] -- <cmd>`**
 - refuses a worktree with a merge in progress, unmerged files or conflict markers; in the gates and land lanes (and `janus
   gate`) also one more than `[landing] max_behind` (default 10) commits behind the landing branch, never an agent's own jobs
@@ -439,11 +456,14 @@ One way to run a build or test job on any machine: that machine's pueue, never a
   is the local machine's landing lane (parallel 1). Groups are created on first use (`jobs` and `gates` with one slot per job cap).
 - admission on every host and lane is by reservations: the job waits in its pueue task, one job at a time under
   `runs/admit.lock` (a pid-owned lock dir where there is no `flock`), until its reservation fits: running jobs' cores +
-  `cores_per_job` <= `cores`, and their memory + the agents' + this job's class figure (the max of its class's last
+  this job's cores (its class's learned cores: CPU seconds / run time of its last runs, 1 to `cores_per_job`) <= `cores`, and their memory + the agents' + this job's class figure (the max of its class's last
   `history_n` recorded peaks + `margin_pct`, `job_gb` until learned) <= `ram_gb - services_gb`; not while back-pressure
   pauses admission (memory PSI over `psi_pause`, load over `load_pause` x `cores` for `hold_s`); disk >= `min_disk_gb`. The
   rule lives in `<root>/runs/cap.sh`, rewritten on every `janus run` and launch (by rename) and re-read by waiting jobs every
-  15 s; each job records its peak memory in `runs/history.tsv`. `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Local land
+  15 s; each job records its peak memory, run time, CPU seconds and queue wait in `runs/history.tsv`. Waiting jobs go
+  shortest expected run time (their class's median) first, minus `age_weight` x seconds waited; a job is admitted only if it
+  fits beside every job ahead of it. The admitted job is capped at its cores (`MAKEFLAGS=-jN`, `CARGO_BUILD_JOBS`,
+  `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS`, `OMP_NUM_THREADS` unless set; Linux scope `CPUQuota`; podman `--cpus`). `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Local land
   lane: the disk floor, the host's `admit_check`, and no `legacy_lanes` lane still running.
 - runs the job in `systemd-run --user --scope -p MemoryMax=<job_gb>` after the host's `run_env` and `job_setup`; with
   `runner = "podman"` in the host's container settings (`--memory=<job_gb>`, nice 15 and idle IO; `--usb` adds `usb_args`
@@ -587,6 +607,8 @@ with `[budget] wrapup_usd` (default 0.5) to write its report.
 | `[script:<pid>] running script ... was changed after it started` | stop that process and relaunch it; write scripts by rename |
 | `refused: <wt> has conflict markers` / `is N commits behind main` | finish the merge or merge the landing branch first; `--allow-unmerged` overrides |
 | `janus: waiting for admission (<class>; <what blocks>): reserved N job(s): C of K cores, M MB + agents A MB + this job J MB of T MB ...` (in a job log) | the host has not got that much room yet; it starts by itself when it has |
+| `[overrun:<host>:<job>] ... has run N min, Kx its expected M min` | the job runs far longer than its class's median there: read its log; `janus cancel` it if stuck |
+| `refused: a whole-suite run (...) needs --broad <reason>` | narrow the command (one package, a filter), or pass `--broad <why it must be whole>`: it then runs at low priority |
 | `[old-rule:<host>] N job(s) still wait under the old cap rule` | jobs queued before the measured rule; re-queue them with `janus run`, then stop the old tasks |
 | `(read-only: not the registered orchestrator session ...)` after `janus check` | expected for anyone but the orchestrator: nothing was saved, tuned or stamped |
 | `refused: <dir> is the cwd of open unit(s) ...` / `is a main checkout` | give the unit its own worktree |

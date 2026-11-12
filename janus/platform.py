@@ -1,13 +1,14 @@
 """The one adapter for OS- and tool-specific behaviour (owner direction 2026-11-11).
 
 Every OS- or tool-specific choice lives here, so a second platform is a new function, not a new branch inside the tool:
-process listing (`ps`), the elapsed-time flavour `ps` prints, the terminal/pane tool (`herdr`), the secret store (the macOS
-keychain) and the service manager (launchd/systemd). Only the macOS/Linux variants that already exist are implemented;
-behaviour is unchanged. run() is the one subprocess call (context.sh adds the environment policy on top of it), so this module
-imports nothing of janus and sits at the bottom of the package. Still to fold in: containers/scopes (`podman`, `systemd-run`) and
-the host-discovery variants.
+process listing (`ps`), the elapsed-time flavour `ps` prints, the terminal/pane tool (herdr, else tmux), the secret store
+(macOS keychain, Linux secret-tool or pass; a key file is the caller's fallback), the service manager (launchd or systemd user
+units) and how a host is discovered (HOST_FACTS: one read-only shell script, macOS and Linux branches, parsed by parse_facts).
+The coordinator may be either OS. run() is the one subprocess call (context.sh adds the environment policy on top of it), so this
+module imports nothing of janus and sits at the bottom of the package. Still to fold in: containers/scopes (`podman`,
+`systemd-run`) in job scripts, and launch.py's direct herdr calls (pane_tool says which tool a machine has).
 """
-import json, subprocess, sys
+import json, shutil, subprocess, sys
 
 
 def run(cmd, cwd=None, inp=None, timeout=25, env=None):
@@ -43,24 +44,27 @@ def herdr(*a, timeout=20):
     except Exception: return None
 
 
-def keychain_get(item):
-    """(rc, password) from the macOS keychain, or None where there is no keychain (not macOS)."""
-    if sys.platform != "darwin": return None
-    rc, o, e = run(["security", "find-generic-password", "-s", item, "-w"])
-    return rc, o
+def secret_get(item):
+    """(rc, secret) from the OS secret store: the macOS keychain (`security`), else the freedesktop store (`secret-tool lookup
+    service <item>`), else `pass show <item>` (its first line); None where none of them is installed."""
+    if sys.platform == "darwin": return run(["security", "find-generic-password", "-s", item, "-w"])[:2]
+    if shutil.which("secret-tool"):
+        rc, o = run(["secret-tool", "lookup", "service", item])[:2]
+        if rc == 0 and o.strip(): return rc, o
+    if shutil.which("pass"):
+        rc, o = run(["pass", "show", item])[:2]; return rc, (o.splitlines() or [""])[0]
+    return None
 
 
-def launchd_watcher_loaded(name="com.janus.watch"):
-    """True when the launchd watcher job is loaded (macOS)."""
-    return run(["launchctl", "list", name])[0] == 0
+def watcher_service():
+    """What runs the watcher on this machine: ("launchd", label) on macOS, ("systemd", timer) elsewhere."""
+    return ("launchd", "com.janus.watch") if sys.platform == "darwin" else ("systemd", "janus-watch.timer")
 
 
-def systemd_watcher_active(name="janus-watch.timer"):
-    """True when the systemd user timer is active (Linux)."""
-    return run(["systemctl", "--user", "is-active", name])[0] == 0
-
-
-__all__ = ["run", "ps_table", "secs", "herdr", "keychain_get", "launchd_watcher_loaded", "systemd_watcher_active"]
+def watcher_loaded():
+    """True when this machine's watcher service is loaded (launchd job) or active (systemd user timer)."""
+    kind, name = watcher_service()
+    return run(["launchctl", "list", name] if kind == "launchd" else ["systemctl", "--user", "is-active", name])[0] == 0
 
 
 # The kernel's high-water mark of a job's largest process (run_sampled in templates.ADMIT): a job shorter than the 5 s sampling
@@ -72,3 +76,59 @@ MAXRSS_PY = ("import resource, subprocess, sys\n"
              "m = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss\n"
              "open(sys.argv[1], 'w').write(str(int(m / (1048576 if sys.platform == 'darwin' else 1024))))\n"
              "sys.exit(rc if rc >= 0 else 128 - rc)\n")
+
+
+def pane_tool():
+    """The terminal/pane tool agents get here: "herdr", else "tmux", else None."""
+    return next((t for t in ("herdr", "tmux") if shutil.which(t)), None)
+
+
+# Host discovery (imp-sched item 1): read-only, one shell run per host (local sh or one ssh), no assumption about the OS. Prints
+# key=value lines; tool=, feature=, login= and dev= repeat. PATH gets the host's bin dir (%(bin)s) like the probe; %(agent_env)s is
+# the host's agent_env (agents' HOME and PATH may differ from the login's), run in a subshell before the agent CLI and login checks.
+HOST_FACTS = r'''PATH="$HOME/.local/bin:%(bin)s:$PATH:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+echo "arch=$(uname -m)"
+if [ "$(uname)" = Darwin ]; then
+  echo "os=mac"; echo "cores=$(sysctl -n hw.ncpu)"; echo "mem_mb=$(( $(sysctl -n hw.memsize) / 1048576 ))"
+  ioreg -p IOUSB -w0 2>/dev/null | grep -q '+-o .*@' && echo "dev=usb"
+  security find-generic-password -s 'Claude Code-credentials' >/dev/null 2>&1 && echo "login=claude"
+else
+  echo "os=linux"; echo "cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)"; echo "mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+  ls /dev/bus/usb/*/* >/dev/null 2>&1 && echo "dev=usb"
+  ls /dev/video* >/dev/null 2>&1 && echo "dev=video"; [ -e /dev/kvm ] && echo "dev=kvm"
+  { ls /dev/nvidia0 || ls /dev/dri/renderD*; } >/dev/null 2>&1 && echo "dev=gpu"
+  case $(systemctl --user is-system-running 2>/dev/null) in running|degraded|starting) echo "feature=systemd-user";; esac
+  U=$(id -u); grep -qw cpu /sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/cgroup.controllers 2>/dev/null && echo "feature=cpu-quota"
+  grep -qw memory /sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/cgroup.controllers 2>/dev/null && echo "feature=memory-max"
+fi
+d=%(root)s; [ -d "$d" ] || d=$HOME; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
+for t in pueue pueued podman docker systemd-run launchctl bwrap firejail sandbox-exec tmux herdr flock secret-tool pass security git rsync python3 uv cargo node nvidia-smi; do
+  command -v "$t" >/dev/null 2>&1 && echo "tool=$t"
+done
+( %(agent_env)s
+  for t in claude codex opencode; do command -v "$t" >/dev/null 2>&1 && echo "tool=$t"; done   # agents' PATH may differ too
+  { [ -s "$HOME/.claude/.credentials.json" ] || grep -qs oauthAccount "$HOME/.claude.json"; } && echo "login=claude"
+  [ -s "$HOME/.codex/auth.json" ] && echo "login=codex"
+  [ -s "$HOME/.local/share/opencode/auth.json" ] && echo "login=opencode" ) 2>/dev/null
+true'''
+
+ARCH = {"arm64": "aarch64", "amd64": "x86_64"}
+
+
+def parse_facts(text):
+    """HOST_FACTS output as {os, arch, cores, mem_mb, disk_gb, tools, features, logins, devices}. features holds the os, the
+    arch, every tool and the probed features, so one --needs list can name any of them."""
+    f = {"tools": [], "features": [], "logins": [], "devices": []}
+    many = {"tool": "tools", "feature": "features", "login": "logins", "dev": "devices"}
+    for l in text.splitlines():
+        k, _, v = l.strip().partition("=")
+        if not v: continue
+        if k in many:
+            if v not in f[many[k]]: f[many[k]].append(v)
+        elif k in ("cores", "mem_mb", "disk_gb"): f[k] = int(v) if v.isdigit() else None
+        elif k in ("os", "arch"): f[k] = ARCH.get(v, v)
+    f["features"] = sorted({f.get("os"), f.get("arch"), *f["tools"], *f["features"]} - {None})
+    return f
+
+
+__all__ = ["run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts"]

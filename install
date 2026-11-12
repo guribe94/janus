@@ -157,30 +157,12 @@ def watcher(project):
     run(["launchctl", "bootout", f"gui/{os.getuid()}/com.janus.watch"]) if plist.exists() else None
     run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)])
 
-SERVICE = "[Unit]\nDescription=pueued\n[Service]\nExecStart={bin}/pueued {cfg}\nRestart=always\n[Install]\nWantedBy=default.target\n"
-
-def host_tools(name, h):
+def host_tools(name, h, root):
+    """A remote host's setup is janus install-host's: it discovers the host first (OS, arch, tools), then folders, pueued as a
+    user service, a copy of janus for read-only commands, the heartbeat watchdog when configured (the installed release's janus)."""
     if h.get("local"): return
-    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", h["ssh"]]
-    arch = {"aarch64": "aarch64", "x86_64": "x86_64"}[h["arch"]]
-    bindir = h.get("bin", "~/.local/bin"); base = "https://github.com/Nukesor/pueue/releases/latest/download"
-    shared = h.get("pueue_dir")   # a shared server: pueue's files under this dir, a linked user unit (no files in a shared home)
-    cfg = h.get("pueue_config"); cflag = f"--config {cfg}" if cfg else ""
-    say(f"== {name} ({h['ssh']}, {arch}), no sudo ==")
-    steps = [f"mkdir -p {bindir}"]
-    for b in ("pueue", "pueued"):
-        steps.append(f"curl -fsSL -o {bindir}/{b}.new {base}/{b}-{arch}-unknown-linux-musl && chmod +x {bindir}/{b}.new && mv -f {bindir}/{b}.new {bindir}/{b}")
-    unit = SERVICE.format(bin=bindir, cfg=cflag)
-    if shared:
-        base_dir = shared
-        steps.append(f"mkdir -p {base_dir}/pueue.d/data {base_dir}/pueue.d/run")
-        if cfg: steps.append(f"printf 'shared:\\n  pueue_directory: {base_dir}/pueue.d/data\\n  runtime_directory: {base_dir}/pueue.d/run\\n' > {cfg}")
-        steps.append(f"printf %s {shlex.quote(unit)} > {base_dir}/pueued.service")
-        steps.append(f"systemctl --user link {base_dir}/pueued.service && systemctl --user enable --now pueued.service")
-    else:
-        steps.append(f"mkdir -p ~/.config/systemd/user && printf %s {shlex.quote(unit)} > ~/.config/systemd/user/pueued.service")
-        steps.append("systemctl --user daemon-reload && systemctl --user enable --now pueued.service")
-    for s in steps: run([*ssh, s])
+    me = CUR / "janus.py" if (CUR / "janus.py").exists() else HERE / "janus.py"
+    run(["sh", "-c", f"cd {shlex.quote(str(root))} && {shlex.quote(sys.executable)} {shlex.quote(str(me))} install-host {shlex.quote(name)}"])
 
 def main():
     root = None
@@ -190,7 +172,7 @@ def main():
     if A.rollback: rollback(); return
     if A.release_only: release(); return
     if A.hosts_only:
-        for n, h in tomllib.loads((root / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h)
+        for n, h in tomllib.loads((root / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, root)
         return
     say("== release and links ==")
     release()
@@ -203,7 +185,7 @@ def main():
     say("== tools ==")
     if sys.platform == "darwin": run(["brew", "install", "beads", "pueue"]); run(["brew", "services", "start", "pueue"])
     if root and not A.no_hosts:
-        for n, h in tomllib.loads((root / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h)
+        for n, h in tomllib.loads((root / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, root)
     elif not root: say("no janus.toml found: host tools skipped")
 
 main()

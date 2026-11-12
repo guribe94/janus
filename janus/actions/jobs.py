@@ -2,14 +2,14 @@
 
 janus run / janus cancel / janus busy / janus thrash, and the job queries every layer above uses (task_status, task_rc,
 job_state, unit_jobs, orphan_jobs)."""
-import argparse, calendar, json, os, re, shlex, subprocess, sys, time
+import argparse, calendar, concurrent.futures as cf, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 from janus.beads import Beads
 from janus.board import board
-from janus.cap import cap_lib, cap_nums, class_mb, host_cap
-from janus.context import Err, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh
-from janus.probe import probe, probe_all, pueue
-from janus.platform import MAXRSS_PY
+from janus.cap import cap_lib, cap_nums, capv, class_mb, class_secs, class_usage, host_cap
+from janus.context import Err, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
+from janus.platform import ARCH, MAXRSS_PY
+from janus.probe import host_facts, probe, probe_all, pueue
 from janus.templates import ADMIT
 from janus.units import agent_ended, unit_state
 
@@ -47,9 +47,9 @@ def save_task_log(cfg, h, u, tid, remove=False):
         if remove: hrun(h, f"{pueue(h)} remove {int(tid)} 2>/dev/null; true")
     return rc == 0
 
-LANES = ("gates", "jobs", "land", "gates-quick")   # gates-quick: one slot kept for gates under [landing] quick_gate_min
+LANES = ("gates", "jobs", "land", "gates-quick", "place")   # gates-quick: one slot kept for gates under [landing] quick_gate_min; place: jobs waiting for a host (--needs)
 
-AGE_MIN = {"gates": 240, "jobs": 120, "land": 240, "gates-quick": 60}   # class age limits (minutes from enqueue); janus.toml [lanes.<lane>] age_min overrides
+AGE_MIN = {"gates": 240, "jobs": 120, "land": 240, "gates-quick": 60, "place": 240}   # class age limits (minutes from enqueue); janus.toml [lanes.<lane>] age_min overrides
 
 LSSH = [*SSH, "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
 
@@ -70,7 +70,7 @@ def agent_res(cfg, hn, h, name, pid):
 
 def ensure_lanes(h, cfg=None):
     p = pueue(h); n = slots(h, cfg)
-    g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1, "gates-quick": 1} if h.get("local") else {})
+    g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1, "gates-quick": 1, "place": 16} if h.get("local") else {})
     return "; ".join(f"{p} group add -p {int(k)} {g_} >/dev/null 2>&1" for g_, k in g.items()) + "; true"
 
 def runs_dir(cfg, h): return h["_rd"]
@@ -83,7 +83,7 @@ def write_cap(cfg, hn, h):
 
 def ctr(h):
     """A podman host's container settings ([hosts.<h>.container]): image, mount (host dir, default the host's root), mount_at
-    (default /f), args, usb_args, usb_lock, host_dirs, name_prefixes, cpus."""
+    (default /f), args, usb_args, usb_lock, host_dirs, name_prefixes. Its --cpus is the job's admitted cores."""
     c = dict(h.get("container", {})); c.setdefault("mount", h.get("fleet", h.get("root", "/tmp"))); c.setdefault("mount_at", "/f")
     return c
 
@@ -106,9 +106,12 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     synced worktree of that name. Per host (janus.toml): run_env (shell run first), job_setup (shell run in the worktree before
     the command), job_log (a line per job start/end), and for runner = "podman" the [hosts.<h>.container] settings."""
     q = shlex.quote; rd = h["_rd"]; sub = a.subdir or "."; sub_ = lambda x: str(x).replace("{name}", name).replace("{jid}", jid)
-    head = f"#!/bin/bash\n# janus run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={qp(rd)}; R=\"$RD\"/{q(jid)}\nexport JANUS_WRAP={q(jid)}   # janus run inside records the jobs it queues under this (cancel follows them)\n"
+    tq = int(fl(os.environ.get("JANUS_TQ")) or now())   # when the job was asked for (a placement passes the original time): its queue wait
+    head = (f"#!/bin/bash\n# janus run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={qp(rd)}; R=\"$RD\"/{q(jid)}; TQ={tq}\n"
+            f"export JANUS_WRAP={q(jid)}   # janus run inside records the jobs it queues under this (cancel follows them)\n")
+    broad = bool(getattr(a, "broad", None)); nice = 19 if broad else 10   # a broad run (--broad) runs at the lowest CPU priority
     setup = h.get("job_setup", ""); log = h.get("job_log", "/dev/null")
-    adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY)}
+    adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''"}
     if h.get("local"):
         pre = ""
         if a.lane == "land":   # the local landing lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
@@ -117,10 +120,10 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
                    f"  for s in {base}; do o=$(cat $s/pid 2>/dev/null); [ -n \"$o\" ] && kill -0 $o 2>/dev/null && busy=$s; done\n"
                    f"  [ \"$d\" -ge {h.get('min_disk_gb', 5)} ] && {{ [ -z {q(ck)} ] || {ce + ' ' if ce else ''}sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
                    f"  [ \"$said\" ] || {{ echo \"janus: land lane waiting (disk ${{d}} GB, floor {h.get('min_disk_gb', 5)}; old lane busy: ${{busy:-none}})\"; said=1; }}; sleep 15; done\n")
-        body = f"{pre}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n 10 bash -c {q(cmd)}\n"
+        body = f"{pre}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n {nice} bash -c {q(cmd)}\n"
     else:
         cap = int(h.get("job_gb", 2) * 1024)
-        scope = f"systemd-run --user --scope -q {q('--unit=janus-' + jid)} -p MemoryMax={cap}M --"
+        scope = f"systemd-run --user --scope -q {q('--unit=janus-' + jid)} -p MemoryMax={cap}M -p \"CPUQuota=$((CC * 100))%\" --"   # CC: the admitted cores
         if h.get("runner") == "podman":   # the job runs in the host's container settings, capped at job_gb
             c = ctr(h)
             if not c.get("image"): raise Err(f"host {hn}: runner podman needs [hosts.{hn}.container] image")
@@ -132,15 +135,15 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
                     + "".join(f"mkdir -p {q(sub_(d))}\n" for d in c.get("host_dirs", []))
                     + (f"exec 8>{qp(c['usb_lock'])}; flock 8\n" if a.usb and c.get("usb_lock") else "") + adm +
                     f"printf '%s janus-run start [%s] %s %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} {q(cmd)} >> {qp(log)}\n"
-                    f"run_sampled {scope} nice -n 15 ionice -c 3 podman run --rm --init --name {q('janus-run-' + jid)} {hw}"
-                    f"--memory={cap}m --memory-swap={cap}m --cpus={q(str(c.get('cpus', h.get('cores_per_job', 2))))} -v {qp(c['mount'])}:{q(c['mount_at'])} -w {qp(cw)} {args} "
+                    f"run_sampled {scope} nice -n {max(nice, 15)} ionice -c 3 podman run --rm --init --name {q('janus-run-' + jid)} {hw}"
+                    f"--memory={cap}m --memory-swap={cap}m --cpus=$CC -v {qp(c['mount'])}:{q(c['mount_at'])} -w {qp(cw)} {args} "
                     f"{q(c['image'])} bash -c {q(inner)}; rc=$?\n"
                     f"printf '%s janus-run end [%s] %s exit %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} $rc >> {qp(log)}\nexit $rc\n")
         else:
             wd = wd or remote_wt(h, name)
             body = (f"{h.get('run_env', '')}\ncd {qp(wd)} && " + (f"({setup}) && " if setup else "") + f"cd {q(sub)} || exit $?\n" + adm +
                     f"printf '%s janus-run [%s] %s %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} {q(cmd)} >> {qp(log)}\n"
-                    f"run_sampled {scope} nice -n 10 bash -c {q(cmd)}\n")
+                    f"run_sampled {scope} nice -n {nice} bash -c {q(cmd)}\n")
     return head + "main() {\n" + body + "}\nmain 2>&1 | tee -a \"$R.log\"\nrc=${PIPESTATUS[0]}; echo $rc > \"$R.rc\"; exit $rc\n"
 
 def sync_wt(cfg, hn, h, src, name):
@@ -197,11 +200,122 @@ def finish_job(cfg, hn, h, tid, jid, quiet=False):
     try: return int(o.strip())
     except ValueError: return task_rc(t)
 
+# Late-binding placement (imp-sched item 2): a job that declares --needs (os, arch, features, devices, memory) instead of --host is
+# placed when it can start: on whichever host meets them and has room by its admission (the coordinator is a full worker). When none
+# has room now, a placement task waits in the coordinator's own pueue ("place" group) and dispatches the job to the first host that
+# has; a job pinned with --host stays there (a thrash stop re-queues it on the same host).
+
+NEED_KEYS = {"os": "os", "arch": "arch", "feature": "features", "features": "features", "device": "devices", "devices": "devices", "mem": "mem_mb"}
+
+def parse_needs(items):
+    """--needs values ("linux,x86_64", "device=usb", "mem=4G", "feature=podman+cargo") as {os, arch, features, devices, mem_mb}.
+    A bare word must be one of the host's features or devices (its os and arch are features too)."""
+    n = {"features": set(), "devices": set()}
+    for it in ",".join(items or []).replace(" ", ",").split(","):
+        if not it: continue
+        k, eq, v = it.partition("=")
+        if not eq: n["features"].add(ARCH.get(k, k)); continue
+        if k not in NEED_KEYS: raise Err(f"--needs {it}: unknown key {k} (os, arch, feature, device, mem)")
+        if k == "mem":
+            m = re.fullmatch(r"(\d+(?:\.\d+)?)([GgMm]?)[Bb]?", v)
+            if not m: raise Err(f"--needs {it}: memory as 4G or 512M")
+            n["mem_mb"] = int(float(m.group(1)) * (1 if m.group(2) in "Mm" and m.group(2) else 1024))
+        elif k in ("os", "arch"): n[k] = ARCH.get(v, v)
+        else: n[NEED_KEYS[k]] |= set(v.split("+"))
+    return n if any(n.values()) else {}
+
+def host_meets(cfg, n, f, needs):
+    """(ok, why not) of host n's discovered facts f against parsed needs."""
+    if not needs: return True, ""
+    if not f: return False, "never discovered (unreachable)"
+    have = set(f["features"]) | set(f["devices"]); miss = []
+    for k in ("os", "arch"):
+        if needs.get(k) and f.get(k) != needs[k]: miss.append(f"{k} {f.get(k)}, not {needs[k]}")
+    miss += [f"no {x}" for x in sorted(needs["features"] - have)] + [f"no device {x}" for x in sorted(needs["devices"] - set(f["devices"]))]
+    if needs.get("mem_mb") and cap_nums(cfg, cfg.hosts[n])["memcap"] < needs["mem_mb"]:
+        miss.append(f"{cap_nums(cfg, cfg.hosts[n])['memcap']} MB for jobs, needs {needs['mem_mb']}")
+    return not miss, ", ".join(miss)
+
+def place_job(cfg, lane, needs):
+    """(host with room now or None, one line per host). Room: the host's admission would admit a job now (cap_admit) and its
+    free reservations exceed the jobs already waiting there; among those, the most room left."""
+    fs = host_facts(cfg, refresh="stale"); lines, cands = [], []
+    for n, h in cfg.hosts.items():
+        if lane == "land" and not h.get("local"): continue
+        ok, why = host_meets(cfg, n, fs.get(n), needs)
+        if ok: cands.append(n)
+        else: lines.append(f"{n}: does not meet the needs ({why})")
+    if not cands: raise Err("no host meets --needs: " + "; ".join(lines))
+    with cf.ThreadPoolExecutor(8) as ex: hs = dict(zip(cands, ex.map(lambda n: probe(n, cfg.hosts[n], ro=True, cfg=cfg), cands)))
+    best, score = None, None
+    for n in cands:
+        p = hs[n]
+        if not p["ok"]: lines.append(f"{n}: meets the needs; unreachable ({p['err']})"); continue
+        hc = host_cap(cfg, n, p, []); adm = p.get("cap_admit", "yes").strip()
+        room = adm == "yes" and not hc["pause"] and hc["free"] > hc["queued"]
+        lines.append(f"{n}: meets the needs; " + (f"room now ({hc['free']} free, {hc['queued']} waiting)" if room else
+                     f"full (admission: {adm}; {hc['free']} free, {hc['queued']} waiting)"))
+        if room and (score is None or hc["free"] - hc["queued"] > score): best, score = n, hc["free"] - hc["queued"]
+    return best, lines
+
+# A whole-suite run needs --broad <reason> (owner rule after two broad runs held 7 cores for 3 h while short jobs waited 4 h): it
+# then runs at the lowest priority (nice 19, pueue priority -5, counted double in the short-first order). Broad: the command matches
+# [capacity] broad_patterns (default below), or its job class ran a median of [capacity] broad_min minutes or more on that host.
+# Gates (their own steps too) and the land lane are exempt (whole-suite by design, and ordered by their own lanes).
+BROAD_PATTERNS = [r"\bcargo\s+(test|nextest\s+run|clippy|build|check)\b.*\s--(workspace|all)\b", r"(^|[;&|]\s*)(\S*/)?pytest\s*($|[;&|])"]
+
+def job_class(cfg, hn, h, cmd):
+    """The job class runs/cap.sh will give cmd on host hn (cap_class, run here on the host's library)."""
+    rc, o, e = sh(["sh", "-c", cap_lib(cfg, hn, h) + '\ncap_class "$1"', "sh", cmd])
+    return o.strip() or "job"
+
+def host_history(cfg, h):
+    """The host's runs/history.tsv lines (the last 2000)."""
+    if h.get("local"):
+        try: return (Path(h["_rd"]) / "history.tsv").read_text().splitlines()[-2000:]
+        except OSError: return []
+    return hrun(h, f"tail -n 2000 {qp(h['_rd'] + '/history.tsv')} 2>/dev/null")[1].splitlines()
+
+def broad_why(cfg, hn, h, cmd):
+    """Why cmd is a whole-suite run on host hn, or None."""
+    for rx in cfg.capc.get("broad_patterns", BROAD_PATTERNS):
+        if re.search(rx, cmd): return f"it matches the broad pattern {rx!r}"
+    cls = job_class(cfg, hn, h, cmd); e = class_secs(host_history(cfg, h), cls); lim = capv(cfg, h, "broad_min")
+    if e and e >= lim * 60: return f"its job class {cls} ran a median of {e // 60} min on {hn} (broad_min {lim:g})"
+    return None
+
+def record_job(cfg, ref, jid, src, spec):
+    """The tree a job uses, for janus busy (dropped once the job has ended), and what it ran, so a thrash stop can re-queue it."""
+    if cfg.run.dry: return
+    bd_ = cfg.f("runs") / "busy"; bd_.mkdir(parents=True, exist_ok=True); (bd_ / jid).write_text(f"{ref}\t{src}\n")
+    js = cfg.f("runs") / "jobs"; js.mkdir(parents=True, exist_ok=True)
+    (js / f"{jid}.json").write_text(json.dumps({"host": ref.split(":")[0], "task": ref.split(":")[1], **spec, "at": int(now())}))
+
+def queue_placement(cfg, a, src, cmd, jid, label):
+    """No host meeting the needs has room now: a placement task in the coordinator's "place" group runs janus run --place-wait,
+    which dispatches the job to the first host with room and waits for it (its exit code is the job's). JANUS_WRAP: janus cancel
+    of the placement task follows the job it dispatched."""
+    ln = next((n for n, h in cfg.hosts.items() if h.get("local")), None)
+    if not ln: raise Err("no host meeting --needs has room now, and there is no local host (the coordinator) to wait on")
+    h = cfg.hosts[ln]; tok = f"place-{jid}"
+    argv = [sys.executable, str(JANUS_SELF), "run", "--needs", ",".join(a.needs), "--lane", a.lane, "--wt", src, "--place-wait"]
+    argv += [x for k, v in (("--unit", a.unit), ("--subdir", a.subdir), ("--priority", a.priority or None), ("--broad", getattr(a, "broad", None))) if v for x in (k, str(v))]
+    argv = ["env", f"JANUS_TQ={int(now())}", *argv]   # the job's queue wait counts from now
+    argv += ["--usb"] * bool(a.usb) + ["--allow-unmerged"] * bool(a.allow_unmerged) + ["--", cmd]
+    if cfg.run.dry: say(f"+ [{ln}] pueue add -g place -l {label} -- env JANUS_WRAP={tok} {shlex.join(argv[2:])}"); return
+    rc, o, e = hrun(h, f"{ensure_lanes(h, cfg)}; {pueue(h)} add -g place -l {shlex.quote(label)} -w {qp(str(cfg.root))} --print-task-id -- "
+                       + pq(f"env JANUS_WRAP={tok} {shlex.join(argv)}"))
+    if rc: raise Err(f"pueue add on {ln} failed: {(e or o).strip()[-120:]}")
+    tid = o.strip().splitlines()[-1]; record_job(cfg, f"{ln}:{tid}", tok, src, {"lane": "place", "unit": a.unit, "wt": src, "cmd": cmd, "needs": a.needs})
+    print(f"janus: no host meeting the needs has room now: placement queued as {ln}:{tid}; it dispatches the job to the first host with room", file=sys.stderr)
+    if a.no_wait: say(f"{ln}:{tid}"); return
+    subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {int(tid)}; {pueue(h)} log {int(tid)} --full"])
+    return task_rc(task_status(h, tid))
+
 def cmd_run(cfg, a):
-    hn = a.host
-    if hn not in cfg.hosts: raise Err(f"unknown host {hn}")
-    h = cfg.hosts[hn]
-    if a.lane == "land" and not h.get("local"): raise Err("the land lane is the Mac's")
+    needs = parse_needs(getattr(a, "needs", None))
+    if not a.host and not needs: raise Err("give --host <host> (the job stays there) or --needs <requirements> (placed where they are met and there is room)")
+    if a.host and a.host not in cfg.hosts: raise Err(f"unknown host {a.host}")
     cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
     if not cmd: raise Err("no command")
     cmd = cmd[0] if len(cmd) == 1 else shlex.join(cmd)   # one argument is shell text; several are quoted words
@@ -211,6 +325,25 @@ def cmd_run(cfg, a):
     why = tree_guard(cfg, src, behind=a.lane in ("gates", "land"))   # behind main matters for gates and landing only (item 5)
     if why and not a.allow_unmerged: raise Err(f"refused: {src} {why} (--allow-unmerged to run anyway)")
     jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
+    label = f"unit:{unit}" if unit else f"run:{name}"   # unit:<name>: check reports it once that unit is closed (M3)
+    if a.host and needs:
+        ok, why = host_meets(cfg, a.host, host_facts(cfg, refresh="stale").get(a.host), needs)
+        if not ok: raise Err(f"refused: {a.host} does not meet --needs ({why})")
+    elif not a.host:
+        if cfg.run.dry: cfg.run.ro = True   # a dry run saves nothing (not even the discovery)
+        best, lines = place_job(cfg, a.lane, needs)
+        while best is None and getattr(a, "place_wait", False):   # the placement task: wait until a host has room
+            time.sleep(int(os.environ.get("JANUS_PLACE_POLL_S", "30"))); best, lines = place_job(cfg, a.lane, needs)
+        if cfg.run.dry: say("placement: " + "; ".join(lines) + f" -> {best or 'no room now: a placement task waits for the first host with room'}")
+        if best is None: return queue_placement(cfg, a, src, cmd, jid, label)
+        a.host = best; print(f"janus: placed on {best} (" + "; ".join(lines) + ")", file=sys.stderr)
+    hn = a.host; h = cfg.hosts[hn]
+    if a.lane == "land" and not h.get("local"): raise Err("the land lane is the coordinator's")
+    broad = getattr(a, "broad", None)
+    if a.lane == "jobs" and not broad and os.environ.get("JANUS_LANE") != "gates":   # a gate's own steps are exempt
+        why = broad_why(cfg, hn, h, cmd)
+        if why: raise Err(f"refused: a whole-suite run ({why}) needs --broad <reason>: it then runs at low priority (nice 19, after shorter jobs); or narrow it (one package, a test filter)")
+    if broad: print(f"janus: broad run ({broad}): low priority", file=sys.stderr)
     if cfg.run.dry: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
     if not h.get("local"): sync_wt(cfg, hn, h, src, name)
     rd = runs_dir(cfg, h)
@@ -218,16 +351,12 @@ def cmd_run(cfg, a):
     rc, o, e = hrun(h, f"mkdir -p {qp(rd)} && cat > {qp(f'{rd}/{jid}.sh')} && {ensure_lanes(h, cfg)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
     if not rc: rc, o, e = write_cap(cfg, hn, h)
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
-    label = f"unit:{unit}" if unit else f"run:{name}"   # unit:<name>: check reports it once that unit is closed (M3)
     rc, o, e = hrun(h, f"{pueue(h)} add -g {shlex.quote(a.lane)} -l {shlex.quote(label)} -w {qp(rd)} --print-task-id"
-                       + (f" -o {int(a.priority)}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- {pq('bash ' + qp(f'{rd}/{jid}.sh'))}")
+                       + (f" -o {int(a.priority)}" if a.priority else " -o 10" if a.lane == "gates" else " -o -5" if broad else "") + f" -- {pq('bash ' + qp(f'{rd}/{jid}.sh'))}")
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
     tid = o.strip()
-    if not cfg.run.dry:   # the tree this job uses, for janus busy (row 53): one line per job, dropped once the job has ended
-        bd_ = cfg.f("runs") / "busy"; bd_.mkdir(parents=True, exist_ok=True); (bd_ / jid).write_text(f"{hn}:{tid}\t{src}\n")
-        js = cfg.f("runs") / "jobs"; js.mkdir(parents=True, exist_ok=True)   # what it ran, so a thrash stop can re-queue it (item 3)
-        (js / f"{jid}.json").write_text(json.dumps({"host": hn, "task": tid, "lane": a.lane, "unit": unit, "wt": src, "cmd": cmd,
-                                                     "subdir": a.subdir, "usb": bool(a.usb), "priority": a.priority, "at": int(now())}))
+    record_job(cfg, f"{hn}:{tid}", jid, src, {"lane": a.lane, "unit": unit, "wt": src, "cmd": cmd, "subdir": a.subdir, "usb": bool(a.usb),
+                                              "priority": a.priority, "needs": getattr(a, "needs", None), "pinned": not needs, "broad": broad})
     wrap = os.environ.get("JANUS_WRAP")   # queued from inside another janus job or gate (a wrapper): record it, so cancel follows (row 49)
     if wrap and re.fullmatch(r"[\w.-]+", wrap):
         wd = cfg.f("runs") / "wrap"; wd.mkdir(parents=True, exist_ok=True)
@@ -390,17 +519,20 @@ def own_admitted_jobs(cfg, hs, n):
     return sorted(r, key=lambda x: x[3], reverse=True)
 
 def requeue_host(cfg, hs, units, n, spec):
-    """Another host where the job may run now (reachable, not thrashing, room by admission; the land lane stays local), else n."""
+    """Another host where the job may run now (reachable, not thrashing, room by admission, meets the job's --needs; the land lane
+    stays local), else n. A job pinned with --host stays on n."""
+    if spec.get("pinned"): return n
+    needs = parse_needs(spec.get("needs")); fs = host_facts(cfg) if needs else {}
     for m, h in cfg.hosts.items():
         p = hs.get(m) or {}
-        if m == n or not p.get("ok") or (spec.get("lane") == "land" and not h.get("local")): continue
+        if m == n or not p.get("ok") or (spec.get("lane") == "land" and not h.get("local")) or not host_meets(cfg, m, fs.get(m), needs)[0]: continue
         if h.get("shared") and (host_psi(p) or 0) > thrash_cfg(h)[0]: continue
         if host_cap(cfg, m, p, units)["free"] > 0 and not host_cap(cfg, m, p, units)["pause"]: return m
     return n
 
 def requeue(cfg, spec, to):
     """Queue a recorded job (.janus/runs/jobs/<jid>.json) again on host to; returns what janus run printed last (its new id)."""
-    args = argparse.Namespace(host=to, lane=spec.get("lane", "jobs"), unit=spec.get("unit"), wt=spec["wt"], subdir=spec.get("subdir"),
+    args = argparse.Namespace(host=to, needs=spec.get("needs"), broad=spec.get("broad"), lane=spec.get("lane", "jobs"), unit=spec.get("unit"), wt=spec["wt"], subdir=spec.get("subdir"),
                               usb=spec.get("usb", False), priority=spec.get("priority") or 0, no_wait=True, allow_unmerged=True, command=[spec["cmd"]])
     import io, contextlib
     buf = io.StringIO()
@@ -463,6 +595,30 @@ def orphan_jobs(cfg, hs, units):
 def job_of(t):
     m = re.search(r"/runs/([^/ ]+)\.sh", (t or {}).get("command", ""))
     return m.group(1) if m else None
+
+def facts_line(n, f):
+    """One host's discovered facts as one line."""
+    if not f: return f"{n}: never discovered (unreachable so far)"
+    tools = [t for t in f["tools"] if t not in ("git", "rsync", "python3", "flock", "security")]
+    extra = [x for x in f["features"] if x not in f["tools"] and x not in (f.get("os"), f.get("arch"))]
+    return (f"{n}: {f.get('os')} {f.get('arch')}, {f.get('cores')} cores, {(f.get('mem_mb') or 0) / 1024:.1f} GB RAM, {f.get('disk_gb')} GB free; "
+            f"tools {' '.join(tools) or '-'}; features {' '.join(extra) or '-'}; logins {' '.join(f['logins']) or '-'}; "
+            f"devices {' '.join(f['devices']) or '-'} (as of {ts(f.get('at'))})")
+
+def cmd_hosts(cfg, a):
+    """janus hosts: what each host is (discovered: OS, arch, cores, memory, disk, tools, agent logins, devices; cached, refreshed
+    by check after [capacity] discover_h, or now with --refresh)."""
+    cfg.run.ro = cfg.run.ro or not a.refresh   # only --refresh saves what it found
+    fs = host_facts(cfg, refresh=True if a.refresh else "stale")
+    with cf.ThreadPoolExecutor(8) as ex: hs = dict(zip(cfg.hosts, ex.map(lambda n: probe(n, cfg.hosts[n], ro=True, cfg=cfg), cfg.hosts)))
+    use = {n: class_usage(p.get("hist", []), cap_nums(cfg, cfg.hosts[n])["cpj"]) if p["ok"] else [] for n, p in hs.items()}
+    if a.json: return 0, [json.dumps({n: {**(fs.get(n) or {}), "usage": use[n]} for n in cfg.hosts}, indent=1)]
+    m = lambda s: "-" if s is None else f"{s / 60:.0f}m" if s >= 90 else f"{s}s"
+    L = []
+    for n in cfg.hosts:   # per job class: runs, expected run time, learned cores, CPU, queue wait (the report's numbers)
+        L.append(facts_line(n, fs.get(n)))
+        L += [f"  {u['class']}: {u['runs']} runs, expect {m(u['expect_s'])}, {u['cores']} core(s), cpu {m(u['cpu_s'])}, wait p50 {m(u['wait_p50'])} p95 {m(u['wait_p95'])}" for u in use[n][:8]]
+    return 0, L
 
 def collect_job(cfg, ref):
     hn, _, tid = ref.partition(":")
