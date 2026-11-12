@@ -430,6 +430,7 @@ cap_record() {  # $1 class $2 peak MB $3 seconds $4 exit code: one line of RD/hi
 cap_report() {  # for orch's probe: the sums, the pause, each reservation, the last 300 history lines
   res_sum; cap_measure; cap_paused
   echo "cap_rj=$RJ"; echo "cap_rc=$RC"; echo "cap_rm=$RM"; echo "cap_ra=$RA"; echo "cap_ram=$RAM"; echo "cap_pause=$PAUSE"; echo "cap_psi=$PSI"
+  admit_ok job >/dev/null 2>&1; echo "cap_admit=${BLK:-yes}"   # the admission's own verdict for one more job now (yes, or what blocks it)
   [ -n "$RL" ] && printf '%%s\n' "$RL" | sed '/^$/d'
   [ -f "$RD/history.tsv" ] && tail -n 300 "$RD/history.tsv" | sed 's/^/hist=/'
   true
@@ -827,15 +828,19 @@ def secs(et):
     while len(p) < 3: p.insert(0, 0)
     return (int(d) if d else 0) * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
 
-def proc_findings(cfg):
+def proc_findings(cfg, ps_text=None):
     """On this machine (the Mac): CPU burners an agent started (busy over 10 min, under an agent or orphaned from one), and test
-    or build runs outside the pueue lanes (orch run / orch gate put them in a lane)."""
-    rc, o, e = sh(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,pcpu=,etime=,command="], timeout=10)
+    or build runs outside the pueue lanes (orch run / orch gate put them in a lane). ps_text: a ps table (tests)."""
+    o = ps_text if ps_text is not None else sh(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,pcpu=,etime=,command="], timeout=10)[1]
     t, pg = {}, {}
     for l in o.splitlines():
         f = l.split(None, 5)
         if len(f) == 6 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), fl(f[3]), f[4], f[5]); pg[int(f[0])] = int(f[2])
     up = lambda p: [q for q in ancestors({k: (v[0],) for k, v in t.items()}, p)[1:]]
+    kids = {}
+    for k, v in t.items(): kids.setdefault(v[0], []).append(k)
+    def lane_below(p, depth=0):   # a descendant runs orch run/gate: the build goes through a lane (a shim, a wrapper script)
+        return depth < 6 and any(re.search(r"orch(\.py)? (run|gate)\b", t[c][3]) or lane_below(c, depth + 1) for c in kids.get(p, []))
     launchers = {os.path.basename(m["launcher"]) for m in cfg.models.values() if m.get("launcher")}   # older project launchers
     F = []
     for p, (pp, cpu, et, c) in t.items():
@@ -846,7 +851,7 @@ def proc_findings(cfg):
             F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}"))
             cfg._viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
                               "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": env_unit(p)})
-        if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc):
+        if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc) and not lane_below(p):
             F.append((f"localtest:{p}", f"test/build run on this machine outside the pueue lanes (pid {p}, {et}): {c[:70]}; use orch run"))
     return F
 
@@ -1043,17 +1048,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
-    rc, o, e = sh(["git", "status", "--porcelain"], cwd=cfg.root)
-    if rc == 0:
-        dirty = o.splitlines()
-        hp = handoff_path(cfg).relative_to(cfg.root) if handoff_path(cfg).is_relative_to(cfg.root) else None
-        if hp and any(l[3:].strip() == str(hp) for l in dirty):   # check's own rewrite of the Live block is not a change (row 50)
-            rc2, old, _ = sh(["git", "show", f"HEAD:{hp}"], cwd=cfg.root)
-            if rc2 == 0 and old.split(LE, 1)[-1] == handoff_path(cfg).read_text().split(LE, 1)[-1]: dirty = [l for l in dirty if l[3:].strip() != str(hp)]
-        if dirty: F.append(("git:dirty", f"{len(dirty)} uncommitted path(s) in {cfg.root.name}"))
-        rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=cfg.root)
-        if rc == 0 and o.strip() != "0": F.append(("git:unpushed", f"{o.strip()} unpushed commit(s)"))
-        elif rc: F.append(("git:noupstream", "git has no upstream: add a remote, then orch commit-state (it pushes with --set-upstream)"))
+    F += git_findings(cfg)
     try:
         ins = Beads(cfg).issues("instruction")
         if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done or bd remember): " + "; ".join(i['title'][:50] for i in ins[:3])))
@@ -1063,6 +1058,26 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap"))
     if not cfg.ro and not DRY: F = enforce(cfg, F)
+    return F
+
+def git_findings(cfg):
+    """git:dirty, git:unpushed, git:noupstream of the project's own repository."""
+    F = []
+    rc, o, e = sh(["git", "status", "--porcelain", "-uall"], cwd=cfg.root)
+    if rc == 0:
+        dirty = o.splitlines()
+        # orch's own state files (acks, notes, open, stops, running, hosts, stamps, job runs, the pueue shim) change on every
+        # check and ack: never a finding. The orchestrator's notes (.md files in the state dir) still count.
+        sd = cfg.state.resolve().relative_to(cfg.root.resolve()).as_posix() + "/" if cfg.state.resolve().is_relative_to(cfg.root.resolve()) else None
+        if sd: dirty = [l for l in dirty if not (l[3:].strip().strip('"').startswith(sd) and not l[3:].strip().strip('"').endswith(".md"))]
+        hp = handoff_path(cfg).relative_to(cfg.root) if handoff_path(cfg).is_relative_to(cfg.root) else None
+        if hp and any(l[3:].strip() == str(hp) for l in dirty):   # check's own rewrite of the Live block is not a change (row 50)
+            rc2, old, _ = sh(["git", "show", f"HEAD:{hp}"], cwd=cfg.root)
+            if rc2 == 0 and old.split(LE, 1)[-1] == handoff_path(cfg).read_text().split(LE, 1)[-1]: dirty = [l for l in dirty if l[3:].strip() != str(hp)]
+        if dirty: F.append(("git:dirty", f"{len(dirty)} uncommitted path(s) in {cfg.root.name}"))
+        rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=cfg.root)
+        if rc == 0 and o.strip() != "0": F.append(("git:unpushed", f"{o.strip()} unpushed commit(s)"))
+        elif rc: F.append(("git:noupstream", "git has no upstream: add a remote, then orch commit-state (it pushes with --set-upstream)"))
     return F
 
 def tune_pueue(cfg, hs, units):
@@ -2941,10 +2956,13 @@ def lane_findings(cfg, hs, units=()):
             wt = int(p.get(f"wait_{lane}", 0) or 0)   # running tasks still waiting in orch's own admission
             if q and (g.get("status") != "Running" or len(r) < par):
                 F.append((f"stalled:{n}:{lane}", f"{n} {lane} STALLED: {len(q)} queued, {len(r)} of {par} slots running, group {g.get('status')}"))
-            elif (q or wt) and lane != "land" and host_cap(cfg, n, p, list(units))["free"] > 0 and len(r) - wt < slots(h, cfg):
-                F.append((f"idle:{n}:{lane}", f"{n} {lane} IDLE: {len(q)} queued, {wt} waiting for admission, {len(r) - wt} running, room for more"))
+            elif q and not wt and lane != "land" and len(r) < (h.get("gate_slots", slots(h, cfg)) if lane == "gates" else slots(h, cfg)) and \
+                    (p["cap_admit"].strip() == "yes" if "cap_admit" in p else host_cap(cfg, n, p, list(units))["free"] > 0):
+                # idle by the admission's own verdict (row 48): work queued in pueue, none held by admission, and admission would
+                # take one more now; jobs waiting inside their scripts are held by admission, never idle
+                F.append((f"idle:{n}:{lane}", f"{n} {lane} IDLE: {len(q)} queued in pueue, {len(r)} running, and admission would admit one now"))
             if q: backlog.setdefault(lane, []).append(n)
-            elif len(r) < par: free.setdefault(lane, []).append(n)
+            elif len(r) < par and not wt and p.get("cap_admit", "yes").strip() == "yes": free.setdefault(lane, []).append(n)   # free by admission (row 48)
             for x in mine:
                 s = x["status"]; info = s.get(st(x), {}) if isinstance(s, dict) else {}
                 try: since = time.mktime(time.strptime(info.get("enqueued_at", "")[:19], "%Y-%m-%dT%H:%M:%S"))
