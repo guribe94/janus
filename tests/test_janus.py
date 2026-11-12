@@ -1532,6 +1532,16 @@ class DoctorProjectListed(unittest.TestCase):
         line = self._doctor(self._project(), False)
         self.assertTrue(line.startswith("WARN "), line); self.assertIn("not listed in", line); self.assertIn("will not visit", line)
 
+    def test_the_line_follows_the_file_the_watcher_reads(self):
+        """Catches (the doctor line): the doctor judged listing by `projects()` (which drops a listed dir without a janus.toml)
+        instead of the projects file the watcher actually reads, so a project the watcher will visit could read as 'not listed'
+        (and the earlier release printed 'ok project not listed', a self-contradiction)."""
+        d = self._project()
+        real = janus.projects; janus.projects = lambda: []
+        try: line = self._doctor(d, True)
+        finally: janus.projects = real
+        self.assertTrue(line.startswith("ok "), line); self.assertIn("project listed in", line); self.assertNotIn("not listed", line)
+
 
 class SkillPointers(unittest.TestCase):
     def test_a_release_copy_missing_a_pointed_path_is_caught(self):
