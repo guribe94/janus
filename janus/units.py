@@ -141,20 +141,23 @@ def park_jobs(cfg, text):
     `\\s*` spans the line break), so a unit parked as `WAITING` with `here:9` on the next line is read the same either way.
     Finding 5: a prose line, or a park line whose ids janus cannot read (`mac:9` for an unknown host, a bare `9`), is not a park.
     Finding B residue 1: words after the park word (`WAITING on jobs:`) do not stop the reader -- the ids on the following lines
-    are read too (a blank line is skipped, a `Jobs:`-like header is skipped, a `VERDICT:` line or a prose line ends the search).
-    (None, []) when there is no such park line."""
+    are read too. Finding B residue 2: a bullet/numbered LIST of ids parks on ALL of them. A blank line is skipped, a `Jobs:`-like
+    header is skipped, a `VERDICT:` line or a prose line ends the list. (None, []) when there is no such park line."""
     out = (None, [])
     for m in WAIT_RX.finditer(text):
         jobs = [f"{h}:{t}" for h, t in JOBREF.findall(m.group(1)) if h in cfg.hosts]
-        if not jobs:   # finding B residue 1: a word after the park word (ids on the next lines) must not hide them; read the
-            for line in text[m.end():].splitlines():   # following lines until the first that names a job janus knows
-                st = line.strip()
-                if not st: continue                     # a blank line between the park word and its ids
-                if st.startswith("VERDICT:"): break
-                found = [f"{h}:{t}" for h, t in JOBREF.findall(line) if h in cfg.hosts]
-                if found: jobs = found; break
-                if st.endswith(":"): continue           # a header like `Jobs:` before the list
-                break
+        # finding B residue 1: words after the park word (`WAITING on jobs:`) do not hide the ids on the following lines; read
+        # them. Finding B residue 2: a bullet/numbered LIST of ids parks on ALL of them, so keep collecting the following lines
+        # while each names a job (a blank line is skipped, a `Jobs:`-like header is skipped, a `VERDICT:` line or a prose line
+        # ends the list).
+        for line in text[m.end():].splitlines():
+            st = line.strip()
+            if not st: continue
+            if st.startswith("VERDICT:"): break
+            found = [f"{h}:{t}" for h, t in JOBREF.findall(line) if h in cfg.hosts]
+            if found: jobs.extend(found); continue
+            if st.endswith(":"): continue               # a header like `Jobs:` before the list
+            break
         # finding A: the line index is a splitlines index, exactly like verdict's `text.splitlines()` (a form feed, U+2028 or
         # \x1c-\x1e counts as a line break in splitlines but not in `count("\n")`, so the two indexes must use one model).
         if jobs: out = (len(text[:m.start()].splitlines()), list(dict.fromkeys(jobs)))
