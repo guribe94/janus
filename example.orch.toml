@@ -54,6 +54,10 @@ args = []
 # gates_required = 1
 # gate_names = ["{unit}", "land-{unit}", "land-{unit}-*", "{unit}-*"]   # gate names that belong to a unit (plus orch gate --unit)
 # branch = "main"        # where landed work is; default origin's HEAD branch
+# scope_cmd = "bin/gate-steps.sh {unit} {tree}"   # orch gate-scope: prints the tree's gate steps, '[@host ]<step>: <command>'
+# known_failures = "out/known-failures.tsv"       # <test id cols...> TAB <cause> TAB <unit fixing it>; gates with only these pass
+# gate_timeout_min = 120  # a gate's process group is stopped after this long (RESULT: FAIL, EXIT_timeout=124)
+# quick_gate_min = 15     # gates expected under this many minutes use the one-slot gates-quick group
 
 # Caps exist only when the owner sets them.
 # [caps]

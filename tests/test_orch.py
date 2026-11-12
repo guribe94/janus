@@ -748,6 +748,58 @@ class ReviewFixes9(unittest.TestCase):
         o = subprocess.run(["sh", "-c", f"HOME=/home/me; echo {sl}"], capture_output=True, text=True).stdout.strip()
         self.assertEqual(o, "-home-me-o-worktrees-u")
 
+class GatePolicy(unittest.TestCase):
+    """fixes10 item 2: known failures (PASS with only known failures; findings for entries with no open unit or that pass now),
+    a per-gate time limit, a quick slot by expected length, and the affected-scope hook."""
+    def setUp(self):
+        self.d, self.cfg = project('\n[landing]\nknown_failures = "out/known.tsv"\nquick_gate_min = 10\nscope_cmd = "sh scope.sh {unit} {tree}"\n')
+        (self.d / "out/known.tsv").write_text("# id cols, cause, unit\nsuite\tflaky_a\tissue 1\tfix-a\nsuite\tstale_b\told\t-\n")
+        self.cfg.ro = False
+
+    def test_judge_and_default_runner(self):
+        g = self.d / "out/g1"; g.mkdir()
+        self.assertEqual(orch.judge_gate(self.cfg, "g1", 1)[0], "FAIL")          # names no failure: a build error, a timeout
+        (g / "failed.txt").write_text("suite/flaky_a\n"); self.assertEqual(orch.judge_gate(self.cfg, "g1", 1)[:2], ("PASS", []))
+        (g / "failed.txt").write_text("suite/stale_b\n"); self.assertEqual(orch.judge_gate(self.cfg, "g1", 1)[0], "FAIL")   # no fixing unit
+        (g / "failed.txt").write_text("suite/flaky_a\nsuite/new_c\n"); self.assertEqual(orch.judge_gate(self.cfg, "g1", 1)[1], ["suite/new_c"])
+        (g / "tests.sh").write_text('echo suite/flaky_a > "$ORCH_GATE_OUT/failed.txt"; exit 1\n')
+        log = self.d / "out/gates.log"
+        r = subprocess.run(["sh", "-c", orch.GATE_DEFAULT, "gate", str(g / "tests.sh"), "g1", str(log), sys.executable, str(ORCH_PY)],
+                           env={**os.environ, "ORCH_ROOT": str(self.d)}, cwd=self.d, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("KNOWN=1 RESULT: PASS", log.read_text())
+        log.write_text("2026-01-01 00:00:00 g1 EXIT_tests=1 RESULT: FAIL\n"); os.utime(g / "failed.txt", (0, 0))
+        self.assertEqual(orch.gate_results(self.cfg)["g1"][1], "FAIL")   # an old failed.txt does not re-judge a newer line
+        (g / "failed.txt").write_text("suite/flaky_a\n"); log.write_text(time.strftime("%Y-%m-%d %H:%M:%S") + " g1 EXIT_tests=1 RESULT: FAIL\n")
+        self.assertEqual(orch.gate_results(self.cfg)["g1"][1], "PASS")   # a project runner's FAIL with known failures only
+
+    def test_known_failure_findings(self):
+        keys = [k for k, _ in orch.known_failure_findings(self.cfg, {"fix-a"})]
+        self.assertEqual(keys, ["known-failure:suite/stale_b"])                     # no unit named
+        self.assertIn("known-failure:suite/flaky_a", [k for k, _ in orch.known_failure_findings(self.cfg, set())])   # its unit is not open
+        g = self.d / "out/g2"; g.mkdir(); (g / "passed.txt").write_text("suite/flaky_a\n")
+        (self.d / "out/gates.log").write_text(time.strftime("%Y-%m-%d %H:%M:%S") + " g2 EXIT_tests=0 RESULT: PASS\n")
+        self.assertIn("known-failure:suite/flaky_a:passes", [k for k, _ in orch.known_failure_findings(self.cfg, {"fix-a"})])
+
+    def test_timeout_and_quick_slot(self):
+        a = type("A", (), {"name": "land-u1-x", "timeout_min": 0.01, "command": ["--", "sleep 30"]})()
+        t0 = time.time(); self.assertEqual(orch.cmd_gate_exec(self.cfg, a), 124); self.assertLess(time.time() - t0, 15)
+        self.assertIn("land-u1-x EXIT_timeout=124 RESULT: FAIL", (self.d / "out/gates.log").read_text())
+        self.assertIsNone(orch.gate_estimate(self.cfg, "land-u1-x"))               # a stopped run is not a length
+        a.timeout_min = 0; a.command = ["true"]; self.assertEqual(orch.cmd_gate_exec(self.cfg, a), 0)
+        self.assertIsNotNone(orch.gate_estimate(self.cfg, "land-u9-x"))              # same family, another unit
+        self.assertIsNone(orch.gate_estimate(self.cfg, "other"))
+        self.assertIn("gates-quick", orch.ensure_lanes(self.cfg.hosts["here"], self.cfg))
+
+    def test_scope_hook(self):
+        tree = self.d / "tree"; tree.mkdir(); (tree / "f").write_text("x\n")
+        (self.d / "scope.sh").write_text('echo "# steps for $1"; echo "lint: test -f f"; echo "unit: test $1 = u1"\n')
+        st = orch.scope_steps(self.cfg, "u1", tree)
+        self.assertEqual(st, [(None, "lint", "test -f f"), (None, "unit", "test u1 = u1")])
+        r = subprocess.run(["bash", "-c", orch.scope_script(self.cfg, "u1", tree, st)], capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.split()), (0, ["EXIT_lint=0", "EXIT_unit=0"]))
+        (self.d / "scope.sh").write_text('echo "@nohost x: true"\n')
+        with self.assertRaises(orch.Err): orch.scope_steps(self.cfg, "u1", tree)
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project)."""
