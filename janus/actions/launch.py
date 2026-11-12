@@ -264,7 +264,9 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
             + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
     return (head + f"**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
-            f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
+            f"brings back a patch of your changes, your REPORT and logs). **No git here (janus):** your copy has no `.git` and no "
+            f"remote, so do not run git commands; write the code, and list every file you changed in your report (janus collects a "
+            f"patch of your changes). Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
             f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=rep)
             + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
