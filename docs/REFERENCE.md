@@ -456,6 +456,7 @@ table is the plain-language list of the families the reference must name; the re
 | `quality` | a finished unit changed test files but named no failure each test catches (report.json) |
 | `related` | two units whose work meets (same file or module, branch, gate area or a learned post) |
 | `report-due` | a status report to the owner is due |
+| `review` | a critical unit finished DONE with no review of its final code |
 | `rule-subject` | two standing rules (beads memories) share one subject |
 | `scheduler` | job-running work outside a host's janus lanes |
 | `script` | a running script's file was changed after it started |
@@ -808,6 +809,10 @@ with `[budget] wrapup_usd` (default 0.5) to write its report.
   unit until the review passes or `janus quality review <unit> --override '<reason>'` accepts its findings.
 - `janus check` raises `test-signal:<gate>` for a gate that takes over `[quality] signal_min_min` (20) minutes and has not failed
   in its last `signal_runs` (5) recorded runs: scope or trim it (deleting a step is the owner's call).
+- `janus check` raises `review:<unit>` for a tier **critical** unit that finished DONE with no later review of it: launch a review
+  with `--of <unit>` (the strongest model, different vendor) that starts after the unit's last commit, or re-review after any
+  change. `[landing] hold_h` (hours; unset by default) refuses a NEW implement unit when a gated DONE unit has waited that long
+  and a provider is under 25 % of its cap — "land first" (S1 finish-and-land, S3 land-first-lean).
 - **`janus soak [--minutes N] [--live]`** exercises janus's read-only paths on a live project and prints one pass/fail line per
   step: the watcher's wake decision, a check, peers, the reports index, a brief header (with the session memory), a transcript,
   each ledger, and the decision log. Read-only by default; `--live` also runs one watcher pass. `--minutes 0` is one pass.

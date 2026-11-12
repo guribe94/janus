@@ -291,6 +291,27 @@ def place(cfg, a, brief, mc, units, hs):
     if want and want not in cfg.hosts: want = None
     return allowed, ("tests run on " + want + ", but " + a.unit + "'s model is not allowed there; " if want else "") + "most room", want
 
+def land_first_block(cfg, units, hs):
+    """Why a NEW implement unit is refused (None when it is not): [landing] hold_h is set, a capped provider has under 25 % of its
+    cap left, and a finished DONE unit's gates passed over hold_h hours ago but it is not landed. Then the work that is done is
+    landed before more is started (S1 finish-and-land, S3 land-first-lean). Inert unless [landing] hold_h is set."""
+    h = cfg.c.get("landing", {}).get("hold_h")
+    if not h: return None
+    from janus.findings.work import landing_findings
+    from janus.ledger import committed
+    if not any("cap_usd" in pv and committed(cfg, pv) >= 0.75 * pv["cap_usd"] for pv in cfg.prov.values()): return None
+    stuck = []
+    for k, why in landing_findings(cfg, units, hs):
+        if not k.endswith(":unlanded"): continue
+        n = k.split(":")[1]; u = next((x for x in units if x["name"] == n), None)
+        if not u: continue
+        try: age = (now() - report_path(cfg, u).stat().st_mtime) / 3600
+        except OSError: continue
+        if age >= h: stuck.append(f"{n} ({age:.0f} h)")
+    if not stuck: return None
+    return ("land first: " + ", ".join(stuck[:6]) + ("..." if len(stuck) > 6 else "") + f" passed their gates over {h} h ago and are not "
+            f"landed, while a provider is under 25 % of its cap: land them (janus land <unit>), then start more work")
+
 def choose(cfg, a, brief, mc, units, hs):
     """(agent host, build host, why) for a new unit, or Err saying why not and when to expect room. The agent host has room for
     one more agent by reservations (room); the build host (where its builds and tests run: placement, else the agent host) has
@@ -379,6 +400,9 @@ def cmd_launch(cfg, a):
     hs = getattr(a, "probes", None) or probe_all(cfg)
     ag = herdr_agents(cfg) if not getattr(a, "probes", None) else {}
     for x in units: x.setdefault("state", unit_state(x, hs, ag))   # finished units hold no build position
+    if a.kind == "implement":   # land the done work before starting more (S1 finish-and-land, S3 land-first-lean; inert unless configured)
+        lb = land_first_block(cfg, units, hs)
+        if lb: raise Err(f"refused: {lb}")
     hn, build, why_place = choose(cfg, a, brief, mc, units, hs)
     h = cfg.hosts[hn]; local = h.get("local", False)
     if getattr(a, "new_worktree", None) and a.cwd:   # finding 12: --new-worktree makes its own tree
@@ -435,6 +459,7 @@ def cmd_launch(cfg, a):
     pred = predecessor_name(cfg, name, a.resume_of)   # RELATED: names and the predecessor reach the brief (imp-awareness)
     u = {"v": UNIT_V, "host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
+    if a.of: u["of"] = a.of   # the unit a review checks (review:<unit> for a critical unit needs a later review of it)
     if report: u["report"] = str(report); u["resume"] = True
     item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
     if item: u["item"] = item

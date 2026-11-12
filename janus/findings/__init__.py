@@ -65,6 +65,7 @@ FAMILIES = {
     "quality": Family("a finished unit changed test files but named no failure each test catches (report.json)"),
     "related": Family("two units whose work meets (same file or module, branch, gate area or a learned post): janus introduce", urgent=True),
     "report-due": Family("a status report to the owner is due", urgent=True),
+    "review": Family("a critical unit finished DONE with no review of its final code"),
     "rule-subject": Family("two standing rules (beads memories) on one subject"),
     "scheduler": Family("job-running work outside a host's janus lanes", urgent=True),
     "script": Family("a running script's file was changed after it started", urgent=True),
