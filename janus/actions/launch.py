@@ -386,6 +386,15 @@ def cmd_launch(cfg, a):
     shared, handover = cwd_taken(cfg, units, cwd, name, getattr(a, "resume_of", None), getattr(a, "share_with", None))
     if shared and not (local and a.kind in ("review", "audit")):
         raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}; give the unit its own worktree (H9)")
+    if handover:   # finding 5: the handover is refused BEFORE the successor starts, never after it launched
+        from janus.actions.lifecycle import uncollected
+        hand = next((x for x in units if x["name"] == handover), None)
+        why = None if cfg.run.dry else uncollected(cfg, hand)
+        if why: raise Err(f"refused: --resume-of {handover}: {why}")
+        hst = (hand or {}).get("state") or (unit_state(hand, hs, ag) if hand else "unknown")
+        what = f"still {hst}" if hst != "unknown" else "in an unknown state (its host could not say whether it runs)"
+        if hst in ("working", "queued", "blocked", "unknown"):
+            raise Err(f"{handover}: cannot hand over its tree: its agent is {what}; stop it first (janus stop {handover}), then hand its tree over")
     if main_checkout(cwd) and not a.allow_main: raise Err(f"refused: {cwd} is a main checkout with linked worktrees; use a worktree (or --allow-main)")
     if qset(cfg, "brief_lint"):   # [quality] brief_lint: a brief that fails is refused with every reason (opt-in, item 5)
         probs = lint_brief(cfg, brief, cwd=cwd, reachable=local)
