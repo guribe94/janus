@@ -146,6 +146,38 @@ class Item12FinalGate(unittest.TestCase):
                          "cd ${wt} && ./gate ${unit}")
 
 
+class Item8ThrashExplicit(unittest.TestCase):
+    def test_a_thrash_stop_is_written_to_the_job_log_and_names_the_requeue(self):
+        """Catches (finding 8): a shared-host PSI stop/re-queue was recorded only in the watcher log and the check's finding,
+        never in the stopped job's own log, and the finding did not say the job was re-queued on the same host (still over the
+        limit); the over-since clock was not reset, so each pass stopped the next newest job."""
+        import json as _json
+        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\nshared = true\nthrash_psi = 10\nthrash_min = 5\n'
+                         'job_log = "/r/runs/job.log"\n'); cfg.run.ro = False
+        jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
+        (jd / "new-2.json").write_text(_json.dumps({"host": "far", "task": "2", "lane": "jobs", "unit": "u", "wt": str(d),
+                                                    "cmd": "make", "at": 200, "pinned": True}))
+        t = {"status": {"Running": {"start": "2026-01-01T11:00:00"}}, "command": "bash /r/runs/new-2.sh", "label": "unit:u@t", "group": "jobs"}
+        hs = {"far": {"ok": True, "psi": "12.5", "pueue": {"tasks": {"2": t}}}, "here": {"ok": True}}
+        cfg.jput("thrash.json", {"far": int(time.time()) - 600})
+        calls = []; hl = []
+        saved = (janus.cancel_job, janus.cmd_run, janus.host_cap, janus.board, janus.hrun)
+        janus.cancel_job = lambda cfg, ref, force=False: calls.append(("cancel", ref)) or [f"cancelled {ref}"]
+        janus.cmd_run = lambda cfg, a: calls.append(("run", a.host)) or print("far:9")
+        janus.host_cap = lambda *a: {"free": 0, "pause": "memory PSI 12.5 over 10"}; janus.board = lambda *a, **k: (0, "", "")
+        janus.hrun = lambda h, s, **k: (hl.append(s), (0, "", ""))[1]
+        try:
+            out = janus.tend_thrash(cfg, hs, [], lambda m: None)
+            self.assertTrue(any("SAME host" in l for l in out), f"the finding does not name the re-queue target: {out}")
+            log = (cfg.f("runs") / "new-2.log").read_text()
+            self.assertIn("janus thrash", log); self.assertIn("far:2", log); self.assertIn("far:9", log)
+            self.assertTrue(any("job.log" in s and "janus thrash" in s for s in hl), hl)
+            n = len(calls); janus.tend_thrash(cfg, hs, [], lambda m: None)   # the clock was reset: no immediate second stop
+            self.assertEqual(len(calls), n, "the over-since clock was not reset, so the next pass stopped another job")
+        finally:
+            janus.cancel_job, janus.cmd_run, janus.host_cap, janus.board, janus.hrun = saved
+
+
 class Item9ResumeCard(unittest.TestCase):
     def test_resume_posts_the_card_as_waiting_with_the_new_task(self):
         """Catches: a unit resumed with janus resume --message whose run is queued in pueue (agents slot full) showed board GONE
