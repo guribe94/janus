@@ -238,8 +238,10 @@ def resume_message(cfg, hs, u, jobs):
              f"real exit codes.")
     return "\n".join(L)
 
-def resume_unit(cfg, u, msg, wrapup=False):
-    """Continue the unit's own agent session with msg (see above). The caller saves u. Returns a line saying what was done."""
+def resume_unit(cfg, u, msg, wrapup=False, budget=None):
+    """Continue the unit's own agent session with msg (see above). budget: a new budget for this run (`janus resume --budget`,
+    same tree), instead of the unit's remaining budget (item 24: a capped unit with an unpushed commit can be continued). The
+    caller saves u. Returns a line saying what was done."""
     name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); text = JANUS_MARK + msg
     if via == "herdr":
         if not cfg.run.dry: herdr("agent", "prompt", name, text)
@@ -254,11 +256,11 @@ def resume_unit(cfg, u, msg, wrapup=False):
     if u.get("run"):   # the run before is closed first (idempotent): its reported cost, else its budget
         cost, _ = run_cost(od / "api.json", (u.get("budget") or pv.get("budget_per_unit", 0)) if u.get("run") != u.get("wrapup") else bset(cfg, "wrapup_usd"))
         ledger_done(cfg, pv, u["run"], name, cost, "resumed")
+    spent = unit_spent(cfg, u); explicit = budget is not None
     if wrapup: budget = bset(cfg, "wrapup_usd")
-    else:
-        budget = round((u.get("budget") or pv.get("budget_per_unit", 0)) - unit_spent(cfg, u), 2)
-        if budget < bset(cfg, "resume_min_usd"):
-            raise Err(f"{name}: ${budget:.2f} of its ${u.get('budget')} budget left (under [budget] resume_min_usd); resume it with janus launch --resume-of and a new budget")
+    elif budget is None: budget = round((u.get("budget") or pv.get("budget_per_unit", 0)) - spent, 2)
+    if budget < bset(cfg, "resume_min_usd"):
+        raise Err(f"{name}: ${budget:.2f} budget left (under [budget] resume_min_usd): resume it with janus resume {name} --budget <usd> (same tree), or janus launch --resume-of and a new budget")
     k = len(unit_runs(u)) + 1; run = f"{name}.r{k}.{int(now())}"
     run = reserve_budget(cfg, mc, name, budget, run)
     local = h.get("local", False); old = u.get("task")
@@ -281,7 +283,8 @@ def resume_unit(cfg, u, msg, wrapup=False):
         ledger_done(cfg, pv, run, name, 0, "died-at-start")
         raise Err(f"{name}: the resumed run died at once ({why})")
     if old is not None: save_task_log(cfg, h, u, old, remove=True)   # the finished task's log is kept, then the task removed
-    u.update(task=int(o.strip() or 0), run=run, runs=[*unit_runs(u), run], resumes=u.get("resumes", 0) + 1, resumed_at=int(now()))
+    u.update(task=int(o.strip() or 0), run=run, runs=[*unit_runs(u), run], resumes=u.get("resumes", 0) + 1, resumed_at=int(now()),
+             **({"budget": round(spent + budget, 2)} if explicit else {}))   # item 24: the unit's budget grows by the new run's
     if wrapup: u["wrapup"] = run
     chk = f"herdr {name}" if via == "herdr" else f"pueue {u['host']}:{u['task']}" if via == "pueue" else f"tmux {u['host']}:{unit_tmux(u)}"
     board(cfg, "post", name, "waiting", f"resumed as task {u['task']}", env={"BOARD_CHECK": chk})   # item 9: a queued run is not GONE
@@ -318,7 +321,7 @@ def cmd_resume(cfg, a):
         if left and not a.force: raise Err(f"{u['name']} waits on {', '.join(left)}, not finished (--force to resume now)")
         msg = resume_message(cfg, hs, u, jobs)
     else: raise Err(f"{u['name']} is not parked: give --message")
-    say(resume_unit(cfg, u, msg))
+    say(resume_unit(cfg, u, msg, budget=getattr(a, "budget", None)))
     if cfg.run.dry: return
     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
     bd.comment(u["id"], f"{ts()} resumed")

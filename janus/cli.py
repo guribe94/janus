@@ -55,7 +55,8 @@ def main():
     add("resume", cmd_resume, A("unit", nargs="?", help="a parked unit to resume; with no unit: continue the orchestration in a new session"),
         A("--runtime", choices=["claude", "codex"], help="the runtime for the new orchestrator session (default: the registered one)"),
         A("--here", action="store_true", help="register this session as the orchestrator, instead of starting a new one"),
-        A("--message", help="resume a unit with this text instead of its jobs' results"), A("--force", action="store_true", help="resume although its jobs have not finished"), dry=True)
+        A("--message", help="resume a unit with this text instead of its jobs' results"), A("--force", action="store_true", help="resume although its jobs have not finished"),
+        A("--budget", type=float, help="a new budget for this run (same tree), instead of the unit's remaining budget"), dry=True)
     add("ledger", cmd_ledger, A("action", choices=["check", "repair", "reconcile"]), A("--provider"), dry=True)
     add("doctor", cmd_doctor, A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", cmd_backlog, A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...>"), dry=True)
