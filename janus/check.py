@@ -16,7 +16,7 @@ from janus.findings.hosts import (enforce, host_findings, lane_findings, orphan_
     script_findings, thrash_findings, tidy_findings)
 from janus.findings.awareness import note_findings, related_findings   # imp-awareness: related:<a>:<b>, note:<agent>:<n>
 from janus.findings.memory import memory_findings, rule_findings
-from janus.findings.quality import test_signal_findings
+from janus.findings.quality import quality_findings, test_signal_findings
 from janus.findings.sched import overrun_findings
 from janus.findings.units import (budget_findings, cap_findings, card_findings, ledger_findings, peer_findings,
     report_findings, spend_findings, unit_findings)
@@ -56,7 +56,7 @@ def collect_findings(cfg, hs, units, ag, bd_err, bd=None):
     cfg.jput("running.json", {"n": running})
     F += cap_findings(cfg, units)
     F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg) + tidy_findings(cfg) + context_findings(cfg)
-    F += test_signal_findings(cfg)
+    F += test_signal_findings(cfg) + quality_findings(cfg, units)
     F += lane_findings(cfg, hs, units) + overrun_findings(cfg, hs)
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg, viol=viol) + script_findings()
     F += ledger_findings(cfg, units)

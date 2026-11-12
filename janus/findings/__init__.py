@@ -61,6 +61,7 @@ FAMILIES = {
     "pressure": Family("a host's admission is paused by back-pressure", urgent=True),
     "provider": Family("a unit runs on a disabled provider"),
     "question": Family("an open board question", urgent=True),
+    "quality": Family("a finished unit changed test files but named no failure each test catches (report.json)"),
     "related": Family("two units whose work meets (same file or module, branch, gate area or a learned post): janus introduce", urgent=True),
     "report-due": Family("a status report to the owner is due", urgent=True),
     "rule-subject": Family("two standing rules (beads memories) on one subject"),

@@ -441,6 +441,7 @@ table is the plain-language list of the families the reference must name; the re
 | `pressure` | a host's admission is paused by back-pressure |
 | `provider` | a unit runs on a disabled provider |
 | `question` | an open board question |
+| `quality` | a finished unit changed test files but named no failure each test catches (report.json) |
 | `related` | two units whose work meets (same file or module, branch, gate area or a learned post) |
 | `report-due` | a status report to the owner is due |
 | `rule-subject` | two standing rules (beads memories) share one subject |
