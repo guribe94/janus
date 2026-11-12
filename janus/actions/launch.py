@@ -36,7 +36,7 @@ def deferred_block(cfg, name, item=None):
     or its backlog item. The owner deferred that work (S3 first-collection-means-working: a deferral is not silently started), so
     ask before starting it."""
     try: ins = Beads(cfg).issues("instruction")
-    except Err: return None
+    except Exception: return None   # beads unavailable (or a test double): no deferral to enforce
     for i in ins:
         if "deferral" not in (i.get("labels") or []): continue
         t = (i.get("title") or "")
