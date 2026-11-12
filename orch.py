@@ -2844,6 +2844,8 @@ def cmd_run(cfg, a):
                        + (f" -o {int(a.priority)}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- {pq('bash ' + qp(f'{rd}/{jid}.sh'))}")
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
     tid = o.strip()
+    if not DRY:   # the tree this job uses, for orch busy (row 53): one line per job, dropped once the job has ended
+        bd_ = cfg.f("runs") / "busy"; bd_.mkdir(parents=True, exist_ok=True); (bd_ / jid).write_text(f"{hn}:{tid}\t{src}\n")
     wrap = os.environ.get("ORCH_WRAP")   # queued from inside another orch job or gate (a wrapper): record it, so cancel follows (row 49)
     if wrap and re.fullmatch(r"[\w.-]+", wrap):
         wd = cfg.f("runs") / "wrap"; wd.mkdir(parents=True, exist_ok=True)
@@ -2868,6 +2870,64 @@ def tree_guard(cfg, wt, behind=True):
     rc, o, e = g("rev-list", "--count", f"HEAD..{br}")
     if rc == 0 and o.strip().isdigit() and int(o) > mx: return f"is {o.strip()} commits behind {br} (max {mx}): merge {br} first"
     return None
+
+BUSY_PATTERNS = ["mutants"]   # [busy] patterns default: tools that edit the tree in place while they run (mutation testing)
+
+def busy_reasons(cfg, wt, hs=None, ps=None):
+    """Why the tree wt is in use (row 53): an orch job queued or running on it (any host and lane; a job whose host does not
+    answer counts as busy), an open unit's own jobs when the unit's cwd is wt (a remote agent's lane jobs on its copy), or a
+    local process matching [busy] patterns (default: mutation testing, which edits sources in place) that runs in or names
+    the tree. A periodic WIP snapshot must not commit while any holds."""
+    names = {str(Path(wt).absolute()), str(Path(wt).resolve())}; wt = Path(wt).resolve(); why = []
+    bdir = cfg.f("runs") / "busy"; recs = []
+    for f in sorted(bdir.glob("*")) if bdir.is_dir() else []:
+        try: ref, src = f.read_text().strip().split("\t", 1)
+        except ValueError: continue
+        recs.append((f, ref, Path(src)))
+    hosts = {r.split(":")[0] for _, r, _ in recs}
+    units = []
+    try: units = Beads(cfg).units()
+    except Err: pass
+    mine = [u for u in units if u.get("cwd") and Path(u["cwd"]).resolve() == wt]
+    if hs is None:   # a unit's jobs may run on any host; job records name theirs
+        hs = probe_all(cfg) if mine else {n: probe(n, cfg.hosts[n], cfg=cfg) for n in hosts if n in cfg.hosts}
+    for f, ref, src in recs:
+        hn, _, tid = ref.partition(":"); p = hs.get(hn) or {}
+        t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid)
+        if p.get("ok") and (t is None or task_rc(t) is not None):
+            if not DRY: f.unlink(missing_ok=True)   # ended or removed: the record goes
+            continue
+        if src.resolve() == wt or wt in src.resolve().parents:
+            st = t["status"] if p.get("ok") else None; st = st if isinstance(st, str) else next(iter(st or {}), "")
+            why.append(f"job {ref} ({f.name}) " + (f"is {st.lower()}" if p.get("ok") else f"on unreachable {hn}: assumed running"))
+    for u in mine:
+        why += [f"unit {u['name']}'s job {j}" for j in unit_jobs(hs, u["name"])]
+    pats = cfg.c.get("busy", {}).get("patterns", BUSY_PATTERNS)
+    if pats:
+        rx = re.compile("|".join(re.escape(x) for x in pats))
+        for l in (ps if ps is not None else sh(["ps", "-axo", "pid=,command="])[1]).splitlines():
+            pid, _, c = l.strip().partition(" ")
+            if not pid.isdigit() or not rx.search(c) or int(pid) == os.getpid(): continue
+            cwd = proc_cwd(int(pid))
+            if any(n in c for n in names) or (cwd and (cwd == wt or wt in cwd.parents)):
+                why.append(f"process {pid} ({c.strip()[:80]})")
+    return why
+
+def proc_cwd(pid):
+    """A local process's working directory, or None."""
+    try: return Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+    except OSError: pass
+    rc, o, e = sh(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"], timeout=10)
+    n = next((l[1:] for l in o.splitlines() if l.startswith("n")), None)
+    return Path(n).resolve() if rc == 0 and n else None
+
+def cmd_busy(cfg, a):
+    """orch busy <wt>: exit 0 (and say why) while a job or a mutation run uses the tree, 1 when it is free (row 53)."""
+    cfg.ro = True   # read-only on every host (the probe leaves the overload tracker alone)
+    why = busy_reasons(cfg, a.wt)
+    for w in why: say(f"busy: {w}")
+    if not why: say(f"free: no orch job, unit job or [busy] process uses {Path(a.wt).resolve()}")
+    return 0 if why else 1
 
 def cmd_cancel(cfg, a):
     """Cancel an orch job (<host>:<task>) that outlived its intent (issue 36): see cancel_job."""
@@ -3731,6 +3791,7 @@ def main():
     add("gate", A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $ORCH_UNIT)"), A("--priority", type=int, default=10),
         A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"),
         A("--allow-unmerged", action="store_true", help="gate a tree mid-merge, with conflict markers or far behind the landing branch"), dry=True)
+    add("busy", A("wt", help="a worktree: exit 0 while an orch job, a unit's job or a mutation run uses it, else 1"))
     add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", A("--max", type=int, help="launch at most this many"), dry=True)
     add("report", A("--brief", action="store_true", help="summary lines only"), A("--sent", action="store_true", help="record that the report was sent (clears report-due)"))
