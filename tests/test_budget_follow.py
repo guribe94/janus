@@ -280,4 +280,28 @@ class Item4FinishReserve(unittest.TestCase):
         self.assertEqual(janus.reserve_findings(self.cfg, self.units), [])
         for k in ("spend:api:reserve", "spend:api:short"): janus.finding(k, "x")   # both keys are of a registered family
 
+class Item5UnitHistory(unittest.TestCase):
+    """A new unit's budget is learned from what past UNITS cost to finish: every run of each, the resumes included."""
+    def setUp(self):
+        self.d, self.cfg = project(); self.pv = self.cfg.prov["api"]; self.mc = self.cfg.models["m"]; self.pv["cap_usd"] = 100; self.au = {}; self.cfg.run.all_units = self.au
+    def unit(self, name, costs, verdict="VERDICT: DONE - exit 0\n", t0=100):
+        ids = [f"{name}.{t0}.{t0}"] + [f"{name}.r{k}.{t0 + k}" for k in range(2, len(costs) + 1)]
+        for run, c in zip(ids, costs): janus.reserve_budget(self.cfg, self.mc, name, 2, run); janus.ledger_done(self.cfg, self.pv, run, name, c, 0)
+        (self.d / "out" / name).mkdir(exist_ok=True); (self.d / "out" / name / "REPORT.md").write_text(verdict)
+        self.au[name] = {"name": name, "kind": "implement", "tier": "normal", "model": "m", "run": ids[-1], "runs": ids, "status": "closed"}
+
+    def test_a_resumed_units_runs_are_one_sample(self):
+        """Catches (item 5): three units that each needed $3.50 over three runs (a $2.00 run, then resumes of $1.00 and $0.50,
+        each paying to load the context again) taught a budget of $1.50 -- the median of the nine RUNS -- so the next unit was
+        capped and resumed the same way."""
+        for n in ("u1", "u2", "u3"): self.unit(n, (2.0, 1.0, 0.5))
+        self.assertEqual(janus.cost_history(self.cfg, "api"), {("implement", "normal"): [3.5, 3.5, 3.5]})
+        b, why = janus.budget_for(self.cfg, self.mc, "implement", "normal")
+        self.assertEqual(b, 5.0, why); self.assertIn("median $3.50 of 3 past implement/normal unit(s)", why); self.assertIn("resume", why)
+
+    def test_a_name_launched_again_is_a_unit_of_its_own(self):
+        """Catches (item 5): summing by name alone would add an earlier unit of the same name to the later one."""
+        self.unit("u1", (0.6,)); self.unit("u1", (1.0, 0.5), t0=500)
+        self.assertEqual(janus.cost_history(self.cfg, "api"), {("implement", "normal"): [0.6, 1.5]})
+
 if __name__ == "__main__": unittest.main()
