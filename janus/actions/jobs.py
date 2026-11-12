@@ -303,7 +303,7 @@ BROAD_PATTERNS = [r"\bcargo\s+(test|nextest\s+run|clippy|build|check)\b.*\s--(wo
 PKG_RX = re.compile(r"(^|\s)(?:-p\s*|--package[=\s])\S")   # a cargo command that names one package (-p X, --package=X)
 WS_RX = re.compile(r"--(workspace|all)(?![-\w])")          # a whole-workspace/all-packages flag (never --all-targets/--all-features)
 CARGO_RX = re.compile(r"(^|\s)cargo\s+(test|nextest\s+run|clippy|build|check)\b")
-SEG_RX = re.compile(r"\|\||&&|[;&|]")                      # command separators: each command is judged alone (finding 1)
+CARGO_BROAD = BROAD_PATTERNS[0]   # the default cargo whole-suite pattern: the one-package exception applies to IT only (finding 4)
 
 def job_class(cfg, hn, h, cmd):
     """The job class runs/cap.sh will give cmd on host hn (cap_class, run here on the host's library)."""
@@ -325,14 +325,16 @@ def one_package_cargo(seg):
 
 def broad_why(cfg, hn, h, cmd):
     """Why cmd is a whole-suite run on host hn, or None. Item 25(b): a cargo command that names a package (`-p X`,
-    `--package=X`) covers one package, not the whole workspace. Finding 1: each `;`/`&&`/`||`/`|` command is judged on its own
-    (a ` -p x` in a *different* command never switches the guard off), `--all` never matches `--all-targets`/`--all-features`,
-    and the one-package exception holds only for the cargo command itself -- never for whatever pattern happens to be first
-    (a project's own first broad_pattern, e.g. pytest, keeps its meaning)."""
-    segs = [s.strip() for s in SEG_RX.split(cmd)]
+    `--package=X`) covers one package, not the whole workspace, so the DEFAULT cargo pattern does not apply to it. Finding 1:
+    each command is judged on its own (a ` -p x` in a *different* command never switches the guard off). Finding 4 (fix-install6):
+    the split is the quote-aware `_segments` (a `;`/`|` inside a quoted argument never starts a command, and the `&` of a
+    redirect -- `2>&1`, `&>log` -- never splits), and the one-package exception applies to the default cargo pattern ONLY, so a
+    project's own cargo-like pattern (`\\bcargo\\s+nextest\\b`, `--release\\b`) keeps its meaning."""
+    from janus.findings.hosts import _segments
+    segs = [" ".join(w) for w in _segments(cmd)]
     for rx in cfg.capc.get("broad_patterns", BROAD_PATTERNS):
         for seg in segs:
-            if re.search(rx, seg) and not one_package_cargo(seg):
+            if re.search(rx, seg) and not (rx == CARGO_BROAD and one_package_cargo(seg)):
                 return f"it matches the broad pattern {rx!r}"
     cls = job_class(cfg, hn, h, cmd); e = class_secs(host_history(cfg, h), cls); lim = capv(cfg, h, "broad_min")
     if e and e >= lim * 60: return f"its job class {cls} ran a median of {e // 60} min on {hn} (broad_min {lim:g})"

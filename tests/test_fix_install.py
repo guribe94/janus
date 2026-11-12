@@ -572,6 +572,22 @@ class Item25Soak(unittest.TestCase):
                             "a stray -p switched off a project's own first broad_pattern")
         finally: janus.job_class, janus.host_history = saved
 
+    def test_a_separator_inside_a_command_never_hides_the_whole_suite_guard(self):
+        """Catches (finding 4, fix-install6): the guard split the line on every `;`/`&`/`|` quoted or not, so the `&` of `2>&1`
+        split a command and `cargo test >t.log 2>&1 --workspace` was not refused; and the one-package exception applied to every
+        pattern, so a project's own cargo-like pattern (`\\bcargo\\s+nextest\\b`, `--release\\b`) lost its meaning."""
+        d, cfg = project(); h = cfg.hosts["here"]
+        saved = (janus.job_class, janus.host_history)
+        janus.job_class = lambda *a: "job"; janus.host_history = lambda *a: []
+        try:
+            for c in ["cargo test >t.log 2>&1 --workspace", "cargo test 2>&1 --workspace | tee t.log",
+                      "cargo test --features 'a;b' --workspace"]:
+                self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a separator inside a command hid the guard: {c}")
+            cfg.capc = {**cfg.capc, "broad_patterns": [r"\bcargo\s+nextest\b", r"--release\b"]}
+            for c in ["cargo nextest run -p x", "cargo build -p x --release"]:
+                self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a project's own cargo pattern lost its meaning: {c}")
+        finally: janus.job_class, janus.host_history = saved
+
 
 class Item26GateExec(unittest.TestCase):
     """Item 26: the wrapper `janus gate` queues (`janus gate-exec <name> --timeout-min <lim> -- <cmd>`) must run the gate
