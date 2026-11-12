@@ -49,6 +49,7 @@ notify() { [ -s "$BD/.notify" ] && { nohup sh -c "$(head -1 "$BD/.notify")" </de
 # Apply one post on the master board (caller holds the lock): log line, question record, card rewritten through temp + mv.
 apply() {
   local t=$1 a=$2 k=$3 x=$4 c f task brief machine state step blockers report check q n
+  mkdir -p "$BD/agents" "$BD/to"
   if [ "$k" = question ]; then   # a question gets an id; it needs an answer until the orchestrator gives one
     mkdir -p "$BD/questions"; n=$(( $(cat "$BD/.qseq" 2>/dev/null || echo 0) + 1 )); echo $n > "$BD/.qseq"; q=q$n
     printf -- '- id: %s\n- agent: %s\n- asked: %s\n- state: open\n- text: %s\n' "$q" "$a" "$t" "$x" > "$BD/questions/$q.md"
@@ -235,6 +236,15 @@ case $cmd in
     [ $master = 1 ] || die "sync runs on the coordinating machine only"
     if [ -n "$FLOCK" ]; then exec 8>>"$BD/.sync.lock"; "$FLOCK" -n 8 || exit 0; fi   # one sync at a time
     S="ssh -n -o BatchMode=yes -o ConnectTimeout=8"
+    if [ -s "$OUT/outbox.log" ]; then   # posts made here before this folder became the coordinating board
+      mv "$OUT/outbox.log" "$OUT/local.$$"
+      lmerge() { while IFS= read -r l; do
+          d=${l%% *} r=${l#* }; tm=${r%% *} r=${r#* }; a=${r%% *} r=${r#* }; k=${r%%:*} x=${r#*: }
+          okkind "$k" || continue; case $a in ''|*[!A-Za-z0-9._-]*) continue;; esac
+          BOARD_BRIEF= BOARD_MACHINE= BOARD_CHECK= BOARD_REPORT= BOARD_HOST=$(localname) apply "$d $tm" "$a" "$k" "$x"
+        done < "$OUT/local.$$"; }
+      locked "$BD/.lock" lmerge && rm -f "$OUT/local.$$"
+    fi
     hostsf | while read -r h ssh root; do
       # Pull: under the host's outbox lock, rename outbox.log to a numbered sending file, then merge every sending file in name
       # order. A merged name is recorded before the file is deleted there, so nothing is merged twice or lost.
