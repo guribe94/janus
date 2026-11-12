@@ -123,6 +123,10 @@ def findkey(o, sub):
             r = findkey(v, sub)
             if r: return r
 
+def fl(x, d=0.0):
+    try: return float(x)
+    except Exception: return d
+
 def ps_table():
     """{pid: (ppid, pgid, started, command)} for every process (one ps call)."""
     rc, o, e = sh(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,lstart=,command="], timeout=10)
@@ -221,4 +225,4 @@ ORCH_SELF = Path(__file__).resolve().parent.parent / "orch.py"   # the installed
 
 ORCH_MARK = "[orch] "   # every prompt orch itself sends starts with this, so UserPromptSubmit never files it as an instruction (M4)
 
-__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "DRY", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "SECRET_ENV", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "ORCH_SELF", "ORCH_MARK"]
+__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "DRY", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "SECRET_ENV", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "ORCH_SELF", "ORCH_MARK"]

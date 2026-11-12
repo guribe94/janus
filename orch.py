@@ -4,6 +4,11 @@ Reads orch.toml from the current directory or a parent. See docs/DESIGN.md and s
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
 from orchkit.templates import *   # the shell/Python templates orch writes (section 7, Step 1: templates.py)
+from orchkit.board import *
+from orchkit.units import *
+from orchkit.ledger import *
+from orchkit.probe import *
+from orchkit.cap import *
 from orchkit.beads import *
 from orchkit.context import *
 
@@ -37,101 +42,17 @@ from orchkit.context import *
 
 # ---------------------------------------------------------------- hosts: one probe per host
 
-def probe_extra(h):
-    """Running orch jobs still waiting in their admission (per lane), the old scripts' queue, other job schedulers on the host
-    (one scheduler per host, orch-fixes8), and on remote hosts builds or tests an agent runs outside the lanes (issue 22)."""
-    rd = h["_rd"]
-    # old_rule: waiting jobs whose script sources neither runs/cap.sh nor runs/admit.sh (queued before the measured rule; audit H5)
-    w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
-         f'b=${{f##*/}}; echo "waitjob=${{b%.*}}"; case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
-         f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"')
-    # schedulers (orch.toml, per host): extended regexes for the command lines of other job-running processes (an old queue); each
-    # running one prints sched=<pid> <command>. legacy_lanes (the Mac): pid-file folders of an old lane; a live pid is one too.
-    for rx in h.get("schedulers", []):
-        w += f"\nps -A -o pid=,command= | grep -E {shlex.quote(rx)} | grep -v -e grep -e pueued -e 'cap_report' -e {FIXTURE_MARK} | head -5 | sed 's/^ */sched=/'"
-    for s in h.get("legacy_lanes", "").split():
-        w += f'\no=$(cat {shlex.quote(s)}/pid 2>/dev/null); [ -n "$o" ] && kill -0 "$o" 2>/dev/null && echo "sched=$o old lane {s}"'
-    if not h.get("local"): w += "\n" + DIRECT_PROBE % {"rx": shlex.quote(BUILD_ERE)}
-    # legacy_probe (orch.toml, per host): shell that prints legacy_wait=<n> and legacy_run=<n> for a project's older job queue
-    # while it drains, so a jammed old queue shows in orch check
-    return w + "\n" + h.get("legacy_probe", "")
 
 # Remote lane enforcement (issue 22): processes on a Linux host whose environment carries ORCH_UNIT (an agent and what it starts),
 # whose command is a build or test, and that do not run under pueued (a lane job): printed as direct=<pid> <pgid> <unit> <secs> <cmd>.
 # Only the topmost such process of a tree is printed; a call of the unit's lane runner (<root>/run/<unit>.lane) is the lane.
-BUILD_ERE = "(^|[ /])cargo(-[a-z]+)? (test|nextest|build|clippy|bench)( |$)|(^|[ /])pytest( |$)|(^|[ /])(npm|pnpm) (run )?test( |$)|xcodebuild.* test"
 
-def pueue(h):
-    c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
-    return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
-LIST_KEYS = ("res", "hist", "sched", "direct", "waitjob")   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
 
-def probe(name, h, ro=True, cfg=None):
-    """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,
-    history), other schedulers, direct builds, pueue status and tmux sessions. ro: the overload tracker is only read."""
-    lib = cap_lib(cfg, name, h) if cfg else ""
-    rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": qp(h.get("root", "/")), "pueue": pueue(h), "extra": probe_extra(h),
-                                "rd": qp(h["_rd"]), "ro": "1" if ro else "", "cap": lib or "cap_report() { :; }"}, timeout=25)
-    if rc: return {"name": name, "ok": False, "err": (e or o).strip().splitlines()[-1][:80] if (e or o).strip() else f"rc {rc}"}
-    head, _, rest = o.partition("--pueue\n"); pj, _, tm = rest.partition("--tmux\n")
-    p = {"name": name, "ok": True, "tmux": tm.split(), **{k: [] for k in LIST_KEYS}}
-    for l in head.splitlines():
-        k, _, v = l.partition("=")
-        if k in LIST_KEYS: p[k].append(v)
-        else: p[k] = v
-    try: p["pueue"] = json.loads(pj) if pj.strip() else None
-    except Exception: p["pueue"] = None
-    return p
 
-def probe_all(cfg):
-    with cf.ThreadPoolExecutor(8) as ex:
-        ps = list(ex.map(lambda kv: probe(*kv, ro=cfg.ro, cfg=cfg), cfg.hosts.items()))
-    d = {p["name"]: p for p in ps}
-    un = cfg.jget("hosts.json")
-    for n, p in d.items():
-        if p["ok"]: un.pop(n, None)
-        else: un.setdefault(n, now())
-    cfg.jput("hosts.json", un)
-    return d
 
-def fl(x, d=0.0):
-    try: return float(x)
-    except Exception: return d
 
-def margins(h, p, cleanup=False, cfg=None):
-    """Why the host is over its disk or memory-pressure margins. A cleanup unit is exempt from the disk floor (it is what frees
-    it); memory pressure still counts. Load is judged by back-pressure (cap_paused: sustained, not one reading)."""
-    why = []
-    if p.get("cap_psi") and fl(p["cap_psi"]) > capv(cfg, h, "psi_pause"): why.append(f"memory pressure {p['cap_psi']}")
-    elif not p.get("cap_psi") and p.get("psi") and fl(p["psi"]) >= 5: why.append(f"memory pressure {p['psi']}")
-    if not cleanup and p.get("disk_gb") and fl(p["disk_gb"]) < h.get("min_disk_gb", 10): why.append(f"disk {p['disk_gb']}G")
-    return why
 
-def room(cfg, name, p, units, cleanup=False):
-    """(number of agents that fit now, why not), by reservations: the host's memory for reservations (ram_gb - services_gb)
-    minus its jobs' and agents' reservations, over the agent figure (learned: class agent in the host's history, else
-    agent_gb); none while admission is paused (back-pressure), and the owner's caps."""
-    h = cfg.hosts[name]
-    if not p["ok"]: return 0, "unreachable"
-    why = margins(h, p, cleanup, cfg); hc = host_cap(cfg, name, p, units)
-    n = (hc["memcap"] - hc["rm"] - hc["agents_mb"]) // max(hc["amb"], 1)
-    if n < 1: why.append(f"memory reserved: jobs {hc['rm']} MB + {hc['on']} agent(s) {hc['agents_mb']} MB of {hc['memcap']} MB (RAM - services)")
-    if hc["pause"] and not cleanup: why.append(f"admission paused: {hc['pause']}")
-    caps = cfg.caps
-    if caps.get("host", {}).get(name) is not None:
-        n = min(n, caps["host"][name] - sum(1 for u in units if u.get("host") == name))
-    if caps.get("total") is not None: n = min(n, caps["total"] - len(units))
-    return (0, "; ".join(why) or "caps") if why or n < 1 else (int(n), "")
-
-def cap_line(cfg, name, p, units):
-    if not p["ok"]: return f"{name} UNREACHABLE ({p['err']})"
-    n, why = room(cfg, name, p, units); hc = host_cap(cfg, name, p, units)
-    av = f"{fl(p.get('avail_mb')) / 1024:.1f}G" if p.get("avail_mb") else "unknown"
-    return (f"{name} room={n} build: {hc['rj']} running ({hc['rc']}/{hc['cores']} cores, {hc['rm']}/{hc['memcap']} MB reserved), "
-            f"{hc['queued']} queued, {len(hc['agents'])} agent(s) for {hc['slots']} slot(s), free {hc['free']} x {hc['jmb']} MB; "
-            f"avail={av} load={p.get('load') or 'unknown'} psi={p.get('cap_psi') or p.get('psi') or '-'} disk={p.get('disk_gb')}G"
-            + (f" PAUSED: {hc['pause']}" if hc["pause"] else "") + (f" FULL: {why}" if n < 1 else ""))
 
 # ---------------------------------------------------------------- capacity: reservations, back-pressure, history (orch-fixes8)
 # "Launch as much as we can, but no more." Admission is by reservations, never by a momentary reading: each running job holds
@@ -141,118 +62,17 @@ def cap_line(cfg, name, p, units):
 # load_pause x cores for hold_s); a running job is never killed for it. One shell library per host (runs/cap.sh) holds the
 # rule: every waiting job sources it each poll, and every probe carries it inline, so orch check, launch and fill read the
 # same numbers the admission uses. Settings: per host, else [capacity], else the default below.
-CAP_DEFAULTS = {"cores": 4, "cores_per_job": 1, "ram_gb": 4, "services_gb": 0, "job_gb": 2, "agent_gb": 1.0, "psi_pause": 10,
-                "load_pause": 1.25, "hold_s": 60, "history_n": 5, "margin_pct": 15, "min_disk_gb": 10}
-
-def capv(cfg, h, k):
-    return h.get(k, (cfg.capc if cfg else {}).get(k, CAP_DEFAULTS[k]))
-
-def cap_nums(cfg, h):
-    """The host's capacity in integers: cores, cores per job, memory for reservations (MB), job default/cap (MB), agent (MB)."""
-    return {"cores": int(capv(cfg, h, "cores")), "cpj": max(1, int(-(-capv(cfg, h, "cores_per_job") // 1))),
-            "memcap": int((capv(cfg, h, "ram_gb") - capv(cfg, h, "services_gb")) * 1024), "capmb": int(capv(cfg, h, "job_gb") * 1024),
-            "agmb": int(capv(cfg, h, "agent_gb") * 1024), "hn": int(capv(cfg, h, "history_n")), "margin": int(capv(cfg, h, "margin_pct"))}
 
 
-def cap_lib(cfg, hn, h):
-    """runs/cap.sh for host h: the rule above with the host's numbers, its [capacity.classes], and how its jobs are seen
-    (systemd scopes orch-<jid>.scope; podman containers by container.name_prefixes; the Mac: process trees)."""
-    n = cap_nums(cfg, h); pod = h.get("runner") == "podman"
-    if pod:
-        pre = h.get("container", {}).get("name_prefixes", ["orch-run-"])
-        jobids = "podman ps --format '{{.Names}}' | awk '" + " ".join(
-            f"/^{re.escape(x)}/ {{" + ("sub(/^orch-run-/, \"\"); " if x == "orch-run-" else "") + "print; next}" for x in pre) + "'"
-        sample = ('  i=$(podman ps -q --no-trunc --filter name=orch-run-$2 2>/dev/null | head -1)\n'
-                  '  [ -n "$i" ] && v=$(awk \'/^anon /{print int($2/1048576)}\' "$US/libpod-$i.scope/memory.stat" 2>/dev/null)')
-    elif h.get("local"):
-        jobids, sample = "true", '  v=$(tree_mb "$1")'
-    else:
-        jobids = "ls -d $AS/orch-*.scope | sed 's#.*/orch-##; s#[.]scope$##'"
-        sample = ('  v=$(awk \'/^anon /{print int($2/1048576)}\' "$AS/orch-$2.scope/memory.stat" 2>/dev/null)\n'
-                  '  [ -n "$v" ] || v=$(tree_mb "$1")')
-    cls = "".join(f"  printf '%s\\n' \"$c\" | grep -Eq {shlex.quote(rx)} && {{ echo {shlex.quote(k)}; return; }}\n"
-                  for k, rx in (cfg.capc.get("classes", {}) if cfg else {}).items())
-    return CAP_LIB % {**n, "name": hn, "psip": capv(cfg, h, "psi_pause"), "loadx": capv(cfg, h, "load_pause"), "hold": int(capv(cfg, h, "hold_s")),
-                      "disk": int(capv(cfg, h, "min_disk_gb")), "jobids": jobids, "sample": sample, "classes": cls}
 
-def class_mb(hist, cls, d, cap, hn=5, margin=15):
-    """The reservation of a job class from history lines (time, class, peak MB, secs, rc): the same rule as cap_mb in runs/cap.sh."""
-    ag = cls == "agent"
-    pk = sorted([int(f[2]) for f in (l.split("\t") for l in hist) if len(f) >= 3 and f[1] == cls and f[2].isdigit() and int(f[2]) > 0][-(hn * 3 if ag else hn):])
-    if not pk: return d
-    v = max(128 if ag else 256, int((pk[(len(pk) - 1) // 2] if ag else pk[-1]) * (100 + margin) / 100))
-    return min(v, cap) if cap > 0 else v
 
-def class_secs(hist, cls):
-    """Median run time (s) of a job class from history lines, None without history."""
-    s = sorted(int(f[3]) for f in (l.split("\t") for l in hist) if len(f) >= 4 and f[1] == cls and f[3].isdigit())
-    return s[len(s) // 2] if s else None
 
-def tree_rss_mb(pid):
-    """Resident memory (MB) of process pid and its descendants (one ps call)."""
-    rc, o, e = sh(["ps", "-A", "-o", "pid=,ppid=,rss="], timeout=10)
-    pp, rs = {}, {}
-    for l in o.splitlines():
-        f = l.split()
-        if len(f) == 3 and f[0].isdigit(): pp[int(f[0])] = int(f[1]); rs[int(f[0])] = int(f[2])
-    q, ch = {pid}, True
-    while ch:
-        ch = False
-        for x, y in pp.items():
-            if y in q and x not in q: q.add(x); ch = True
-    return sum(rs.get(x, 0) for x in q) // 1024
 
-def record_history(rd, cls, peak, secs, rc):
-    """One line of <runs>/history.tsv (the format cap_record writes)."""
-    with open(Path(rd) / "history.tsv", "a") as f: f.write(f"{int(now())}\t{cls}\t{int(peak)}\t{int(secs)}\t{rc}\n")
 
-def host_cap(cfg, n, p, units):
-    """The host's capacity now, from its probe (the numbers the admission sees) and the open units:
-    slots: build jobs that fit when nothing runs; free: further jobs that fit now; agents: open units whose builds run here."""
-    h = cfg.hosts[n]; c = cap_nums(cfg, h); hist = p.get("hist", [])
-    # a typical job here: the largest reservation of the classes run lately (job_gb when nothing is recorded yet)
-    recent = {l.split("\t")[1] for l in hist[-50:] if l.count("\t") >= 2}
-    jmb = max([class_mb(hist, k, c["capmb"], c["capmb"], c["hn"], c["margin"]) for k in recent] or [c["capmb"]])
-    amb = class_mb(hist, "agent", c["agmb"], 0, c["hn"], c["margin"])
-    rj, rc, rm, ra, ram = (int(fl(p.get(k))) for k in ("cap_rj", "cap_rc", "cap_rm", "cap_ra", "cap_ram"))
-    t = list(((p.get("pueue") or {}).get("tasks") or {}).values())
-    qd = sum(1 for x in t if x.get("group") in ("jobs", "gates") and "Queued" in str(x.get("status")))
-    qd += int(fl(p.get("wait_jobs"))) + int(fl(p.get("wait_gates")))
-    here = [u for u in units if (u.get("build") or u.get("host")) == n and u.get("state") not in ("done", "failed", "gone", "idle")]
-    on = [u for u in units if u.get("host") == n and u.get("state") not in ("done", "failed", "gone", "idle", "parked")]
-    agents_mb = max(ram, len(on) * amb)   # every open agent on the host holds the agent figure (reservation files of api agents at least)
-    slots = max(1, min(c["cores"] // c["cpj"], (c["memcap"] - agents_mb) // max(jmb, 1)))
-    pause = p.get("cap_pause", "")
-    free = 0 if pause else max(0, min((c["cores"] - rc) // c["cpj"], (c["memcap"] - rm - agents_mb) // max(jmb, 1)))
-    if rj == 0 and not pause: free = max(free, 1)
-    return {**c, "jmb": jmb, "amb": amb, "rj": rj, "rc": rc, "rm": rm, "ra": ra, "agents_mb": agents_mb, "queued": qd, "slots": slots,
-            "free": free, "pause": pause, "agents": [u["name"] for u in here], "on": len(on), "hist": hist, "res": p.get("res", [])}
 
-def next_free(hc):
-    """When a build reservation is expected to free: the earliest (start + median run time of its class) of the running jobs."""
-    ends = []
-    for r in hc["res"]:
-        f = r.split()
-        if len(f) >= 5 and f[3].isdigit():
-            s = class_secs(hc["hist"], f[4])
-            if s: ends.append(int(f[3]) + s)
-    return min(ends) if ends else None
 
-def build_room(cfg, n, hc, kind="implement"):
-    """(ok, why) for one more agent whose builds and tests run on host n (orch-fixes8 item 3): it needs a free build reservation
-    there (agents for the host < its build slots), or a bounded queue position: at most one queued job per running job, and
-    no more agents than twice the slots. A paused host takes none. Refusals say when to expect room."""
-    if kind in cfg.capc.get("no_build_kinds", []): return True, "no builds"
-    a = len(hc["agents"]); s = hc["slots"]
-    if hc["pause"]: return False, f"{n} admission paused ({hc['pause']}); retry when it clears (running jobs are not killed)"
-    if a < s: return True, f"build reservation {a + 1} of {s} on {n}"
-    used = max(hc["queued"], a - s)   # queue positions in use: jobs queued now, or agents past the slots (each may queue one)
-    if a < 2 * s and used < hc["rj"]: return True, f"queue position on {n} ({used} of {hc['rj']} in use: one queued job per running job)"
-    nf = next_free(hc)
-    when = (f"a build slot should free about {ts(nf)}" if nf and nf > now() else "a build slot frees when a running job ends") + \
-           (f", or when one of {', '.join(hc['agents'][:4])} closes" if hc["agents"] else "")
-    return False, (f"{n} build capacity full: {a} agent(s) for {s} build slot(s) + {s} queue position(s); {hc['rj']} running, "
-                   f"{hc['queued']} queued; {when}")
+
+
 
 # ---------------------------------------------------------------- the API ledger (orch owns it) and the secret store
 # One TSV per provider ([providers.<p>] ledger), one row per event:  ts  unit  running|<cost>  <budget>|done rc=<x>  <run id>.
@@ -264,127 +84,19 @@ def build_room(cfg, n, hc, kind="implement"):
 # budget while it runs. A malformed ledger refuses every new run until `orch ledger repair`.
 
 
-def ledger_path(cfg, pv): return cfg.root / pv["ledger"]
 
-def ledger_parse(text):
-    """(runs, problems, notes). runs: {run id: {unit, running: [line numbers], done: [...], budget, cost}}. problems make the
-    ledger malformed (a launch is refused); notes are only reported."""
-    runs, bad, notes = {}, [], []
-    for i, l in enumerate(text.splitlines(), 1):
-        if not l.strip(): continue
-        f = l.split("\t")
-        if len(f) != 5 or not f[1].strip() or not f[4].strip():
-            bad.append(f"line {i}: {len(f)} field(s), want 5 (ts, unit, running|cost, budget|done rc=, run id): {l[:80]!r}"); continue
-        r = runs.setdefault(f[4], {"unit": f[1], "running": [], "done": [], "budget": None, "cost": None, "ts": f[0]})
-        if r["unit"] != f[1]: bad.append(f"line {i}: run id {f[4]} belongs to {r['unit']}, not {f[1]}"); continue
-        if f[2] == "running":
-            if not NUM.match(f[3].strip()): bad.append(f"line {i}: running row without a numeric budget: {f[3][:20]!r}"); continue
-            r["running"].append(i)
-            if r["budget"] is None: r["budget"] = float(f[3])
-        elif NUM.match(f[2].strip()) and f[3].startswith("done"):
-            r["done"].append(i)
-            if r["cost"] is None: r["cost"] = float(f[2]); r["how"] = f[3]
-        else: bad.append(f"line {i}: neither a running row nor a done row: {l[:80]!r}")
-    for k, r in runs.items():
-        if len(r["running"]) > 1: bad.append(f"run {k} ({r['unit']}): {len(r['running'])} running rows (lines {', '.join(map(str, r['running'][:5]))}{'...' if len(r['running']) > 5 else ''})")
-        if len(r["done"]) > 1: bad.append(f"run {k} ({r['unit']}): {len(r['done'])} done rows (lines {', '.join(map(str, r['done'][:5]))}{'...' if len(r['done']) > 5 else ''})")
-        if r["done"] and not r["running"]: notes.append(f"run {k} ({r['unit']}): a done row without a running row (counted)")
-    return runs, bad, notes
 
-def ledger_read(cfg, pv):
-    try: return ledger_parse(ledger_path(cfg, pv).read_text())
-    except FileNotFoundError: return {}, [], []
 
-def spend(runs):
-    """Committed dollars: per run id, its done cost, or its budget while it runs."""
-    return sum(r["cost"] if r["done"] else (r["budget"] or 0.0) for r in runs.values())
 
-def committed(cfg, pv): return spend(ledger_read(cfg, pv)[0])
 
-def ledger_append(cfg, pv, row):
-    """One row, appended with a single write to an O_APPEND descriptor (the caller holds the lock)."""
-    p = ledger_path(cfg, pv); p.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-    try: os.write(fd, ("\t".join(map(str, row)) + "\n").encode())
-    finally: os.close(fd)
 
-def tstamp(): return time.strftime("%Y-%m-%d %H:%M:%S")
 
-def reserve_budget(cfg, mc, name, budget, run=None):
-    """Under the ledger's lock: refuse when the ledger is malformed or the budget would pass the cap, else write the run's one
-    running row. Idempotent: a run id that already has its running row is returned as it is. Returns the run id."""
-    pv = cfg.prov[mc["provider"]]; run = run or f"{name}.{os.getpid()}.{int(now())}"
-    if DRY: return run
-    with Locked(ledger_path(cfg, pv)):
-        runs, bad, _ = ledger_read(cfg, pv)
-        if bad: raise Err(f"refused: the {mc['provider']} ledger {pv['ledger']} is malformed ({bad[0]}; {len(bad)} problem(s)): run orch ledger check, then orch ledger repair")
-        r = runs.get(run)
-        if r and r["done"]: raise Err(f"refused: run {run} is already finished (done row at line {r['done'][0]}); a re-run gets a new run id")
-        if r and r["running"]: return run
-        if "cap_usd" in pv:
-            c = spend(runs)
-            if c + budget > pv["cap_usd"]: raise Err(f"refused: ${c:.2f} committed + ${budget} would pass the ${pv['cap_usd']} cap of {mc['provider']}")
-        ledger_append(cfg, pv, [tstamp(), name, "running", budget, run])
-    return run
 
-def ledger_done(cfg, pv, run, name, cost, rc):
-    """Write the run's one done row (idempotent: nothing when it already has one). Returns True when written."""
-    if DRY: return False
-    with Locked(ledger_path(cfg, pv)):
-        r = ledger_read(cfg, pv)[0].get(run)
-        if r and r["done"]: return False
-        ledger_append(cfg, pv, [tstamp(), name, cost, RECONCILED if rc == "unknown" else f"done rc={rc}", run])
-    return True
 
-def run_cost(path, budget):
-    """The cost an API run reported in its json output, else its whole budget (a run stopped before it wrote its cost is
-    charged everything, so the cap never undercounts)."""
-    try: c = json.loads(Path(path).read_text()).get("total_cost_usd")
-    except Exception: c = None
-    return (float(c), True) if isinstance(c, (int, float)) else (float(budget or 0), False)
 
-def settle_run(cfg, u, rc):
-    """Close an API unit's ledger run (its done row) when it ended without writing one: stopped, killed or closed."""
-    mc = cfg.models.get(u.get("model"), {}); pv = cfg.prov.get(mc.get("provider"), {})
-    if mc.get("kind") != "api" or not u.get("run") or "ledger" not in pv: return
-    cost, _ = run_cost(cfg.p("out", "out") / u["name"] / "api.json", u.get("budget") or pv.get("budget_per_unit", 0))
-    if ledger_done(cfg, pv, u["run"], u["name"], cost, rc): say(f"ledger: run {u['run']} closed at ${cost:.2f} ({rc})")
 
-def read_secret(pv):
-    """(variable, value) of a provider's API key from the configured secret store, never printed or written anywhere:
-    key_keychain (macOS keychain item, `security find-generic-password -s <item> -w`), else key_file (lines VAR=value; refused
-    unless only its owner can read it, mode 600)."""
-    var = pv.get("key_env", "ANTHROPIC_API_KEY"); tried = []
-    if pv.get("key_keychain") and sys.platform == "darwin":
-        rc, o, e = sh(["security", "find-generic-password", "-s", pv["key_keychain"], "-w"])
-        if rc == 0 and o.strip(): return var, o.strip()
-        tried.append(f"keychain item {pv['key_keychain']} (not found)")
-    if pv.get("key_file"):
-        p = Path(os.path.expanduser(pv["key_file"]))
-        try: st = p.stat()
-        except OSError: tried.append(f"{p} (missing)")
-        else:
-            if st.st_mode & 0o077: raise Err(f"{p} can be read by others (mode {oct(st.st_mode & 0o777)}): chmod 600 {p}")
-            for l in p.read_text().splitlines():
-                k, _, v = l.strip().removeprefix("export ").partition("=")
-                if k.strip() == var and v.strip(): return var, v.strip().strip("'\"")
-            tried.append(f"{p} (no {var}=)")
-    raise Err(f"no API key: " + ("; ".join(tried) or "set key_keychain (macOS) or key_file (mode 600) in the provider's orch.toml table"))
 
-def model_ok(cfg, m):
-    c = cfg.models.get(m)
-    if not c: return False, "unknown model"
-    pv = cfg.prov.get(c["provider"], {})
-    if not pv.get("enabled"): return False, f"provider {c['provider']} disabled"
-    if "ledger" in pv:
-        runs, bad, _ = ledger_read(cfg, pv)
-        if bad: return False, f"{c['provider']} ledger malformed ({len(bad)} problem(s); orch ledger check)"
-        if "cap_usd" in pv:
-            left = pv["cap_usd"] - spend(runs)
-            if left < pv.get("budget_per_unit", 0): return False, f"{c['provider']} budget left ${left:.0f}"
-    return True, ""
 
-RECONCILED = "done unknown"   # a reconciled run: its agent is gone with no done row; its budget is counted as the upper bound
 
 def unreconciled(cfg, pv, units):
     """[(run id, unit, budget, why)] of runs with a running row and no done row whose agent is gone: the unit is closed, the run
@@ -456,97 +168,15 @@ def cmd_ledger(cfg, a):
     return worst
 
 # ---------------------------------------------------------------- units
-def unit_state(u, ps, agents):
-    """working | idle | blocked | queued | done | failed | gone, from the live source the unit runs in."""
-    via = u.get("via")
-    if via == "herdr":
-        a = agents.get(u["name"])
-        return a.get("agent_status", "unknown") if a else "gone"
-    p = ps.get(u.get("host"), {})
-    if not p.get("ok"): return "unknown"
-    if via == "tmux": return "working" if f"orch-{u['name']}" in p.get("tmux", []) else "gone"
-    if via == "pueue":
-        t = ((p.get("pueue") or {}).get("tasks") or {}).get(str(u.get("task")))
-        if not t: return "gone"
-        s = t.get("status"); k = s if isinstance(s, str) else next(iter(s), "")
-        if k == "Done": return "done" if s["Done"].get("result") == "Success" or s["Done"] == "Success" else "failed"
-        return {"Queued": "queued", "Running": "working"}.get(k, k.lower())
-    return "unknown"
 
-def verdict(cfg, u):
-    """The unit's final VERDICT line, from the report it writes (a resumed unit: its original report, report_path). A resumed
-    report still holds the earlier run's verdict, so only a verdict written after the resume started counts, and a line 1
-    that is still PENDING means not finished."""
-    p = report_path(cfg, u)
-    try: t = p.read_text().splitlines()
-    except OSError: return None
-    if u.get("resume") and (p.stat().st_mtime < u.get("started", 0) or (t and "PENDING" in t[0])): return None
-    return next((l for l in reversed(t) if l.startswith("VERDICT:") and "PENDING" not in l), None)   # PENDING is not a verdict
 
-def herdr_agents(cfg):
-    r = herdr("agent", "list")
-    return {a.get("name") or a["pane_id"]: a for a in (r or {}).get("agents", [])} if r else {}
 
-def ws_id(cfg, create=False):
-    lab = cfg.c.get("herdr", {}).get("workspace", cfg.name)
-    r = herdr("workspace", "list") or {}
-    for w in r.get("workspaces", []):
-        if w.get("label") == lab: return w["workspace_id"]
-    if create and not DRY:
-        r = herdr("workspace", "create", "--label", lab, "--no-focus") or {}
-        return r.get("workspace", {}).get("workspace_id")
 
 # ---------------------------------------------------------------- check
-def board_script(cfg):
-    """The message board script: paths.board (a project's own), else the board.sh shipped next to orch.py (orch-swarm item 6)."""
-    return cfg.p("board") if cfg.paths.get("board") else ORCH_SELF.parent / "board.sh"
-def board_dir(cfg): return cfg.root / cfg.paths.get("board_dir", "board")
-def board(cfg, *args, env=None, timeout=25):
-    """Run the board script with BOARD_DIR set (the shipped board keeps its files there; a project's own script may ignore it).
-    The shipped board's files (.master, .hosts, .notify) exist from the first call: posts never land in an outbox here, and a
-    remote unit's rule names <root>/bin/board.sh (not this machine's path)."""
-    if not cfg.paths.get("board") and not DRY: board_files(cfg)   # .master, and .hosts before a remote unit's rule is written
-    return sh([str(board_script(cfg)), *args], env={"BOARD_DIR": str(board_dir(cfg)), **(env or {})}, timeout=timeout)
 
-def board_rows(cfg):
-    """Every open card on the board: {name: {"state", "silent", "gone", "text"}} (audit H8: all cards, not only orch's units)."""
-    rc, o, e = board(cfg, "summary", env={"BOARD_SILENT_MIN": str(cfg.silent // 60)})
-    rows = {}
-    for l in (o.splitlines()[1:] if rc == 0 else []):
-        f = l.split()
-        if len(f) < 3 or l[:1] in (" ", "=", "\t"): continue   # the shipped board's group headings and its needs-answer lines
-        rows[f[0]] = {"state": f[2], "silent": bool(re.search(r"\bSILENT \d+m", l)), "gone": "GONE" in l,
-                      "text": re.sub(r"\s+", " ", l.split(None, 4)[-1] if len(f) > 4 else "")[:140]}
-    return rows
 
-def board_questions(cfg):
-    """Open questions [(id, agent, asked, text)] from the shipped board (board.sh questions); None when the board script has no
-    question ids (a project's own script: its question cards are judged by state)."""
-    rc, o, e = board(cfg, "questions")
-    if rc: return None
-    return [tuple((l.split("\t") + ["", "", ""])[:4]) for l in o.splitlines() if l.strip()]
 
-def learned_posts(cfg):
-    """[(id <agent>:<n>, text)] of every learned post on the board's log (n counts that agent's learned posts, oldest first)."""
-    try: lines = (board_dir(cfg) / "log.md").read_text(errors="replace").splitlines()
-    except OSError: return []
-    n, out = {}, []
-    for l in lines:
-        m = re.match(r"^\S+ \S+ ([A-Za-z0-9._-]+) learned: (.*)$", l)
-        if m: n[m.group(1)] = n.get(m.group(1), 0) + 1; out.append((f"{m.group(1)}:{n[m.group(1)]}", m.group(2)))
-    return out
 
-def board_findings(cfg, names):
-    """question:<id> (stays until answered), learned:<agent>:<n> (until remembered or rejected)."""
-    F = []
-    for q, ag, at, tx in board_questions(cfg) or []:
-        try: age = int((now() - time.mktime(time.strptime(at, "%Y-%m-%d %H:%M"))) / 60)
-        except ValueError: age = 0
-        F.append((f"question:{q}", f"{ag}{'' if ag in names else ' (not a unit)'} asks [{q}] ({age} min): {tx[:160]}; check MEMORY.md (orch memory), then board.sh answer {q} <text>"))
-    done = cfg.jget("learned.json")
-    F += [(f"learned:{i}", f"{i.split(':')[0]} proposes for the session memory: {t[:160]}; orch remember --fact|--decision|--pitfall <text> --learned {i}, or orch learned --reject {i}")
-          for i, t in learned_posts(cfg) if i not in done]
-    return F
 
 def cmd_learned(cfg, a):
     if a.reject:
@@ -565,31 +195,7 @@ def board_upkeep(cfg, units):
     for c in (board_dir(cfg) / "agents").glob("*.md") if (board_dir(cfg) / "agents").is_dir() else []:
         if c.stem not in names and au.get(c.stem, {}).get("status") == "closed": board(cfg, "close", c.stem)
 
-def board_files(cfg):
-    bd = board_dir(cfg); bd.mkdir(exist_ok=True)
-    me = next((n for n, h in cfg.hosts.items() if h.get("local")), "local")
-    if not (bd / ".master").exists(): (bd / ".master").write_text(me + "\n")
-    hosts = "".join(f"{n} {h['ssh']} {h['root']}\n" for n, h in cfg.hosts.items() if not h.get("local") and h.get("ssh") and h.get("root"))
-    if not (bd / ".hosts").exists() or (bd / ".hosts").read_text() != hosts: atomic_write(bd / ".hosts", hosts)
-    # with the writer's PATH (the watcher's): the agent whose post runs it may not have herdr on its PATH
-    nt = (f"cd {shlex.quote(str(cfg.root))} && PATH={shlex.quote(os.environ.get('PATH', ''))} ORCH_ROOT={shlex.quote(str(cfg.root))} "
-          f"{shlex.quote(sys.executable)} {shlex.quote(str(ORCH_SELF))} watch --alert\n")
-    if not (bd / ".notify").exists() or (bd / ".notify").read_text() != nt: atomic_write(bd / ".notify", nt)
 
-def board_alerts(cfg, log):
-    """Prompt the orchestrator at once on a new board question or block (orch-swarm item 6): each is told once."""
-    qs = board_questions(cfg)
-    items = [(f"q:{q}", f"QUESTION [{q}] from {ag}: {tx[:200]}") for q, ag, at, tx in (qs or [])]
-    items += [(f"b:{c}:{hashlib.md5(r['text'].encode()).hexdigest()[:8]}", f"BLOCKED {c}: {r['text'][:200]}") for c, r in board_rows(cfg).items()
-              if r["state"] == "blocked" or (qs is None and r["state"] == "question")]
-    seen = cfg.jget("alerted.json"); new = [(k, t) for k, t in items if k not in seen]
-    if not new: return None
-    pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
-    msg = (ORCH_MARK + "Board needs you now: " + " | ".join(t for _, t in new) + ". Check MEMORY.md (orch memory) first; answer with "
-           "board.sh answer <id> <text> (a block: board.sh direct <agent> <text>); orch remember what every agent should know.")
-    if not pane or herdr("agent", "prompt", pane, msg) is None: log(f"board alert not delivered (no orchestrator pane): {msg[:300]}"); return None
-    log(f"board alert: {msg[:600]}"); cfg.jput("alerted.json", {**{k: v for k, v in seen.items() if now() - v < 7 * 86400}, **{k: now() for k, _ in new}})
-    return msg
 
 def gate_findings(cfg, hs=None):
     """Failed gates of the last 12 h: only each gate's latest result counts, and none while a newer run of that gate is queued or
@@ -1313,7 +919,6 @@ def resume_report(cfg, a, brief):
     if not p.parent.is_dir(): raise Err(f"report {p}: its folder does not exist")
     return None if p == (cfg.p("out", "out") / a.unit / "REPORT.md").resolve() else p
 
-def report_path(cfg, u): return Path(u["report"]) if u.get("report") else cfg.p("out", "out") / u["name"] / "REPORT.md"
 
 def main_checkout(cwd):
     """True when cwd is the main working tree of a repository that has linked worktrees (agents get a worktree, H9)."""
