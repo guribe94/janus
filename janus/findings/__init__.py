@@ -33,7 +33,7 @@ FAMILIES = {
     "gate": Family("a gate failed in the last 12 h (its latest result)"),
     "gate-common": Family("the same failure in two or more gates: suspect the test or fixture"),
     "git": Family("the project's repository is dirty, unpushed or has no upstream"),
-    "handoff": Family("the orchestrator notes are stale or too long"),
+    "handoff": Family("the orchestrator notes are stale or too long, or the state folder has no HANDOFF.md"),
     "host": Family("a host is unreachable", urgent=True),
     "idle": Family("a host or lane has room while work waits"),
     "idle-backlog": Family("ready backlog items without briefs while hosts have room, or held by budget", urgent=True),

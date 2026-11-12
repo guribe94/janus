@@ -1,18 +1,20 @@
 """janus init, doctor, queue, register and install-host: a shareable project setup, new machines, and the one registered
 orchestrator session."""
-import argparse, concurrent.futures as cf, json, os, re, shlex, sys, time
+import argparse, concurrent.futures as cf, json, os, re, shlex, sys, time, tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from janus.actions.jobs import remote_wt
 from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, wait_shell
 from janus.board import board_dir, board_script
-from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, atomic_write, clean_env, herdr, hrun, now, pending_age, projects, qp,
+from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, Run, atomic_write, clean_env, herdr, hrun, now, pending_age, projects, qp,
     record_session_proc, say, session_alive, sh, slug, ts)
 from janus.hooks import session_start_text
 from janus.ledger import ledger_read, read_secret, spend
 from janus.platform import pane_tool, run, watcher_loaded, watcher_service
 from janus.probe import discover, probe, pueue
-from janus.units import ws_id
+from janus.project import label_owner, project_id, tmux_name
+from janus.units import all_units, ws_id
 
 def cmd_register(cfg, a):
     """The only way to change the registered orchestrator session (with the watcher's pending claim for a new one it started)."""
@@ -228,10 +230,53 @@ def cmd_init(cfg, a):
 OLD_CFG, NEW_CFG = "orch.toml", "janus.toml"   # the old names are quoted here on purpose: this is the one-time migration off them
 OLD_STATE, NEW_STATE = ".orch", ".janus"
 
-def migrate(project=None):
-    """One-time, idempotent move from orch to janus: the project's orch.toml -> janus.toml and .orch/ -> .janus/, the hook
-    commands a previous install wrote, and the watcher. Safe to run twice; prints what it changed. Stops and says so if both
-    the old and the new file/folder exist (nothing is merged by hand here)."""
+# Item 1: the old names a config value can carry. The specific ones first (so bin/orch.py and .orch/HANDOFF.md win over a bare
+# orch); the bare name is rewritten only as a whole path token (a folder, $HOME/orch, a command word), never inside a word.
+OLD_VALUE = [(".orch", ".janus"), ("orch.py", "janus.py"), ("orchkit", "janus"), ("orch.toml", "janus.toml"),
+             ("ORCH_", "JANUS_"), ("com.orch.watch", "com.janus.watch"), ("orchestrating", "janus")]
+
+def old_value(v):
+    """One config value with the old names replaced (item 1). Only a value reaches here: comments are never rewritten."""
+    for a, b in OLD_VALUE: v = v.replace(a, b)
+    return re.sub(r"(?<![\w.-])orch(?![\w.-])", "janus", v)
+
+ASSIGN = re.compile(r"^(\s*[A-Za-z0-9_.-]+\s*=\s*)(.*)$")
+
+def value_comment(rest):
+    """(value, trailing comment) of a line's right-hand side, split at the first # outside a quoted string."""
+    q = ""; esc = False
+    for i, ch in enumerate(rest):
+        if esc: esc = False; continue
+        if ch == "\\" and q == '"': esc = True; continue
+        if q:
+            if ch == q: q = ""
+        elif ch in "\"'": q = ch
+        elif ch == "#": return rest[:i], rest[i:]
+    return rest, ""
+
+def rewrite_config(path, dry=False):
+    """Rewrite every value in a migrated janus.toml that names the old state folder or an old name (item 1); comments and
+    anything that is not a value are left as written. Returns one line per change; writes nothing in dry mode."""
+    lines, changes = path.read_text().split("\n"), []
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("#"): continue   # a comment is not a value (the one place old names may stay on purpose)
+        m = ASSIGN.match(line)
+        if not m: continue
+        val, com = value_comment(m.group(2))
+        new = old_value(val)
+        if new == val: continue
+        key = m.group(1).split("=", 1)[0].strip()
+        changes.append(f"{path}: {key}: {val.strip()} -> {new.strip()}")
+        lines[i] = m.group(1) + new + com
+    if changes and not dry: atomic_write(path, "\n".join(lines))
+    return changes
+
+def migrate(project=None, dry=False):
+    """One-time, idempotent move from orch to janus: the project's orch.toml -> janus.toml and .orch/ -> .janus/, every config
+    value that still names the old state folder or an old name (item 1), the hook commands a previous install wrote, the watcher,
+    and the project's own pre-existing jobs, sessions and cards which get their project id (item 6). Safe to run twice; prints
+    what it changed. `--dry-run` (item 3) prints what it would change and changes nothing. Stops and says so if both the old and
+    the new file/folder exist (nothing is merged by hand here)."""
     root = Path(project or os.getcwd()).resolve()
     old_cfg, new_cfg = root / OLD_CFG, root / NEW_CFG
     if not old_cfg.is_file() and not new_cfg.is_file():
@@ -242,16 +287,23 @@ def migrate(project=None):
     if old_state.is_dir() and new_state.exists():
         print(f"janus: both {OLD_STATE}/ and {NEW_STATE}/ exist in {root}; merge them by hand", file=sys.stderr); return 1
     did = []
-    if old_cfg.is_file(): os.replace(old_cfg, new_cfg); did.append(f"{root}: {OLD_CFG} -> {NEW_CFG}")
-    if old_state.is_dir(): os.replace(old_state, new_state); did.append(f"{root}: {OLD_STATE}/ -> {NEW_STATE}/")
-    did += migrate_hooks() + migrate_watcher()
+    if old_cfg.is_file():
+        did.append(f"{root}: {OLD_CFG} -> {NEW_CFG}")
+        if not dry: os.replace(old_cfg, new_cfg)
+    if old_state.is_dir():
+        did.append(f"{root}: {OLD_STATE}/ -> {NEW_STATE}/")
+        if not dry: os.replace(old_state, new_state)
+    src = new_cfg if new_cfg.is_file() else old_cfg   # the renamed config (in dry mode, the file that would be renamed)
+    if src.is_file(): did += rewrite_config(src, dry=dry)   # item 1
+    did += migrate_hooks(dry=dry) + migrate_watcher(dry=dry)
+    if new_cfg.is_file() or (dry and old_cfg.is_file()): did += adopt_items(root, dry=dry, config=src)   # item 6
     for x in did: say(x)
-    say("janus migrate: " + ("done" if did else "nothing to do (already migrated)"))
+    say("janus migrate: " + ("done" if did else "nothing to do (already migrated)") + (" [dry-run: nothing changed]" if dry else ""))
     return 0
 
-def migrate_hooks():
+def migrate_hooks(dry=False):
     """Point the hook commands a previous install wrote (…/orch hook <event>, or an older …/orch.py hook <event>) at janus.
-    A rewritten file is backed up first; returns one line per file changed."""
+    A rewritten file is backed up first; returns one line per file changed (the plan only, in dry mode)."""
     out = []
     for p in (Path.home() / ".claude/settings.json", Path.home() / ".codex/hooks.json"):
         if not p.is_file(): continue
@@ -265,34 +317,116 @@ def migrate_hooks():
                     if re.search(r"(^|[/\s])orch(\.py)? hook \w+$", c):
                         h["command"] = re.sub(r"orch(\.py)? hook ", r"janus\1 hook ", c); n += 1
         if n:
-            p.with_name(p.name + ".bak-orch").write_text(p.read_text()); atomic_write(p, json.dumps(data, indent=2) + "\n")
             out.append(f"{p}: {n} hook command(s) -> janus")
+            if not dry:
+                p.with_name(p.name + ".bak-orch").write_text(p.read_text()); atomic_write(p, json.dumps(data, indent=2) + "\n")
     return out
 
-def migrate_watcher():
+def migrate_watcher(dry=False):
     """Replace the orch watcher with the janus one: macOS boots out com.orch.watch and installs the shipped
-    com.janus.watch.plist; Linux renames the systemd units. Returns one line per change."""
+    com.janus.watch.plist; Linux renames the systemd units. Returns one line per change (the plan only, in dry mode)."""
     out = []
     if sys.platform == "darwin":
         old = Path.home() / "Library/LaunchAgents/com.orch.watch.plist"
         new = Path.home() / "Library/LaunchAgents/com.janus.watch.plist"
         if old.exists():
-            run(["launchctl", "bootout", f"gui/{os.getuid()}/com.orch.watch"]); old.unlink(); out.append("removed the com.orch.watch watcher")
+            out.append("removed the com.orch.watch watcher")
+            if not dry: run(["launchctl", "bootout", f"gui/{os.getuid()}/com.orch.watch"]); old.unlink()
         src = JANUS_SELF.parent / "launchd" / "com.janus.watch.plist"
         if src.is_file() and not new.exists():
-            new.parent.mkdir(parents=True, exist_ok=True); (Path.home() / ".config/janus").mkdir(parents=True, exist_ok=True)
-            new.write_text(src.read_text().replace("__HOME__", str(Path.home())))
-            run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(new)]); out.append("installed the com.janus.watch watcher")
+            out.append("installed the com.janus.watch watcher")
+            if not dry:
+                new.parent.mkdir(parents=True, exist_ok=True); (Path.home() / ".config/janus").mkdir(parents=True, exist_ok=True)
+                new.write_text(src.read_text().replace("__HOME__", str(Path.home())))
+                run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(new)])
     else:
         u = Path.home() / ".config/systemd/user"
         units = [("orch-watch.service", "janus-watch.service"), ("orch-watch.timer", "janus-watch.timer")]
         if any((u / a).exists() for a, _ in units):
-            run(["systemctl", "--user", "disable", "--now", "orch-watch.timer"])
-            for a, b in units:
-                if (u / a).exists() and not (u / b).exists(): (u / b).write_text((u / a).read_text().replace("orch", "janus")); (u / a).unlink()
-            run(["systemctl", "--user", "daemon-reload"]); run(["systemctl", "--user", "enable", "--now", "janus-watch.timer"])
             out.append("renamed the systemd watcher units to janus-watch")
+            if not dry:
+                run(["systemctl", "--user", "disable", "--now", "orch-watch.timer"])
+                for a, b in units:
+                    if (u / a).exists() and not (u / b).exists(): (u / b).write_text((u / a).read_text().replace("orch", "janus")); (u / a).unlink()
+                run(["systemctl", "--user", "daemon-reload"]); run(["systemctl", "--user", "enable", "--now", "janus-watch.timer"])
     return out
+
+# Item 6: jobs, sessions and cards made before the project id existed carry none, so janus lists them as machine state and never
+# collects, cancels or tracks them. migrate adopts the ones that are this project's — a pueue label or tmux session whose name
+# matches one of the project's units (janus-<unit>, or its old orch-<unit> name on this machine), and a card of such a unit — by
+# adding @<project id>, and lists every item it cannot attribute. Only this machine's items (the brief's scope).
+
+def _adopt_view(root, config):
+    """A minimal read-only view of the config for adoption, so migrate can plan it even before janus.toml exists (dry run)."""
+    c = tomllib.loads(config.read_text()) if config and config.is_file() else {}
+    pr = c.get("project", {})
+    return SimpleNamespace(root=root, c=c, name=pr.get("name", root.name), paths=c.get("paths", {}), hosts=c.get("hosts", {}),
+                           beads=root / pr.get("beads", "."), state=root / pr.get("state", ".janus"), run=Run())
+
+def pueue_editor(path, new):
+    """Write the $EDITOR pueue opens for `pueue edit` (a queued or stashed task): it sets the task's label to new, in either
+    edit_mode (a TOML file per task, or a plain `label` file per task). Returns the editor command line."""
+    path.write_text("# janus migrate: the $EDITOR pueue opens; set the task label to the new project id.\n"
+                    "import pathlib, re, sys\n"
+                    f"new = {new!r}\n"
+                    "for a in sys.argv[1:]:\n"
+                    "    p = pathlib.Path(a); f = (p / 'label') if p.is_dir() else p\n"
+                    "    if not f.is_file(): continue\n"
+                    "    if f.name == 'label': f.write_text(new + '\\n'); continue\n"
+                    "    t = f.read_text()\n"
+                    "    t = (re.sub(r'^label\\s*=.*$', 'label = ' + repr(new), t, count=1, flags=re.M)\n"
+                    "         if re.search(r'^label\\s*=', t, re.M) else t.rstrip('\\n') + '\\nlabel = ' + repr(new) + '\\n')\n"
+                    "    f.write_text(t)\n")
+    return f"python3 {shlex.quote(str(path))}"
+
+def adopt_items(root, dry=False, config=None):
+    """Item 6: give this project's own pre-existing items their project id, and list what it cannot attribute. A pueue job whose
+    label matches one of the project's units is relabelled (…@<id>) through pueue's editor when it is queued or stashed, else
+    listed; a tmux session named janus-<unit> or orch-<unit> is renamed (…@<id>); a card of such a unit gets its project field.
+    Returns one line per adoption and one per item left alone; changes nothing in dry mode."""
+    view = _adopt_view(root, config); pid = project_id(view); units = set(all_units(view)); out = []
+    rc, o, e = sh(["pueue", "status", "--json"])
+    if rc == 0 and o.strip():
+        try: tasks = json.loads(o).get("tasks", {})
+        except Exception: tasks = {}
+        for tid, t in sorted(tasks.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
+            lab = t.get("label") or ""
+            if label_owner(lab)[1] is not None: continue
+            base = lab.split(":", 1)[1] if lab.startswith(("unit:", "run:", "gate:")) else lab
+            if base not in units:
+                out.append(f"job {tid} ({lab or (t.get('command') or '')[:40]}): not one of this project's units; left alone")
+                continue
+            new = f"{lab}@{pid}"; st = t.get("status"); st = st if isinstance(st, str) else next(iter(st), "")
+            if st not in ("Queued", "Stashed", "Locked"):
+                out.append(f"job {tid} ({lab} -> {new}): {st.lower() or 'running'}, pueue relabels only a queued or stashed task; adopt it by hand (pueue edit {tid})")
+                continue
+            out.append(f"job {tid}: {lab} -> {new}")
+            if not dry:
+                ed = view.state / f".pueue-label-{tid}.py"; ed.parent.mkdir(parents=True, exist_ok=True)
+                sh(["pueue", "edit", str(tid)], env={"EDITOR": pueue_editor(ed, new)}, timeout=30)
+    elif rc: out.append(f"pueue: no queue on this machine ({e.strip()[:60] or 'rc %s' % rc}); no jobs adopted")
+    rc, o, e = sh(["tmux", "list-sessions", "-F", "#{session_name}"])
+    if rc == 0:
+        for s in o.split():
+            if label_owner(s)[1] is not None: continue
+            pref = "janus-" if s.startswith("janus-") else "orch-" if s.startswith("orch-") else None
+            if not pref: continue
+            name = s[len(pref):]
+            if name not in units: out.append(f"session {s}: not one of this project's units; left alone"); continue
+            new = tmux_name(view, name); out.append(f"session {s} -> {new}")
+            if not dry: sh(["tmux", "rename-session", "-t", s, new])
+    elif rc: out.append(f"tmux: no server on this machine ({e.strip()[:60] or 'rc %s' % rc}); no sessions adopted")
+    for c in (sorted((board_dir(view) / "agents").glob("*.md")) if (board_dir(view) / "agents").is_dir() else []):
+        name, txt = c.stem, c.read_text(errors="replace")
+        if re.search(r"^- project: *\S", txt, re.M): continue   # already adopted
+        if name not in units: out.append(f"card {name}: not one of this project's units; left alone"); continue
+        out.append(f"card {name}: project {pid}")
+        if not dry:
+            if re.search(r"^- project:", txt, re.M): txt = re.sub(r"^- project:.*$", f"- project: {pid}", txt, count=1, flags=re.M)
+            else:
+                L = txt.split("\n"); L.insert(1, f"- project: {pid}"); txt = "\n".join(L)
+            atomic_write(c, txt)
+    return [f"adopt: {x}" for x in out]
 
 def cmd_doctor(cfg, a): return doctor(cfg, a)
 
@@ -324,7 +458,9 @@ def doctor(cfg, a):
         r(False, f"no janus.toml in {Path.cwd()} or a parent", "janus init"); return 1
     say(f"-- project {cfg.name} ({cfg.root})")
     pl = Path.home() / ".config/janus/projects"
-    r(cfg.root in projects() or None, f"project not listed in {pl} (the watcher will not visit it)", f"run ./install --project {cfg.root}")
+    listed = any(p.resolve() == cfg.root.resolve() for p in projects())   # item 4: equivalent paths match, and the message follows the fact
+    r(listed or None, f"project {'listed in' if listed else 'not listed in'} {pl}" + ("" if listed else " (the watcher will not visit it)"),
+      f"run ./install --project {cfg.root}")
     if not cfg.hosts: r(False, "no [hosts.*] in janus.toml", "add [hosts.<this machine>] local = true")
     elif not any(h.get("local") for h in cfg.hosts.values()): r(False, "no host has local = true", "mark this machine's [hosts.<name>] local = true")
     for m, c in cfg.models.items():
