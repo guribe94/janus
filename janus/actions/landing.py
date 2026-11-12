@@ -161,7 +161,9 @@ def final_gate_cmd(ld, unit, wt, branch):
     placeholder inside double quotes inside single quotes) works; `./gate "$(echo {branch})"` passes the value through
     `shlex.quote` inside the substitution (the value's `$(...)` is literal there); a placeholder alone between matching quotes
     drops them and is quoted once (shlex.quote); one inside single quotes is escaped for single quotes; one bare is shlex.quote'd.
-    A `${...}` in the config is left intact (only a bare {name} is substituted)."""
+    A `${...}` in the config is left intact (only a bare {name} is substituted). NOTE (finding D part 2): a SECOND shell level
+    (`sh -c '..."{branch}"...'`, `ssh h "...'{branch}'..."`) re-parses the command in a fresh shell, which no scan of one level
+    can make safe; `final_gate_cmd_checked` (what cmd_land uses) refuses a branch janus cannot quote there."""
     s = ld.get("final_gate") or ""
     vals = {"unit": str(unit), "wt": str(wt), "branch": str(branch)}
     out, i, n = [], 0, len(s)
@@ -220,6 +222,19 @@ def final_gate_cmd(ld, unit, wt, branch):
         out.append(c); i += 1
     return "".join(out)
 
+GATE_BRANCH_RX = re.compile(r"^[A-Za-z0-9._/+@-]+$")
+
+def final_gate_cmd_checked(ld, unit, wt, branch):
+    """final_gate_cmd after checking the agent-named branch (finding D part 2): a branch outside `[A-Za-z0-9._/+@-]` is refused.
+    A second shell level (`sh -c '..."{branch}"...'`, `ssh h "...'{branch}'..."`) re-parses the command in a fresh shell, so no
+    quoting of one template can make an arbitrary value safe there; refusing the metacharacters is the sound generic rule (and the
+    branch is the only agent-controlled value), so cmd_land gates only through here. A branch name outside the set (a space, a
+    quote, a `$`, a backtick, a `;`, `&`, `|` or a newline) is refused with how to rename it."""
+    if not GATE_BRANCH_RX.match(str(branch)):
+        raise Err(f"branch {branch!r} holds characters outside [A-Za-z0-9._/+@-]: the final gate inserts it into a shell command and a "
+                  f"second shell level cannot be quoted safely; rename it (git branch -m) and land again")
+    return final_gate_cmd(ld, unit, wt, branch)
+
 def cmd_land(cfg, a):
     """janus land <unit>: in the unit's worktree, merge the current landing branch ([landing] branch, default main); on a conflict
     stop (the tree is left as it was) and dispatch a merge unit merge-<unit> (--no-dispatch: only say so); gate the merged tree
@@ -273,7 +288,7 @@ def cmd_land(cfg, a):
             if rc: git(wt, "merge", "--abort"); raise Err(f"git merge {br} failed although merge-tree was clean: {(e or o).strip()[-160:]}; aborted")
             say(f"merged {br} into {branch}")
     # 2. gate the merged tree on the final-gate host
-    gh, gc = ld.get("final_gate_host"), final_gate_cmd(ld, a.unit, wt, branch)
+    gh, gc = ld.get("final_gate_host"), final_gate_cmd_checked(ld, a.unit, wt, branch)
     if a.no_gate: say("gate skipped (--no-gate)")
     elif not gh or not gc: raise Err("set [landing] final_gate_host and final_gate (the command that gates a merged tree) in janus.toml, or --no-gate")
     else:

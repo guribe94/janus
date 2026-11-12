@@ -195,6 +195,25 @@ class Item12FinalGate(unittest.TestCase):
         self.assertEqual(r.returncode, 0, cmd + " :: " + r.stderr)
         self.assertIn("CHECK-RAN", r.stdout)
 
+    def test_a_second_shell_level_refuses_a_branch_it_cannot_quote(self):
+        """Catches (finding D part 2): a second shell level (`sh -c '...\"{branch}\"...'`, `ssh h \"...'{branch}'...\"`)
+        re-parses the command in a fresh shell, so no quoting of one level can make an arbitrary value safe there; janus
+        refuses a branch outside [A-Za-z0-9._/+@-] and the test runs a REAL nested shell (`ssh` that runs its argument), not a
+        stub, for the branch that passes the check."""
+        d = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-i12n-"))
+        (d / "bin").mkdir(); ssh = d / "bin" / "ssh"; ssh.write_text('#!/bin/sh\nshift; exec sh -c "$*"\n'); ssh.chmod(0o755)
+        marker = d / "PWNED"
+        (d / "gate").write_text('#!/bin/sh\nprintf %s "$1" > "$(dirname "$0")/arg"\n'); (d / "gate").chmod(0o755)
+        hostile = "wk/x$(touch${IFS}" + str(marker) + ")"
+        with self.assertRaises(janus.Err):
+            janus.final_gate_cmd_checked({"final_gate": 'ssh h \'./gate "{branch}"\''}, "u1", str(d), hostile)
+        self.assertFalse(marker.exists(), "a refused branch still reached a shell")
+        out = janus.final_gate_cmd_checked({"final_gate": 'ssh h \'./gate "{branch}"\''}, "u1", str(d), "wk/ok-1.2_ok")
+        env = {**os.environ, "PATH": str(d / "bin") + os.pathsep + os.environ.get("PATH", "")}
+        r = subprocess.run(["sh", "-c", out], capture_output=True, text=True, cwd=d, env=env, timeout=20)
+        self.assertEqual(r.returncode, 0, out + " :: " + r.stderr)
+        self.assertEqual((d / "arg").read_text(), "wk/ok-1.2_ok")
+
 
 class Item8ThrashExplicit(unittest.TestCase):
     def test_a_thrash_stop_is_written_to_the_job_log_and_names_the_requeue(self):
