@@ -32,9 +32,10 @@ CARGO_OPT_ARG = {"--config", "--target", "--target-dir", "--features", "--manife
 
 def _segments(c):
     """The commands in c, each a list of words: quoting and backslash escapes are honoured, so a ; or | inside a quoted
-    argument (an ack or a commit message) never starts a new command (finding 4)."""
+    argument (an ack or a commit message) never starts a new command (finding 4), and the `&` of a redirect (`2>&1`, `&>log`) is
+    part of its word, never a separator (finding 4, fix-install6)."""
     segs, cur, w, q, esc = [], [], "", None, False
-    for ch in c:
+    for i, ch in enumerate(c):
         if esc: w += ch; esc = False; continue
         if q:
             if ch == q: q = None
@@ -43,8 +44,11 @@ def _segments(c):
         elif ch in "'\"": q = ch
         elif ch == "\\": esc = True
         elif ch in ";&|()\n":
-            if w: cur.append(w); w = ""
-            if cur: segs.append(cur); cur = []
+            if ch == "&" and (i > 0 and c[i - 1] == ">" or i + 1 < len(c) and c[i + 1] == ">"):
+                w += ch   # the `&` of a redirect, not a separator
+            else:
+                if w: cur.append(w); w = ""
+                if cur: segs.append(cur); cur = []
         elif ch.isspace():
             if w: cur.append(w); w = ""
         else: w += ch
