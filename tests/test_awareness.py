@@ -131,6 +131,17 @@ class Related(unittest.TestCase):
         janus.introduce(self.cfg, "alpha", "beta", "both change the module pkg")
         self.assertEqual([k for k, _ in janus.related_findings(self.cfg, self.units, {})], [])
 
+    def test_a_learned_post_from_a_closed_unit_is_not_related(self):
+        """Catches (item 17): related:<a>:<b> fired for a pair where one unit is closed (a learned post from a closed unit
+        named a running unit's area)."""
+        both = demo_units(self.d, [("alpha", ["pkg/a.py"]), ("gone", ["pkg/b.py"])])
+        units = [u for u in both if u["name"] == "alpha"]
+        janus.Beads.units = lambda s: [dict(u) for u in units]
+        self.cfg.run.all_units = {"gone": {**both[1], "status": "closed"}}
+        (self.bd / "log.md").write_text("2026-01-01 00:00 gone learned: pkg is shared ground\n")
+        F = dict(janus.related_findings(self.cfg, units, {}))
+        self.assertEqual(list(F), [], f"a closed unit was called related: {F}")
+
 
 class Notes(unittest.TestCase):
     """board.sh note: an agent writes onto another card; check lists it; a bad name or missing author is refused."""

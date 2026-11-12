@@ -106,7 +106,7 @@ def related_cases(cfg, units, hs=None):
     for gn, (_t, res) in sorted(gate_results(cfg).items()):
         if res != "FAIL": continue
         un = unit_of_gate(gn, allnames)
-        if not un or un in info: continue   # a running unit's own area: the module case above covers it
+        if not un or un in info or un not in umap: continue   # a running unit's own area (module case above); only an OPEN unit (item 17)
         rec = au.get(un) or umap.get(un)
         if not rec: continue
         mods = {m for m in (module_of(f) for f in unit_changes(cfg, rec, units)[1]) if m != HERE}
@@ -116,6 +116,7 @@ def related_cases(cfg, units, hs=None):
             if shared: add(v, un, f"gate {gn} failed in the module {', '.join(shared[:3])} that {un} owns", "gate", shared[0])
     for lid, text in learned_posts(cfg):
         poster = lid.rsplit(":", 1)[0]
+        if poster not in umap: continue   # item 17: a learned post from a closed unit is not a live collision
         for v in names:
             if v == poster or not same_repo(poster, v): continue
             area = [*info[v]["mods"], *info[v]["files"]]
