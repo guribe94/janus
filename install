@@ -20,7 +20,7 @@ A = ap.parse_args(); DRY = A.dry_run
 EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch", "Stop": None}
 ORCH = HOME / ".local/bin/orch"
 SHARE = HOME / ".local/share/orch"; REL = SHARE / "releases"; CUR = SHARE / "current"
-PARTS = ["orch.py", "board.sh", "skill", "example.orch.toml", "tests"]
+PARTS = ["orch.py", "orchkit", "board.sh", "skill", "example.orch.toml", "tests"]
 KEEP = 5   # releases kept (current and the newest others)
 
 def say(m): print(("[dry-run] " if DRY else "") + m, flush=True)

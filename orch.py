@@ -3,6 +3,7 @@
 Reads orch.toml from the current directory or a parent. See docs/DESIGN.md and skill/SKILL.md."""
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
+from orchkit.templates import *   # the shell/Python templates orch writes (section 7, Step 1: templates.py)
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 EXCL = ["--exclude", ".git", "--exclude", "target", "--exclude", ".venv", "--exclude", "node_modules"]
@@ -196,28 +197,6 @@ class Beads:
     def comment(self, i, text): sh(["bd", "comments", "add", i, text], cwd=self.cfg.beads)
 
 # ---------------------------------------------------------------- hosts: one probe per host
-PROBE = r'''PATH="$HOME/.local/bin:%(bin)s:$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
-if [ "$(uname)" = Darwin ]; then
- # Two readings, the larger wins: the kernel's free level (memory_pressure's "free percentage", read straight from sysctl, no
- # tool run under load) and vm_stat's free + inactive + speculative + purgeable pages. Under load one of them can read 0
- # (memory_pressure timing out or the level lagging), which made the Mac look full; an empty reading is reported as empty.
- mem=$(sysctl -n hw.memsize 2>/dev/null); fp=$(sysctl -n kern.memorystatus_level 2>/dev/null)
- [ -n "$fp" ] || fp=$(memory_pressure 2>/dev/null | awk '/free percentage/{gsub(/%%/,"",$NF);print int($NF)}')
- a=0; [ -n "$fp" ] && [ -n "$mem" ] && a=$((mem/1048576*fp/100))
- b=$(vm_stat 2>/dev/null | awk '/page size of/{ps=$(NF-1)} /^Pages (free|inactive|speculative|purgeable):/{gsub(/\./,"",$NF);n+=$NF} END{if (ps) print int(n*ps/1048576)}')
- mb=${b:-0}; [ "$a" -gt "$mb" ] && mb=$a; [ "$mb" -gt 0 ] || mb=
- echo "avail_mb=$mb"; echo "load=$(sysctl -n vm.loadavg | tr -d '{}' | awk '{print $1}')"; echo "os=mac"
-else
- echo "avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"; echo "load=$(cut -d' ' -f1 /proc/loadavg)"
- echo "psi=$(awk '/^some/{sub("avg10=","",$2);print $2}' /proc/pressure/memory 2>/dev/null)"; echo "os=linux"
-fi
-d=%(root)s; [ -d "$d" ] || d=/; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
-%(extra)s
-RD=%(rd)s; CAP_RO=%(ro)s
-%(cap)s
-cap_report
-echo "--pueue"; %(pueue)s status --json 2>/dev/null
-echo "--tmux"; tmux ls -F '#S' 2>/dev/null; true'''
 
 def probe_extra(h):
     """Running orch jobs still waiting in their admission (per lane), the old scripts' queue, other job schedulers on the host
@@ -242,14 +221,6 @@ def probe_extra(h):
 # whose command is a build or test, and that do not run under pueued (a lane job): printed as direct=<pid> <pgid> <unit> <secs> <cmd>.
 # Only the topmost such process of a tree is printed; a call of the unit's lane runner (<root>/run/<unit>.lane) is the lane.
 BUILD_ERE = "(^|[ /])cargo(-[a-z]+)? (test|nextest|build|clippy|bench)( |$)|(^|[ /])pytest( |$)|(^|[ /])(npm|pnpm) (run )?test( |$)|xcodebuild.* test"
-DIRECT_PROBE = r'''if [ -d /proc/1 ]; then
- for f in /proc/[0-9]*/environ; do u=$(tr '\0' '\n' < $f 2>/dev/null | sed -n 's/^ORCH_UNIT=//p'); [ -n "$u" ] && echo "${f#/proc/} $u"; done 2>/dev/null | sed 's#/environ##' > /tmp/.orch-units.$$
- ps -A -o pid=,ppid=,pgid=,etimes=,args= | awk -v rx=%(rx)s 'NR == FNR {u[$1] = $2; next} {pp[$1] = $2; pg[$1] = $3; et[$1] = $4; c = $0; sub(/^ *[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+ +/, "", c); cmd[$1] = c}
-   END {for (p in u) {if (!(p in cmd) || cmd[p] !~ rx || cmd[p] ~ /\.lane( |$)|orch(\.py)? (run|gate) |orch-test-fixture/) continue; q = pp[p]; lane = 0; n = 0
-          while (q > 1 && n++ < 50) {if (cmd[q] ~ /pueued/ || cmd[q] ~ /cmd\.sh|\/runs\/[^ ]*\.sh/) {lane = 1; break}; if (u[q] != "" && cmd[q] ~ rx) {lane = 1; break}; q = pp[q]}
-          if (!lane) print "direct=" p, pg[p], u[p], et[p], substr(cmd[p], 1, 100)}}' /tmp/.orch-units.$$ - 2>/dev/null
- rm -f /tmp/.orch-units.$$
-fi'''
 
 def pueue(h):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
@@ -343,99 +314,6 @@ def cap_nums(cfg, h):
             "memcap": int((capv(cfg, h, "ram_gb") - capv(cfg, h, "services_gb")) * 1024), "capmb": int(capv(cfg, h, "job_gb") * 1024),
             "agmb": int(capv(cfg, h, "agent_gb") * 1024), "hn": int(capv(cfg, h, "history_n")), "margin": int(capv(cfg, h, "margin_pct"))}
 
-CAP_LIB = r'''# orch capacity library for host %(name)s (written by orch, see cap_lib in orch.py; do not edit: the next orch run rewrites it).
-# Sourced by every waiting job each poll and sent inline with every probe. Needs RD (the runs dir).
-CORES=%(cores)d CPJ=%(cpj)d MEMCAP=%(memcap)d CAPMB=%(capmb)d AGMB=%(agmb)d PSIP=%(psip)s LOADX=%(loadx)s HOLD=%(hold)d DISK=%(disk)d HN=%(hn)d MARGIN=%(margin)d
-U=$(id -u); AS=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/app.slice; US=/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/user.slice
-cap_mb() {  # $1 class, $2 default MB, $3 cap MB (0: none): the max of the class's last HN recorded peaks + MARGIN %%, at least
-  # 256 (class agent: the median of its last 3 x HN peaks, at least 128: many light agents seldom peak together)
-  [ -f "$RD/history.tsv" ] || { echo "$2"; return; }
-  awk -F'\t' -v c="$1" -v n=$HN -v m=$MARGIN -v d="$2" -v cap="$3" 'BEGIN {if (c == "agent") n *= 3} $2 == c && $3 > 0 {p[k++ %% n] = $3}
-    END {if (!k) {print d; exit}; j = 0; for (i in p) v_[++j] = p[i] + 0
-         for (a = 2; a <= j; a++) {x = v_[a]; b = a - 1; while (b > 0 && v_[b] > x) {v_[b + 1] = v_[b]; b--}; v_[b + 1] = x}
-         mx = (c == "agent") ? v_[int((j + 1) / 2)] : v_[j]; lo = (c == "agent") ? 128 : 256
-         v = int(mx * (100 + m) / 100); if (v < lo) v = lo; if (cap > 0 && v > cap) v = cap; print v}' "$RD/history.tsv"
-}
-cap_class() {  # the job class of a command: the first [capacity.classes] pattern it matches, else its first command words
-  c=$1
-%(classes)s  printf '%%s\n' "$c" | awk '{n = split($0, seg, /&&|;|\|\|/)
-    for (s = 1; s <= n; s++) {m = split(seg[s], w, " "); i = 1; wr = 0
-      while (i <= m && (w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || w[i] ~ /^(env|nice|ionice|timeout|nohup|time|exec|command|stdbuf|systemd-run)$/ || (wr && (w[i] ~ /^-/ || w[i] ~ /^[0-9.]+[smhd]?$/)))) {if (w[i] !~ /=/ || w[i] ~ /^-/) wr = 1; i++}
-      if (i > m || w[i] ~ /^(cd|export|source|\.|set|true|:|\(|\)|echo|printf)$/) continue
-      out = ""; k = 0
-      for (; i <= m && k < 3; i++) {x = w[i]; if (x ~ /^-/ || x ~ /=/ || x ~ /^[<>|&]/ || x ~ /^[0-9.:]+$/) break
-        if (x ~ /\//) {sub(/.*\//, "", x); out = out (k ? "_" : "") x; k++; break}
-        out = out (k ? "_" : "") x; k++}
-      gsub(/[^A-Za-z0-9_.+-]/, "", out); if (out != "") {print out; exit}}
-    print "job"}'
-}
-res_sum() {  # live reservations: RJ jobs holding RC cores and RM MB, RA agents holding RAM MB; RL lists them. A reservation
-  # whose process is gone is removed (not by a read-only probe). Jobs without one (older scripts, another scheduler) count at CAPMB.
-  RJ=0 RC=0 RM=0 RA=0 RAM=0 RL=
-  for f in "$RD"/*.res; do
-    [ -e "$f" ] || continue
-    p= c= m= t= k=; { read -r p c m t k < "$f"; } 2>/dev/null
-    case "$p$c$m" in *[!0-9]*|"") continue;; esac
-    if ! kill -0 "$p" 2>/dev/null; then [ -n "$CAP_RO" ] || rm -f "$f"; continue; fi
-    case $k in agent*) RA=$((RA + 1)); RAM=$((RAM + m));; *) RJ=$((RJ + 1)); RC=$((RC + c)); RM=$((RM + m));; esac
-    RL="$RL
-res=$p $c $m $t $k ${f##*/}"
-  done
-  for j in $( { %(jobids)s; } 2>/dev/null); do
-    [ -e "$RD/$j.res" ] && continue
-    RJ=$((RJ + 1)); RC=$((RC + CPJ)); RM=$((RM + CAPMB)); RL="$RL
-res=- $CPJ $CAPMB - untracked $j"
-  done
-}
-cap_measure() {  # PSI (macOS: the kernel's pressure level, warn = 50, critical = 100), LOAD (1 min), DF (GB free in RD)
-  if [ "$(uname)" = Darwin ]; then
-    case $(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) in 4) PSI=100;; 2) PSI=50;; *) PSI=0;; esac
-    LOAD=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
-  else
-    PSI=$(awk '/^some/{sub("avg10=", "", $2); print $2}' /proc/pressure/memory 2>/dev/null); LOAD=$(awk '{print $1}' /proc/loadavg)
-  fi
-  PSI=${PSI:-0}; LOAD=${LOAD:-0}; DF=$(df -Pk "$RD" 2>/dev/null | awk 'NR==2{print int($4/1048576)}'); DF=${DF:-0}
-}
-cap_paused() {  # back-pressure: PAUSE is why admission waits (memory PSI over PSIP; load over LOADX x CORES for HOLD s, tracked in RD/overload)
-  PAUSE=; nowt=$(date +%%s)
-  awk -v a="$PSI" -v b="$PSIP" 'BEGIN {exit !(a + 0 > b + 0)}' && PAUSE="memory PSI avg10 $PSI over $PSIP"
-  if awk -v l="$LOAD" -v c="$CORES" -v x="$LOADX" 'BEGIN {exit !(l + 0 > c * x)}'; then
-    since= last=; { read -r since last < "$RD/overload"; } 2>/dev/null
-    { [ -n "$last" ] && [ $((nowt - last)) -le $((HOLD + 60)) ]; } || since=$nowt   # a gap in the readings starts a new period
-    [ -n "$CAP_RO" ] || { echo "$since $nowt" > "$RD/overload.$$" && mv -f "$RD/overload.$$" "$RD/overload"; }
-    [ $((nowt - since)) -ge "$HOLD" ] && PAUSE="${PAUSE:+$PAUSE; }load $LOAD over $LOADX x $CORES cores for $((nowt - since)) s"
-  else [ -n "$CAP_RO" ] || rm -f "$RD/overload"; fi
-}
-admit_ok() {  # $1 the job's class. Sets MB (its reservation) and why; true when it may start now
-  MB=$(cap_mb "${1:-job}" $CAPMB $CAPMB); res_sum; cap_measure; cap_paused
-  why="reserved $RJ job(s): $RC of $CORES cores, $RM MB + agents $RAM MB + this ${1:-job} $MB MB of $MEMCAP MB (RAM - services); PSI $PSI, load $LOAD, disk $DF GB (floor $DISK)${PAUSE:+; PAUSED: $PAUSE}"
-  BLK=; [ -n "$PAUSE" ] && BLK="paused"; [ "$DF" -ge "$DISK" ] || BLK="$BLK disk"
-  if [ "$RJ" -gt 0 ]; then [ $((RC + CPJ)) -le "$CORES" ] || BLK="$BLK cores"; [ $((RM + RAM + MB)) -le "$MEMCAP" ] || BLK="$BLK memory"; fi
-  [ -z "$BLK" ]
-}
-job_mb() {  # $1 pid, $2 job id: the job's resident memory now, in MB (empty when it cannot be read)
-  v=
-%(sample)s
-  echo "$v"
-}
-tree_mb() {  # resident memory of process $1 and all its descendants, MB
-  ps -A -o pid=,ppid=,rss= | awk -v r="$1" '{pp[$1] = $2; rs[$1] = $3} END {q[r] = 1; do {ch = 0; for (x in pp) if (!(x in q) && (pp[x] in q)) {q[x] = 1; ch = 1}} while (ch); for (x in q) s += rs[x]; print int(s / 1024)}'
-}
-cap_record() {  # $1 class $2 peak MB $3 seconds $4 exit code: one line of RD/history.tsv (its last 2000 lines are kept)
-  [ "${2:-0}" -gt 0 ] 2>/dev/null || return 0
-  printf '%%s\t%%s\t%%s\t%%s\t%%s\n' "$(date +%%s)" "$1" "$2" "$3" "$4" >> "$RD/history.tsv"
-  [ "$(wc -l < "$RD/history.tsv")" -gt 2400 ] && tail -n 2000 "$RD/history.tsv" > "$RD/history.tsv.$$" && mv -f "$RD/history.tsv.$$" "$RD/history.tsv"
-  return 0
-}
-cap_report() {  # for orch's probe: the sums, the pause, each reservation, the last 300 history lines
-  res_sum; cap_measure; cap_paused
-  echo "cap_rj=$RJ"; echo "cap_rc=$RC"; echo "cap_rm=$RM"; echo "cap_ra=$RA"; echo "cap_ram=$RAM"; echo "cap_pause=$PAUSE"; echo "cap_psi=$PSI"
-  admit_ok job >/dev/null 2>&1; echo "cap_admit=${BLK:-yes}"   # the admission's own verdict for one more job now (yes, or what blocks it)
-  [ -n "$RL" ] && printf '%%s\n' "$RL" | sed '/^$/d'
-  [ -f "$RD/history.tsv" ] && tail -n 300 "$RD/history.tsv" | sed 's/^/hist=/'
-  true
-}
-'''
 
 def cap_lib(cfg, hn, h):
     """runs/cap.sh for host h: the rule above with the host's numbers, its [capacity.classes], and how its jobs are seen
@@ -985,13 +863,6 @@ def env_unit(pid):
 
 # Stop a process group after one warning (register item 23): TERM the group, KILL what is left after 5 s. When the group also
 # holds an agent (claude, codex) or pueued, only the process and its descendants are stopped, never the agent.
-STOP_GROUP = r'''p=%(pid)d g=%(pgid)d
-kids() { ps -A -o pid=,ppid= | awk -v r=$p '{pp[$1] = $2} END {q[r] = 1; do {c = 0; for (x in pp) if (!(x in q) && (pp[x] in q)) {q[x] = 1; c = 1}} while (c); for (x in q) print x}'; }
-if [ "$g" -gt 1 ] && ! ps -A -o pgid=,args= | awk -v g=$g '$1 == g' | grep -Eq '(^|/)(claude|codex)( |$)|node .*(claude|codex)|pueued'; then
-  kill -TERM -$g 2>/dev/null; sleep 5; kill -KILL -$g 2>/dev/null; echo "group $g stopped"
-else
-  t=$(kids); kill -TERM $t 2>/dev/null; sleep 5; kill -KILL $t 2>/dev/null; echo "process $p and its children stopped (group $g holds the agent)"
-fi'''
 
 def enforce(cfg, F):
     """Warn, then stop (orch-fixes8; register items 22, 23). The first time a violation is seen its unit gets a board direction;
@@ -1512,14 +1383,6 @@ def cmd_api_run(cfg, a):
 # A pueue that never stores the caller's environment: an agent holds ANTHROPIC_API_KEY in its own environment (claude passes
 # it to every tool command), and pueue stores a task's whole environment in its state file. The lane runner uses it, and
 # remote API agents get it first on PATH as `pueue` (orch-fixes6: found when a remote agent's lane job stored the key).
-CLEAN_PUEUE = r'''#!/bin/sh
-# pueue with an allow-listed environment (written by orch): a task never stores the caller's ANTHROPIC_API_KEY or tokens
-real=%(real)s
-# an agent's own `pueue add` gets its unit's label, so orch check never calls it an orphan (issue 24)
-if [ "$1" = add ] && [ -n "$ORCH_UNIT" ]; then case " $* " in *" -l "*|*" --label "*|*" --label="*) ;; *) shift; set -- add -l "unit:$ORCH_UNIT" "$@";; esac; fi
-exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" PATH="$PATH" LANG="${LANG:-C.UTF-8}" SHELL="${SHELL:-/bin/sh}" \
-  TMPDIR="${TMPDIR:-/tmp}" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} ${XDG_CONFIG_HOME:+XDG_CONFIG_HOME="$XDG_CONFIG_HOME"} ${ORCH_UNIT:+ORCH_UNIT="$ORCH_UNIT"} ${ORCH_ROLE:+ORCH_ROLE="$ORCH_ROLE"} "$real" "$@"
-'''
 
 def clean_pueue_script(h):
     if h.get("local"):
@@ -1901,16 +1764,6 @@ def get_unit(cfg, name):
 
 # Every process of a unit: the tree under its task or pane, every process group in it, and any process anywhere whose
 # environment has ORCH_UNIT=<unit> (detached children: nohup, setsid, & disown). Printed as "pid pgid" lines (M12).
-UNIT_PROCS = r'''u=%(unit)s; me=$$; roots="%(roots)s"
-if [ -d /proc/1 ]; then
-  env_pids=$(grep -lsaz "^ORCH_UNIT=$u\$" /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3)
-fi   # macOS: the caller passes those pids in roots (mac_env_pids)
-ps -A -o pid=,ppid=,pgid= | awk -v seeds="$env_pids $roots" -v me=$me '
-  {p[$1] = $2; g[$1] = $3; kids[$2] = kids[$2] " " $1}
-  END {n = split(seeds, s, " "); for (i = 1; i <= n; i++) if (s[i] in p) q[s[i]] = 1
-       do {ch = 0; for (x in q) {m = split(kids[x], k, " "); for (j = 1; j <= m; j++) if (!(k[j] in q)) {q[k[j]] = 1; ch = 1}}} while (ch)
-       for (x in q) if (x != me && x > 1) print x, g[x]}'
-'''
 
 def mac_env_pids(unit):
     """pids whose environment has ORCH_UNIT=<unit>. macOS ps -E appends the environment to the command line, so the command
@@ -1977,11 +1830,6 @@ def remote_patch(h, n, fname):
 
 # A remote copy's fingerprint: the checksum of the agent's changes and of its output folder (orch's own files left out), the
 # number of output files and the report's lines other than PENDING. collect records it; stop and close compare (item 4).
-FINGERPRINT = r'''cd %(root)s 2>/dev/null || exit 3
-d=$( { [ -d base/%(n)s ] && diff -ruN %(ex)s base/%(n)s worktrees/%(n)s 2>/dev/null; } | cksum)
-f() { cd out/%(n)s 2>/dev/null && find . -type f ! -name changes.patch ! -name backup.patch ! -name 'task-*.log' ! -name '*.key' "$@"; }
-o=$(f -exec cksum {} + | sort | cksum); n=$(f | wc -l); p=$(grep -cv '^VERDICT: PENDING$' out/%(n)s/REPORT.md 2>/dev/null)
-echo "fp=$d|$o"; echo "n=$n"; echo "p=${p:-0}"'''
 
 def fingerprint(cfg, u):
     h = cfg.hosts[u["host"]]
@@ -3129,34 +2977,6 @@ def write_cap(cfg, hn, h):
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True); atomic_write(Path(rd) / "cap.sh", cap_lib(cfg, hn, h)); return 0, "", ""
     d = qp(rd); return hrun(h, f"mkdir -p {d} && cat > {d}/.cap.sh.$$ && mv -f {d}/.cap.sh.$$ {d}/cap.sh", inp=cap_lib(cfg, hn, h))
 
-ADMIT = r'''# Admission (orch-fixes8): by reservations, rule in $RD/cap.sh (re-read each poll). One job is judged at a time under the lock;
-# an admitted job writes its reservation ($R.res) before the lock is released. A jobs-lane job yields while a gates job waits.
-[ -f "$RD/cap.sh" ] || { echo "orch: no $RD/cap.sh on this host (orch run or orch launch writes it)"; exit 125; }
-lane=%(lane)s; . "$RD/cap.sh"; CLS=$(cap_class %(clsrc)s)
-if command -v flock >/dev/null 2>&1; then exec 7>>"$RD/admit.lock"; lk() { flock 7; }; ulk() { flock -u 7; }
-else   # no flock: a lock dir holding its owner's pid; a dead owner's dir is taken over (a SIGKILL never leaves the host stuck)
-  lk() { until mkdir "$RD/admit.d" 2>/dev/null; do o=$(cat "$RD/admit.d/pid" 2>/dev/null); [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null && rm -rf "$RD/admit.d"; sleep 1; done; echo $$ > "$RD/admit.d/pid"; HELD=1; }
-  ulk() { rm -rf "$RD/admit.d"; HELD=; }; fi
-gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && return 0; done; return 1; }
-W="$R.wait"; [ "$lane" = gates ] && W="$R.gwait"; echo $$ > "$W"
-HELD=; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
-said=
-while :; do
-  if [ "$lane" = gates ] || ! gates_waiting; then
-    lk; CAP_RO=; . "$RD/cap.sh"
-    if admit_ok "$CLS"; then echo "$$ $CPJ $MB $(date +%%s) $CLS" > "$R.res.$$" && mv -f "$R.res.$$" "$R.res"; ulk; break; fi
-    ulk; [ "$said" = "$BLK" ] || { echo "orch: waiting for admission ($CLS; $BLK): $why"; said=$BLK; }
-  fi
-  sleep ${ORCH_POLL_S:-15}
-done
-rm -f "$W"; exec 7>&-; trap 'rm -f "$R.res"' EXIT
-echo "orch: admitted ($CLS, reserves $CPJ cores and $MB MB): $why"
-run_sampled() {  # run "$@", sample its memory every 5 s, then add class, peak MB, seconds and exit code to $RD/history.tsv
-  t0=$(date +%%s); "$@" & pid=$!; peak=0
-  while kill -0 $pid 2>/dev/null; do v=$(job_mb $pid %(jid)s); [ "${v:-0}" -gt "$peak" ] 2>/dev/null && peak=$v; sleep 5; done
-  wait $pid; rc=$?; cap_record "$CLS" "$peak" $(( $(date +%%s) - t0 )) $rc; return $rc
-}
-'''
 
 def ctr(h):
     """A podman host's container settings ([hosts.<h>.container]): image, mount (host dir, default the host's root), mount_at
@@ -3929,67 +3749,6 @@ def push_cmd(repo, cfg=None):
 # ---------------------------------------------------------------- transcripts (orch-swarm item 5)
 # One condenser for Claude Code (jsonl under ~/.claude/projects) and Codex (rollout jsonl under ~/.codex/sessions) transcripts.
 # It runs where the transcript is: here, or on the agent's host as `python3 -` with this source on stdin (standard library only).
-CONDENSE = r'''
-import glob, json, os, re, sys
-mode, grep, tail, since, cwd = sys.argv[1:6]; tail = int(tail); since = float(since); pats = sys.argv[6:]
-rx = re.compile(grep, re.I) if grep else None
-def flat(x):
-    if isinstance(x, list): return " ".join(flat(y) for y in x)
-    if isinstance(x, dict): return str(x.get("text") or x.get("content") or x.get("output") or json.dumps(x))
-    return str(x or "")
-def show(tag, full, n):
-    full = re.sub(r"\s+", " ", full).strip()
-    m = rx.search(full) if rx else None
-    if m and len(full) > n: a = max(0, m.start() - n // 3); return f"{tag}{'...' if a else ''}{full[a:a + n]}{'...' if a + n < len(full) else ''}"
-    return tag + (full if len(full) <= n else full[:n] + "...")
-def tool(name, inp):
-    if isinstance(inp, str):
-        try: inp = json.loads(inp)
-        except Exception: pass
-    k = next((k for k in ("command", "cmd", "file_path", "path", "pattern", "url", "query", "description") if isinstance(inp, dict) and inp.get(k)), None)
-    return f"> {name}: ", flat(inp[k]) if k else (inp if isinstance(inp, str) else json.dumps(inp)), 160
-def items(f):
-    for l in open(f, errors="replace"):
-        try: o = json.loads(l)
-        except Exception: continue
-        t = o.get("type")
-        if t in ("user", "assistant") and isinstance(o.get("message"), dict):      # Claude Code
-            c = o["message"].get("content"); who = "USER: " if t == "user" else "AGENT: "
-            if isinstance(c, str): yield who, c, 600; continue
-            for b in c or []:
-                if not isinstance(b, dict): continue
-                if b.get("type") == "text" and b.get("text", "").strip(): yield who, b["text"], 600
-                elif b.get("type") == "tool_use": yield tool(b.get("name"), b.get("input"))
-                elif b.get("type") == "tool_result": yield ("< ERROR " if b.get("is_error") else "< "), flat(b.get("content")), 200
-        elif t == "response_item":                                                  # Codex
-            p = o.get("payload") or {}; pt = p.get("type")
-            if pt == "message" and p.get("role") in ("user", "assistant"):
-                tx = flat(p.get("content"))
-                if tx.strip() and not tx.lstrip().startswith(("<", "# AGENTS.md")): yield ("USER: " if p["role"] == "user" else "AGENT: "), tx, 600
-            elif pt in ("function_call", "custom_tool_call", "local_shell_call"): yield tool(p.get("name") or pt, p.get("arguments") or p.get("input") or p.get("action"))
-            elif pt in ("function_call_output", "custom_tool_call_output"): yield "< ", flat(p.get("output")), 200
-fs = []
-for p in pats: fs += glob.glob(os.path.expanduser(p), recursive=True)
-fs = sorted(set(fs), key=os.path.getmtime)
-if mode == "newest": fs = fs[-1:]
-if mode == "codex-cwd":   # Codex sessions of a cwd (no thread id known): their session_meta line names it
-    def meta_cwd(f):
-        try: return (json.loads(open(f, errors="replace").readline()).get("payload") or {}).get("cwd")
-        except Exception: return None
-    fs = [f for f in fs if os.path.getmtime(f) >= since and meta_cwd(f) == cwd]
-if not fs: print("(no transcript found)"); sys.exit(3)
-out = []
-for f in fs:
-    body = [show(tag, full, n) for tag, full, n in items(f) if not rx or rx.search(full)]
-    out.append((f, body))
-if tail > 0:   # the last N lines over all sessions, newest session last
-    keep, left = [], tail
-    for f, body in reversed(out):
-        if left <= 0: break
-        keep.insert(0, (f, body[-left:])); left -= len(body[-left:])
-    out = keep
-print("\n".join(f"## {f}\n" + "\n".join(b) for f, b in out))
-'''
 
 def unit_any(cfg, name):
     """An open unit, else the latest record of a closed one."""
