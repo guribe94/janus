@@ -142,6 +142,18 @@ class Related(unittest.TestCase):
         F = dict(janus.related_findings(self.cfg, units, {}))
         self.assertEqual(list(F), [], f"a closed unit was called related: {F}")
 
+    def test_a_detached_head_is_compared_by_its_commit(self):
+        """Catches (item 18): related 'on branches one of which contains the other' fired for a unit whose worktree is a
+        detached HEAD, because the literal HEAD resolved to whatever the other worktree had checked out."""
+        units = demo_units(self.d, [("alpha", ["d1/f"]), ("beta2", ["d2/f"])])
+        g = lambda *a, cwd: subprocess.run(["git", *a], cwd=str(cwd), capture_output=True, check=True)
+        for w in (self.d / "alpha", self.d / "beta2"):   # two sibling commits: neither tip contains the other
+            g("add", "-A", cwd=w); g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "u", cwd=w)
+        g("checkout", "-q", "--detach", cwd=self.d / "beta2")   # beta2's worktree is now a detached HEAD at its commit
+        janus.Beads.units = lambda s: [dict(u) for u in units]
+        F = dict(janus.related_findings(self.cfg, units, {}))
+        self.assertEqual(list(F), [], f"a detached HEAD was treated as containing another unit's branch: {F}")
+
 
 class Notes(unittest.TestCase):
     """board.sh note: an agent writes onto another card; check lists it; a bad name or missing author is refused."""
