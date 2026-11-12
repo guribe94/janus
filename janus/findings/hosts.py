@@ -7,7 +7,7 @@ from janus.project import label_owner, own_label, project_id, tmux_name, unit_tm
 from janus.backlog import ready_work
 from janus.beads import Beads
 from janus.board import board
-from janus.cap import host_cap
+from janus.cap import capv, host_cap
 from janus.context import AGENT_RX, Err, FIXTURE_MARK, ancestors, fl, hrun, now, projects, sh, ts
 from janus.platform import env_janus, secs
 from janus.probe import margins, room
@@ -170,6 +170,14 @@ def lane_findings(cfg, hs, units=()):
             st = lambda x: x["status"] if isinstance(x["status"], str) else next(iter(x["status"]))
             q = [x for x in mine if st(x) == "Queued"]; r = [x for x in mine if st(x) == "Running"]; par = g.get("parallel_tasks", 1)
             wt = int(p.get(f"wait_{lane}", 0) or 0)   # running tasks still waiting in janus's own admission
+            if wt:   # item 21: name why a job is held in admission (disk/mem/psi with numbers), not just that it waits
+                why = (p.get("cap_pause") or "").strip()
+                if not why and p.get("cap_admit", "").strip() == "disk":
+                    why = f"disk {p.get('disk_gb')}G free, floor {capv(cfg, h, 'min_disk_gb')}G"
+                why = why or (p.get("cap_admit") or "admission blocked").strip()
+                F.append((f"blocked:{n}:{lane}", f"{n} {lane}: {wt} job(s) waiting in admission ({why}; jobs hold {p.get('cap_rc', '?')} cores "
+                          f"and {p.get('cap_rm', '?')} MB, agents {p.get('cap_ram', '?')} MB, PSI {p.get('cap_psi', '?')}): free the cause "
+                          f"(janus tidy for disk, or wait for the load/PSI to fall), or cancel and re-queue elsewhere"))
             if q and (g.get("status") != "Running" or len(r) < par):
                 F.append((f"stalled:{n}:{lane}", f"{n} {lane} STALLED: {len(q)} queued, {len(r)} of {par} slots running, group {g.get('status')}: janus check retunes the group; a paused group needs its cause fixed"))
             elif q and not wt and lane != "land" and len(r) < (h.get("gate_slots", slots(h, cfg)) if lane == "gates" else 1 if lane == "gates-quick" else slots(h, cfg)) and \

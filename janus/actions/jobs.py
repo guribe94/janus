@@ -54,6 +54,8 @@ AGE_MIN = {"gates": 240, "jobs": 120, "land": 240, "gates-quick": 60, "place": 2
 
 LSSH = [*SSH, "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
 
+WAIT_STEP = 300   # item 21: the longest a caller waits on one pueue wait before reporting the host's admission reason
+
 def lane_age(cfg, lane): return cfg.c.get("lanes", {}).get(lane, {}).get("age_min", AGE_MIN.get(lane, 120))
 
 def slots(h, cfg=None):
@@ -112,7 +114,8 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
             f"export JANUS_WRAP={q(jid)}   # janus run inside records the jobs it queues under this (cancel follows them)\n")
     broad = bool(getattr(a, "broad", None)); nice = 19 if broad else 10   # a broad run (--broad) runs at the lowest CPU priority
     setup = h.get("job_setup", ""); log = h.get("job_log", "/dev/null")
-    adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''"}
+    adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
+                   "waitmax": int(lane_age(cfg, a.lane) * 60)}   # item 21: give up after the lane's age limit
     if h.get("local"):
         pre = ""
         if a.lane == "land":   # the local landing lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
@@ -180,11 +183,20 @@ def task_rc(t):
     return 137 if r == "Killed" else 1
 
 def finish_job(cfg, hn, h, tid, jid, quiet=False):
-    """Wait for the task (retrying through ssh drops), print its log, return its exit code."""
+    """Wait for the task (retrying through ssh drops), print its log, return its exit code. Each wait is bounded (WAIT_STEP s),
+    so a task held in admission is reported with the host's admission reason instead of waiting in silence (item 21)."""
     miss = 0
     while True:
-        if h.get("local"): rc = subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {int(tid)}"]).returncode
-        else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h)} wait -q {int(tid)}"], stdin=subprocess.DEVNULL).returncode
+        try:
+            if h.get("local"): rc = subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {int(tid)}"], timeout=WAIT_STEP).returncode
+            else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h)} wait -q {int(tid)}"], stdin=subprocess.DEVNULL, timeout=WAIT_STEP).returncode
+        except subprocess.TimeoutExpired:
+            t = task_status(h, tid)
+            if task_rc(t) is not None: break
+            p = probe(hn, h, cfg=cfg)
+            print(f"janus: {hn} task {tid} still waiting after {WAIT_STEP}s (admission {p.get('cap_admit') or '?'}"
+                  + (f"; {p['cap_pause']}" if p.get("cap_pause") else "") + f"): see janus queue {hn}", file=sys.stderr)
+            continue
         t = task_status(h, tid)
         if task_rc(t) is not None: break
         miss = miss + 1 if t is None and rc != 255 else 0
