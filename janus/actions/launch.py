@@ -338,6 +338,15 @@ def unit_tab(cfg, u, mname, hn, h):
     f = f"{pueue(h)} follow {int(u['task'])}"
     herdr("pane", "run", pane, f if h.get("local") else f"ssh -t {shlex.quote(h['ssh'])} {shlex.quote(f)}"); u.update(pane=pane, tab=tab)
 
+def cwd_taken(cfg, units, cwd, name, resume_of=None, share_with=None):
+    """(open units whose cwd is cwd, the unit whose tree this launch takes over). Item 13: `janus launch --resume-of X --cwd X's
+    tree` may take X's own cwd, handing its dirty tree to the successor; X is closed once the successor has started. `share_with`
+    is janus land's merge unit, which shares the conflicted unit's tree on purpose."""
+    shared = [u["name"] for u in units if u.get("cwd") and Path(u["cwd"]).resolve() == cwd and u["name"] != name and cwd != cfg.root.resolve()]
+    if share_with: shared = [x for x in shared if x != share_with]
+    handover = resume_of if resume_of in shared else None
+    return [x for x in shared if x != handover], handover
+
 def cmd_launch(cfg, a):
     name = a.unit
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
@@ -361,8 +370,7 @@ def cmd_launch(cfg, a):
     h = cfg.hosts[hn]; local = h.get("local", False)
     cwd = cfg.p("worktrees", "worktrees") / name
     cwd = (Path(a.cwd) if a.cwd else cwd if cwd.is_dir() else cfg.root).resolve()
-    shared = [u["name"] for u in units if u.get("cwd") and Path(u["cwd"]).resolve() == cwd and u["name"] != name and cwd != cfg.root.resolve()]
-    if shared and getattr(a, "share_with", None): shared = [x for x in shared if x != a.share_with]   # janus land's merge unit
+    shared, handover = cwd_taken(cfg, units, cwd, name, getattr(a, "resume_of", None), getattr(a, "share_with", None))
     if shared and not (local and a.kind in ("review", "audit")):
         raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}; give the unit its own worktree (H9)")
     if main_checkout(cwd) and not a.allow_main: raise Err(f"refused: {cwd} is a main checkout with linked worktrees; use a worktree (or --allow-main)")
@@ -508,6 +516,10 @@ def cmd_launch(cfg, a):
     st = u.get("start_state", "running" if u["via"] == "herdr" else "unknown")
     say((f"launched {name} on {hn} via {u['via']}" if st in ("running", "queued", "finished") else f"queued {name} on {hn} via {u['via']}, NOT confirmed running ({st})")
         + (f" (task {u['task']}{', waiting for an agents slot' if st == 'queued' else ''})" if u.get("task") is not None else ""))
+    if handover:   # item 13: the successor has the predecessor's tree; close the predecessor now (its dirty tree stays)
+        from janus.actions.lifecycle import cmd_close
+        try: cmd_close(cfg, argparse.Namespace(unit=handover, force=True, handover=True, reason=f"handed its worktree to {name} (janus launch --resume-of)"))
+        except Err as ex: say(f"note: {handover} not closed: {ex}")
 
 PATH_RX = re.compile(r"(?<![\w.:/~$>)\]}*-])(/[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*)")
 
