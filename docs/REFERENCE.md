@@ -751,7 +751,8 @@ It also covers the rest of the mess orchestration makes, each by a safe rule:
 - `[tidy] artifacts = ["target", ...]`: globs of rebuildable output removed inside a CLOSED unit's own worktree (an open unit's
   tree is never touched); inert unless set. It keeps a worktree that stays around from pinning build output.
 The watcher refreshes the list every `[tidy] every_min` (60); `janus check` raises `disk:<host>` over a budget and `tidy:<n>`
-with what is reclaimable.
+with what is reclaimable. `janus tidy` prints the disk free before and after from `df` (the real measure; on APFS `du`
+over-counts clone-shared trees), so the space actually freed is visible.
 
 **Gate policy (targeted gates, known failures, time limits).**
 - `janus gate-scope <unit> [--name land-<unit>] [--dry-run]` runs the project's affected-scope hook (`[landing] scope_cmd`,
