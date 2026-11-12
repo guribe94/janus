@@ -377,6 +377,26 @@ def capped(text, n, note):
     on its own, so a long handoff or bd prime can never push the instruction or a later part out)."""
     return text if len(text) <= n else text[:n] + f"\n({note})"
 
+def session_start_text(cfg):
+    """What a session gets at start and on `janus resume --here` (item 4): the instruction first, then the live state, the
+    session memory, the decisions index and the owner rules (bd prime), each labelled and capped on its own (F2). The same text
+    either way, so a resumed session loses nothing (imp-resume reuses this from janus/setup.py)."""
+    # The instruction comes first, the one place the model weights most, and every part is labelled and capped on its own
+    # (F2): a long handoff or bd prime can no longer push the instruction past the cut.
+    head = (f"[janus] You are the orchestrator of {cfg.name} (janus skill). First act: run janus check, act on every line, "
+            f"janus ack <key> \"what you did\", then update the Orchestrator notes. Below: (1) HANDOFF.md: Live state as of "
+            f"the last check, then your notes; (2) session MEMORY.md; (3) decision titles; (4) owner rules (bd prime).")
+    parts = [head]
+    hp = handoff_path(cfg)
+    if hp.exists(): parts += ["## 1 HANDOFF.md", capped(hp.read_text(), 16000, "cut: read .janus/HANDOFF.md")]
+    mt = memory_text(cfg)
+    if mt: parts += ["## 2 MEMORY.md", capped(mt, 8000, "cut: janus memory")]
+    dt = decisions_text(cfg)
+    if dt: parts += ["## 3 Decisions", capped(dt, 6000, "cut: janus decisions")]
+    rc, o, e = sh(["bd", "prime"], cwd=cfg.beads, timeout=20)
+    parts += ["## 4 Owner rules (bd prime)", capped(o if rc == 0 else f"(bd prime unavailable: {e.strip()[:80]})", 6000, "cut: run bd prime")]
+    return "\n\n".join(parts)
+
 def cmd_hook(ev):
     try: d = json.loads(sys.stdin.read() or "{}")
     except Exception: d = {}
@@ -402,21 +422,7 @@ def cmd_hook(ev):
     if session_alive(cfg) is not True: record_session_proc(cfg)
     if d.get("transcript_path"): atomic_write(cfg.f("transcript"), d["transcript_path"])
     if ev == "SessionStart":   # cached state only: the hook has a 60 s limit, and the check runs as the session's first act (M14)
-        # The instruction comes first, the one place the model weights most, and every part is labelled and capped on its own
-        # (F2): a long handoff or bd prime can no longer push the instruction past the cut.
-        head = (f"[janus] You are the orchestrator of {cfg.name} (janus skill). First act: run janus check, act on every line, "
-                f"janus ack <key> \"what you did\", then update the Orchestrator notes. Below: (1) HANDOFF.md: Live state as of "
-                f"the last check, then your notes; (2) session MEMORY.md; (3) decision titles; (4) owner rules (bd prime).")
-        parts = [head]
-        hp = handoff_path(cfg)
-        if hp.exists(): parts += ["## 1 HANDOFF.md", capped(hp.read_text(), 16000, "cut: read .janus/HANDOFF.md")]
-        mt = memory_text(cfg)
-        if mt: parts += ["## 2 MEMORY.md", capped(mt, 8000, "cut: janus memory")]
-        dt = decisions_text(cfg)
-        if dt: parts += ["## 3 Decisions", capped(dt, 6000, "cut: janus decisions")]
-        rc, o, e = sh(["bd", "prime"], cwd=cfg.beads, timeout=20)
-        parts += ["## 4 Owner rules (bd prime)", capped(o if rc == 0 else f"(bd prime unavailable: {e.strip()[:80]})", 6000, "cut: run bd prime")]
-        ctx(ev, "\n\n".join(parts))
+        ctx(ev, session_start_text(cfg))
     elif ev == "UserPromptSubmit":
         pr = (d.get("prompt") or "").strip()
         janus_own = pr.startswith(JANUS_MARK) or pr.startswith("/")   # every prompt janus sends carries the mark (F15: no WAKE prefix list to keep in sync)

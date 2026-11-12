@@ -12,17 +12,24 @@ from janus.actions.backlog import cmd_backlog, cmd_fill
 from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_hosts, cmd_run, cmd_thrash
 from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_scope, cmd_land
 from janus.actions.launch import cmd_api_run, cmd_launch
-from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd_park, cmd_resume, cmd_stop
+from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd_park, cmd_resume as cmd_resume_unit, cmd_stop
 from janus.actions.swarm import cmd_forget, cmd_index, cmd_introduce, cmd_learned, cmd_ledger, cmd_memory, cmd_peers, cmd_remember, cmd_report, cmd_transcript
 from janus.actions.tidy import cmd_tidy
 from janus.check import cmd_ack, cmd_capacity, cmd_check, cmd_status
 from janus.quality import cmd_quality
-from janus.setup import cmd_doctor, cmd_init, cmd_install_host, cmd_queue, cmd_register, migrate
+from janus.setup import cmd_doctor, cmd_init, cmd_install_host, cmd_queue, cmd_register, cmd_resume_orch, migrate
 from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
 WRITERS = {"ack", "launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
            "remember", "forget", "memory", "index", "learned", "register", "board-close", "report"}
+
+def cmd_resume(cfg, a):
+    """janus resume: a parked unit when one is named, else the orchestration itself (janus/setup.cmd_resume_orch): continue it
+    in a Claude or Codex session with nothing lost."""
+    if a.unit is None: return cmd_resume_orch(cfg, a)
+    if a.runtime or a.here: raise Err("--runtime and --here resume the orchestration: give no unit")
+    return cmd_resume_unit(cfg, a)
 
 def main():
     ap = argparse.ArgumentParser(prog="janus"); sp = ap.add_subparsers(dest="cmd", required=True)
@@ -45,7 +52,10 @@ def main():
     add("api-run", cmd_api_run, A("unit"), A("--run", required=True), A("--model", required=True), A("--budget", type=float, required=True), A("--brief", required=True),
         A("--cwd", required=True), A("--report"), A("--resume-session", help="continue this agent session"), A("--prompt-file", help="the prompt (default: the brief's)"))
     add("park", cmd_park, A("unit"), dry=True)
-    add("resume", cmd_resume, A("unit"), A("--message", help="resume with this text instead of its jobs' results"), A("--force", action="store_true", help="resume although its jobs have not finished"), dry=True)
+    add("resume", cmd_resume, A("unit", nargs="?", help="a parked unit to resume; with no unit: continue the orchestration in a new session"),
+        A("--runtime", choices=["claude", "codex"], help="the runtime for the new orchestrator session (default: the registered one)"),
+        A("--here", action="store_true", help="register this session as the orchestrator, instead of starting a new one"),
+        A("--message", help="resume a unit with this text instead of its jobs' results"), A("--force", action="store_true", help="resume although its jobs have not finished"), dry=True)
     add("ledger", cmd_ledger, A("action", choices=["check", "repair", "reconcile"]), A("--provider"), dry=True)
     add("doctor", cmd_doctor, A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", cmd_backlog, A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...>"), dry=True)
