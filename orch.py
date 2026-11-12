@@ -1392,7 +1392,7 @@ def place(cfg, a, brief, mc, units, hs):
     first matching [placement] rule of orch.toml (regex over unit name and brief text = host), or the worktree's sticky host in
     out/linux-host/<unit>), when the model may run there; else the allowed host with the most measured room."""
     allowed = [n for n in cfg.hosts if n in mc.get("hosts", list(cfg.hosts))]
-    if a.host: return [a.host], "--host"
+    if a.host: return [a.host], "--host", (a.test_host if a.test_host in cfg.hosts else None)   # (hosts, why, build host): review-fixes8 #1
     txt = brief.read_text() if brief.is_file() else ""
     want = a.test_host
     if not want:
@@ -1411,8 +1411,8 @@ def choose(cfg, a, brief, mc, units, hs):
     """(agent host, build host, why) for a new unit, or Err saying why not and when to expect room. The agent host has room for
     one more agent by reservations (room); the build host (where its builds and tests run: placement, else the agent host) has
     a free build reservation or a bounded queue position (build_room, orch-fixes8 item 3)."""
-    hosts, why_place, want = place(cfg, a, brief, mc, units, hs)
     if a.host and a.host not in cfg.hosts: raise Err(f"unknown host {a.host}")
+    hosts, why_place, want = place(cfg, a, brief, mc, units, hs)
     best, bn, notes = None, 0, []
     for n in hosts:
         r, why = room(cfg, n, hs[n], units, a.kind == "cleanup")
@@ -1580,6 +1580,7 @@ def cmd_launch(cfg, a):
                 if d: raise Err(f"{name}: {d}")
                 herdr("agent", "prompt", name, prompt)
                 u.update(via="herdr", pid=findkey(herdr("pane", "process-info", "--pane", pane), "pid"))
+                agent_res(cfg, hn, h, name, u.get("pid"))
             else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
         else:
             cli = {"claude": "claude", "codex": "codex", "opencode": "opencode run"}[mc["kind"]]
@@ -1591,6 +1592,7 @@ def cmd_launch(cfg, a):
             rc, o, er = X(h, pre + f"tmux new -d -s orch-{name} {shlex.quote(inner)} && tmux display -p -t orch-{name} '#{{pane_pid}}'")
             if rc: raise Err("tmux start failed: " + er.strip()[:100])
             u.update(via="tmux", pid=int(o.strip() or 0))
+            if not DRY: agent_res(cfg, hn, h, name, u["pid"])
             if not DRY:
                 pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd)
                 herdr("pane", "run", pane, f"ssh -t {h['ssh']} tmux attach -t orch-{name}"); u.update(pane=pane, tab=tab)
@@ -2076,8 +2078,9 @@ def gate_results(cfg):
     return r
 
 def landed(cfg, u):
-    """True when the unit's worktree HEAD is on the landing branch ([landing] branch, default the main repo's HEAD branch);
-    None when it cannot be told (no worktree of its own)."""
+    """True when the unit's worktree HEAD is on the landing branch ([landing] branch, default the main repo's HEAD branch):
+    an ancestor of it, or (squash-landed, orch land) its tree is the tree of one of the branch's last 200 commits. None when
+    it cannot be told (no worktree of its own)."""
     c = Path(u.get("cwd", "/"))
     if c.resolve() == cfg.root.resolve() or not c.is_dir(): return None
     br = cfg.c.get("landing", {}).get("branch")
@@ -2085,7 +2088,9 @@ def landed(cfg, u):
         rc, o, e = sh(["git", "-C", str(c), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         br = o.strip() if rc == 0 and o.strip() else "main"
     rc, o, e = sh(["git", "-C", str(c), "merge-base", "--is-ancestor", "HEAD", br])
-    return True if rc == 0 else False if rc == 1 else None
+    if rc != 1: return True if rc == 0 else None
+    t = sh(["git", "-C", str(c), "rev-parse", "HEAD^{tree}"])[1].strip()
+    return t in sh(["git", "-C", str(c), "log", "--format=%T", "-n", "200", br])[1].split()
 
 def landing_findings(cfg, units, hs=None):
     ld = cfg.c.get("landing", {}); mins = ld.get("finished_min", 30); need = ld.get("gates_required", 1)
@@ -2347,6 +2352,14 @@ def slots(h, cfg=None):
     work; each job still waits for admission by reservations (runs/cap.sh), which also counts memory."""
     n = cap_nums(cfg, h); return max(1, n["cores"] // n["cpj"])
 
+def agent_res(cfg, hn, h, name, pid):
+    """An interactive agent's reservation (runs/agent-<unit>.res, its pane's pid), as API agents write theirs: the shell admission
+    (cap.sh) then counts it like the launcher does (review-fixes8 #3); it is dropped when the pid is gone."""
+    if not pid: return
+    mb = class_mb([], "agent", cap_nums(cfg, h)["agmb"], 0)
+    write_cap(cfg, hn, h)
+    hrun(h, f"mkdir -p {h['_rd']} && echo '{int(pid)} 0 {mb} {int(now())} agent' > {h['_rd']}/agent-{name}.res")
+
 def ensure_lanes(h, cfg=None):
     p = pueue(h); n = slots(h, cfg)
     g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1} if h.get("local") else {})
@@ -2365,10 +2378,12 @@ ADMIT = r'''# Admission (orch-fixes8): by reservations, rule in $RD/cap.sh (re-r
 [ -f "$RD/cap.sh" ] || { echo "orch: no $RD/cap.sh on this host (orch run or orch launch writes it)"; exit 125; }
 lane=%(lane)s; . "$RD/cap.sh"; CLS=$(cap_class %(clsrc)s)
 if command -v flock >/dev/null 2>&1; then exec 7>>"$RD/admit.lock"; lk() { flock 7; }; ulk() { flock -u 7; }
-else lk() { until mkdir "$RD/admit.d" 2>/dev/null; do sleep 1; done; }; ulk() { rmdir "$RD/admit.d" 2>/dev/null; }; fi
+else   # no flock: a lock dir holding its owner's pid; a dead owner's dir is taken over (a SIGKILL never leaves the host stuck)
+  lk() { until mkdir "$RD/admit.d" 2>/dev/null; do o=$(cat "$RD/admit.d/pid" 2>/dev/null); [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null && rm -rf "$RD/admit.d"; sleep 1; done; echo $$ > "$RD/admit.d/pid"; HELD=1; }
+  ulk() { rm -rf "$RD/admit.d"; HELD=; }; fi
 gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && return 0; done; return 1; }
 W=$R.wait; [ $lane = gates ] && W=$R.gwait; echo $$ > $W
-trap 'rm -f $W $R.res' EXIT; trap 'rm -f $W $R.res; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
+HELD=; trap 'rm -f $W $R.res; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; trap 'rm -f $W $R.res; [ -n "$HELD" ] && rm -rf "$RD/admit.d"; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
 said=
 while :; do
   if [ $lane = gates ] || ! gates_waiting; then
@@ -2699,10 +2714,16 @@ def cmd_land(cfg, a):
     if not base: raise Err(f"no branch {br}")
     ahead = int(git(wt, "rev-list", "--count", f"{br}..HEAD")[1].strip() or 0); behind = int(git(wt, "rev-list", "--count", f"HEAD..{br}")[1].strip() or 0)
     if not ahead: raise Err(f"{branch} has no commits over {br}: nothing to land")
+    if landed(cfg, u): raise Err(f"{a.unit} is already landed: {br} holds its tree ({branch} has no change since): orch close {a.unit}")
     say(f"land {a.unit}: {branch} in {wt}, {ahead} commit(s) ahead of {br} ({base[:9]}), {behind} behind")
     # 1. merge the current landing branch (dry run: merge-tree only)
     rc, o, e = git(wt, "merge-tree", "--write-tree", "--name-only", "HEAD", br)
-    if rc not in (0, 1): raise Err(f"git merge-tree failed: {(e or o).strip()[:120]}")
+    if rc not in (0, 1) and not DRY:   # git before 2.38 has no merge-tree --write-tree: a trial merge, always aborted (tree clean)
+        rc2, o2, e2 = git(wt, "merge", "--no-commit", "--no-ff", br, timeout=600)
+        cf_ = git(wt, "diff", "--name-only", "--diff-filter=U")[1]; git(wt, "merge", "--abort")
+        if rc2 and not cf_.strip(): raise Err(f"git merge-tree and a trial merge failed: {(e or o).strip()[:80]}; {(e2 or o2).strip()[:80]}")
+        rc, o = (1, "-\n" + cf_) if cf_.strip() else (0, "")
+    elif rc not in (0, 1): raise Err(f"git merge-tree failed: {(e or o).strip()[:120]}")
     if rc == 1:
         files = [l for l in o.split("\n\n")[0].splitlines()[1:] if l.strip()][:20] or ["(see git merge)"]   # tree id, then the conflicted paths
         say(f"STOP: merging {br} conflicts in {len(files)} file(s): {', '.join(files[:6])}")

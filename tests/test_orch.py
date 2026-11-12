@@ -228,6 +228,13 @@ class Capacity(unittest.TestCase):
         self.assertFalse((rd / "t-1.res").exists())
         f = (rd / "history.tsv").read_text().split("\t")
         self.assertTrue(f[1].startswith("python")); self.assertGreaterEqual(int(f[2]), 50)   # class and its peak (60 MB held)
+    def test_launch_host_option(self):
+        """review-fixes8 #1: --host placed the agent with a 2-tuple where choose() unpacks 3."""
+        d, cfg = project()
+        a = type("A", (), {"host": "here", "test_host": None, "unit": "u", "kind": "review"})()
+        hs = {"here": {"name": "here", "ok": True, "avail_mb": "8000", "disk_gb": "100"}}
+        hn, b, why = orch.choose(cfg, a, d / "briefs/none.md", cfg.models["m"], [], hs)
+        self.assertEqual((hn, b), ("here", "here"))
     def test_build_room_and_when(self):
         p = host_probe(cap_rj="2", cap_rc="4", cap_rm="5000", hist=[f"{int(time.time()) - 100}\tcargo_test\t2000\t600\t0"],
                        res=[f"1 2 2300 {int(time.time()) - 60} cargo_test a.res"])
@@ -295,6 +302,16 @@ class Land(unittest.TestCase):
         self.assertEqual(orch.cmd_land(self.cfg, self.a()), 3)                 # conflict: stops ...
         self.assertEqual(self.g("rev-parse", "HEAD", cwd=self.wt).stdout, head)   # ... with the tree untouched
         self.assertNotEqual(self.g("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=self.wt).returncode, 0)
+    def test_land_once(self):
+        """review-fixes8 #2: after a squash-land the unit counts as landed (its tree is on main), and a second land is refused."""
+        (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: b", cwd=self.wt)
+        (self.r / "c").write_text("main moved\n"); self.g("add", "c"); self.g("commit", "-qm", "main: c")
+        self.assertIs(orch.landed(self.cfg, self.u), False)
+        self.assertEqual(orch.cmd_land(self.cfg, self.a()), 0)
+        self.assertIs(orch.landed(self.cfg, self.u), True)
+        with self.assertRaises(orch.Err) as e: orch.cmd_land(self.cfg, self.a())
+        self.assertIn("already landed", str(e.exception))
+        self.assertEqual(self.g("rev-list", "--count", "main").stdout.strip(), "3")   # no duplicate squash commit
     def test_gate_required(self):
         (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: b", cwd=self.wt)
         with self.assertRaises(orch.Err) as e: orch.cmd_land(self.cfg, self.a(no_gate=False))
