@@ -201,6 +201,11 @@ project directory as the orchestrator (for example, run `claude` there), and ins
 This one session is the orchestrator; hooks act only for it (other sessions are left alone — see docs/REFERENCE.md,
 section 2). If the session id is not known yet, `register` says `pending` and the next hook event claims it.
 
+To take over an orchestrator that is already running (another session, or another machine), run `janus resume
+[--runtime claude|codex] [--here]`: it asks a live orchestrator to stop, syncs the state, and starts a new session in the
+chosen runtime — or, with `--here`, registers the current session — with the handoff, rules and a fresh check. Hand back by
+leaving the notes current and running `janus register` in the session you keep (see docs/REFERENCE.md, section 5).
+
 ## Adding machines
 
 Add a `[hosts.<name>]` entry per machine with its ssh name, architecture, a root folder, and its cores and memory. Run
