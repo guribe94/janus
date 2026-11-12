@@ -349,9 +349,57 @@ check output.
 close it (it was a one-off, now done) or make it a standing rule with `bd remember "..."`. Rules come back at every session
 start through `bd prime`, so the owner never has to repeat them.
 
-**The message board.** `paths.board` is your script. orch calls `summary` with `BOARD_SILENT_MIN` (each row: name, machine,
-state; `SILENT` or `GONE` flags; `check` reports question and blocked states and both flags for every card), `rule <unit> <machine>` (text added to every agent prompt), `post` (on launch) and `close` (on close).
-Agents post their progress to it; the orchestrator reads `orch` output rather than the board or panes directly.
+A rule that changes an older one replaces it: `bd remember "<rule>" --key <subject>`, reusing the old rule's key (`bd memories
+<word>` finds it). `check` raises `rule-subject:<subject>` when two rules share a subject.
+
+### Memory
+
+`.orch/MEMORY.md` is the session's curated memory: three sections (Decisions, Facts, Pitfalls), one dated line per entry. The
+orchestrator is its only writer:
+- `orch remember --decision|--fact|--pitfall "<text>" [--source <path|sha|job>] [--key <subject>]`: a fact needs a source;
+  an exact duplicate is refused; an entry with the same `--key` replaces the older one (moved to `.orch/memory-history.md`).
+- `orch forget <n|subject|text>` moves an entry to the history; `orch memory` lists them; `orch memory --keep <n>` re-dates
+  one after review. Agents cannot write it (`ORCH_ROLE=agent` is refused); they propose with a `learned` board post.
+- `check`: `memory-long` over `[memory] cap_lines` (30), `memory-source:<n>` when a cited path is gone, `memory-review:<n>`
+  for an entry older than `review_days` (14), `memory-subject:<key>` for two entries on one subject.
+- Every agent's brief starts with it, under "Session memory (curated by the orchestrator; your brief wins on conflict)", and
+  the orchestrator's SessionStart hook injects it with the handoff and `bd prime`.
+
+### Swarm awareness
+
+Headless agents (`claude -p --bare`) skip CLAUDE.md, memories and hooks: they see only their prompt and brief. So orch's brief
+header carries, after the run rules and the memory, pointers (never content):
+- the project's agent instructions (`[memory] agent_docs`, default `AGENTS.md`: the root one and the one in each folder touched);
+- the reports index: `out/INDEX.md` (one line per unit: verdict, result, report path), written by `orch index` and at every
+  `orch commit-state`, with a copy `index.md` in the board folder;
+- the peers file: `peers.md` in the board folder, written every check/watch cycle: one line per running unit with host,
+  model, branch, files changed so far, current step, jobs it waits on, report and transcript location (`orch peers` prints it);
+- how to read another agent's transcript: `orch transcript <unit> [--grep <re>] [--tail N]` finds the unit's sessions from its
+  run records, reads them on the host that holds them (Claude Code jsonl, Codex sessions; opencode keeps its own database and is
+  not read) and prints condensed text: messages and one-line tool summaries. `orch collect` saves `out/<unit>/transcript.md`.
+- the rule: read peers and the index when your task touches another unit's area; read a transcript only to solve a problem
+  another unit met, by grep or tail, never whole.
+
+`check` raises `overlap:<a>:<b>` when two running units change the same file. Because the index and peers live in the board
+folder, the board's sync carries them to every host: the same files serve one machine or many.
+
+### Board
+
+`paths.board` unset means the `board.sh` shipped with orch (a project may keep its own script there). Its files live in
+`paths.board_dir` (default `board/`); check writes `.master`, `.hosts` (from orch.toml) and `.notify` there.
+- Agents post **state changes only**: `status` at start, `waiting <job ids>` when parked (never SILENT or GONE; orch posts it
+  when it parks a unit), `blocked`, `question`, `learned <fact and source>`, `done <VERDICT line>`. Steps go in the report.
+- A question gets an id (`q12`) and stays "needs answer" until the orchestrator answers it: `board.sh answer <id> <text>`, or
+  `board.sh direct <agent> <text>` (answers that agent's open questions). `check` raises `question:<id>` until then. A new
+  question or block runs `orch watch --alert`, which prompts the orchestrator at once (each one once).
+- `board.sh direct all <text>` broadcasts to every open card (it answers no question); remember a standing one with
+  `orch remember`.
+- A `learned` post shows in `check` as `learned:<agent>:<n>` until `orch remember ... --learned <agent>:<n>` or
+  `orch learned --reject <agent>:<n>`.
+- `board.sh summary` groups cards: needs answer, question, blocked, working, waiting, done. `board.sh digest [--since 1h]`
+  tells a human what landed, started, finished, was asked, answered, failed or learned.
+- Cards of closed units are archived by check. Other hosts post to an outbox under their root; `board.sh sync` (the watcher
+  runs it each pass) merges the outboxes and pushes the board, and the script itself, to `<root>/board/` and `<root>/bin/`.
 
 ## 7. Multiple machines, capacity and network outages
 
