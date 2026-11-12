@@ -361,48 +361,34 @@ def old_orch_procs(ps_text=None, root=None):
     return [(int(f[0]), f[1]) for f in (l.split(None, 1) for l in o.splitlines())
             if len(f) == 2 and f[0].isdigit() and _old_orch_script(int(f[0]), _sh_words(f[1]), r)]
 
-def _loop_name(cmd):
-    """The old loop a process runs (`handoff-queue`, `fleet-loops`, ...) from its own script argument, or None. Finding 5
-    (fix-install6) uses it to tell a handoff-queue worker -- which waits for its gate's result in a `while ...; do sleep 5; done`
-    loop, so its only child is `sleep` -- from a loop that idles in sleep and may be stopped."""
-    w = _sh_words(cmd)
-    i = 0
-    while i < len(w) and (os.path.basename(w[i]) in OLD_ORCH_WRAPS or re.match(r"^[A-Za-z_]\w*=", w[i])): i += 1
-    if i < len(w) and os.path.basename(w[i]) in OLD_ORCH_SHELLS:
-        j = i + 1
-        while j < len(w) and w[j].startswith("-"): j += 1
-        i = j
-    if i >= len(w): return None
-    b = os.path.basename(w[i])
-    return b[:-3] if b.endswith(".sh") else b
-
-def live_children(pid, keep_sleep=False):
-    """pids of the process's living children that are real work: a handoff-queue worker mid-handoff has its child gate running.
-    Finding 4: a standing loop idles in `sleep 30` (its only child), which is not work, so TERMing the loop is safe and
-    --retire stops the loops it exists for. Finding 5 (fix-install6): a handoff-queue worker waits for its gate's result in a
-    `while ...; do sleep 5; done` loop, so its only child is `sleep` -- keep_sleep keeps it, so the worker is never TERMed
-    mid-handoff (which would leave the handoff half-done and orphan its gate)."""
+def live_children(pid):
+    """pids of the process's living children that are real work: a standing loop idles in `sleep 30` (its only child), which is
+    not work, so TERMing the loop is safe and `--retire` stops the loops it exists for (finding 4). Finding F: the worker's OWN
+    live state -- a real child (its gate mid-handoff), not the loop's name -- decides; a `sleep` child is never work, so an idle
+    loop, a handoff-queue worker included, is stopped, while a worker whose gate runs is kept. The literal `handoff-queue` test
+    the previous fix added is dropped: it could never tell an idle handoff-queue loop (also in sleep) from a mid-handoff one."""
     rc, o, e = run(["pgrep", "-P", str(pid)], timeout=10)
     if rc or not o.strip(): return []
     kids = [int(x) for x in o.split()]
     rc, o, e = run(["ps", "-o", "pid=,comm=", "-p", ",".join(map(str, kids))], timeout=10)
     if rc or not o.strip(): return kids
     return [int(l.split()[0]) for l in o.splitlines()
-            if l.strip() and (keep_sleep or os.path.basename(l.split(None, 1)[1]) != "sleep")]
+            if l.strip() and os.path.basename(l.split(None, 1)[1]) != "sleep"]
 
 def retire_old_orch(dry=False, retire=False, ps_text=None, root=None):
     """Item 14: list the old orch's standing processes (the full command line, so the owner can tell a loop from a waiter) and,
     only with the owner's explicit yes (--retire), stop them (TERM). Finding 6: a process that still holds a live child (a
-    handoff-queue worker mid-handoff, whose child gate TERM would orphan) is listed and left alone. Finding 4: an idle loop's
-    `sleep` child is not work, so the loop is stopped (not kept). Finding 5 (fix-install6): a handoff-queue worker polling with
-    `sleep` is mid-handoff, so it is kept too, and the `kill` result is read (a refused TERM is reported, never counted as sent)."""
+    worker mid-handoff, whose child gate TERM would orphan) is listed and left alone. Finding 4: an idle loop's `sleep` child is
+    not work, so the loop is stopped (not kept). Finding F: the worker's own live state decides -- a real child (a gate) keeps
+    it, a `sleep` child does not, whatever the loop is named -- so an idle handoff-queue loop is stopped and a mid-handoff one
+    kept; and the `kill` result is read (a refused TERM is reported, never counted as sent)."""
     procs = old_orch_procs(ps_text, root)
     if not procs: return []
     out = [f"old orch process {p} still running: {c}" for p, c in procs]
     if retire and not dry:
         n = 0
         for p, c in procs:
-            ch = live_children(p, keep_sleep=_loop_name(c) == "handoff-queue")
+            ch = live_children(p)
             if ch:
                 out.append(f"-> kept pid {p}: it has a live child ({', '.join(map(str, ch))}): a mid-handoff worker, TERM would orphan its gate")
                 continue
