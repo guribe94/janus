@@ -154,6 +154,29 @@ class Item12FinalGate(unittest.TestCase):
         for cfg_form in ('bin/gate.sh --branch "{branch}"', "bin/gate.sh --branch '{branch}'"):
             self.assertEqual(janus.final_gate_cmd({"final_gate": cfg_form}, "u1", "/w", v), "bin/gate.sh --branch " + _s.quote(v), cfg_form)
 
+    def test_a_placeholder_in_any_quoting_form_is_safe_and_sh_c_works(self):
+        """Catches (finding 3, fix-install6): final_gate_cmd dropped the config's quotes only when the placeholder was alone
+        between matching quotes, so a placeholder inside double quotes with surrounding text (`--ref "refs/heads/{branch}"`,
+        `"--branch={branch}"`, `ssh h "./gate '{branch}'"`) was inserted raw and `$(...)` in the agent's branch ran on the gate
+        host; and `sh -c 'cd "{wt}" && ./check'` (double quotes nested in single quotes) lost the config's quotes, so the
+        shlex.quote single quotes broke the outer `sh -c` quotes and the gate failed (rc 1) although the path was fine."""
+        d = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-i12g-"))
+        wt = d / "My Code" / "wt"; wt.mkdir(parents=True)
+        (wt / "check").write_text("#!/bin/sh\necho CHECK-RAN\n"); (wt / "check").chmod(0o755)
+        cmd = janus.final_gate_cmd({"final_gate": "sh -c 'cd \"{wt}\" && ./check'"}, "u1", str(wt), "b")
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, cwd=d)
+        self.assertEqual(r.returncode, 0, cmd + " :: " + r.stderr)
+        self.assertIn("CHECK-RAN", r.stdout)
+        (d / "bin").mkdir(); (d / "bin" / "ssh").write_text("#!/bin/sh\nexit 0\n"); (d / "bin" / "ssh").chmod(0o755)
+        env = {**os.environ, "PATH": str(d / "bin") + os.pathsep + os.environ.get("PATH", "")}
+        for form in ('cd "{wt}/sub" && ./gate --branch {branch}', './gate --ref "refs/heads/{branch}"',
+                     './gate "--branch={branch}"', "ssh h \"./gate '{branch}'\"", './gate "{branch}"', "./gate {branch}"):
+            marker = d / "PWNED"
+            evil = "wk/x$(touch${IFS}" + str(marker) + ")"
+            out = janus.final_gate_cmd({"final_gate": form}, "u1", "/w/My Code/wt", evil)
+            subprocess.run(["sh", "-c", out], capture_output=True, text=True, cwd=d, env=env, timeout=20)
+            self.assertFalse(marker.exists(), f"a $() in the branch ran for {form!r}: {out}")
+
 
 class Item8ThrashExplicit(unittest.TestCase):
     def test_a_thrash_stop_is_written_to_the_job_log_and_names_the_requeue(self):

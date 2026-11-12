@@ -146,24 +146,54 @@ gates the merged tree and squash-lands it. Write REPORT.md with what each confli
 
 def git(wt, *a, timeout=120): return sh(["git", "-C", str(wt), *a], timeout=timeout)
 
+def _dq_escape(v):
+    """v made literal inside a shell double-quoted string: escape the characters double quotes still expand (\\, ", $, `)."""
+    return re.sub(r'([\\"$`])', r'\\\1', str(v))
+
 def final_gate_cmd(ld, unit, wt, branch):
-    """The [landing] final_gate command with {unit}, {wt} and {branch} substituted (item 12), each shell-quoted (finding 7): an
-    agent names its own branch and the command runs on the final-gate host, so a hostile branch name or a path with a space
-    must not split the command. A `${...}` in the config is left intact (only a bare {name} is substituted), and a placeholder
-    already inside quotes in the config (`--wt "{wt}"`) is substituted unquoted, never quoted twice (finding 10)."""
+    """The [landing] final_gate command with {unit}, {wt} and {branch} substituted (item 12), each shell-quoted for the quote
+    context it sits in (finding 7, finding 3): an agent names its own branch and the command runs on the final-gate host, so a
+    hostile branch name or a path with a space must not split the command, and a `$(...)` in the value must never run in ANY
+    quoting form. The template is scanned with its quote state tracked (a `"` inside single quotes is literal, a `'` inside double
+    quotes is literal), so `sh -c 'cd "{wt}" && ./check'` (a placeholder inside double quotes inside single quotes) still works: a
+    placeholder alone between matching quotes drops them and is quoted once (shlex.quote), one inside double quotes is escaped for
+    double quotes, one inside single quotes is escaped for single quotes, and one bare is shlex.quote'd. A `${...}` in the config
+    is left intact (only a bare {name} is substituted)."""
     s = ld.get("final_gate") or ""
-    for k, v in (("unit", unit), ("wt", str(wt)), ("branch", branch)):
-        out, i = [], 0
-        for m in re.finditer(r"(?<!\$)\{" + k + r"\}", s):
-            if m.start() < i: continue
-            before = s[m.start() - 1] if m.start() else ""; after = s[m.end()] if m.end() < len(s) else ""
-            q = before if before and before == after and before in "\"'" else ""
-            # finding 10: the config's own quotes are DROPPED and shlex.quote is always applied, so a value is never inserted
-            # raw inside the config's quotes (which let `"$(...)"` run); the value itself keeps its shell safety.
-            out += [s[i:m.start() - 1] if q else s[i:m.start()], shlex.quote(str(v))]
-            i = m.end() + (1 if q else 0)
-        s = "".join(out) + s[i:]
-    return s
+    vals = {"unit": str(unit), "wt": str(wt), "branch": str(branch)}
+    out, i, q, n = [], 0, None, len(s)   # q: the shell quote context at i (None, "'", '"')
+    def ph(j):
+        if j and s[j - 1] == "$": return None   # `${name}` in the config is not a placeholder
+        m = re.match(r"\{(\w+)\}", s[j:])
+        return (m.group(1), j + m.end()) if m and m.group(1) in vals else None
+    while i < n:
+        c = s[i]
+        if q is None:
+            if c in "\"'":
+                m = re.match(r"([\"'])\{(\w+)\}\1", s[i:])
+                if m and m.group(2) in vals:   # the placeholder alone between matching quotes: drop the pair, quote once
+                    out.append(shlex.quote(vals[m.group(2)])); i += m.end(); continue
+                out.append(c); q = c; i += 1; continue
+            if c == "\\":
+                out.append(c); i += 1
+                if i < n: out.append(s[i]); i += 1
+                continue
+            g = ph(i)
+            if g: out.append(shlex.quote(vals[g[0]])); i = g[1]; continue
+        elif q == "'":
+            if c == "'": out.append(c); q = None; i += 1; continue
+            g = ph(i)
+            if g: out.append(vals[g[0]].replace("'", "'\\''")); i = g[1]; continue
+        else:   # q == '"'
+            if c == '"': out.append(c); q = None; i += 1; continue
+            if c == "\\":
+                out.append(c); i += 1
+                if i < n: out.append(s[i]); i += 1
+                continue
+            g = ph(i)
+            if g: out.append(_dq_escape(vals[g[0]])); i = g[1]; continue
+        out.append(c); i += 1
+    return "".join(out)
 
 def cmd_land(cfg, a):
     """janus land <unit>: in the unit's worktree, merge the current landing branch ([landing] branch, default main); on a conflict
