@@ -148,5 +148,26 @@ class OnceOnly(unittest.TestCase):
             self.assertEqual(calls, [False, True], "a capped run was wrapped up twice")
 
 
+class MoveOffDownHost(unittest.TestCase):
+    def test_a_moved_job_never_runs_twice_and_device_jobs_stay(self):
+        """Catches (panel-eng F3): after a partition the host's old copy of a moved job had started, was not cancelled on its
+        return and ran twice; and a job needing a device (--usb) moved to a host without it."""
+        d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/tmp/x"\n[autopilot]\nenabled = true\n')
+        jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
+        jd.joinpath("j1.json").write_text(json.dumps({"host": "far", "task": 5, "unit": "u"}))
+        jd.joinpath("j2.json").write_text(json.dumps({"host": "far", "task": 6, "unit": "u", "usb": True}))
+        cancels, queued = [], []
+        q = {"status": "Queued", "label": "unit:u"}; r = {"status": "Running", "label": "unit:u"}
+        with mock.patch.object(janus, "cancel_job", lambda cfg, ref: cancels.append(ref) or ["cancelled"]), \
+             mock.patch.object(janus, "requeue", lambda cfg, spec, to: queued.append(spec["task"]) or "here:9"), \
+             mock.patch.object(janus, "requeue_host", lambda *a: "here"), mock.patch.object(janus, "board", lambda *a, **k: (0, "", "")):
+            janus.move_off_down_hosts(cfg, {"far": {"ok": True, "pueue": {"tasks": {"5": q, "6": q}}}, "here": {"ok": True}}, [], lambda m: None)
+            cfg.jput("hosts.json", {"far": time.time() - 3600})
+            janus.move_off_down_hosts(cfg, {"far": {"ok": False}, "here": {"ok": True}}, [], lambda m: None)
+            self.assertEqual(queued, [5], "the device job was moved, or the plain one was not")
+            janus.move_off_down_hosts(cfg, {"far": {"ok": True, "pueue": {"tasks": {"5": r, "6": q}}}, "here": {"ok": True}}, [], lambda m: None)
+        self.assertEqual(cancels, ["far:5"], "the old copy that started during the partition was not cancelled")
+
+
 if __name__ == "__main__":
     unittest.main()
