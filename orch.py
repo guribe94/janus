@@ -1126,10 +1126,10 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
-    F += git_findings(cfg) + memory_findings(cfg)
+    F += git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg)
     try:
         ins = Beads(cfg).issues("instruction")
-        if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done or bd remember): " + "; ".join(i['title'][:50] for i in ins[:3])))
+        if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done, or bd remember --key <subject>: same subject replaces): " + "; ".join(i['title'][:50] for i in ins[:3])))
     except Err: pass
     for s in handoff_stale(cfg, running): F.append(("handoff", s))
     if sys.platform == "darwin" and sh(["launchctl", "list", "com.orch.watch"])[0]: F.append(("watcher", "watcher com.orch.watch is not running: run install"))
@@ -3676,6 +3676,27 @@ def mem_source_gone(cfg, s):
     p = Path(os.path.expanduser(s.split(":")[0] if re.match(r"^[^/]+:\d+$", s) else s))
     return not (p if p.is_absolute() else cfg.root / p).exists()
 
+RULE_STOP = {"a", "an", "the", "of", "on", "in", "to", "for", "and", "or", "is", "are", "be", "by", "with", "at", "from", "owner",
+             "must", "always", "never", "only", "all", "every", "use", "do", "not", "no"}
+
+def rule_subject(key):
+    """A standing rule's subject: the first three words of its beads memory key that are not filler (claude-api-on-the-new-key-cap
+    and claude-api-on-the-new-key-keychain share 'claude api new')."""
+    w = [x for x in re.split(r"[^a-z0-9]+", key.lower()) if x and x not in RULE_STOP and not x.isdigit()]
+    return "-".join(w[:3]) if len(w) >= 2 else None
+
+def rule_findings(cfg):
+    """rule-subject:<subject> when two standing rules (beads memories) are on the same subject: a newer rule replaces the older
+    (bd remember <text> --key <the old key>), it never sits beside it (orch-swarm item 7)."""
+    rc, o, e = sh(["bd", "memories", "--json"], cwd=cfg.beads)
+    try: mem = json.loads(o) if rc == 0 and o.strip() else {}
+    except Exception: return []
+    if not isinstance(mem, dict): return []
+    by = {}
+    for k in mem: by.setdefault(rule_subject(k), []).append(k)
+    return [(f"rule-subject:{sj}", f"{len(ks)} standing rules on one subject ({', '.join(sorted(ks)[:4])}): keep the current one under one key "
+             f"(bd remember \"<rule>\" --key {sorted(ks)[0]}) and bd forget the others") for sj, ks in by.items() if sj and len(ks) > 1]
+
 def learned_mark(cfg, lid, how):
     """Record that learned post <agent>:<n> was remembered or rejected (check then stops listing it)."""
     lid = lid.removeprefix("learned:"); d = cfg.jget("learned.json"); d[lid] = {"how": how, "t": int(now())}
@@ -4125,7 +4146,8 @@ def cmd_hook(ev):
         if pr and not orchs and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
             try:
                 i = Beads(cfg).create("instr: " + re.sub(r"\s+", " ", pr)[:70], "instruction", pr[:4000]); cfg.touch("changed")
-                ctx(ev, f"Filed as instruction {i}: close it as done, or make it a standing rule with bd remember.")
+                ctx(ev, f"Filed as instruction {i}: close it as done, or make it a standing rule with bd remember \"<rule>\" --key <subject> "
+                    "(a rule on a subject that already has one replaces it: use that rule's key, bd memories); if it affects several agents, also orch remember --decision.")
             except Err: pass
     elif ev == "PreToolUse":
         why = pretool_why(cfg, d)
