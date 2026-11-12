@@ -95,6 +95,10 @@ for). Optional `[lanes.<lane>] age_min` overrides a lane's age limit. `example.j
 **`[caps]`** (optional, only when the owner wants them): `total = 6`, and `[caps.host] server = 2`. With no caps the limit
 is what each machine can safely hold.
 
+**`[janus]`**: `issues_file` (the skill's issue register that `janus issue` appends to and `janus check` writes a repeated
+finding to; unset by default) and `ack_issue_n` (default 3: the number of acks of one finding key at which it earns an issue
+row).
+
 **`[providers.<name>]`**: `enabled`, and optionally `cap_usd`, `ledger`, `budget_per_unit`, the secret store of the API key
 (`key_keychain`: a macOS keychain item; `key_file`: a `VAR=value` file that only you can read, mode 600; `key_env`: the
 variable, default `ANTHROPIC_API_KEY`) and `cmd` (the agent command; default `claude --bare -p --model {api_id}
@@ -155,7 +159,8 @@ $ janus check
 [gate:nightly@09:12:44] gate nightly FAILED at 09:12:44 (x y); re-queue or classify
 [board:u7:question] u7 is QUESTION on the board: which baseline? ...; answer with board.sh direct
 ```
-Options: `--brief` (at most 8 lines), `--escalate` (only problems open longer than `deadline_min`).
+Options: `--brief` (at most 8 lines), `--escalate` (only problems open longer than `deadline_min`), `--acked` (list the
+findings a live ack is hiding: key, the ack's decision, its age and its ttl).
 What it reports: per host and lane (`gates`, `jobs`, `land`), queued work with free slots or a paused group ("STALLED"),
 queued or admission-waiting work while the host has room for another job ("IDLE"), a host with free slots in a lane while
 another host has a backlog there, lane jobs older than their class age limit (enqueue to now: gates 240, jobs 120, land 240
@@ -270,6 +275,12 @@ acked unit:parser:finished
 ```
 
 **`janus status`**: prints the Live state (hosts, units, ready work, spend, problems) without counting as a cycle.
+
+**`janus issue "<text>" [--evidence <path|sha|job>] [--key <finding key>]`**: append one row to the skill's issue register
+(`[janus] issues_file`, a path under the project root or absolute; refused when unset). A row is generic: no project, host or
+person. `--key <k>` makes it idempotent (a row for that key is written once) and is what `check`'s `issue:<k>` finding points
+at; when the register is configured, `janus check` writes that row itself the first time a key has been acked `[janus]
+ack_issue_n` (3) times, so a rule that keeps coming back is tracked, not re-remembered.
 
 **`janus decide` / `janus decisions`**: the decision records (docs/DECISIONS.md). `janus decide "<title>" --by owner|orchestrator
 --decision "<one sentence>" [--why "<ruling>"] [--context ...] [--options "<option and trade-off>" ...] [--consequences ...]
@@ -419,6 +430,7 @@ table is the plain-language list of the families the reference must name; the re
 | `idle-backlog` | ready backlog items without briefs while hosts have room, or held by budget |
 | `idle-with-backlog` | ready backlog units with briefs would fit now (`janus fill`) |
 | `instructions` | unclassified owner instructions in beads |
+| `issue` | a finding key acked 3+ times with no issue row logged (every oddity is logged) |
 | `known-failure` | a known failure with no open unit fixing it, or one that passes now |
 | `landing` | a finished DONE unit has no gate, or passed its gates and is not landed |
 | `learned` | an agent's learned post awaits remember or reject |

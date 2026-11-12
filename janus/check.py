@@ -11,7 +11,7 @@ from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
 from janus.context import DECISION_ACKS, Err, LB, note_event, LE, NOTES0, atomic_write, handoff_path, hrun, is_orchestrator, now, say, ts
 from janus.decisions import decision_findings
-from janus.findings import ackable, finding, live_acks
+from janus.findings import ackable, ack_ttl, finding, live_acks
 from janus.findings.hosts import (enforce, host_findings, lane_findings, orphan_job_findings, pane_findings, proc_findings,
     script_findings, thrash_findings, tidy_findings)
 from janus.findings.awareness import note_findings, related_findings   # imp-awareness: related:<a>:<b>, note:<agent>:<n>
@@ -23,6 +23,7 @@ from janus.findings.units import (budget_findings, cap_findings, card_findings, 
 from janus.findings.work import (backlog_findings, gate_findings, git_findings, known_failure_findings, landing_findings,
     orchestrator_findings, session_findings)
 from janus.ledger import committed
+from janus.issue import auto_log_issues, repeated_issue_findings
 from janus.project import own_card
 from janus.transcripts import card_fields
 from janus.reset import context_findings
@@ -63,6 +64,7 @@ def collect_findings(cfg, hs, units, ag, bd_err, bd=None):
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
     F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running)
     F += decision_findings(cfg)
+    F += repeated_issue_findings(cfg)
     F += spend_findings(cfg)
     if not cfg.run.ro and not cfg.run.dry: F = enforce(cfg, F, viol)
     return [finding(k, t) for k, t in F]
@@ -111,6 +113,7 @@ def run_check(cfg, cycle=True, writer=None):
         except Err as e: bd_err = str(e)
         ag = herdr_agents(cfg)
         F = collect_findings(cfg, hs, units, ag, bd_err, bd)
+        if not cfg.run.ro and not cfg.run.dry: auto_log_issues(cfg)   # a key acked 3+ times earns an issue row once
         if not cfg.run.ro: tune_pueue(cfg, hs, units)
         acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
         F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)
@@ -120,6 +123,10 @@ def run_check(cfg, cycle=True, writer=None):
     return F, live, hs, units
 
 def cmd_check(cfg, a):
+    if getattr(a, "acked", False):   # the acked-findings view: what an ack is hiding, and for how long (audit acked-findings-hidden)
+        acks = live_acks(cfg)
+        return 0, ([f"[{k}] acked {int((now() - v.get('t', 0)) / 60)} min ago (ttl {ack_ttl(k) // 60} min): {v.get('d', '')}"
+                    for k, v in sorted(acks.items())] or ["(no live acks)"])
     F, live, hs, units = run_check(cfg)
     op = cfg.jget("open.json")
     if a.escalate: F = [f for f in F if now() - op.get(f.key, now()) > cfg.deadline]
@@ -144,7 +151,10 @@ def cmd_status(cfg, a):
 def cmd_ack(cfg, a):
     k, d = a.problem, a.decision
     if not ackable(k): raise Err(f"{k} cannot be acked: it costs money every hour; act on it (janus park {k.split(':', 1)[1]})")
+    if k.split(":", 1)[0] in ("idle", "landing") and re.match(r"(?i)^\s*(?:i |we )?(?:will|'ll|am going to|are going to|going to|plan|intend|shall)\b", d or ""):
+        raise Err(f"ack {k} with what was DONE, not what you will do (a plan is not a decision): run it, then ack")
     acks = live_acks(cfg); acks[k] = {"t": now(), "d": d}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
+    cnt = cfg.jget("ack-counts.json"); cnt[k] = cnt.get(k, 0) + 1; cfg.jput("ack-counts.json", cnt)   # a key acked 3+ times earns an issue row
     if getattr(a, "decision_class", False) or k.split(":", 1)[0] in DECISION_ACKS: note_event(cfg, "decision")   # routine acks leave the notes fresh
     try:
         bd = Beads(cfg); m = re.match(r"unit:([^:]+)", k)

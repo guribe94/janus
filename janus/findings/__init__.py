@@ -39,6 +39,7 @@ FAMILIES = {
     "idle-backlog": Family("ready backlog items without briefs while hosts have room, or held by budget", urgent=True),
     "idle-with-backlog": Family("ready backlog units with briefs would fit now (janus fill)", urgent=True),
     "instructions": Family("unclassified owner instructions in beads", urgent=True),
+    "issue": Family("a finding key acked 3+ times with no issue row logged (every oddity is logged)"),
     "known-failure": Family("a known failure with no open unit fixing it, or one that passes now"),
     "landing": Family("a finished DONE unit has no gate, or passed its gates and is not landed", urgent=True),
     "learned": Family("an agent's learned post awaits remember or reject"),
