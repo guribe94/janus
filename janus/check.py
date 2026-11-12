@@ -5,6 +5,7 @@ the Live part of HANDOFF.md (a writer only: the registered orchestrator or the w
 import contextlib, json, re
 from janus.actions.jobs import slots
 from janus.backlog import ready_work
+from janus.autopilot import autopilot_findings
 from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
 from janus.context import DECISION_ACKS, Err, LB, note_event, LE, NOTES0, atomic_write, handoff_path, hrun, is_orchestrator, now, say, ts
@@ -21,6 +22,8 @@ from janus.findings.units import (budget_findings, cap_findings, card_findings, 
 from janus.findings.work import (backlog_findings, gate_findings, git_findings, known_failure_findings, landing_findings,
     orchestrator_findings, session_findings)
 from janus.ledger import committed
+from janus.project import own_card
+from janus.transcripts import card_fields
 from janus.reset import context_findings
 from janus.probe import cap_line, probe_all, pueue, room
 from janus.units import all_units, herdr_agents, unit_state
@@ -32,7 +35,7 @@ def board_upkeep(cfg, units):
     board_files(cfg)
     names = {u["name"] for u in units}; au = all_units(cfg)
     for c in (board_dir(cfg) / "agents").glob("*.md") if (board_dir(cfg) / "agents").is_dir() else []:
-        if c.stem not in names and au.get(c.stem, {}).get("status") == "closed": board(cfg, "close", c.stem)
+        if c.stem not in names and au.get(c.stem, {}).get("status") == "closed" and own_card(cfg, card_fields(cfg, c.stem)): board(cfg, "close", c.stem)
 
 def collect_findings(cfg, hs, units, ag, bd_err):
     """Every finding of one pass, as registered Findings, in the order check prints them (findings/*.py hold the families)."""
@@ -43,6 +46,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     F += host_findings(cfg, hs, units, viol) + pane_findings(cfg, units, ag)
     F += board_findings(cfg, names) + card_findings(cfg, names) + note_findings(cfg)
     UF, running = unit_findings(cfg, hs, units, ag); F += UF
+    F += autopilot_findings(cfg, units)   # unit:<n>:relaunch: a remote unit the autopilot leaves to the orchestrator (fix-core F4)
     F += peer_findings(cfg, units, hs)   # peers.md, overlap:<a>:<b> (janus-swarm item 4)
     F += related_findings(cfg, units, hs)   # related:<a>:<b> when two running units' work meets (imp-awareness)
     board_upkeep(cfg, units)
@@ -119,7 +123,8 @@ def cmd_check(cfg, a):
     if a.escalate: F = [f for f in F if now() - op.get(f.key, now()) > cfg.deadline]
     if a.json:
         return 0, [json.dumps({"read_only": cfg.run.ro, "findings": [{**f.data(), "open_since": int(op.get(f.key, now()))} for f in F]}, indent=1)]
-    L = [f"[{k}] {t}" for k, t in F]
+    mine = [f for f in F if f.family != "machine"]; mach = [f for f in F if f.family == "machine"]   # machine state: listed apart, last
+    L = [f"[{k}] {t}" for k, t in mine] + (["machine state (no project id; not this project's, never acted on):"] + [f"  [{k}] {t}" for k, t in mach] if mach else [])
     if a.brief and len(L) > 8: L = L[:8] + [f"[more] +{len(L) - 8} more: run janus check"]
     return 0, L + (["(read-only: not the registered orchestrator session, so nothing was saved, tuned or stamped)"] if cfg.run.ro else [])
 

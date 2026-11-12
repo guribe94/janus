@@ -7,6 +7,7 @@ from janus.actions.swarm import write_index
 from janus.beads import Beads
 from janus.context import Err, JANUS_SELF, X, atomic_write, note_event, now, pq, say, sh, ts
 from janus.gates import GATE_DEFAULT, GATE_LINE, judge_gate, landed
+from janus.project import tag
 from janus.probe import pueue
 from janus.quality import land_review
 from janus.units import all_units, get_unit, own_tree
@@ -119,7 +120,7 @@ def cmd_gate(cfg, a):
         except Err as e: say(f"note: gate not recorded on {unit}: {e}")
     X(cfg, h, ensure_lanes(h, cfg))
     tok = f"gate-{re.sub(r'[^A-Za-z0-9_-]', '_', a.name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"   # cancel follows the jobs it queues
-    rc, o, e = X(cfg, h, f"env {pre} {pueue(h)} add -g {group} -l {shlex.quote('gate:' + a.name)} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env JANUS_WRAP={tok} {run}')}")
+    rc, o, e = X(cfg, h, f"env {pre} {pueue(h)} add -g {group} -l {shlex.quote(tag(cfg, 'gate:' + a.name))} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env JANUS_WRAP={tok} {run}')}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
     if cfg.run.dry: return
     tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid} in {group}"

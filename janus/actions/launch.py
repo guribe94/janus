@@ -11,6 +11,7 @@ from janus.context import EXCL, Err, JANUS_SELF, SSH, X, atomic_write, clean_env
 from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
 from janus.memory import MEM_SECTIONS, mem_line, memory_read, mset
 from janus.platform import herdr
+from janus.project import project_id, tag, tmux_name
 from janus.probe import probe_all, pueue, room
 from janus.quality import qset
 from janus.templates import CLEAN_PUEUE
@@ -48,8 +49,9 @@ def wait_shell(pane, unit):
         if rc == 0: return
 
 def new_tab(cfg, label, cwd):
-    ws = ws_id(cfg, create=True) or ""
-    r = herdr("tab", "create", *(["--workspace", ws] if ws else []), "--label", label, "--cwd", str(cwd))
+    ws = ws_id(cfg, create=True)   # the project's workspace is its panes' project id: never a tab outside it
+    if not ws: raise Err(f"herdr workspace {cfg.c.get('herdr', {}).get('workspace', cfg.name)!r} not found and not created: no tab opened")
+    r = herdr("tab", "create", "--workspace", ws, "--label", label, "--cwd", str(cwd))
     if not r: raise Err("herdr tab create failed")
     return r["root_pane"]["pane_id"], r["tab"].get("tab_id")
 
@@ -111,14 +113,14 @@ def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, session=None
     script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export {var}=$K; unset K\n"
               f"cd {qp(rcwd)} || exit 1\n{res}{sd}{shlex.join(api_argv(pv, mc, budget, prompt, session))} < /dev/null > {od}/api.json 2> {od}/api.err; rc=$?\n"
               + (f"cp {od}/api.json {od}/{q(f'api-{run}.json')} 2>/dev/null\n" if run else "") + "exit $rc\n")
-    if cfg.run.dry: return X(cfg, h, f"mkfifo {fifo}; write {qp(sp)}; {pueue(h)} add -g agents -l {name} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}; key | ssh cat > {fifo}")
+    if cfg.run.dry: return X(cfg, h, f"mkfifo {fifo}; write {qp(sp)}; {pueue(h)} add -g agents -l {tag(cfg, name)} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}; key | ssh cat > {fifo}")
     rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo}")
     if rc: return rc, o, e
     rc, o, e = put_script(cfg, h, sp, script)
     if rc: return rc, o, e
     rc, o, e = put_script(cfg, h, f"{R}/run/bin/pueue", clean_pueue_script(h))
     if rc: return rc, o, e
-    rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}")
+    rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {tag(cfg, name)} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}")
     if rc: return rc, o, e
     deliver_key(h, kf, key)
     return 0, o, ""
@@ -136,7 +138,7 @@ def cmd_api_run(cfg, a):
     try: var, key = read_secret(pv)
     except Err as e: ledger_done(cfg, pv, run, name, 0, "no-key"); raise
     shim = cfg.f("bin"); put_script(cfg, {"local": True}, str(shim / "pueue"), clean_pueue_script({"local": True}))
-    env = clean_env({"JANUS_ROLE": "agent", "JANUS_UNIT": name, "JANUS_ROOT": str(cfg.root), "JANUS_REPORT": a.report or str(od / "REPORT.md"), "BOARD_DIR": str(board_dir(cfg)), var: key})
+    env = clean_env({"JANUS_ROLE": "agent", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root), "JANUS_REPORT": a.report or str(od / "REPORT.md"), "BOARD_DIR": str(board_dir(cfg)), var: key})
     env["PATH"] = f"{shim}:{env['PATH']}"   # the agent's own `pueue add` never stores the key in pueue's state file
     prompt = Path(a.prompt_file).read_text() if a.prompt_file else agent_prompt(cfg, name, a.brief, hn, a.report or str(od / "REPORT.md"))
     argv = api_argv(pv, mc, a.budget, prompt, a.resume_session)
@@ -196,7 +198,7 @@ def lane_runner(cfg, hn, h, name, rcwd):
             f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=\"$RD/$jid\"\nprintf '%s\\n' \"$*\" > \"$R.cmd\"\n"
             f"cat > \"$R.sh\" <<'JANUS_JOB_EOF'\n{js}JANUS_JOB_EOF\nsed -i \"s/__JID__/$jid/g\" \"$R.sh\"\n"
             f"{pueue(h)} group add -p 1 jobs >/dev/null 2>&1\n"
-            f"tid=$(env -i HOME=\"$HOME\" USER=\"$USER\" PATH=\"$PATH\" ${{XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"}} LANG=\"${{LANG:-C.UTF-8}}\" {pueue(h)} add -g jobs -l unit:{name} -w \"$RD\" --print-task-id -- \"bash $(printf %q \"$R.sh\")\") || exit 125\n"
+            f"tid=$(env -i HOME=\"$HOME\" USER=\"$USER\" PATH=\"$PATH\" ${{XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"}} LANG=\"${{LANG:-C.UTF-8}}\" {pueue(h)} add -g jobs -l {tag(cfg, 'unit:' + name)} -w \"$RD\" --print-task-id -- \"bash $(printf %q \"$R.sh\")\") || exit 125\n"
             f"echo \"lane: queued {hn}:$tid ($jid)\" >&2\n[ -n \"$det\" ] && {{ echo \"{hn}:$tid\"; exit 0; }}\n"
             f"{pueue(h)} wait -q $tid; cat \"$R.log\"; exit $(cat \"$R.rc\" 2>/dev/null || echo 255)\n")
 
@@ -400,7 +402,7 @@ def cmd_launch(cfg, a):
     else:
         u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
         bd.run("update", u["id"], "--status", "in_progress"); bd.save(u)
-    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_ROOT": str(cfg.root),
+    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root),
            **({"BOARD_DIR": str(board_dir(cfg))} if local else {})}   # remote: <root>/bin/board.sh finds <root>/board itself
     try:
         if not local:
@@ -439,7 +441,7 @@ def cmd_launch(cfg, a):
             if local:
                 cmd = shlex.join([sys.executable, str(JANUS_SELF), "api-run", name, "--run", run, "--model", mname, "--budget", str(budget),
                                   "--brief", rbrief, "--cwd", rcwd, "--report", env["JANUS_REPORT"]])
-                rc, o, e = X(cfg, h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {pq(cmd)}", env=env)
+                rc, o, e = X(cfg, h, f"{pueue(h)} add -g agents -l {tag(cfg, name)} -w {shlex.quote(rcwd)} --print-task-id -- {pq(cmd)}", env=env)
             else:
                 rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, run=run)
             if rc and not cfg.run.dry: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
@@ -479,18 +481,19 @@ def cmd_launch(cfg, a):
             mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -- " if mm else ""   # fixes5 item 7
             inner = f"cd {qp(rcwd)} && exec env {e} {sd}{cli} {shlex.join(mc.get('args', []))} {shlex.quote(prompt)}"
             pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
-            rc, o, er = X(cfg, h, pre + f"tmux new -d -s janus-{name} {shlex.quote(inner)} && tmux display -p -t janus-{name} '#{{pane_pid}}'")
+            tm = tmux_name(cfg, name)
+            rc, o, er = X(cfg, h, pre + f"tmux new -d -s {shlex.quote(tm)} {shlex.quote(inner)} && tmux display -p -t {shlex.quote(tm)} '#{{pane_pid}}'")
             if rc: raise Err("tmux start failed: " + er.strip()[:100])
-            u.update(via="tmux", pid=int(o.strip() or 0))
+            u.update(via="tmux", tmux=tm, pid=int(o.strip() or 0))
             if not cfg.run.dry:   # launched means the agent's session is alive a moment later (a broken command line ends it at once)
                 time.sleep(3)
-                if hrun(h, pre + f"tmux has-session -t janus-{name}")[0] or not u["pid"]:
-                    raise Err(f"the agent's tmux session janus-{name} ended at once; nothing is running")
+                if hrun(h, pre + f"tmux has-session -t {shlex.quote(tm)}")[0] or not u["pid"]:
+                    raise Err(f"the agent's tmux session {tm} ended at once; nothing is running")
                 u["start_state"] = "running"
             if not cfg.run.dry: agent_res(cfg, hn, h, name, u["pid"])
             if not cfg.run.dry:
                 pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd)
-                herdr("pane", "run", pane, f"ssh -t {shlex.quote(h['ssh'])} tmux attach -t janus-{name}"); u.update(pane=pane, tab=tab)
+                herdr("pane", "run", pane, f"ssh -t {shlex.quote(h['ssh'])} tmux attach -t {shlex.quote(tm)}"); u.update(pane=pane, tab=tab)
     except Err as ex:
         if not cfg.run.dry:
             u["via"] = "failed"; bd.save(u); bd.comment(u["id"], f"{ts()} launch failed: {ex}")

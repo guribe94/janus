@@ -115,6 +115,16 @@ class Autopilot(unittest.TestCase):
         janus.tend_autopilot(self.cfg, {}, [u2], [], log.append); self.assertEqual(len(self.launched), 1, "acted on a held unit")
         self.assertIsNone(janus.ending(self.cfg, self.unit(verdict="VERDICT: DONE")))
 
+    def test_a_crashed_remote_unit_is_not_relaunched_and_the_finding_names_its_patch(self):
+        """Catches (panel-eng F4): a crashed remote unit relaunched from this machine's tree, without the code it wrote (kept
+        only in its remote tree and out/<unit>/changes.patch), and the orchestrator not told where that code is."""
+        d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/tmp/x"\n[autopilot]\nenabled = true\n')
+        u = self.unit(host="far", collected_at=time.time() + 60)
+        janus.tend_autopilot(cfg, {}, [u], [], lambda m: None)
+        self.assertEqual(self.launched, [], "a remote unit was relaunched from this machine's tree")
+        F = dict(janus.autopilot_findings(cfg, [u]))
+        self.assertIn("out/u1/changes.patch", F.get("unit:u1:relaunch", ""), F)
+
     def test_off_by_default_and_question_answered_only_from_an_exact_memory_subject(self):
         """Catches: the autopilot acting without the owner's opt-in, and answering a question memory does not settle."""
         d, cfg = project()
@@ -126,6 +136,78 @@ class Autopilot(unittest.TestCase):
         ans = [p for p in self.posts if p[0] == "answer"]
         self.assertEqual(len(ans), 1, ans); self.assertEqual(ans[0][1], "7"); self.assertIn("gates run on the build host", ans[0][2])
         self.assertIn("question:7", self.cfg.jget("acks.json"))
+
+    def test_a_question_merely_mentioning_a_memory_key_is_not_answered(self):
+        """Catches (panel-eng F7): a question that only mentions a memory key as a word ("may I skip the gate-host check?")
+        answered with that entry, so the agent proceeds on a non-answer."""
+        janus.memory_write(self.cfg, [("Decisions", "2026-11-11", "gate-host", "gates run on the build host", None)])
+        with mock.patch.object(janus, "board_questions", lambda c: [(9, "a3", "", "may I skip the gate-host check for docs?")]):
+            janus.tend_autopilot(self.cfg, {}, [], [], lambda m: None)
+        self.assertEqual([p for p in self.posts if p[0] == "answer"], [], "answered a question that did not ask for the entry")
+
+
+class OnceOnly(unittest.TestCase):
+    def test_resume_and_wrapup_once_even_when_the_unit_record_save_fails(self):
+        """Catches (panel-eng F1): bd.save failing after a resume or a wrap-up, so the next pass derives the same state and
+        starts a second agent run on the same session and worktree."""
+        import copy
+        d, cfg = project(); (d / "out/u").mkdir(parents=True); (d / "out/u/REPORT.md").write_text("VERDICT: PENDING\nWAITING here:7\n")
+        rec = {"id": "x-1", "name": "u", "host": "here", "via": "pueue", "model": "m", "started": 0, "parked": {"jobs": ["here:7"], "since": 0, "by": "report"}}
+        hs = {"here": {"ok": True, "pueue": {"tasks": {"7": {"status": {"Done": {"result": "Success"}}}}}}}
+        calls = []
+        def resume(cfg, u, msg, wrapup=False): calls.append(wrapup); u.update(task=99, run="u.r2"); return "queued a new run"
+        def bad_save(self, u): raise janus.Err("bd update: database is locked")
+        with mock.patch.object(janus, "resume_unit", resume), mock.patch.object(janus.Beads, "save", bad_save), \
+             mock.patch.object(janus.Beads, "comment", lambda s, *a: None), mock.patch.object(janus, "wrap_due", lambda c, u: not u.get("_park")):
+            for _ in range(2):
+                u = copy.deepcopy(rec); u["_park"] = ["here:7"]; janus.tend_parked(cfg, hs, [u], lambda m: None)
+            self.assertEqual(calls, [False], "a parked unit was resumed twice")
+            for _ in range(2): janus.tend_parked(cfg, hs, [copy.deepcopy(rec)], lambda m: None)
+            self.assertEqual(calls, [False, True], "a capped run was wrapped up twice")
+
+
+class MoveOffDownHost(unittest.TestCase):
+    def test_a_moved_job_never_runs_twice_and_device_jobs_stay(self):
+        """Catches (panel-eng F3): after a partition the host's old copy of a moved job had started, was not cancelled on its
+        return and ran twice; and a job needing a device (--usb) moved to a host without it."""
+        d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/tmp/x"\n[autopilot]\nenabled = true\n')
+        jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
+        jd.joinpath("j1.json").write_text(json.dumps({"host": "far", "task": 5, "unit": "u"}))
+        jd.joinpath("j2.json").write_text(json.dumps({"host": "far", "task": 6, "unit": "u", "usb": True}))
+        cancels, queued = [], []
+        q = {"status": "Queued", "label": "unit:u@t"}; r = {"status": "Running", "label": "unit:u@t"}
+        with mock.patch.object(janus, "cancel_job", lambda cfg, ref: cancels.append(ref) or ["cancelled"]), \
+             mock.patch.object(janus, "requeue", lambda cfg, spec, to: queued.append(spec["task"]) or "here:9"), \
+             mock.patch.object(janus, "requeue_host", lambda *a: "here"), mock.patch.object(janus, "board", lambda *a, **k: (0, "", "")):
+            janus.move_off_down_hosts(cfg, {"far": {"ok": True, "pueue": {"tasks": {"5": q, "6": q}}}, "here": {"ok": True}}, [], lambda m: None)
+            cfg.jput("hosts.json", {"far": time.time() - 3600})
+            janus.move_off_down_hosts(cfg, {"far": {"ok": False}, "here": {"ok": True}}, [], lambda m: None)
+            self.assertEqual(queued, [5], "the device job was moved, or the plain one was not")
+            janus.move_off_down_hosts(cfg, {"far": {"ok": True, "pueue": {"tasks": {"5": r, "6": q}}}, "here": {"ok": True}}, [], lambda m: None)
+        self.assertEqual(cancels, ["far:5"], "the old copy that started during the partition was not cancelled")
+
+
+class TwoProjects(unittest.TestCase):
+    def test_project_b_never_touches_project_a_jobs_on_a_shared_queue(self):
+        """Catches (cross-project safety): on one queue shared by projects a and b, b's watcher and autopilot calling a's job an
+        orphan or stuck and cancelling or re-queuing it; and a job with no project id acted on instead of listed."""
+        d, cfg = project("\n[autopilot]\nenabled = true\n"); cfg.c["project"]["id"] = "b"
+        old = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3 * 86400))
+        job = lambda lab, jid: {"id": int(jid[1:]), "group": "jobs", "label": lab, "command": f"bash /r/runs/{jid}.sh", "status": {"Running": {"enqueued_at": old}}}
+        hs = {"here": {"ok": True, "pueue": {"groups": {"jobs": {"status": "Running", "parallel_tasks": 4}},
+                                             "tasks": {"1": job("unit:x@a", "j1"), "2": job("unit:gone@b", "j2"), "3": job("unit:y", "j3")}}}}
+        jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
+        for jid, tid in (("j1", 1), ("j2", 2), ("j3", 3)):   # b's records even name a's task (an id reused across projects)
+            (jd / f"{jid}.json").write_text(json.dumps({"host": "here", "task": tid, "unit": "gone", "wt": str(d), "cmd": "make"}))
+        acted = []
+        with mock.patch.object(janus, "cancel_job", lambda cfg, ref, force=False: acted.append(ref) or ["cancelled"]), \
+             mock.patch.object(janus, "requeue", lambda cfg, spec, to: acted.append(f"requeue {spec['task']}") or "here:9"), \
+             mock.patch.object(janus, "Beads", NoBeads), mock.patch.object(janus, "board", lambda *a, **k: (0, "", "")):
+            self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [])], ["here:2"])
+            F = [janus.finding(k, t) for k, t in janus.lane_findings(cfg, hs, [])]
+            self.assertEqual([f.key for f in F if f.key.startswith("age:")], ["age:here:2"])
+            janus.tend_autopilot(cfg, hs, [], F, lambda m: None)
+        self.assertEqual(acted, ["here:2", "requeue 2"], "b acted on a job that is not b's")
 
 
 if __name__ == "__main__":

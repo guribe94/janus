@@ -58,7 +58,7 @@ class Ledger(unittest.TestCase):
         self.assertFalse(janus.model_ok(self.cfg, "m")[0])
 
     def test_cap_refuses(self):
-        janus.reserve_budget(self.cfg, self.mc, "u1", 9)
+        janus.reserve_budget(self.cfg, self.mc, "u1", 7)   # $8.40 held with the overshoot margin
         with self.assertRaises(janus.Err): janus.reserve_budget(self.cfg, self.mc, "u2", 2)
 
     def test_repair(self):
@@ -474,7 +474,7 @@ class Register(unittest.TestCase):
         self.assertIn("11 commits behind", janus.tree_guard(cfg, d))       # gates and land: refused
         self.assertIsNone(janus.tree_guard(cfg, d, behind=False))            # an agent's own jobs: never for being behind (item 5)
     def test_shim_labels_agent_jobs(self):
-        self.assertIn('add -l "unit:$JANUS_UNIT"', janus.clean_pueue_script({"local": True}))
+        self.assertIn('add -l "unit:$JANUS_UNIT${JANUS_PROJECT:+@$JANUS_PROJECT}"', janus.clean_pueue_script({"local": True}))
     def test_rg_patterns_are_data(self):
         d, cfg = project()
         for c in ['rg -n "rm -rf|kill -9" .', "grep -c 'pueue kill' log"]: self.assertIsNone(janus.judge(cfg, c, str(d), janus.edit_ok_dirs(cfg)), c)
@@ -657,13 +657,13 @@ class Park(unittest.TestCase):
         self.assertEqual(janus.waiting_line_jobs(cfg, u), ["here:7", "here:8"])   # unknown hosts ignored
         u["handled_jobs"] = ["here:7"]; self.assertEqual(janus.waiting_line_jobs(cfg, u), ["here:8"])
         hs = {"here": {"ok": True, "waitjob": ["wt-1"], "pueue": {"tasks": {
-            "7": {"status": {"Done": {"result": "Success"}}}, "8": {"status": {"Running": {}}, "command": "bash /x/runs/wt-1.sh", "label": "unit:u"},
-            "9": {"status": {"Queued": {}}, "label": "unit:u"}}}}}
+            "7": {"status": {"Done": {"result": "Success"}}}, "8": {"status": {"Running": {}}, "command": "bash /x/runs/wt-1.sh", "label": "unit:u@t"},
+            "9": {"status": {"Queued": {}}, "label": "unit:u@t"}}}}}
         self.assertEqual(janus.job_state(hs, "here:7"), ("done", 0))
         self.assertEqual(janus.job_state(hs, "here:8")[0], "admission")   # running, but still in janus's admission wait
         self.assertEqual(janus.job_state(hs, "here:9")[0], "queued")
         self.assertEqual(janus.job_state(hs, "here:5")[0], "gone")
-        self.assertEqual(sorted(janus.unit_jobs(hs, "u")), ["here:8", "here:9"])
+        self.assertEqual(sorted(janus.unit_jobs(cfg, hs, "u")), ["here:8", "here:9"])
         r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\n"); self.assertEqual(janus.verdict(cfg, u), "VERDICT: DONE")
 
     def test_wrapup_once_when_capped_without_verdict(self):
@@ -682,8 +682,8 @@ class Park(unittest.TestCase):
         parked unit's job."""
         d, cfg = project(); run = lambda: {"status": {"Running": {}}}
         hs = {"here": {"ok": True, "pueue": {"tasks": {
-            "1": {**run(), "label": "unit:closed"}, "2": {**run(), "label": "unit:api"}, "3": {**run(), "label": "unit:idle"},
-            "4": {**run(), "label": "unit:parked"}, "5": {**run(), "label": "run:x"}, "6": {"status": {"Done": {"result": "Success"}}, "label": "unit:closed"}}}}}
+            "1": {**run(), "label": "unit:closed@t"}, "2": {**run(), "label": "unit:api@t"}, "3": {**run(), "label": "unit:idle@t"},
+            "4": {**run(), "label": "unit:parked@t"}, "5": {**run(), "label": "run:x@t"}, "6": {"status": {"Done": {"result": "Success"}}, "label": "unit:closed@t"}}}}}
         units = [{"name": "api", "via": "pueue", "state": "done"}, {"name": "idle", "via": "herdr", "state": "idle"},
                  {"name": "parked", "via": "pueue", "state": "parked", "_park": ["here:4"]}]
         wd = d / ".janus/runs/wrap"; wd.mkdir(parents=True); (wd / "w-1").write_text("here:5 x-1\n")   # its wrapper is not running
@@ -1011,7 +1011,7 @@ class Thrash(unittest.TestCase):
         for jid, tid, at in (("old-1", "1", 100), ("new-2", "2", 200)):
             (jd / f"{jid}.json").write_text(json.dumps({"host": "far", "task": tid, "lane": "jobs", "unit": "u", "wt": str(d), "cmd": "make", "at": at}))
         (jd / "copied-4.json").write_text(json.dumps({"host": "far", "task": "99", "wt": str(d), "cmd": "x", "at": 999}))   # not this task
-        run = lambda jid, start: {"status": {"Running": {"start": start}}, "command": f"bash /r/runs/{jid}.sh", "label": "unit:u", "group": "jobs"}
+        run = lambda jid, start: {"status": {"Running": {"start": start}}, "command": f"bash /r/runs/{jid}.sh", "label": "unit:u@t", "group": "jobs"}
         hs = {"far": {"ok": True, "psi": "55.0", "pueue": {"tasks": {"1": run("old-1", "2026-01-01T10:00:00"), "2": run("new-2", "2026-01-01T11:00:00"),
                        "3": run("theirs-3", "2026-01-01T12:00:00"), "4": run("copied-4", "2026-01-01T13:00:00")}}},
               "here": {"ok": True}}
@@ -1064,9 +1064,10 @@ class Tidy(unittest.TestCase):
         (w / "dirty/a").write_text("2\n"); (w / "untracked/new").write_text("x\n")
         (w / "unlanded/b").write_text("b\n"); g("add", "b", cwd=w / "unlanded"); g("commit", "-qm", "b", cwd=w / "unlanded")
         cfg.run.all_units = {"old": {"status": "closed"}, "live": {"status": "open"}}
-        ag = {"old": {"pane_id": "p1", "agent_status": "idle"}, "live": {"pane_id": "p2"}, "orchestrator": {"pane_id": "p0"}}
+        ag = {"old": {"pane_id": "p1", "agent_status": "idle", "workspace_id": "w1"}, "live": {"pane_id": "p2", "workspace_id": "w1"}, "orchestrator": {"pane_id": "p0", "workspace_id": "w1"}}
         rows = {"ghost": {"gone": True}, "live": {"gone": True}, "fine": {"gone": False}}
-        real = janus.ws_id; janus.ws_id = lambda cfg, create=False: None
+        (d / "board/agents").mkdir(parents=True); (d / "board/agents/ghost.md").write_text("# ghost\n- project: t\n")
+        real = janus.ws_id; janus.ws_id = lambda cfg, create=False: "w1"
         try: P = janus.tidy_plan(cfg, [{"name": "live", "cwd": str(w / "inuse")}], ag, rows)
         finally: janus.ws_id = real
         self.assertEqual([(k, Path(t).name if k == "worktree" else t) for k, t, _ in P], [("worktree", "landed"), ("pane", "p1"), ("card", "ghost")])

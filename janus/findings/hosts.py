@@ -3,6 +3,7 @@ lane stalls, idle slots and job ages, thrash acts, tidy and disk; enforce (warn,
 import os, re, time
 from pathlib import Path
 from janus.actions.jobs import LANES, lane_age, orphan_jobs, slots
+from janus.project import label_owner, own_label, tmux_name, unit_tmux, untagged
 from janus.backlog import ready_work
 from janus.beads import Beads
 from janus.board import board
@@ -68,13 +69,14 @@ def env_unit(pid):
 def enforce(cfg, F, viol):
     """Warn, then stop (janus-fixes8; register items 22, 23). The first time a violation is seen its unit gets a board direction;
     when it is still there [enforce] grace_min (default 5) later, its process group is stopped: a CPU burner's (stop_burners,
-    default true) and an agent's direct build or test, here or on a remote host (stop_direct, default true since imp-autopilot).
+    default true), an agent's direct build or test, here or on a remote host (stop_direct, default true since imp-autopilot), and
+    a Claude/Anthropic API process janus did not start (stop_api, default true: spend safety).
     One warning per unit: a unit warned in the last day gets no second one, its next violation is stopped at once.
     Running lane jobs are never touched. Only the registered orchestrator's check and the watcher act; anyone else only reports."""
     ec = cfg.c.get("enforce", {}); grace = ec.get("grace_min", 5) * 60; st = cfg.jget("enforce.json"); new = {}; notes = {}
     wu = {k: t for k, t in (st.get("_units") or {}).items() if now() - t < 86400}   # unit -> when it got its one warning
     for v in viol:
-        s = st.get(v["key"]) or {}; stop_ok = ec.get("stop_burners", True) if v["kind"] == "burner" else ec.get("stop_direct", True)
+        s = st.get(v["key"]) or {}; stop_ok = ec.get({"burner": "stop_burners", "api": "stop_api"}.get(v["kind"], "stop_direct"), True)
         u = v.get("unit")
         if not s.get("warned") and u in wu and stop_ok:   # already warned once: no second warning, stopped at once
             s = {"warned": wu[u] - grace, "unit": u}
@@ -179,7 +181,7 @@ def lane_findings(cfg, hs, units=()):
                 s = x["status"]; info = s.get(st(x), {}) if isinstance(s, dict) else {}
                 try: since = time.mktime(time.strptime(info.get("enqueued_at", "")[:19], "%Y-%m-%dT%H:%M:%S"))
                 except ValueError: continue
-                if st(x) in ("Queued", "Running") and now() - since > lane_age(cfg, lane) * 60:
+                if st(x) in ("Queued", "Running") and now() - since > lane_age(cfg, lane) * 60 and own_label(cfg, x) is not None:   # own jobs only
                     F.append((f"age:{n}:{x['id']}", f"{n}:{x['id']} {lane} {x.get('label')} {st(x).lower()} {int((now() - since) / 60)} min, over the {lane_age(cfg, lane)} min limit: janus cancel {n}:{x['id']} and re-queue it, or ack with why it is right"))
         if int(p.get("old_rule", 0) or 0):
             F.append((f"old-rule:{n}", f"{n}: {p['old_rule']} job(s) still wait under the old cap rule ({p.get('old_rule_jobs', '').strip()[:120]}): "
@@ -197,6 +199,7 @@ def host_findings(cfg, hs, units, viol):
     """host:, margin:, idle:<host>, pressure:, scheduler:, direct: (each also goes to viol for enforce), orphan:job: and
     orphan:tmux: from each host's probe."""
     F = []; names = {u["name"] for u in units}; un = cfg.jget("hosts.json")
+    orch_pid = (cfg.f("session_pid").read_text().split() or [""])[0] if cfg.f("session_pid").exists() else ""   # the orchestrator is not flagged
     ready = 0
     try: ready = len(ready_work(cfg))
     except Err: pass
@@ -229,23 +232,39 @@ def host_findings(cfg, hs, units, viol):
             F.append((f"direct:{n}:{f[0]}", f"agent {f[2]} runs a build or test directly on {n} (pid {f[0]}, {int(fl(f[3])) // 60} min, outside the lanes): "
                       f"{(f[4] if len(f) > 4 else '')[:80]}; it must use {cfg.hosts[n].get('root', '~')}/run/{f[2]}.lane"))
             viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
+        for a in p.get("apiproc", []):   # spend safety: an API process janus did not start spends outside the ledger
+            f = a.split(None, 3)
+            if len(f) < 3 or not f[0].isdigit() or (cfg.hosts[n].get("local") and f[0] == orch_pid): continue
+            F.append((f"spend:proc:{n}:{f[0]}", f"Claude/Anthropic API process pid {f[0]} on {n} ({f[2]}) was not started by janus (an API key, no JANUS_UNIT): "
+                      f"it spends outside the ledger and the caps: {(f[3] if len(f) > 3 else '')[:70]}; launch API work through janus; it is stopped after [enforce] grace_min"))
+            viol.append({"key": f"spend:proc:{n}:{f[0]}", "kind": "api", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": None})
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
-            lab = t.get("label") or ""
+            if k not in ("Running", "Queued"): continue
+            lab = own_label(cfg, t)   # cross-project safety: only this project's jobs; one with no project id is machine state
+            if lab is None:
+                if untagged(t): F.append((f"machine:job:{n}:{t.get('id')}", f"job {t.get('id')} on {n} ({t.get('label') or t.get('command', '')[:40]}) carries no project id: machine state, not this project's; janus does not act on it"))
+                continue
             owned = lab in names or (lab.startswith("unit:") and lab[5:] in names) or (t.get("group") in LANES and ":" in lab and not lab.startswith("unit:"))
-            if k in ("Running", "Queued") and not owned:   # a lane job labelled unit:<name> whose unit is closed is an orphan too (M3)
+            if not owned:   # a lane job labelled unit:<name> whose unit is closed is an orphan too (M3)
                 F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({lab or t.get('command', '')[:40]}) has no open unit: janus cancel {n}:{t.get('id')}"))
+        mine = {unit_tmux(u) for u in units}
         for s in p.get("tmux", []):
-            if s.startswith("janus-") and s[6:] not in names: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: collect what it wrote, then stop it (janus stop, or relaunch its unit)"))
+            if not s.startswith("janus-") or s in mine: continue
+            base, pid = label_owner(s)
+            if pid is None: F.append((f"machine:tmux:{n}:{s}", f"tmux session {s} on {n} carries no project id: machine state, not this project's; janus does not act on it"))
+            elif pid == tmux_name(cfg, "x").rpartition("@")[2]: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: collect what it wrote, then stop it (janus stop, or relaunch its unit)"))
     return F
 
 def pane_findings(cfg, units, ag):
-    """orphan:pane: an agent in this project's herdr workspace with no open unit (not the orchestrator)."""
+    """orphan:pane: an agent in this project's herdr workspace with no open unit (not the orchestrator). Without the project's
+    workspace no pane is this project's: nothing is reported (cross-project safety)."""
     F = []; ws = ws_id(cfg); names = {u["name"] for u in units}
+    if not ws: return F
     janus_pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
     pane_units = {u.get("pane") for u in units}
     for k, a in ag.items():
-        if ws and a.get("workspace_id") != ws: continue
+        if a.get("workspace_id") != ws: continue
         if k in names or a.get("pane_id") in pane_units or a.get("pane_id") == janus_pane or k == "orchestrator": continue
         F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit: janus tidy closes panes of closed units; otherwise register it as a unit or close it"))
     return F
