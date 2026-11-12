@@ -42,6 +42,12 @@ class Holds(unittest.TestCase):
 
 
 class Auto(unittest.TestCase):
+    def setUp(self):
+        self.real = (janus.tidy_all, janus.tidy_do)
+
+    def tearDown(self):
+        janus.tidy_all, janus.tidy_do = self.real
+
     def test_auto_removes_only_the_safe_kinds(self):
         d, cfg = project("\n[tidy]\nauto = true\nevery_min = 0\n")
         calls = []
@@ -60,6 +66,12 @@ class Auto(unittest.TestCase):
 
 
 class Artifacts(unittest.TestCase):
+    def setUp(self):
+        self.real = janus.all_units
+
+    def tearDown(self):
+        janus.all_units = self.real
+
     def test_artifacts_of_a_closed_unit_are_removed_open_untouched(self):
         d, cfg = project('\n[tidy]\nartifacts = ["target"]\n')
         cw = d / "wt/closed1"; cw.mkdir(parents=True); (cw / "target").mkdir(); (cw / "target/x").write_text("x")
