@@ -45,12 +45,12 @@ def verdict(cfg, u):
         jp = p.with_name("report.json")
         if jp.exists(): mt = max(mt, jp.stat().st_mtime)
         if mt < u.get("started", 0) or (t and "PENDING" in t[0]): return None
-    # finding 1 (high): the LAST of the report's VERDICT: lines and its plain WAITING park lines decides. A park line after the
-    # last VERDICT line means parked, never finished, whatever earlier DONE lines (or a stale report.json) say; the janus brief
-    # header tells every agent to park by writing a bare `WAITING <job ids>` line, so this must hold for every unit, not only a
-    # resumed one (units.py:41-47 read line 1 only for a resumed unit; a park line is the decisive signal).
+    # finding 1 (high): the LAST of the report's VERDICT: lines and its park lines decides. A park line after the last VERDICT
+    # line means parked, never finished, whatever earlier DONE lines (or a stale report.json) say. Finding 5: a park line counts
+    # only when it names a job janus knows (a host in cfg.hosts) -- a prose line, or a park line whose ids janus cannot read
+    # (`mac:9` for an unknown host, a bare `9`), is not a park, so the closing VERDICT line still stands.
     vi = next((i for i in range(len(t) - 1, -1, -1) if t[i].startswith("VERDICT:")), None)
-    pi = next((i for i in range(len(t) - 1, -1, -1) if WAIT_RX.match(t[i])), None)
+    pi = next((i for i in range(len(t) - 1, -1, -1) if _park_line(cfg, t[i])), None)
     if pi is not None and (vi is None or pi > vi): return None
     last = t[vi] if vi is not None else None                                  # the report's last VERDICT line decides
     if last is not None and NONFINAL.search(last): return None                # ends parked/pending: not finished
@@ -130,6 +130,13 @@ ENDED = ("done", "failed", "gone", "idle")
 WAIT_RX = re.compile(r"^[\s*>-]*WAITING\b\**:?\s*(.*)$", re.M)
 
 JOBREF = re.compile(r"(?<![\w/.-])([A-Za-z0-9][\w.-]*):(\d+)\b")
+
+def _park_line(cfg, line):
+    """True when line is a park line that names a job janus knows (a host in cfg.hosts): finding 5 -- a prose line, or a park
+    line whose ids janus cannot read (`mac:9` for an unknown host, a bare `9`), is not a park, so the report's closing VERDICT
+    line decides."""
+    m = WAIT_RX.match(line)
+    return bool(m) and any(h in cfg.hosts for h, _ in JOBREF.findall(m.group(1)))
 
 def report_text(cfg, u):
     try: return report_path(cfg, u).read_text()
