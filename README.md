@@ -383,9 +383,12 @@ environment queues a job. Remote API agents need `claude` on the host.
 
 One way to run a build or test job on any machine: that machine's pueue, never an ssh connection.
 
-**`orch run --host <h> --lane gates|jobs|land [--unit <u>] --wt <worktree> [--subdir <d>] [--usb] [--priority N] [--no-wait] -- <cmd>`**
-- refuses a worktree with a merge in progress, unmerged files, conflict markers, or more than `[landing] max_behind` (default
-  10) commits behind the landing branch (`--allow-unmerged` overrides).
+**`orch run --host <h> --lane gates|jobs|land [--unit <u>] --wt <worktree> [--subdir <d>] [--usb] [--priority N] [--detach] -- <cmd>`**
+- refuses a worktree with a merge in progress, unmerged files or conflict markers; in the gates and land lanes (and `orch
+  gate`) also one more than `[landing] max_behind` (default 10) commits behind the landing branch, never an agent's own jobs
+  lane work (`--allow-unmerged` overrides).
+- `--detach` (alias `--no-wait`) queues it, prints `<host>:<task>` and returns: agents then write `WAITING <ids>` in their
+  report and end the turn; the watcher resumes them with the results (section "Park and resume").
 - syncs the worktree to a remote host: `rsync -rlpgoD --checksum --delete` with no `-t` (a changed file gets the transfer
   time as its mtime, so cargo never reuses an artifact built from older content), without the host's `sync_exclude`; a
   podman host first reflink-clones `container.clone_base`. Every `paths.sync_require` path must arrive.

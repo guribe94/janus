@@ -2601,7 +2601,7 @@ def cmd_run(cfg, a):
     src = str(Path(a.wt).resolve()); name = Path(src).name
     if not Path(src).is_dir(): raise Err(f"worktree {src} not found")
     unit = a.unit or os.environ.get("ORCH_UNIT")
-    why = tree_guard(cfg, src)
+    why = tree_guard(cfg, src, behind=a.lane in ("gates", "land"))   # behind main matters for gates and landing only (item 5)
     if why and not a.allow_unmerged: raise Err(f"refused: {src} {why} (--allow-unmerged to run anyway)")
     jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
     if DRY: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
@@ -2624,9 +2624,10 @@ def cmd_run(cfg, a):
     if a.no_wait: say(f"{hn}:{tid}"); return
     return finish_job(cfg, hn, h, tid, jid)
 
-def tree_guard(cfg, wt):
-    """Why a tree must not be built or gated (issues 33, 41): a merge in progress, conflict markers in changed files, or more
-    than [landing] max_behind (default 10) commits behind the landing branch. None when fine or not a git tree."""
+def tree_guard(cfg, wt, behind=True):
+    """Why a tree must not be built or gated (issues 33, 41): a merge in progress, conflict markers in changed files, or (behind:
+    the gates and land lanes and orch gate only, never an agent's own jobs; orch-fixes9 item 5) more than [landing] max_behind
+    (default 10) commits behind the landing branch. None when fine or not a git tree."""
     g = lambda *x: sh(["git", "-C", str(wt), *x])
     if g("rev-parse", "--git-dir")[0]: return None
     if g("rev-parse", "-q", "--verify", "MERGE_HEAD")[0] == 0: return "has a merge in progress (MERGE_HEAD)"
@@ -2634,6 +2635,7 @@ def tree_guard(cfg, wt):
     if o.strip(): return f"has unmerged files: {' '.join(o.split()[:3])}"
     rc, o, e = g("grep", "-n", "-I", "-E", "^(<<<<<<<|>>>>>>>) ", "--", ".")
     if rc == 0 and o.strip(): return f"has conflict markers ({o.splitlines()[0][:80]})"
+    if not behind: return None
     br = cfg.c.get("landing", {}).get("branch") or "main"; mx = cfg.c.get("landing", {}).get("max_behind", 10)
     rc, o, e = g("rev-list", "--count", f"HEAD..{br}")
     if rc == 0 and o.strip().isdigit() and int(o) > mx: return f"is {o.strip()} commits behind {br} (max {mx}): merge {br} first"
