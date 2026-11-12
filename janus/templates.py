@@ -37,14 +37,28 @@ DIRECT_PROBE = r'''if [ -d /proc/1 ]; then
 fi'''
 
 # Claude/Anthropic API processes janus did not start (spend safety): an API key in the environment and no JANUS_UNIT (every
-# agent janus starts has one), command claude or anthropic. Prints apiproc=<pid> <pgid> <etime> <command>; never the environment.
-API_PROBE = r'''if [ -d /proc/1 ]; then
- for f in /proc/[0-9]*/environ; do e=$(tr '\0' '\n' < "$f" 2>/dev/null); case "$e" in *ANTHROPIC_API_KEY=*) case "$e" in *JANUS_UNIT=*) ;; *) p=${f#/proc/}; echo "${p%/environ}";; esac;; esac; done 2>/dev/null > /tmp/.janus-api.$$
+# agent janus starts has one), command claude or anthropic. Prints apiproc=<pid> <pgid> <etime> <command> and, for whose it is
+# (re-check N2), apiinfo=<pid> <tty> <owner> <root>: owner is JANUS_PROJECT of the nearest ancestor with JANUS_UNIT (a unit's
+# tree; '?' for a unit without a project id, '-' for none), root its JANUS_ROOT, else its cwd. Never the environment itself.
+API_PROBE = r'''T=/tmp/.janus-api.$$
+if [ -d /proc/1 ]; then
+ for f in /proc/[0-9]*/environ; do p=${f#/proc/}; p=${p%/environ}; e=$(tr '\0' '\n' < "$f" 2>/dev/null)
+  case "$e" in *JANUS_UNIT=*) o=$(printf '%s\n' "$e" | sed -n 's/^JANUS_PROJECT=//p' | head -1); echo "u $p ${o:-?}";;
+   *ANTHROPIC_API_KEY=*) echo "k $p $(printf '%s\n' "$e" | sed -n 's/^JANUS_ROOT=//p' | head -1)";; esac
+ done 2>/dev/null > $T
 else
- ps -Eww -A -o pid=,command= 2>/dev/null | awk '/ANTHROPIC_API_KEY=/ && !/JANUS_UNIT=/ {print $1}' > /tmp/.janus-api.$$
+ ps -Eww -A -o pid=,command= 2>/dev/null | awk '/ JANUS_UNIT=/ {o = "?"; if (match($0, / JANUS_PROJECT=[^ ]+/)) o = substr($0, RSTART + 15, RLENGTH - 15); print "u", $1, o; next}
+   / ANTHROPIC_API_KEY=/ {r = ""; if (match($0, / JANUS_ROOT=[^ ]+/)) r = substr($0, RSTART + 12, RLENGTH - 12); print "k", $1, r}' > $T
 fi
-ps -A -o pid=,pgid=,etime=,command= | awk 'NR == FNR {k[$1] = 1; next} ($1 in k) {c = $0; sub(/^ *[0-9]+ +[0-9]+ +[^ ]+ +/, "", c); if (c ~ /(^|\/)claude( |$)|node .*claude|anthropic/) print "apiproc=" $1, $2, $3, substr(c, 1, 100)}' /tmp/.janus-api.$$ - 2>/dev/null
-rm -f /tmp/.janus-api.$$'''
+ps -A -o pid=,ppid=,pgid=,etime=,tty=,command= | awk -v I=$T.i 'NR == FNR {if ($1 == "u") u[$2] = $3; else {k[$2] = 1; r[$2] = substr($0, length($1 $2) + 3)}; next}
+  {pp[$1] = $2; c = $0; sub(/^ *[0-9]+ +[0-9]+ +[0-9]+ +[^ ]+ +[^ ]+ +/, "", c)
+   if (($1 in k) && c ~ /(^|\/)claude( |$)|node .*claude|anthropic/) {print "apiproc=" $1, $3, $4, substr(c, 1, 100); a[$1] = $5}}
+  END {for (p in a) {o = "-"; q = pp[p]; n = 0; while (q > 1 && n++ < 50) {if (q in u) {o = u[q]; break}; q = pp[q]}; print p, a[p], o, r[p] > I}}' $T - 2>/dev/null
+[ -f $T.i ] && while read -r p t o r; do
+ [ -n "$r" ] || r=$(readlink /proc/$p/cwd 2>/dev/null || lsof -a -p $p -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+ echo "apiinfo=$p $t $o ${r:--}"
+done < $T.i
+rm -f $T $T.i'''
 
 CAP_LIB = r'''# janus capacity library for host %(name)s (written by janus, see cap_lib in janus.py; do not edit: the next janus run rewrites it).
 # Sourced by every waiting job each poll and sent inline with every probe. Needs RD (the runs dir).
