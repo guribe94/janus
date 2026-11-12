@@ -9,7 +9,7 @@ from janus.beads import Beads
 from janus.board import board
 from janus.cap import host_cap
 from janus.context import AGENT_RX, Err, FIXTURE_MARK, ancestors, fl, hrun, now, projects, sh, ts
-from janus.platform import secs
+from janus.platform import env_janus, secs
 from janus.probe import margins, room
 from janus.templates import STOP_GROUP
 from janus.units import all_units, ws_id
@@ -46,23 +46,25 @@ def proc_findings(cfg, ps_text=None, viol=None):
         anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "janus.py api-run" in t[q][3]), None)
         lane = any("pueued" in t[q][3] for q in anc)
         if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
-            F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; it is stopped after [enforce] grace_min unless it moves to a lane (janus run)"))
-            if viol is not None: viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
-                              "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": env_unit(p)})
+            # cross-project safety (re-check N3): whose burner it is, by project id (its own environment, else its agent's);
+            # another project's is neither shown nor touched; one without an id (an agent janus did not start, an orphan) is
+            # reported only; only a burner under this project's own agents is warned and stopped
+            e = env_janus(p); e = e if e.get("JANUS_PROJECT") else env_janus(agent) if agent else {}
+            proj = e.get("JANUS_PROJECT"); mine = proj == project_id(cfg)
+            if proj and not mine: continue
+            F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; "
+                      + ("it is stopped after [enforce] grace_min unless it moves to a lane (janus run)" if mine else "reported only (not under this project's agents)")))
+            if viol is not None and mine: viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
+                              "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": e.get("JANUS_UNIT")})
         if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc) and not lane_below(p):
-            u = env_unit(p) if viol is not None else None   # an agent's (JANUS_UNIT): warned once, then stopped (enforce)
+            e = env_janus(p) if viol is not None else {}   # an agent's (JANUS_UNIT): warned once, then stopped (enforce)
+            if e.get("JANUS_PROJECT") and e["JANUS_PROJECT"] != project_id(cfg): continue   # another project's: not shown, not touched
+            u = e.get("JANUS_UNIT") if e.get("JANUS_PROJECT") == project_id(cfg) else None
             F.append((f"localtest:{p}", f"test/build run on this machine outside the pueue lanes (pid {p}, {et}){' by ' + u if u else ''}: {c[:70]}; use janus run"
                       + ("; it is stopped after [enforce] grace_min" if u else "")))
             if u: viol.append({"key": f"localtest:{p}", "kind": "direct", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
                                "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": u})
     return F
-
-def env_unit(pid):
-    """JANUS_UNIT of a local process (macOS ps -E appends the environment after the command), or None."""
-    rc, o, e = sh(["ps", "-Eww", "-p", str(pid), "-o", "command="], timeout=10)
-    rc2, c, e2 = sh(["ps", "-ww", "-p", str(pid), "-o", "command="], timeout=10)
-    m = re.search(r"(?:^|\s)JANUS_UNIT=(\S+)", o[len(c.rstrip("\n")):] if o.startswith(c.rstrip("\n")) else "")
-    return m.group(1) if m else None
 
 # Stop a process group after one warning (register item 23): TERM the group, KILL what is left after 5 s. When the group also
 # holds an agent (claude, codex) or pueued, only the process and its descendants are stopped, never the agent.
