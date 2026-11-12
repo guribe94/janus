@@ -121,6 +121,11 @@ arguments. `hosts` limits where a model may run.
 **`[routing]`**: ordered lists per tier: `critical`, `normal`, and `review`. The first model whose provider is enabled
 and within budget wins. A review skips models of the implementer's vendor.
 
+**Adding a model, or turning a provider off.** Add a `[models.<name>]` entry (provider, vendor, kind; `api_id` for an `api`
+model; optional `args`, `hosts`) and name it in `[routing]`; `janus doctor` then checks it (provider enabled, within budget,
+its CLI on PATH). To stop using a provider, set `[providers.<name>].enabled = false`: routing skips it, and `janus check`
+reports a disabled provider a unit still uses.
+
 Then, in a session that will be the orchestrator:
 
 ```
@@ -169,6 +174,8 @@ $ janus capacity
 laptop room=2 avail=9.4G load=2.10 psi=- disk=80G agents=1
 server room=0 avail=3.1G load=1.20 psi=0.00 disk=60G agents=2 FULL: memory 3.1G free, reserve 3G
 ```
+`psi` is memory pressure stall information: the share of time work stalled on memory (the kernel's avg10 reading for the
+host); `-` means the host did not report a figure.
 
 **`janus launch <unit> --kind implement|review|audit|cleanup [--tier critical|normal] [--host h] [--test-host h] [--model m] [--brief f] [--cwd d] [--allow-main] [--budget usd] [--of unit] [--dry-run]`**
 ```
@@ -259,7 +266,22 @@ acked unit:parser:finished
 
 **`janus status`**: prints the Live state (hosts, units, ready work, spend, problems) without counting as a cycle.
 
+**`janus decide` / `janus decisions`**: the decision records (docs/DECISIONS.md). `janus decide "<title>" --by owner|orchestrator
+--decision "<one sentence>" [--why "<ruling>"] [--context ...] [--options "<option and trade-off>" ...] [--consequences ...]
+[--supersedes <n>] [--instruction <beads id>]` writes the next numbered record, marks the record it supersedes, and regenerates
+`.janus/decisions/INDEX.md`; `janus decisions [--grep <regex>]` lists the records, newest first. The index is injected at
+session start, so the record chain is in front of the orchestrator before it decides anything those records touch.
+
 **Notes.** After each decision, update the *Orchestrator notes* part of `.janus/HANDOFF.md` (see section 5).
+
+**A unit failed — what now.** The command depends on how it ended:
+- *Crashed or capped with no verdict* (`unit:<u>:finished`): relaunch from its report with `janus launch <u> --resume-of <u>`;
+  with `[autopilot] enabled` the watcher does this for a local unit.
+- *Finished with a verdict*: `janus collect <u>` for a remote unit, then `janus close <u>`.
+- *Done but not landed* (`landing:<u>:unlanded`): `janus gate <name>`, then `janus land <u>`.
+- *Parked, not failed* (`VERDICT: WAITING`): its jobs are still running; the watcher resumes it when they finish (`janus
+  resume <u>` resumes it by hand).
+- *A stuck lane job*: `janus cancel <host>:<task>`.
 
 ## 4. What the hooks enforce, and why
 
@@ -282,6 +304,15 @@ Agents: their Stop is blocked until `REPORT.md` (path in `JANUS_REPORT`) has lin
 `VERDICT: DONE|BLOCKED|FAILED` line, and a mention of exit codes.
 
 A denial reads: "Orchestrators do not operate by hand (...). Use janus launch/stop/collect/close, or brief an agent."
+
+## 4a. Findings and their actions
+
+Every line `janus check` prints is `[key] problem`, and each names the action that clears it. This section is the reference
+for those keys: one short recipe per finding — what it means and what to do — so the orchestrator can act without guessing.
+
+PLACEHOLDER — the per-finding recipes (moved out of `skill/SKILL.md` by the fix-prompts unit) are pasted in here at
+integration. Until then, use the `janus check` line itself, the troubleshooting table in section 7, and the command's own
+`--help`.
 
 ## 5. Handoff, instructions, rules, memory and the board
 
@@ -357,6 +388,24 @@ folder, the board's sync carries them to every host: the same files serve one ma
   tells a human what landed, started, finished, was asked, answered, failed or learned.
 - Cards of closed units are archived by check. Other hosts post to an outbox under their root; `board.sh sync` (the watcher
   runs it each pass) merges the outboxes and pushes the board, and the script itself, to `<root>/board/` and `<root>/bin/`.
+
+### The owner takes over, and hands back
+
+**The orchestrator is just the registered session.** `janus resume [--runtime claude|codex] [--here]` takes over safely: if a
+registered orchestrator is alive it asks it to stop and waits a bounded time, so two never run at once (the state writer lock
+is the guard); it commits and pushes the state folder first, and pulls it if this machine is behind its remote; running agents
+and jobs are untouched — they belong to their hosts' queues — and parked units keep their jobs. `--here` registers the current
+Claude or Codex session as the orchestrator; without it, `resume` starts one in the requested runtime in the project's herdr
+workspace (or tmux). Either way SessionStart reloads the handoff, the standing rules, the decision index and a fresh check, so
+the new session starts with nothing lost. Under Codex, confirm the hooks are trusted (`/hooks`) once.
+
+To work in the session yourself, `janus resume --here` (or `janus register`) makes the current session the orchestrator; its
+hooks still file every prompt as an instruction. Everything that must survive is on disk: rules (`bd prime`), session memory
+(`.janus/MEMORY.md`), decisions (`.janus/decisions/`), and live state plus your notes (`.janus/HANDOFF.md`).
+
+**Hand back** by leaving the notes current and running `janus register` in the session you will keep; SessionStart then
+reloads the handoff, rules and check output. The watcher starts a new orchestrator only when the registered pane and process
+are gone and the transcript has been quiet for 20 minutes (section 2), so a live session is never doubled.
 
 ## 6. Multiple machines, capacity and network outages
 
@@ -630,9 +679,6 @@ Open items and their reasons are tracked in `docs/ISSUES.md`. Not yet verified l
 - A board question or block waking the orchestrator at once, and the session memory in agents' briefs (tested, marked
   "verify live" in `docs/ISSUES.md`).
 - Codex's PreToolUse tool names (the handler accepts `Bash`, `shell`, `local_shell` and any tool input with `command`/`cmd`).
-
-Planned, not built: commands to write and search decision records (`janus decide`), and the autopilot described in
-`docs/DESIGN.md`.
 
 Asked for but not in the code: moving unstarted jobs to another host after `unreachable_min`
 (the setting is read but unused), pushing state to a bare repo, `MemoryMax` for herdr agents on a macOS coordinator (no

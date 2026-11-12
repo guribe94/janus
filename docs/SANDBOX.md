@@ -1,8 +1,11 @@
 # Sandbox
 
 `sandbox/run` runs an agent's command with a write limit: the command can write only where that agent works,
-and it cannot read the keychain or a list of denied paths. It is the enforcement behind the owner's rule that
-an agent may write only its worktree and its output folder, and may not read the keychain or another repository.
+and it cannot read the keychain or a list of denied paths. It is **optional and not wired into launches**: no janus
+launch, job or watcher calls it, so nothing enforces the owner's rule that an agent may write only its worktree and
+its output folder, and may not read the keychain or another repository (owner ruling: the sandbox is optional and
+unwired). An agent, a launcher or you can wrap a command with it by hand: it is built and tested, and it is the
+intended enforcement for the trust model, but it is not the enforcement in use.
 
 ## What it is
 
@@ -44,15 +47,13 @@ The write list is what makes "only its worktree and its output folder" true; the
 "cannot read the keychain or another repository" true. Both are per run, so two agents on the same machine get
 different allow lists from the same code.
 
-## How janus calls it
+## How janus would call it
 
-The call site is added in the improvements round; `run` is the interface it will use:
+Nothing in janus calls `sandbox/run` today (see the top). If it were wired in, this is the interface:
+janus would pass the unit's worktree and output folder, and `SANDBOX_DENY` with the other repositories (and any
+secret paths) the agent must not read:
 
     sandbox/run <unit-worktree> <out/<unit>> -- <agent command...>
-
-janus will pass the unit's worktree and output folder, and `SANDBOX_DENY` with the other repositories (and any
-secret paths) the agent must not read. Nothing in janus calls `sandbox/run` yet, so today it is opt-in: a
-launcher or an agent can wrap a command with it by hand.
 
 ## Limits (known, not fixed here)
 

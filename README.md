@@ -3,8 +3,8 @@
 janus lets one AI session run a software project as its orchestrator: it hands work to many AI coding agents on one or
 more machines, watches them, checks their results, lands what passes and cleans up. The orchestrator never does the work
 itself. janus is a command-line tool (`janus`, standard-library Python), a one-page skill the orchestrator loads, a set
-of hooks that hold it to that role, and a watcher that wakes it. It is glue over standard tools: git, ssh, rsync, beads,
-pueue, tmux and herdr.
+of hooks that hold it to that role, and a watcher that wakes it. It is glue over standard tools: git, ssh, rsync, beads (a
+local issue tracker, `bd`), pueue (a per-machine job queue), tmux and herdr (terminal panes).
 
 Terms used below: a *unit* is one piece of work given to one agent; its *brief* is the written task; a *gate* is the
 test run a change must pass before it *lands* (is merged into the main branch).
@@ -192,12 +192,14 @@ python3 ~/code/janus/janus.py init     # writes a commented janus.toml and .janu
 $EDITOR janus.toml                     # this machine, models, routing, where the API key is stored
 bd init                                # beads, once
 ~/code/janus/install --dry-run         # shows every change; then run it without --dry-run
-janus doctor                           # checks the whole setup and names the fix for each problem
+janus doctor                           # after that real install: checks the whole setup and names the fix for each problem
 ```
 
 `install` builds a tested release, links the `janus` command and the skill, adds the hooks to Claude Code and Codex, and
-installs the watcher. Codex needs one manual step: run `/hooks` in Codex to trust them. Then open the orchestrator
-session in the project and run `janus register`.
+installs the watcher. Codex needs one manual step: run `/hooks` in Codex to trust them. Then start your agent CLI in the
+project directory as the orchestrator (for example, run `claude` there), and inside that session run `janus register`.
+This one session is the orchestrator; hooks act only for it (other sessions are left alone — see docs/REFERENCE.md,
+section 2). If the session id is not known yet, `register` says `pending` and the next hook event claims it.
 
 ## Adding machines
 
@@ -210,7 +212,7 @@ backs off when it is under pressure. Every key is documented in `example.janus.t
 
 | Command | What it does |
 |---|---|
-| `janus check` | one line per problem; silent when all is well |
+| `janus check` | one line per problem; silent when all is well (run outside the registered session it also prints a closing `(read-only: …)` note; see REFERENCE §7) |
 | `janus ack <key> "<decision>"` | acknowledge a problem and record the decision |
 | `janus status`, `janus capacity` | the whole picture; room per host |
 | `janus launch <unit> --kind implement --tier normal` | start an agent on the brief `briefs/<unit>.md`, on a host with room |
@@ -219,9 +221,16 @@ backs off when it is under pressure. Every key is documented in `example.janus.t
 | `janus gate-scope <unit>`, `janus gate <name>` | write a targeted gate; queue it |
 | `janus land <unit>` | merge main, gate the merged tree, squash-land |
 | `janus remember --fact "<text>" --source <path>` | add to session memory |
+| `janus decide "<title>" --by owner\|orchestrator --decision "…" --why "…"` | write a decision record (`.janus/decisions/`) |
+| `janus decisions --grep <topic>` | find why a decision was made |
 | `janus tidy --dry-run` | list worktrees, branches, files and caches that can go |
 | `janus report` | a status report for the owner |
 | `board.sh summary`, `board.sh answer <id> <text>` | see the board; answer a question |
+| edit `[models.*]` / `[providers.*].enabled` in janus.toml, then `janus doctor` | add a model, or turn a provider off |
+| `bd remember "<rule>" --key <subject>` | add or replace a standing rule (reuse the subject key to replace) |
+| `janus launch <unit> --resume-of <unit>` | recover a crashed or capped unit from its report |
+
+On a machine running other janus projects, `check` also reports machine-level state (queues, panes, hosts) that is not yours.
 
 Every command, option, hook rule and setting is in [docs/REFERENCE.md](docs/REFERENCE.md), with a troubleshooting table.
 
@@ -230,6 +239,5 @@ Every command, option, hook rule and setting is in [docs/REFERENCE.md](docs/REFE
 Built, with tests: the hooks, `check`, launch and admission by reservations, park and resume, the ledger, targeted
 gates, the board with question ids, session memory, peers and transcripts. Not yet seen working live: the watcher
 starting a new orchestrator, the controlled context reset, a remote agent end to end, and a board question waking the
-orchestrator. Decision records are plain files written from `skill/templates/decision.md`; commands to write and search
-them are planned. The open items are listed in [docs/REFERENCE.md](docs/REFERENCE.md#known-gaps) and
-[docs/ISSUES.md](docs/ISSUES.md).
+orchestrator. Decision records are written and searched with `janus decide` and `janus decisions`. The open items are
+listed in [docs/REFERENCE.md](docs/REFERENCE.md#known-gaps) and [docs/ISSUES.md](docs/ISSUES.md).
