@@ -589,6 +589,11 @@ class Memory(unittest.TestCase):
         keys = {k for k, _ in orch.memory_findings(cfg)}
         self.assertIn("memory-long", keys); self.assertTrue(any(k.startswith("memory-source:") for k in keys))
         orch.cmd_forget(cfg, argparse.Namespace(text="a third")); self.assertEqual(len(orch.memory_read(cfg)), 2)
+        hd = orch.brief_header(cfg, "here", cfg.hosts["here"], "u1", d, True)   # every agent's brief starts with it
+        self.assertIn("Session memory (curated by the orchestrator; your brief wins on conflict)", hd)
+        self.assertIn("tests run on linux only", hd); self.assertIn("peers.md", hd); self.assertIn("orch transcript", hd)
+        rh = orch.brief_header(cfg, "far", {"root": "/r", "ssh": "x"}, "u2", "/r/worktrees/u2", False)
+        self.assertIn("tests run on linux only", rh); self.assertIn("/r/board/peers.md", rh)
 
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):

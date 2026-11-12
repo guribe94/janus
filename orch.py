@@ -757,9 +757,17 @@ def ws_id(cfg, create=False):
         return r.get("workspace", {}).get("workspace_id")
 
 # ---------------------------------------------------------------- check
+def board_script(cfg):
+    """The message board script: paths.board (a project's own), else the board.sh shipped next to orch.py (orch-swarm item 6)."""
+    return cfg.p("board") if cfg.paths.get("board") else ORCH_SELF.parent / "board.sh"
+def board_dir(cfg): return cfg.root / cfg.paths.get("board_dir", "board")
+def board(cfg, *args, env=None, timeout=25):
+    """Run the board script with BOARD_DIR set (the shipped board keeps its files there; a project's own script may ignore it)."""
+    return sh([str(board_script(cfg)), *args], env={"BOARD_DIR": str(board_dir(cfg)), **(env or {})}, timeout=timeout)
+
 def board_rows(cfg):
     """Every open card on the board: {name: {"state", "silent", "gone", "text"}} (audit H8: all cards, not only orch's units)."""
-    rc, o, e = sh([str(cfg.p("board", "bin/board.sh")), "summary"], env={"BOARD_SILENT_MIN": str(cfg.silent // 60)})
+    rc, o, e = board(cfg, "summary", env={"BOARD_SILENT_MIN": str(cfg.silent // 60)})
     rows = {}
     for l in (o.splitlines()[1:] if rc == 0 else []):
         f = l.split()
@@ -882,9 +890,9 @@ def enforce(cfg, F):
         s = st.get(v["key"]) or {}; stop_ok = ec.get("stop_burners", True) if v["kind"] == "burner" else ec.get("stop_direct", False)
         u = v.get("unit")
         if not s.get("warned"):
-            if u: sh([str(cfg.p("board", "bin/board.sh")), "direct", u, f"orch: your process {v['pid']} ({v['kind']}) on {v['host']} breaks the lane rule: "
+            if u: board(cfg, "direct", u, f"orch: your process {v['pid']} ({v['kind']}) on {v['host']} breaks the lane rule: "
                       + ("stop it now and run builds and tests through the lane" if v["kind"] == "direct" else "stop this CPU burner now") +
-                      (f"; orch stops it at {ts(now() + grace)}" if stop_ok else "")])
+                      (f"; orch stops it at {ts(now() + grace)}" if stop_ok else ""))
             s = {"warned": now(), "unit": u}; notes[v["key"]] = f"warned {u or 'no unit'} at {ts()}" + (f"; stops at {ts(now() + grace)}" if stop_ok else "")
         elif stop_ok and not s.get("stopped") and now() - s["warned"] >= grace:
             h = cfg.hosts[v["host"]]
@@ -1163,7 +1171,7 @@ def cmd_board_close(cfg, a):
     except Err as e: raise Err(f"beads unavailable, so it cannot tell whether {a.agent} is an open unit: {e}")
     if a.agent in open_units: raise Err(f"{a.agent} is an open unit: use orch close {a.agent}")
     if DRY: say(f"+ board.sh close {a.agent}"); return
-    rc, o, e = sh([str(cfg.p("board", "bin/board.sh")), "close", a.agent])
+    rc, o, e = board(cfg, "close", a.agent)
     if rc: raise Err(f"board.sh close {a.agent}: {(e or o).strip()[:120]}")
     cfg.touch("changed"); say(f"board card {a.agent} archived")
 
@@ -1203,7 +1211,7 @@ def cmd_register(cfg, a):
     if ws:   # plain shell loops: `watch` is not installed on the Mac (M10)
         have = {t.get("label") for t in (herdr("tab", "list", "--workspace", ws) or {}).get("tabs", [])}
         for lab, cmd in (("status", "while :; do clear; orch status; sleep 60; done"),
-                         ("board", f"while :; do clear; {shlex.quote(str(cfg.p('board', 'bin/board.sh')))} summary; sleep 60; done"),
+                         ("board", f"while :; do clear; BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} summary; sleep 60; done"),
                          ("watcher", f"tail -f {shlex.quote(str(cfg.f('watch.log')))}")):
             if lab in have: continue
             r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root), "--no-focus")
@@ -1225,7 +1233,7 @@ def pick_model(cfg, tier, kind, of_vendor, host=None):
 def agent_prompt(cfg, unit, brief, hn, report=None):
     """The first prompt of a unit. It names the report path the unit must keep (row 26: a resumed unit continues its original
     report, which orch reads; the agent must not guess it from the brief)."""
-    rc, o, e = sh([str(cfg.p("board", "bin/board.sh")), "rule", unit, "mac" if cfg.hosts[hn].get("local") else hn])
+    rc, o, e = board(cfg, "rule", unit, *([] if cfg.hosts[hn].get("local") else [hn]))
     rp = f"your report {report}" if report else "REPORT.md (path in the brief)"
     return (f"Read {brief} and carry out every instruction exactly. Keep {rp} current after every step (a run "
             f"stopped by its budget must leave its state written): line 1 'VERDICT: PENDING' "
@@ -1347,7 +1355,7 @@ def cmd_api_run(cfg, a):
     try: var, key = read_secret(pv)
     except Err as e: ledger_done(cfg, pv, run, name, 0, "no-key"); raise
     shim = cfg.f("bin"); put_script({"local": True}, str(shim / "pueue"), clean_pueue_script({"local": True}))
-    env = clean_env({"ORCH_ROLE": "agent", "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root), "ORCH_REPORT": a.report or str(od / "REPORT.md"), var: key})
+    env = clean_env({"ORCH_ROLE": "agent", "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root), "ORCH_REPORT": a.report or str(od / "REPORT.md"), "BOARD_DIR": str(board_dir(cfg)), var: key})
     env["PATH"] = f"{shim}:{env['PATH']}"   # the agent's own `pueue add` never stores the key in pueue's state file
     prompt = Path(a.prompt_file).read_text() if a.prompt_file else agent_prompt(cfg, name, a.brief, hn, a.report or str(od / "REPORT.md"))
     argv = api_argv(pv, mc, a.budget, prompt, a.resume_session)
@@ -1425,17 +1433,48 @@ PARK_RULE = ("**Never wait for a build or test (orch rule).** Submit it with `{s
              "orch resumes this same session with each job's exit code and log path when all of them have finished. A turn spent "
              "waiting costs money and can end the run at its budget cap with nothing written.\n\n")
 
+BOARD_RULE = ("**Board:** post only state changes (status when you start, `waiting <job ids>` when you park, `blocked` or `question` when "
+              "stuck, `learned <fact, with its source>` when you found something every agent should know, `done <VERDICT line>` at the end); "
+              "your steps go in your report, not on the board.")
+
+def swarm_header(cfg, hn, h, name, rcwd, local):
+    """What every agent gets at start besides its brief (orch-swarm item 2): the session memory, then pointers (never content)
+    to the project's agent instructions, the reports index, the peers file and how to read another agent's transcript."""
+    es = memory_read(cfg); L = []
+    if es:
+        L.append("## Session memory (curated by the orchestrator; your brief wins on conflict)")
+        for sec in MEM_SECTIONS.values():
+            sel = [mem_line(e) for e in es if e[0] == sec]
+            if sel: L += [f"{sec}:", *sel]
+        L.append("")
+    bdir = str(board_dir(cfg)) if local else f"{h['root']}/board"
+    docs = mset(cfg, "agent_docs"); docs = [docs] if isinstance(docs, str) else docs
+    L += ["## Other agents and shared knowledge (orch)",
+          f"- Project instructions: read the root {' / '.join(docs)} of your tree ({rcwd}) and the one in each folder you touch, where present.",
+          f"- Reports index: {bdir}/index.md (one line per unit: verdict, result, report path).",
+          f"- Peers: {bdir}/peers.md (each running unit: host, model, branch, files it changed, step, jobs it waits on, report, transcript).",
+          ("- Another agent's transcript: `orch transcript <unit> --grep '<regex>'` or `orch transcript <unit> --tail 20` (condensed)." if local else
+           "- Another agent's transcript: peers.md names where it is; when it is on this host, grep or tail it (never read it whole); "
+           "otherwise ask with a board question and the orchestrator reads it for you."),
+          "- Rule: read peers.md and the index when your task touches another unit's area; read a transcript only to solve a problem "
+          "another unit met, by grep or tail, never whole.",
+          "- " + BOARD_RULE, "", ""]
+    return "\n".join(L)
+
 def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None):
-    """The header every unit's brief gets: where it runs, how it submits builds and tests (detached, then WAITING), its report."""
+    """The header every unit's brief gets: where it runs, how it submits builds and tests (detached, then WAITING), its report,
+    then the session memory and the swarm pointers (swarm_header)."""
     if local:
         b = build or hn
         return (f"<!-- orch: unit {name} runs on {hn} -->\n" + PARK_RULE.format(
-            submit=f"orch run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=report or "REPORT.md"))
+            submit=f"orch run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=report or "REPORT.md")
+            + swarm_header(cfg, hn, h, name, rcwd, True))
     lane = qp(f"{h['root']}/run/{name}.lane")
     return (f"<!-- orch: unit {name} runs on {hn} -->\n**Where you run (orch):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `orch collect` "
             f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
-            f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=report or "REPORT.md"))
+            f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=report or "REPORT.md")
+            + swarm_header(cfg, hn, h, name, rcwd, False))
 
 def place(cfg, a, brief, mc, units, hs):
     """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
@@ -1575,7 +1614,8 @@ def cmd_launch(cfg, a):
     else:
         u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
         bd.run("update", u["id"], "--status", "in_progress"); bd.save(u)
-    env = {"ORCH_ROLE": "agent", "ORCH_REPORT": str(report or outd / "REPORT.md"), "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root)}
+    env = {"ORCH_ROLE": "agent", "ORCH_REPORT": str(report or outd / "REPORT.md"), "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root),
+           **({"BOARD_DIR": str(board_dir(cfg))} if local else {})}   # remote: <root>/bin/board.sh finds <root>/board itself
     try:
         if not local:
             root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
@@ -1669,7 +1709,7 @@ def cmd_launch(cfg, a):
     if DRY: return
     bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); cfg.touch("changed")
     chk = f"herdr {name}" if u["via"] == "herdr" else f"pueue {hn}:{u['task']}" if u["via"] == "pueue" else f"tmux {hn}:orch-{name}"
-    sh([str(cfg.p("board", "bin/board.sh")), "post", name, "status", f"launched ({mname}, {hn})"],
+    board(cfg, "post", name, "status", f"launched ({mname}, {hn})",
        env={"BOARD_MACHINE": hn, "BOARD_BRIEF": str(brief), "BOARD_CHECK": chk})
     st = u.get("start_state", "running" if u["via"] == "herdr" else "unknown")
     say((f"launched {name} on {hn} via {u['via']}" if st in ("running", "queued", "finished") else f"queued {name} on {hn} via {u['via']}, NOT confirmed running ({st})")
@@ -1854,7 +1894,7 @@ def cmd_close(cfg, a):
     if u.get("via") == "pueue":   # the task's log is kept under out/<unit>/ before the task is removed
         if not DRY: save_task_log(cfg, h, u, u["task"])
         X(h, f"{pueue(h)} remove {int(u['task'])} 2>/dev/null; true")
-    X({"local": True}, f"{shlex.quote(str(cfg.p('board', 'bin/board.sh')))} close {u['name']} 2>/dev/null; true")
+    X({"local": True}, f"BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} close {u['name']} 2>/dev/null; true")
     if DRY: return
     if u.get("run") and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"): settle_run(cfg, u, "closed")
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
@@ -3426,7 +3466,7 @@ def doctor(cfg, a):
             if m not in cfg.models: r(False, f"routing {tier}: unknown model {m}", "fix [routing]")
     for k, d in (("briefs", "briefs"), ("out", "out")):
         r(cfg.p(k, d).is_dir() or None, f"paths.{k} {cfg.p(k, d)}", f"mkdir {cfg.p(k, d)}")
-    b = cfg.p("board", "bin/board.sh")
+    b = board_script(cfg)
     r(os.access(b, os.X_OK) or None, f"message board {b}", "optional: agents post progress through it (paths.board)")
     rc, o, e = sh(["bd", "list", "-n", "1", "--json"], cwd=cfg.beads)
     r(rc == 0, f"beads in {cfg.beads}", f"run bd init in {cfg.beads} ({(e or o).strip()[:80]})")
@@ -3765,7 +3805,7 @@ def cmd_hook(ev):
     if session_alive(cfg) is not True: record_session_proc(cfg)
     if d.get("transcript_path"): cfg.f("transcript").write_text(d["transcript_path"])
     if ev == "SessionStart":   # cached state only: the hook has a 60 s limit, and the check runs as the session's first act (M14)
-        parts = [handoff_path(cfg).read_text() if handoff_path(cfg).exists() else ""]
+        parts = [handoff_path(cfg).read_text() if handoff_path(cfg).exists() else "", memory_text(cfg)]   # MEMORY.md (orch-swarm item 2)
         rc, o, e = sh(["bd", "prime"], cwd=cfg.beads, timeout=20); parts.append(o if rc == 0 else f"(bd prime unavailable: {e.strip()[:80]})")
         parts.append("The Live state above is from the last check. You are the orchestrator: dispatch, monitor, verify, land, clean up, report. "
                      "First run orch check, act on each line, orch ack. See the orchestrating skill.")
