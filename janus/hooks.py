@@ -359,8 +359,8 @@ def cmd_hook(ev):
         ctx(ev, "\n\n".join(parts)[:30000])
     elif ev == "UserPromptSubmit":
         pr = (d.get("prompt") or "").strip()
-        orchs = pr.startswith((JANUS_MARK, "janus cycle:", WAKE, "You are the orchestrator. " + WAKE)) or pr in ("/clear", "/compact") or pr.startswith("/")
-        if pr and not orchs and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
+        janus_own = pr.startswith((JANUS_MARK, "janus cycle:", WAKE, "You are the orchestrator. " + WAKE)) or pr in ("/clear", "/compact") or pr.startswith("/")
+        if pr and not janus_own and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
             try:
                 i = Beads(cfg).create("instr: " + re.sub(r"\s+", " ", pr)[:70], "instruction", pr[:4000]); cfg.touch("changed")
                 ctx(ev, f"Filed as instruction {i}: close it as done, or make it a standing rule with bd remember \"<rule>\" --key <subject> "
