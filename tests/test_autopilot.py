@@ -64,7 +64,7 @@ class Enforce(unittest.TestCase):
                           f"{pid}    50   {pid}  90.0    01:00 cargo test -p x\n")
         def run(pid):
             viol = []; F = janus.proc_findings(cfg, ps(pid), viol=viol); return janus.enforce(cfg, F, viol)
-        with mock.patch.object(janus, "env_unit", lambda p: "u1"), mock.patch.object(janus, "board", lambda c, *a, **k: posts.append(a) or (0, "", "")), \
+        with mock.patch.object(janus, "env_janus", lambda p: {"JANUS_UNIT": "u1", "JANUS_PROJECT": "t"}), mock.patch.object(janus, "board", lambda c, *a, **k: posts.append(a) or (0, "", "")), \
              mock.patch.object(janus, "hrun", lambda h, script, **k: stops.append(script) or (0, "stopped", "")):
             F = run(60)
             self.assertTrue(any(k == "localtest:60" and "warned u1" in t for k, t in F), F)
@@ -73,6 +73,22 @@ class Enforce(unittest.TestCase):
             e = cfg.jget("enforce.json"); e["localtest:60"]["warned"] -= 301; cfg.jput("enforce.json", e)
             F = run(60); self.assertEqual(len(stops), 1); self.assertIn("60", stops[0]); self.assertTrue(any("STOPPED" in t for _, t in F))
             run(61); self.assertEqual((len(posts), len(stops)), (1, 2), "a warned unit's next direct test got a second warning, not a stop")
+
+
+    def test_cpu_burners_acted_on_only_under_this_projects_agents(self):
+        """Catches (re-check N3): this project's watcher stopping a long build under another project's agent, or one it cannot
+        tell is its own (an orphan without a project id)."""
+        d, cfg = project()
+        ps = (" 50     1    50   1.0    09:00 /usr/local/bin/claude --print\n 60    50    60  99.0    20:00 /opt/build --all\n"
+              " 70     1    70   1.0    09:00 /usr/local/bin/claude --print\n 80    70    80  99.0    20:00 /opt/build --all\n"
+              " 90     1    90  99.0    20:00 /opt/miner --all\n")
+        env = {50: {"JANUS_UNIT": "x", "JANUS_PROJECT": "other"}, 60: {"JANUS_UNIT": "x", "JANUS_PROJECT": "other"},
+               70: {"JANUS_UNIT": "u1", "JANUS_PROJECT": "t"}, 80: {"JANUS_UNIT": "u1", "JANUS_PROJECT": "t"}}
+        viol = []
+        with mock.patch.object(janus, "env_janus", lambda p: env.get(p, {})):
+            F = janus.proc_findings(cfg, ps, viol=viol)
+        self.assertEqual(sorted(k for k, _ in F if k.startswith("burner:")), ["burner:80", "burner:90"], "another project's burner shown")
+        self.assertEqual([v["key"] for v in viol], ["burner:80"], "a burner not under this project's agents would be stopped")
 
 
 class FakeBeads:

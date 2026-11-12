@@ -8,7 +8,8 @@ The coordinator may be either OS. run() is the one subprocess call (context.sh a
 module imports nothing of janus and sits at the bottom of the package. Still to fold in: containers/scopes (`podman`,
 `systemd-run`) in job scripts, and launch.py's direct herdr calls (pane_tool says which tool a machine has).
 """
-import json, shutil, subprocess, sys
+import json, re, shutil, subprocess, sys
+from pathlib import Path
 
 
 def run(cmd, cwd=None, inp=None, timeout=25, env=None):
@@ -29,6 +30,15 @@ def ps_table():
         if len(f) >= 8 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), int(f[2]), " ".join(f[3:8]), f[8] if len(f) > 8 else "")
     return t
 
+
+def env_janus(pid):
+    """The JANUS_* variables of a local process ({} when none or unreadable): Linux /proc/<pid>/environ; macOS ps -E, which
+    appends the environment after the command, so the command (from plain ps) is cut off first."""
+    try: return {k: v for k, _, v in (x.partition("=") for x in Path(f"/proc/{pid}/environ").read_bytes().decode(errors="replace").split("\0")) if k.startswith("JANUS_")}
+    except OSError: pass
+    o, c = (run(["ps", *f, "-ww", "-p", str(pid), "-o", "command="], timeout=10)[1].rstrip("\n") for f in (["-E"], []))
+    env = o[len(c):] if c and o.startswith(c) else ""
+    return dict(m.groups() for m in re.finditer(r"(?:^|\s)(JANUS_[A-Z_]+)=(\S+)", env))
 
 def secs(et):
     """ps' elapsed time ("[[dd-]hh:]mm:ss") in seconds."""
