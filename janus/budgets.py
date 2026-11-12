@@ -6,7 +6,7 @@ import calendar, json, re, time
 from pathlib import Path
 from janus.context import Err, hrun, now, sh
 from janus.findings import live_acks
-from janus.ledger import RECONCILED, committed, ledger_read, reserved
+from janus.ledger import RECONCILED, budget_of, committed, ledger_read, reserved, run_time
 from janus.transcripts import remote_slug_sh, transcript_of
 from janus.usage import usage_scan
 import janus.usage as usage_mod
@@ -146,8 +146,11 @@ def session_usage(cfg, u, since=0, sid=None):
         try: return usage_scan(f, since) if f else None
         except OSError: return None
     sid = sid or api_out(cfg, u).get("session_id")
-    if not sid or not re.fullmatch(r"[A-Za-z0-9-]{3,64}", str(sid)): return None
-    rc, o, e = hrun(h, f"s={remote_slug_sh(u)}\n{h.get('agent_env', '')}\npython3 - \"$HOME/.claude/projects/$s/{sid}.jsonl\" {int(since)}",
+    if sid and not re.fullmatch(r"[A-Za-z0-9-]{3,64}", str(sid)): return None
+    if not sid and not u.get("rcwd"): return None
+    # a first run has no session id here until it ends: the newest transcript of its own tree there (item 6)
+    pick = f'f="$HOME/.claude/projects/$s/{sid}.jsonl"' if sid else 'f=$(ls -t "$HOME/.claude/projects/$s"/*.jsonl 2>/dev/null | head -1)'
+    rc, o, e = hrun(h, f"s={remote_slug_sh(u)}\n{h.get('agent_env', '')}\n{pick}\npython3 - \"$f\" {int(since)}",
                     inp=Path(usage_mod.__file__).read_text(), timeout=40)
     try: d = json.loads(o.strip().splitlines()[-1]) if rc == 0 and o.strip() else None
     except ValueError: d = None
@@ -163,6 +166,32 @@ def reload_usd(cfg, use):
     cache is cold after a wait) at its model's learned rate. 0.0 when it is not known."""
     r = model_rate(cfg, (use or {}).get("model"))
     return round(use["ctx"] * bset(cfg, "token_weights")["cache_write"] * r, 4) if use and use.get("ctx") and r else 0.0
+
+# Budget-follow item 6: the agent CLI stops a run at its --max-budget-usd without a word to the agent. So every API run is told
+# its budget (budget_note, in its first prompt and in every resume message), and the watcher measures a running run's spend
+# from its session's transcript (run_spend: here, or on the unit's host) and orders it once, at [budget] warn_pct, to checkpoint.
+
+def budget_note(cfg, budget, spent=None, total=None, reload=0.0):
+    """What a run is told about its money: this run's budget, what its unit has used, and the checkpoint rule."""
+    used = ""
+    if total: used = f" (your unit has used ${spent or 0:.2f} of its ${total:g}" + (f"; about ${reload:.2f} of this run goes to loading your context again" if reload else "") + ")"
+    return (f"Budget: this run is stopped without warning once it has spent ${budget:.2f}{used}. Work in small steps; after each one commit your work and "
+            f"write your state in the report (done, left, the next step), so a stop loses nothing. janus posts a budget checkpoint on the board at about "
+            f"{bset(cfg, 'warn_pct')} % of the budget: when you read it, commit, write your state, then park on your jobs or finish with your VERDICT line; "
+            f"start no new long step.")
+
+def run_spend(cfg, u):
+    """(dollars the unit's open run has used so far, that run's budget): its agent session's messages since the run started,
+    priced at the learned rates. (None, budget) when it cannot be told; (None, None) when the unit has no open run."""
+    pv = cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {})
+    r = ledger_read(cfg, pv)[0].get(u.get("run")) if "ledger" in pv and u.get("run") else None
+    if not r or r["done"]: return None, None
+    b = budget_of(cfg, r["budget"] or 0.0); use = session_usage(cfg, u, since=run_time(u["run"]) or u.get("started", 0)); w = bset(cfg, "token_weights"); tot = 0.0
+    for mdl, us in ((use or {}).get("use") or {}).items():
+        rate = model_rate(cfg, mdl)
+        if rate is None: return None, b
+        tot += token_cost(us, w, rate)
+    return (round(tot, 4) if use else None), b
 
 OUTCOMES = (("verdict", "finished with a verdict"), ("capped-partial", "capped, partial work"), ("capped-nothing", "capped, nothing written"),
             ("open", "open unit, no verdict yet"), ("no-verdict", "ended without a verdict"), ("unknown", "unknown (no done row)"),

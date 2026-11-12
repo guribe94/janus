@@ -7,7 +7,7 @@ from janus.actions.launch import api_remote, confirm_started, cwd_taken
 from janus.autopilot import forget, record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
-from janus.budgets import bset, finish_refusal, reload_usd, session_usage
+from janus.budgets import bset, budget_note, finish_refusal, reload_usd, run_spend, session_usage
 from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
     sh, ts)
 from janus.ledger import keep_run_json, ledger_done, reserve_budget, run_cost, settle_run
@@ -309,6 +309,7 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
     if why: raise Err(why)
     k = len(unit_runs(u)) + 1; run = f"{name}.r{k}.{int(now())}"
     run = reserve_budget(cfg, mc, name, budget, run)
+    if not wrapup: text += "\n\n" + budget_note(cfg, budget, spent, round(spent + budget, 2) if explicit else u.get("budget"), reload)   # item 6
     local = h.get("local", False); old = u.get("task")
     report = str(report_path(cfg, u)) if local else f"{h['root']}/out/{name}/REPORT.md"
     env = {"JANUS_ROLE": "agent", "JANUS_REPORT": report, "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root)}
@@ -501,6 +502,27 @@ def tend_parked(cfg, hs, units, log):
                     raise
                 save_soft(bd, u, log)
         except Err as e: log(f"{u['name']}: {e}")
+
+CHECKPOINT = ("janus budget checkpoint: this run has used about ${sp:.2f} of its ${b:g} budget ({pct:.0f} %) and is stopped at ${b:g} without warning. "
+              "Now, before anything else: commit your work, write your state in your report (done, left, the next step, the real exit codes), then "
+              "park on your jobs or finish with your VERDICT line. Start no new long step: about ${left:.2f} is left.")
+
+def tend_checkpoint(cfg, hs, units, log):
+    """The watcher's part of budget-follow item 6: a working API unit whose run has used [budget] warn_pct of its budget is
+    ordered, once per run, to checkpoint (a board direction: the agent reads the board before each step; a remote unit gets it
+    with the pass's sync). The wrap-up run is the checkpoint itself and gets none."""
+    done = cfg.jget("autopilot.json").get("done", {})
+    for u in units:
+        n = u["name"]; mc = cfg.models.get(u.get("model"), {})
+        if u.get("state") != "working" or u.get("via") != "pueue" or mc.get("kind") != "api" or not u.get("run") or u.get("run") == u.get("wrapup"): continue
+        if f"unit:{n}|checkpoint:{u['run']}" in done: continue   # ordered already: no second look (a remote look is an ssh)
+        try:
+            sp, b = run_spend(cfg, u)
+            if sp is None or not b or sp < bset(cfg, "warn_pct") / 100 * b: continue
+            if cfg.run.dry: log(f"{n}: would order a budget checkpoint (${sp:.2f} of ${b:g})"); continue
+            if not record(cfg, f"unit:{n}", f"checkpoint:{u['run']}", f"run at ${sp:.2f} of its ${b:g} budget: ordered to checkpoint", u): continue
+            board(cfg, "direct", n, CHECKPOINT.format(sp=sp, b=b, pct=100 * sp / b, left=max(0.0, b - sp))); log(f"{n}: budget checkpoint ordered (${sp:.2f} of ${b:g})")
+        except Err as e: log(f"{n}: budget checkpoint: {e}")
 
 def save_soft(bd, u, log):
     """Save the unit record best-effort: the once-only facts live in .janus/autopilot.json, so a busy bd only delays it."""
