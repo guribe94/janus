@@ -630,6 +630,38 @@ class Transcript(unittest.TestCase):
         o = run("codex-cwd", "", "0", "0", "/w/x", str(d / "*.jsonl"))
         self.assertIn("AGENT: codex says hi", o); self.assertIn("> shell: ls -l", o); self.assertNotIn("do the task", o)
 
+class Board(unittest.TestCase):
+    """The shipped board: question ids that stay until answered, waiting never SILENT, broadcast, learned posts, the alert."""
+    def test_questions_waiting_broadcast_learned_alert(self):
+        d, cfg = project(); cfg.ro = False
+        orch.board_upkeep(cfg, [])   # .master, .hosts, .notify
+        bd = d / "board"; self.assertTrue((bd / ".master").is_file()); self.assertIn("watch --alert", (bd / ".notify").read_text())
+        (bd / ".notify").write_text("true\n")
+        B = lambda *a, **env: orch.board(cfg, *a, env=env)
+        B("post", "a1", "status", "start"); B("post", "a2", "status", "start")
+        B("post", "a1", "question", "which port?"); B("post", "a1", "status", "carrying on")   # still needs an answer
+        B("post", "a2", "waiting", "here:3")
+        old = "2000-01-01 00:00"; c = bd / "agents/a2.md"; c.write_text(c.read_text().replace(c.read_text().split("- updated: ")[1].strip(), old))
+        rows = orch.board_rows(cfg)
+        self.assertEqual(rows["a2"]["state"], "waiting"); self.assertFalse(rows["a2"]["silent"])   # parked: never SILENT
+        self.assertEqual([k for k, _ in orch.board_findings(cfg, {"a1", "a2"})], ["question:q1"])
+        sent = []; real = orch.herdr
+        orch.herdr = lambda *a, **k: sent.append(a) or {}
+        try:
+            cfg.f("pane").write_text("p1"); logs = []
+            self.assertIn("QUESTION [q1] from a1: which port?", orch.board_alerts(cfg, logs.append))
+            self.assertIsNone(orch.board_alerts(cfg, logs.append))          # told once
+        finally: orch.herdr = real
+        self.assertEqual(sent[0][:3], ("agent", "prompt", "p1"))
+        self.assertIn("broadcast to 2", B("direct", "all", "freeze main")[1])
+        self.assertTrue(B("questions")[1].startswith("q1"))   # a broadcast answers no question
+        B("answer", "q1", "8080"); self.assertEqual(B("questions")[1], "")
+        self.assertIn("[q1] 8080", B("read", "a1")[1]); self.assertIn("freeze main", B("read", "a2")[1])
+        B("post", "a2", "learned", "the cache is in /var/c (source: docs/c.md)")
+        self.assertEqual([k for k, _ in orch.board_findings(cfg, set())], ["learned:a2:1"])
+        orch.learned_mark(cfg, "learned:a2:1", "rejected"); self.assertEqual(orch.board_findings(cfg, set()), [])
+        self.assertIn("asked: 1", B("digest", "--since", "1h")[1])
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         import re

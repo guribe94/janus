@@ -771,10 +771,77 @@ def board_rows(cfg):
     rows = {}
     for l in (o.splitlines()[1:] if rc == 0 else []):
         f = l.split()
-        if len(f) < 3: continue
+        if len(f) < 3 or l[:1] in (" ", "=", "\t"): continue   # the shipped board's group headings and its needs-answer lines
         rows[f[0]] = {"state": f[2], "silent": bool(re.search(r"\bSILENT \d+m", l)), "gone": "GONE" in l,
                       "text": re.sub(r"\s+", " ", l.split(None, 4)[-1] if len(f) > 4 else "")[:140]}
     return rows
+
+def board_questions(cfg):
+    """Open questions [(id, agent, asked, text)] from the shipped board (board.sh questions); None when the board script has no
+    question ids (a project's own script: its question cards are judged by state)."""
+    rc, o, e = board(cfg, "questions")
+    if rc: return None
+    return [tuple((l.split("\t") + ["", "", ""])[:4]) for l in o.splitlines() if l.strip()]
+
+def learned_posts(cfg):
+    """[(id <agent>:<n>, text)] of every learned post on the board's log (n counts that agent's learned posts, oldest first)."""
+    try: lines = (board_dir(cfg) / "log.md").read_text(errors="replace").splitlines()
+    except OSError: return []
+    n, out = {}, []
+    for l in lines:
+        m = re.match(r"^\S+ \S+ ([A-Za-z0-9._-]+) learned: (.*)$", l)
+        if m: n[m.group(1)] = n.get(m.group(1), 0) + 1; out.append((f"{m.group(1)}:{n[m.group(1)]}", m.group(2)))
+    return out
+
+def board_findings(cfg, names):
+    """question:<id> (stays until answered), learned:<agent>:<n> (until remembered or rejected)."""
+    F = []
+    for q, ag, at, tx in board_questions(cfg) or []:
+        try: age = int((now() - time.mktime(time.strptime(at, "%Y-%m-%d %H:%M"))) / 60)
+        except ValueError: age = 0
+        F.append((f"question:{q}", f"{ag}{'' if ag in names else ' (not a unit)'} asks [{q}] ({age} min): {tx[:160]}; check MEMORY.md (orch memory), then board.sh answer {q} <text>"))
+    done = cfg.jget("learned.json")
+    F += [(f"learned:{i}", f"{i.split(':')[0]} proposes for the session memory: {t[:160]}; orch remember --fact|--decision|--pitfall <text> --learned {i}, or orch learned --reject {i}")
+          for i, t in learned_posts(cfg) if i not in done]
+    return F
+
+def cmd_learned(cfg, a):
+    if a.reject:
+        refuse_agent("orch learned --reject")
+        if not any(i == a.reject.removeprefix("learned:") for i, _ in learned_posts(cfg)): raise Err(f"no learned post {a.reject}")
+        learned_mark(cfg, a.reject, "rejected" + (f": {a.why}" if a.why else "")); say(f"rejected {a.reject}"); return
+    done = cfg.jget("learned.json")
+    for i, t in learned_posts(cfg): say(f"{i:24} {done.get(i, {}).get('how', 'open'):10} {t}")
+
+def board_upkeep(cfg, units):
+    """The shipped board's own files (a writer only): .master (this machine's host name), .hosts (other hosts from orch.toml,
+    for sync and rule) and .notify (a new question or block runs `orch watch --alert` at once); cards of closed units archived."""
+    if cfg.ro or DRY or cfg.paths.get("board"): return
+    bd = board_dir(cfg); bd.mkdir(exist_ok=True)
+    me = next((n for n, h in cfg.hosts.items() if h.get("local")), "local")
+    if not (bd / ".master").exists(): (bd / ".master").write_text(me + "\n")
+    hosts = "".join(f"{n} {h['ssh']} {h['root']}\n" for n, h in cfg.hosts.items() if not h.get("local") and h.get("ssh") and h.get("root"))
+    if not (bd / ".hosts").exists() or (bd / ".hosts").read_text() != hosts: atomic_write(bd / ".hosts", hosts)
+    nt = f"cd {shlex.quote(str(cfg.root))} && ORCH_ROOT={shlex.quote(str(cfg.root))} {shlex.quote(sys.executable)} {shlex.quote(str(ORCH_SELF))} watch --alert\n"
+    if not (bd / ".notify").exists() or (bd / ".notify").read_text() != nt: atomic_write(bd / ".notify", nt)
+    names = {u["name"] for u in units}; au = all_units(cfg)
+    for c in (bd / "agents").glob("*.md") if (bd / "agents").is_dir() else []:
+        if c.stem not in names and au.get(c.stem, {}).get("status") == "closed": board(cfg, "close", c.stem)
+
+def board_alerts(cfg, log):
+    """Prompt the orchestrator at once on a new board question or block (orch-swarm item 6): each is told once."""
+    qs = board_questions(cfg)
+    items = [(f"q:{q}", f"QUESTION [{q}] from {ag}: {tx[:200]}") for q, ag, at, tx in (qs or [])]
+    items += [(f"b:{c}:{hashlib.md5(r['text'].encode()).hexdigest()[:8]}", f"BLOCKED {c}: {r['text'][:200]}") for c, r in board_rows(cfg).items()
+              if r["state"] == "blocked" or (qs is None and r["state"] == "question")]
+    seen = cfg.jget("alerted.json"); new = [(k, t) for k, t in items if k not in seen]
+    if not new: return None
+    pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
+    msg = (ORCH_MARK + "Board needs you now: " + " | ".join(t for _, t in new) + ". Check MEMORY.md (orch memory) first; answer with "
+           "board.sh answer <id> <text> (a block: board.sh direct <agent> <text>); orch remember what every agent should know.")
+    if not pane or herdr("agent", "prompt", pane, msg) is None: log(f"board alert not delivered (no orchestrator pane): {msg[:300]}"); return None
+    log(f"board alert: {msg[:600]}"); cfg.jput("alerted.json", {**{k: v for k, v in seen.items() if now() - v < 7 * 86400}, **{k: now() for k, _ in new}})
+    return msg
 
 def gate_findings(cfg, hs=None):
     """Failed gates of the last 12 h: only each gate's latest result counts, and none while a newer run of that gate is queued or
@@ -996,9 +1063,10 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if k in names or a.get("pane_id") in pane_units or a.get("pane_id") == orch_pane or k == "orchestrator": continue
         F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit"))
     board = board_rows(cfg); running = 0
+    BF = board_findings(cfg, names); F += BF; qids = board_questions(cfg) is not None
     for card, r in board.items():   # every card, including those other launchers posted (marked "not a unit")
         tag = "" if card in names else " (not a unit)"
-        if r["state"] in ("question", "blocked"):
+        if r["state"] == "blocked" or (r["state"] == "question" and not qids):
             F.append((f"board:{card}:{r['state']}", f"{card}{tag} is {r['state'].upper()} on the board: {r['text']}; answer with board.sh direct"))
         if r["gone"]: F.append((f"board:{card}:gone", f"{card}{tag} GONE: its process ended without a done post"))
         elif r["silent"] and r["state"] not in ("question", "blocked"):
@@ -1033,6 +1101,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}"))
     cfg._hs = hs; F += peer_findings(cfg, units)   # peers.md, overlap:<a>:<b> (orch-swarm item 4)
+    board_upkeep(cfg, units)
     seen = {k for k, _ in F}
     for r, why in orphan_jobs(cfg, hs, units):   # the watcher cancels these (item 3); check only reports them
         k = f"orphan:job:{r}"
@@ -1628,6 +1697,7 @@ def cmd_launch(cfg, a):
             # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
             X(h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
             put_script(h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
+            if not cfg.paths.get("board"): put_script(h, f"{root}/bin/board.sh", board_script(cfg).read_text())   # the shipped board there (outbox)
             if not DRY: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
             put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["ORCH_REPORT"]) + brief.read_text(), "644")
             if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
@@ -2137,6 +2207,7 @@ def tend_parked(cfg, hs, units, log):
             if jobs:
                 if (u.get("parked") or {}).get("jobs") != jobs:
                     u["parked"] = {"jobs": jobs, "since": int(now()), "by": "report"}; bd.save(u); log(f"park {u['name']} on {', '.join(jobs)}")
+                    if card_fields(cfg, u["name"]).get("state") != "waiting": board(cfg, "post", u["name"], "waiting", " ".join(jobs))   # never SILENT/GONE
                 st = [job_state(hs, j)[0] for j in jobs]
                 if all(x in ("done", "gone") for x in st):
                     log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs)))
@@ -4074,12 +4145,16 @@ def hook_kind(d):
     return "codex" if ("codex" in tp or os.environ.get("CODEX_THREAD_ID")) else "claude"
 
 # ---------------------------------------------------------------- watch (launchd, one pass)
-URGENT = ("unit:", "board:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:",
+URGENT = ("unit:", "board:", "question:", "overlap:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:",
           "idle-with-backlog", "scheduler:", "pressure:", "direct:", "budget80:", "waiting:", "waste", "report-due", "parked:")
 
 def cmd_watch(cfg, a):
-    F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
+    if getattr(a, "alert", False): board_alerts(cfg, log); return   # board.sh .notify: a new question or block, at once
+    if not cfg.paths.get("board") and (board_dir(cfg) / ".hosts").is_file() and (board_dir(cfg) / ".hosts").read_text().strip():
+        board(cfg, "sync", timeout=180)   # the shipped board: merge the hosts' outboxes, push the board (peers, index) to them
+    F, live, hs, units = run_check(cfg, cycle=False, writer=True)
+    board_alerts(cfg, log)
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (orch-fixes9)
     for r, why in orphan_jobs(cfg, hs, units):   # nothing whose owner is gone keeps running or waiting (item 3)
         try: log(f"orphan {r} ({why}): " + "; ".join(cancel_job(cfg, r)))
@@ -4150,7 +4225,8 @@ def main():
         return p
     A = lambda *n, **k: (n, k)
     add("check", A("--brief", action="store_true"), A("--escalate", action="store_true"))
-    add("capacity"); add("status"); add("watch")
+    add("capacity"); add("status"); add("watch", A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"))
+    add("learned", A("--reject", help="reject learned post <agent>:<n> (check stops listing it)"), A("--why", help="why it is rejected"))
     add("launch", A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
         A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
         A("--test-host", help="host where the unit's builds and tests run; the agent is placed there"), A("--allow-main", action="store_true", help="allow a main checkout as cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"),
