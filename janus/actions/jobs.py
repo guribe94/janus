@@ -292,6 +292,7 @@ def place_job(cfg, lane, needs):
 # [capacity] broad_patterns (default below), or its job class ran a median of [capacity] broad_min minutes or more on that host.
 # Gates (their own steps too) and the land lane are exempt (whole-suite by design, and ordered by their own lanes).
 BROAD_PATTERNS = [r"\bcargo\s+(test|nextest\s+run|clippy|build|check)\b.*\s--(workspace|all)\b", r"(^|[;&|]\s*)(\S*/)?pytest\s*($|[;&|])"]
+PKG_RX = re.compile(r"(^|\s)(?:-p\s*|--package[=\s])\S")   # a cargo command that names one package (-p X, --package=X)
 
 def job_class(cfg, hn, h, cmd):
     """The job class runs/cap.sh will give cmd on host hn (cap_class, run here on the host's library)."""
@@ -306,9 +307,13 @@ def host_history(cfg, h):
     return hrun(h, f"tail -n 2000 {qp(h['_rd'] + '/history.tsv')} 2>/dev/null")[1].splitlines()
 
 def broad_why(cfg, hn, h, cmd):
-    """Why cmd is a whole-suite run on host hn, or None."""
-    for rx in cfg.capc.get("broad_patterns", BROAD_PATTERNS):
-        if re.search(rx, cmd): return f"it matches the broad pattern {rx!r}"
+    """Why cmd is a whole-suite run on host hn, or None. Item 25(b): a cargo command that names a package (`-p X`,
+    `--package=X`) covers one package, not the whole workspace, so the cargo pattern -- the FIRST of broad_patterns -- does not
+    apply to it (`cargo test -p X --all-targets` was flagged broad)."""
+    for i, rx in enumerate(cfg.capc.get("broad_patterns", BROAD_PATTERNS)):
+        if not re.search(rx, cmd): continue
+        if i == 0 and PKG_RX.search(cmd): continue
+        return f"it matches the broad pattern {rx!r}"
     cls = job_class(cfg, hn, h, cmd); e = class_secs(host_history(cfg, h), cls); lim = capv(cfg, h, "broad_min")
     if e and e >= lim * 60: return f"its job class {cls} ran a median of {e // 60} min on {hn} (broad_min {lim:g})"
     return None
@@ -381,7 +386,7 @@ def cmd_run(cfg, a):
     if not rc: rc, o, e = write_cap(cfg, hn, h)
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
     rc, o, e = hrun(h, f"{pueue(h)} add -g {shlex.quote(a.lane)} -l {shlex.quote(label)} -w {qp(rd)} --print-task-id"
-                       + (f" -o {int(a.priority)}" if a.priority else " -o 10" if a.lane == "gates" else " -o -5" if broad else "") + f" -- {pq('bash ' + qp(f'{rd}/{jid}.sh'))}")
+                       + (f" -o={int(a.priority)}" if a.priority else " -o=10" if a.lane == "gates" else " -o=-5" if broad else "") + f" -- {pq('bash ' + qp(f'{rd}/{jid}.sh'))}")
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
     tid = o.strip()
     record_job(cfg, f"{hn}:{tid}", jid, src, {"lane": a.lane, "unit": unit, "wt": src, "cmd": cmd, "subdir": a.subdir, "usb": bool(a.usb),
