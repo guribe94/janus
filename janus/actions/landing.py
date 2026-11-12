@@ -157,8 +157,11 @@ def final_gate_cmd(ld, unit, wt, branch):
         for m in re.finditer(r"(?<!\$)\{" + k + r"\}", s):
             if m.start() < i: continue
             before = s[m.start() - 1] if m.start() else ""; after = s[m.end()] if m.end() < len(s) else ""
-            out += [s[i:m.start()], str(v) if before and before == after and before in "\"'" else shlex.quote(str(v))]
-            i = m.end()
+            q = before if before and before == after and before in "\"'" else ""
+            # finding 10: the config's own quotes are DROPPED and shlex.quote is always applied, so a value is never inserted
+            # raw inside the config's quotes (which let `"$(...)"` run); the value itself keeps its shell safety.
+            out += [s[i:m.start() - 1] if q else s[i:m.start()], shlex.quote(str(v))]
+            i = m.end() + (1 if q else 0)
         s = "".join(out) + s[i:]
     return s
 

@@ -145,6 +145,15 @@ class Item12FinalGate(unittest.TestCase):
         self.assertEqual(janus.final_gate_cmd({"final_gate": "cd ${wt} && ./gate ${unit}"}, "u1", "/w", "b"),
                          "cd ${wt} && ./gate ${unit}")
 
+    def test_a_placeholder_the_config_already_quotes_is_not_substituted_raw(self):
+        """Catches (finding 10): with the config form `--branch "{branch}"`, the placeholder's own quotes were kept and the
+        agent's branch name was inserted unquoted between them, so `wk/x$(touch${IFS}/tmp/p)';id;'` ran `$(...)`; and the
+        single-quoted form let the value close the quote and run `id`."""
+        import shlex as _s
+        v = "wk/x$(touch${IFS}/tmp/p)';id;'"
+        for cfg_form in ('bin/gate.sh --branch "{branch}"', "bin/gate.sh --branch '{branch}'"):
+            self.assertEqual(janus.final_gate_cmd({"final_gate": cfg_form}, "u1", "/w", v), "bin/gate.sh --branch " + _s.quote(v), cfg_form)
+
 
 class Item8ThrashExplicit(unittest.TestCase):
     def test_a_thrash_stop_is_written_to_the_job_log_and_names_the_requeue(self):
