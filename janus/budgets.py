@@ -41,33 +41,41 @@ def run_capped(cfg, u, run):
     try: return json.loads(p.read_text()).get("subtype") == "error_max_budget_usd"
     except (OSError, ValueError): return False
 
+RESUME_RUN = re.compile(r"\.r\d+\.\d+$")   # a resume's run id is <unit>.r<k>.<time>; any other run id is a unit's first run
+
 def cost_history(cfg, provider):
-    """{(kind, tier): [cost of each finished run]} of a provider, oldest first. A done run counts when its unit ended with a
-    verdict, when it ended at its budget cap (a capped run shows the budget was too small, so it raises it), or when it cost at
-    least [budget] min_usd (a real run whose report was tidied still counts, finding 9); only a tiny run without a verdict is
-    dropped (the 23 tiny runs that skewed the median to $0.09, item 16c)."""
+    """{(kind, tier): [what each past unit cost]} of a provider, oldest first. One sample per UNIT: its first run and every
+    resume of it added up (budget-follow item 5: a unit's budget pays for all its runs, and each resume pays to load the whole
+    context again, so the median of single runs taught a budget the next unit could not finish on). A name launched again is
+    a unit of its own. A unit counts when it ended with a verdict, when a run of it ended at its budget cap (the budget was too
+    small, so it raises it), or when it cost at least [budget] min_usd (a real unit whose report was tidied still counts,
+    finding 9); only a tiny unit without a verdict is dropped (the 23 tiny runs that skewed the median to $0.09, item 16c)."""
     pv = cfg.prov[provider]
     if "ledger" not in pv: return {}
     runs = ledger_read(cfg, pv)[0]; us = all_units(cfg); byrun = {u.get("run"): u for u in us.values() if u.get("run")}
-    out = {}
+    groups, last = [], {}   # [unit meta, cost, capped] per unit, in ledger order; last: the open group of each unit name
     for k, r in runs.items():
         if not r["done"] or r["cost"] is None: continue
         u = byrun.get(k) or us.get(r["unit"])
         if not u or not u.get("kind"): continue
-        capped = run_capped(cfg, u, k)
-        if not (verdict(cfg, {**u, "resume": False}) or capped or r["cost"] >= bset(cfg, "min_usd")): continue
-        out.setdefault((u["kind"], u.get("tier") or "normal"), []).append(r["cost"])
+        g = last.get(r["unit"]) if RESUME_RUN.search(k) else None
+        if g is None: g = last[r["unit"]] = [u, 0.0, False]; groups.append(g)
+        g[1] += r["cost"]; g[2] = g[2] or run_capped(cfg, u, k)
+    out = {}
+    for u, cost, capped in groups:
+        if not (verdict(cfg, {**u, "resume": False}) or capped or cost >= bset(cfg, "min_usd")): continue
+        out.setdefault((u["kind"], u.get("tier") or "normal"), []).append(round(cost, 6))
     return out
 
 def budget_for(cfg, mc, kind, tier):
     """(budget USD, why) for a new API unit of this kind and tier."""
     pv = cfg.prov[mc["provider"]]; d = pv.get("budget_per_unit", 15)
     c = cost_history(cfg, mc["provider"]).get((kind, tier), [])
-    if len(c) < bset(cfg, "min_runs"): return d, f"budget_per_unit; {len(c)} past {kind}/{tier} run(s), {bset(cfg, 'min_runs')} needed to learn"
+    if len(c) < bset(cfg, "min_runs"): return d, f"budget_per_unit; {len(c)} past {kind}/{tier} unit(s), {bset(cfg, 'min_runs')} needed to learn"
     s = sorted(c); med = s[len(s) // 2] if len(s) % 2 else (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2
     b = max(bset(cfg, "min_usd"), -(-med * (100 + bset(cfg, "margin_pct")) / 100 * 2 // 1) / 2)   # rounded up to $0.50
     if bset(cfg, "max_usd"): b = min(b, bset(cfg, "max_usd"))
-    return b, f"median ${med:.2f} of {len(c)} past {kind}/{tier} run(s) + {bset(cfg, 'margin_pct')}%"
+    return b, f"median ${med:.2f} of {len(c)} past {kind}/{tier} unit(s), their resumes included, + {bset(cfg, 'margin_pct')}%"
 
 def token_cost(usage, w, rate):
     """Dollars for a usage dict (api.json usage or transcript message usage) at rate $ per weighted token."""
