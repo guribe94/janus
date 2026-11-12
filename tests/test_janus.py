@@ -1102,6 +1102,16 @@ class Thrash(unittest.TestCase):
             hs["far"]["psi"] = "5"; janus.tend_thrash(cfg, hs, [], lambda m: None); self.assertNotIn("far", cfg.jget("thrash.json"))
         finally: janus.cancel_job, janus.cmd_run, janus.host_cap, janus.board = saved
 
+    def test_a_shared_host_paused_by_pressure_thrashes_without_a_thrash_psi(self):
+        """Catches (item 19): a shared host whose memory pressure paused admission (PSI over psi_pause, default 10) did not
+        thrash, because the threshold was a fixed 40: a paused host kept a job for an hour and nothing stopped it."""
+        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\nshared = true\n'); cfg.run.ro = False
+        hs = {"far": {"ok": True, "psi": "20", "pueue": {"tasks": {}}}}
+        cfg.jput("thrash.json", {"far": int(time.time()) - 600})                 # over the threshold for 10 min
+        out = janus.tend_thrash(cfg, hs, [], lambda m: None, dry=True)
+        self.assertTrue(any("no job of this project runs there" in l for l in out), out)   # over the threshold, not "fine"
+        self.assertEqual(janus.thrash_cfg(cfg, cfg.hosts["far"])[0], 10)         # psi_pause, not the fixed 40
+
 class RemoteBrief(unittest.TestCase):
     """fixes10 item 4: every absolute path a brief names reaches a remote agent: its tree's paths become its copy's, files under
     the project root are copied to <root>/ctx/<unit>/, other paths must exist on the host, else the launch is refused."""
