@@ -423,6 +423,37 @@ class Item6RetireMatch(unittest.TestCase):
         self.assertEqual(kills, [["kill", "-TERM", "101"]], "a mid-handoff worker was TERMed, orphaning its child gate")
         self.assertTrue(any("102" in l and "child" in l for l in out), out)
 
+    def test_retire_keeps_a_handoff_worker_polling_with_sleep(self):
+        """Catches (finding 5, fix-install6): a handoff-queue worker mid-handoff waits for its gate's result in a
+        `while ...; do sleep 5; done` loop, so its only child is `sleep`; --retire treated sleep as 'not work' and TERMed the
+        worker, leaving the handoff half-done and its gate orphaned. An idle loop whose only child is sleep is still stopped."""
+        ps = (" 501 /bin/zsh /w/proj/bin/fleet-loops.sh\n"
+              " 502 /bin/zsh /w/proj/bin/handoff-queue.sh w1 /w/proj/out/handoff-queue\n")
+        kills = []
+        def fake_run(cmd, **k):
+            if cmd[:1] == ["pgrep"]: return 0, ("888\n" if cmd[-1] == "502" else ""), ""
+            if cmd[:1] == ["ps"]: return 0, "888 sleep\n", ""
+            kills.append(list(cmd)); return 0, "", ""
+        real = janus.run; janus.run = fake_run
+        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
+        finally: janus.run = real
+        self.assertEqual(kills, [["kill", "-TERM", "501"]], "a handoff worker polling with sleep was TERMed mid-handoff")
+        self.assertTrue(any("502" in l and "child" in l for l in out), out)
+
+    def test_retire_reads_the_kill_result(self):
+        """Catches (finding 5, fix-install6): the `kill` result was not read, so a loop started through `sudo` counted as 'sent
+        TERM' when the kill was refused and it kept running."""
+        ps = " 601 sudo /w/proj/bin/fleet-loops.sh far\n"
+        def fake_run(cmd, **k):
+            if cmd[:1] == ["pgrep"]: return 1, "", ""
+            if cmd[:1] == ["ps"]: return 1, "", ""
+            return 1, "", "kill: 601: Operation not permitted"
+        real = janus.run; janus.run = fake_run
+        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
+        finally: janus.run = real
+        self.assertTrue(any("601" in l and "could not TERM" in l for l in out), out)
+        self.assertTrue(any("sent TERM to 0" in l for l in out), out)
+
     def test_retire_stops_an_idle_loop_whose_only_child_is_its_sleep(self):
         """Catches (finding 4): --retire kept EVERY loop with a living child, and a loop that idles in `sleep 30` always has
         one, so --retire never stopped the loops it exists for."""
