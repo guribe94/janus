@@ -35,6 +35,28 @@ times (the full story is in `docs/PLAN.md`). Reminders in a prompt did not fix i
 
 The board script (`paths.board`) and your briefs belong to your project; they are not part of this repository.
 
+## Share with a friend: quick start
+
+Needs macOS or Linux, Python 3.11+, git, ssh, rsync, [beads](https://github.com/steveyegge/beads) (`bd`), pueue, and the agent
+CLIs you route to (Claude Code `claude`, Codex `codex`, opencode); herdr and tmux for agents in panes.
+
+```
+git clone <this repo> ~/code/orchestrator && cd ~/code/orchestrator
+./check                            # the tests; install runs them again on the copy it installs
+cd ~/code/myproject                # your project (a git repo)
+python3 ~/code/orchestrator/orch.py init     # writes a commented orch.toml, .orch/, briefs/, out/
+$EDITOR orch.toml                  # this machine's [hosts.*] entry, models, routing, the API key's secret store
+bd init                            # beads for units, instructions and backlog (once)
+security add-generic-password -s orch-api-key -a "$USER" -w     # macOS: the API key into the keychain (prompted)
+#   Linux: printf 'ANTHROPIC_API_KEY=%s\n' "$KEY" > ~/.config/orch/anthropic.env; chmod 600 ~/.config/orch/anthropic.env
+~/code/orchestrator/install --project .      # release, links, hooks, watcher, tools (--dry-run first to see every change)
+orch doctor                        # tools, release, hooks, watcher, config, secret store, ledger, beads, hosts: fix every FAIL
+```
+
+Then open Claude Code (or Codex) in the project, run `orch register`, and work through the cycle in section 4. Nothing in
+`orch.py` is specific to one project: every path, host, container, model and key name is in `orch.toml`
+(`example.orch.toml` documents every key).
+
 ## 2. Install and uninstall
 
 ```
@@ -43,15 +65,27 @@ The board script (`paths.board`) and your briefs belong to your project; they ar
 ```
 
 Options: `--dry-run`, `--project DIR`, `--no-hosts` (skip the remote machines), `--hosts-only` (only set up pueue on the
-hosts in orch.toml), `--pin-only` (only pin the current `orch.py` and switch `~/.local/bin/orch` to it: the way to deploy an
-edit). On Linux, install writes a systemd user timer `orch-watch.timer` (every 5 min) instead of the launchd agent.
+hosts in orch.toml), `--release-only` (only build, test and switch to a new release: the way to make an edit live),
+`--rollback` (switch back to the previous release), `--skip-tests`. On Linux, install writes a systemd user timer
+`orch-watch.timer` (every 5 min) instead of the launchd agent.
+
+**Releases: nothing live ever points at the working tree.** `install` copies `orch.py`, `skill/`, `example.orch.toml` and
+`tests/` into `~/.local/share/orch/releases/<date>-<content hash>/` (files made read-only), runs the checks on that copy
+(parse, `--help`, hook calls, `tests/test_orch.py`), and only when they pass switches `~/.local/share/orch/current` to it with
+one atomic rename. `~/.local/bin/orch` points at `current/orch.py` and the skill links at `current/skill`, so the toolkit and the
+skill change together, at one instant, to a tested copy. A queued `orch api-run` task names the release it was queued from, so
+a new release never changes a running task. The five newest releases are kept.
+
+**Making a change live (developers):** edit in the repo (or a worktree), run `./check`, commit, then
+`./install --release-only`. A half-edited `orch.py` is never live, and `./install --rollback` undoes a bad release.
 
 What `install` changes:
 
 | Where | Change |
 |---|---|
-| `~/.claude/skills/orchestrating`, `~/.codex/skills/orchestrating` | symlinks to this repo's `skill/` |
-| `~/.local/bin/orch` | symlink to a **pinned copy** `~/.local/share/orch/<hash>/orch.py`, never to the working copy: install parses it and smoke-tests `--help` and a hook call first, then switches the link with one atomic rename. Editing `orch.py` changes nothing live until `./install --pin-only` (make sure `~/.local/bin` is on PATH). Project shims call `~/.local/bin/orch` |
+| `~/.local/share/orch/releases/<v>/`, `~/.local/share/orch/current` | the tested release copy, and the link to it (switched by one rename) |
+| `~/.claude/skills/orchestrating`, `~/.codex/skills/orchestrating` | symlinks to `~/.local/share/orch/current/skill` (older links into an orch working tree are replaced) |
+| `~/.local/bin/orch` | symlink to `~/.local/share/orch/current/orch.py` (make sure `~/.local/bin` is on PATH). Project shims call `~/.local/bin/orch` |
 | `~/.claude/settings.json`, `~/.codex/hooks.json` | adds `~/.local/bin/orch hook <event>` for SessionStart, UserPromptSubmit, PreToolUse (matcher `Bash\|Edit\|Write\|MultiEdit\|NotebookEdit\|apply_patch`) and Stop. Existing keys and hooks are kept; a backup `*.bak-orch-<time>` is written first |
 | `~/Library/LaunchAgents/com.orch.watch.plist` | copied (not linked) and loaded with `launchctl`; runs every 300 s |
 | `~/.config/orch/projects` | the project directory is added; the watcher runs `orch watch` in each listed project |
@@ -59,8 +93,8 @@ What `install` changes:
 | each ssh host in orch.toml | downloads pueue's static binaries into the host's `bin`, writes and enables a user systemd service `pueued`; no sudo |
 
 An existing path that is not our link is skipped, never overwritten. A failing step prints "failed (continuing)".
-Two details in the host step: `arch` must be `aarch64` or `x86_64`, and a host named `linux2`, or one whose `bin` starts
-with `/srv/`, keeps its pueue files under `/srv/app-fleet/tools` (a layout specific to the original project).
+Two details in the host step: `arch` must be `aarch64` or `x86_64`, and a host with `pueue_dir` (a shared server) keeps
+pueue's files and its user unit under that directory instead of the home directory.
 
 **Codex needs one manual step:** open Codex and run `/hooks` to trust the new hooks. Until then they do not run.
 
@@ -68,7 +102,7 @@ with `/srv/`, keeps its pueue files under `/srv/app-fleet/tools` (a layout speci
 1. `launchctl bootout gui/$(id -u)/com.orch.watch`, then delete the plist and the project line in `~/.config/orch/projects`;
 2. remove the entries whose command ends in `orch hook <event>` from `~/.claude/settings.json` and `~/.codex/hooks.json`
    (or restore the `.bak-orch-*` backup);
-3. delete the three symlinks above;
+3. delete the three symlinks above and `~/.local/share/orch`;
 4. optionally `brew uninstall beads pueue`, and on remote hosts `systemctl --user disable --now pueued`.
 
 ## 3. Setting up a project
@@ -83,7 +117,7 @@ reset, 150000).
 
 **`[paths]`**: `board` (script with `post/read/summary/rule/close`), `gate_log` (lines like
 `2026-11-11 09:00:00 name EXIT_x=0 ... RESULT: PASS|FAIL`), `briefs` (`<briefs>/<unit>.md`), `out`
-(`<out>/<unit>/REPORT.md`), `worktrees` (`<worktrees>/<unit>` is the unit's working directory if it exists; example-project:
+(`<out>/<unit>/REPORT.md`), `worktrees` (`<worktrees>/<unit>` is the unit's working directory if it exists; it may be outside the project, e.g.
 `../../worktrees`), `checklist` (the project's status checklist, editable by the orchestrator), `state_docs` (old state docs
 for `orch init`). **`[placement]`**: optional `"<regex>" = "<host>"` rules matched against a unit's name and brief: the host
 where its tests run, where launch places it. Per host, `job_ws_gb` is the working set assumed before one is measured.
@@ -101,20 +135,37 @@ worktrees, briefs and outputs live) and `bin`. Capacity figures: `ram_gb`, `core
 `agent_gb` (per agent), `job_gb` (per pueue job), `min_disk_gb`. Optional `memory_max` (systemd-run limit for remote
 API agents) and `pueue_config`. For `orch run` (section 7a): `services_gb` (measured memory the host's own services use;
 `ram_gb - services_gb` // `job_gb` sets the initial `jobs`/`gates` parallel limits), `gate_slots` (parallel `gates` tasks),
-`legacy`/`legacy_slots` (the old scripts' queue, `heavy` or `runsh`, shown by `orch check` while it drains),
-`runner = "podman"` with `fleet`/`image` (linux2: run in the build container), `worktrees`, `fleet_log`, `run_env` (shell run
-before the job: linux1 sources `build-env.sh`), and on the Mac `admit_check` (agent-capacity) and `legacy_lanes` (old
-`heavy.land` lock dirs the land lane waits for). Optional `[lanes.<lane>] age_min` overrides a lane's age limit.
+`legacy_probe` (shell printing `legacy_wait=<n>` and `legacy_run=<n>` for an older job queue, shown by `orch check` while it
+drains) with `legacy_slots`, `runner = "podman"` with a `[hosts.<h>.container]` table (image, mount, mount_at, args,
+usb_args, usb_lock, host_dirs, clone_base, name_prefixes, cpus), `worktrees`, `job_log`, `run_env` (shell run before every
+job), `job_setup` (shell run in the worktree before the command), `sync_exclude`, `cores_per_job` (CPU admission), and on the
+local machine `admit_check`/`admit_check_env` and `legacy_lanes` (dirs with a pid file of an older lane the land lane waits
+for). Optional `[lanes.<lane>] age_min` overrides a lane's age limit. `example.orch.toml` shows every key.
 
 **`[caps]`** (optional, only when the owner wants them): `total = 6`, and `[caps.host] server = 2`. With no caps the limit
 is what each machine can safely hold.
 
-**`[providers.<name>]`**: `enabled`, and optionally `cap_usd`, `ledger` (a TSV: ts, unit, cost or `running`, budget, run
-id) and `budget_per_unit`. A provider is usable while `cap_usd` minus spend (including budgets of running rows) is at
-least `budget_per_unit`.
+**`[providers.<name>]`**: `enabled`, and optionally `cap_usd`, `ledger`, `budget_per_unit`, the secret store of the API key
+(`key_keychain`: a macOS keychain item; `key_file`: a `VAR=value` file that only you can read, mode 600; `key_env`: the
+variable, default `ANTHROPIC_API_KEY`) and `cmd` (the agent command; default `claude --bare -p --model {api_id}
+--max-budget-usd {budget} --output-format json --dangerously-skip-permissions {prompt}`). A provider is usable while its
+ledger is valid and `cap_usd` minus committed spend is at least `budget_per_unit`.
 
-**`[models.<name>]`**: `provider`, `vendor`, `kind`. `kind = "api"` is a headless launcher run as a pueue task
-(`launcher` is called as `<unit> <brief> <cwd> <budget> <model>`; for a remote host `api_id` names the model).
+**API runs and the ledger belong to orch.** `orch launch` of an API model reserves the budget (under the ledger's lock:
+refused when the ledger is malformed or the cap would be passed; else the run's one `running` row) and queues
+`orch api-run <unit> --run <id> ...` in pueue's agents group with an allow-listed environment (no key). `orch api-run` reads the
+key from the secret store at that moment, gives it only to the agent process (never pueue, a file or argv), forwards
+TERM/INT/HUP to it, and writes the run's one `done` row with the reported cost, or the whole budget when none was reported.
+Ledger rows: `ts  unit  running|<cost>  <budget>|done rc=<x>  <run id>`. Every write takes `<ledger>.lock` (an fcntl lock)
+and is idempotent: a second running or done row for a run id is never written, so retries and re-runs never duplicate. Spend
+is computed per run id (its done cost, or its budget while it runs). `orch ledger check` reports every problem (exit 1 when
+malformed); `orch ledger repair` keeps the first running and first done row of each run id, drops unparseable rows, writes a
+backup `<ledger>.bak-<time>` first and replaces the file by rename. `orch stop` and `orch close` close a run that ended without
+a done row. Remote API agents get the key over ssh into a fifo only their task reads; `orch collect` records their cost.
+Project launchers (an older `launcher` key) are no longer used; doctor says so.
+
+**`[models.<name>]`**: `provider`, `vendor`, `kind`. `kind = "api"` is an API agent run by orch (`api_id` is the model id
+the API takes).
 `claude`, `codex` and `opencode` are agents in a herdr pane (in tmux on remote hosts); `args` are extra command-line
 arguments. `hosts` limits where a model may run.
 
@@ -150,7 +201,7 @@ Options: `--brief` (at most 8 lines), `--escalate` (only problems open longer th
 What it reports: per host and lane (`gates`, `jobs`, `land`), queued work with free slots or a paused group ("STALLED"),
 queued or admission-waiting work while the host has room for another job ("IDLE"), a host with free slots in a lane while
 another host has a backlog there, lane jobs older than their class age limit (enqueue to now: gates 240, jobs 120, land 240
-min), and an old-script queue (linux2 `run.sh`, linux1 `heavy.sh`) with waiters while it runs fewer than `legacy_slots`;
+min), and an older job queue (a host's `legacy_probe`) with waiters while it runs fewer than `legacy_slots`;
 unreachable hosts and what was on them; hosts over their margins (key `margin:<host>:<kinds>`, kinds load, memory, disk);
 idle room while beads has ready work (units, `orch-log` and instructions are not work: `orch launch` marks every unit
 `in_progress`); orphan pueue jobs (including lane jobs labelled `unit:<name>` whose unit is closed), tmux sessions (`orch-*`)
@@ -178,8 +229,10 @@ launched parser on laptop via herdr
 ```
 A `cleanup` unit frees disk and load, so neither `min_disk_gb` nor the load limit refuses it; memory and caps still apply.
 - **Model:** from `[routing]`, or `--model`, which passes the same checks (provider enabled, budget left). Every API launch
-  checks `committed + budget <= cap_usd` under the ledger's lock (`<ledger>.lock`, the same lock `fable-api.sh` takes); a
-  remote launch writes its "running" row under that lock before the task starts.
+  checks `committed + budget <= cap_usd` and reserves the run's "running" row under the ledger's lock before anything is
+  queued. A resumed unit continues its original report: `--resume-of <unit>`, `--report <path>`, or a `REPORT: <path>` /
+  "Continue the same report <path>" line in the brief; check, close, collect and the Stop hook read that report, and a verdict
+  written before the resume started does not count. `--item <id>` (or an `ITEM: <id>` line) ties the unit to a backlog item.
 - **Host:** `--host`; else where the unit's builds and tests run (`--test-host`, a `TEST-HOST: <h>` line in the brief, the
   first matching `[placement]` regex in orch.toml, or the sticky host in `out/linux-host/<unit>`) when the model may run
   there; else the allowed host with the most room.
@@ -224,13 +277,16 @@ the beads issue.
 **`orch board-close <agent>`**: archives a board card that is not an open unit (cards from other launchers); `board.sh close`
 by hand is denied.
 
-**`orch init`**: turns the old state docs in `paths.state_docs` into a one-line pointer to `.orch/HANDOFF.md`, keeping their
-text in `.orch/history-<name>`.
-```
-$ orch close parser
-close parser
-closed
-```
+**`orch init`**: in a folder without an orch.toml, writes a commented starter one (from `example.orch.toml`, this machine
+named after its host name) and creates `.orch/`, `briefs/` and `out/`. In a project that has one, turns the old state docs in
+`paths.state_docs` into a one-line pointer to `.orch/HANDOFF.md`, keeping their text in `.orch/history-<name>`.
+
+**`orch doctor [--no-hosts]`**: checks a setup end to end and names the fix for each problem: tools (git, ssh, rsync, bd,
+pueue and pueued, herdr, tmux, each model's CLI), the installed release and skill links, the hooks, the watcher, the config
+(hosts, models, routing, paths), beads, each API provider's secret store (the key is read, never shown) and ledger, and every
+host over ssh with its pueue. Exit 1 when anything fails.
+
+**`orch ledger check|repair`**, **`orch backlog import|list`**, **`orch queue`**, **`orch cancel`**: sections 3, 7a and 7b.
 
 **`orch commit-state [-m msg] [--dry-run]`**: runs `git add -A`, then scans exactly the staged files for secrets: Anthropic,
 OpenRouter, OpenAI (`sk-proj-`), hex `sk-` keys, AWS access key ids, GitHub and Slack tokens with a realistic length, and
@@ -326,42 +382,64 @@ environment queues a job. Remote API agents need `claude` on the host.
 One way to run a build or test job on any machine: that machine's pueue, never an ssh connection.
 
 **`orch run --host <h> --lane gates|jobs|land [--unit <u>] --wt <worktree> [--subdir <d>] [--usb] [--priority N] [--no-wait] -- <cmd>`**
-- syncs the worktree to a Linux host as the old `linux-test.sh`/`linux2-test.sh` did: `rsync -rlpgoD --checksum --delete`
-  with no `-t` (a changed file gets the transfer time as its mtime, so cargo never reuses an artifact built from older
-  content), no `.git` or build output; linux2 first reflink-clones `/srv/app-fleet/base`. It checks that
-  `reviews/dispatch-evidence` arrived when the worktree has it.
+- refuses a worktree with a merge in progress, unmerged files, conflict markers, or more than `[landing] max_behind` (default
+  10) commits behind the landing branch (`--allow-unmerged` overrides).
+- syncs the worktree to a remote host: `rsync -rlpgoD --checksum --delete` with no `-t` (a changed file gets the transfer
+  time as its mtime, so cargo never reuses an artifact built from older content), without the host's `sync_exclude`; a
+  podman host first reflink-clones `container.clone_base`. Every `paths.sync_require` path must arrive.
 - writes the job as `<root>/runs/<jid>.sh` and queues it in the host's pueue group: `gates` (priority 10) or `jobs`; `land`
-  is the Mac's landing lane (parallel 1). Groups are created on first use (`jobs` and `gates` with one slot per job cap).
-- Linux admission is by measured room (board 2026-11-11 14:44): the job waits in its pueue task, one job at a time under
-  `runs/admit.lock`, until MemAvailable >= `reserve_gb` + the measured per-job working set (the largest anonymous memory,
-  `memory.stat anon`, of the orch jobs running now, or on podman hosts of the orch-run/app-run containers; remembered in
+  is the local machine's landing lane (parallel 1). Groups are created on first use (`jobs` and `gates` with one slot per job cap).
+- Linux admission is by measured room: the job waits in its pueue task, one job at a time under `runs/admit.lock`, until
+  MemAvailable >= `reserve_gb` + the measured per-job working set (the largest anonymous memory, `memory.stat anon`, of the
+  orch jobs running now, or on podman hosts of the containers named by `container.name_prefixes`; remembered in
   `runs/ws_mb`; `job_ws_gb`, default half of `job_gb`, before anything was measured; at most `job_gb`), memory PSI some
-  avg10 < 5, load1 < 1.5 x `cores` (the same rule as capacity) and disk >= `min_disk_gb`; an admitted job keeps the lock 60 s more so its memory shows before the next is judged. The rule lives in
-  `<root>/runs/admit.sh`, rewritten on every `orch run` and re-read by waiting jobs every 15 s, so a rule change reaches jobs
-  already waiting. `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Mac
-  land: 5 GB internal-disk floor, agent-capacity's memory check, and no old `heavy.land` lane still running.
-- runs the job in `systemd-run --user --scope -p MemoryMax=<job_gb>`: on linux1 after `build-env.sh` (sccache,
-  `app_ARAVIS_TEST_ADDRS`, `TMPDIR`, scene cache) and `uv sync` of the processing venv; on linux2 in `run.sh`'s container
-  settings (`localhost/app-build:2`, `/srv/app-fleet` at `/f`, its caches, 2 CPUs, `--memory=<job_gb>`, nice 15 and idle
-  IO; `--usb` adds the D435 devices under `run.usb.lock`). `run.sh` itself is not used or changed.
+  avg10 < 5, load1 < 1.5 x `cores`, disk >= `min_disk_gb`, and CPU: (running orch jobs + 1) x `cores_per_job` <= `cores` (load
+  lags, because builds ramp up after admission). An admitted job keeps the lock 60 s more so its memory shows before the next
+  is judged. The rule lives in `<root>/runs/admit.sh`, rewritten on every `orch run` (by rename) and re-read by waiting jobs
+  every 15 s. `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Local land
+  lane: the disk floor, the host's `admit_check`, and no `legacy_lanes` lane still running.
+- runs the job in `systemd-run --user --scope -p MemoryMax=<job_gb>` after the host's `run_env` and `job_setup`; with
+  `runner = "podman"` in the host's container settings (`--memory=<job_gb>`, nice 15 and idle IO; `--usb` adds `usb_args`
+  under `usb_lock`), with a start and end line in `job_log`.
 - waits with `pueue wait` (retrying through ssh drops), prints the log and exits with the job's exit code. One command
   argument is shell text (like the old `"$*"`); several are quoted with `shlex.join`.
 - If the caller dies the job keeps running. Its log and exit code stay in `<root>/runs/<jid>.{log,rc}` on the host;
   **`orch collect <host>:<task>`** copies them to `.orch/runs/`, prints the log and exits with the job's code (3 while it
   is still queued or running).
 
-**`orch gate <name> [--host h] [--priority N] [--wait]`** queues `out/<name>/tests.sh` as a `gates` task on the Mac through
-`bin/run-handoff.sh`, so the host choice, the `LINUX_TEST_FULL` rule for `land-*`/`merge-*`, the `EXIT_` parsing and the
-RESULT line in `out/handoff-results.log` are exactly as before (`orch check` and `gate-check.sh` read them). Inside it,
-`ORCH_LANE=gates` puts the gate's Linux steps in the hosts' `gates` lanes. `--wait` prints the RESULT line, exit 0 on PASS.
+**`orch gate <name> [--host h] [--unit u] [--priority N] [--wait]`** queues `out/<name>/tests.sh` as a `gates` task on the
+local machine. With `paths.gate_runner` set, that project script runs it with `<name>` (and owns the RESULT line); otherwise
+orch runs `tests.sh` itself and appends `<date> <time> <name> EXIT_tests=<rc> RESULT: PASS|FAIL` to `paths.gate_log`.
+`--host` is passed in `paths.gate_host_env` (default `ORCH_TEST_HOST`); `ORCH_LANE=gates` puts the gate's remote steps in the
+hosts' `gates` lanes. `--unit` (default `$ORCH_UNIT`) records the gate on the unit for the landing check. `--wait` prints the
+RESULT line, exit 0 on PASS. **`orch cancel <host>:<task>`** kills and removes an orch job that outlived its intent.
+**`orch queue [host] [--log N]`** prints each host's pueue status (or a task's log), read-only.
 
-The fleet scripts are shims over these (example-project `gate-logs/orch-20261031/bin`):
-- `linux-test.sh <wt> "<cmd>"` and `linux2-test.sh`: same arguments and exit codes; the full-suite guard (only `land-*` and
-  `merge-*` gates may run whole suites, exit 2 otherwise), `--which`, `LINUX_TEST_HOST=auto` and the D435 rule (USB jobs go to
-  linux2) run first, then `orch run` (lane `jobs`, or `gates` inside `orch gate`). Station gates stay on linux1 by the
-  `export LINUX_TEST_HOST=linux1` pin in their `tests.sh` (out/api-linux-gates/REPORT.md), which `run-handoff.sh` honours.
-- `heavy.sh` with `HEAVY_LANE=land` runs `orch run --host mac --lane land`; other heavy.sh lanes are unchanged.
-- `handoff-queue.sh` workers turn each queue file into `orch gate <job> --priority 100-rank` (linux2 queue: `--host linux2`).
+Project scripts may wrap these (test shims, queue workers); list them in `paths.lane_scripts` so a test they run is not
+reported as running outside the lanes.
+
+## 7b. Backlog and landing
+
+**`orch backlog import`** reads the project's status checklist (`[backlog] file`, default `paths.checklist`): markdown table
+rows (the header names the id, item and status columns) and `- [ ]` lines. Every unfinished item becomes a beads issue
+labelled `backlog` and `status:<status>` (plus `backlog-ready` when its status is in `[backlog] ready`), keyed by external
+ref `backlog:<id>`; a re-import updates labels, closes items that became done and reopens ones that came back, so it is
+idempotent. `orch backlog list` shows what it reads. `orch check` then reports:
+- `idle-backlog:<host>`: the host has room while ready backlog items have no open unit ("write briefs for: ..."); a unit
+  covers an item by `orch launch --item <id>`, an `ITEM: <id>` line, or the id named in the first lines of its brief;
+- `backlog:stale` / `backlog:import`: the checklist changed since the last import, or was never imported;
+- `landing:<unit>:nogate`: a unit with VERDICT DONE for over `[landing] finished_min` (30) minutes has no gate queued or
+  run (gates belong to a unit by `orch gate --unit` or `[landing] gate_names` patterns);
+- `landing:<unit>:unlanded`: its gates passed (`gates_required`, default 1) but its worktree HEAD is not on the landing branch.
+
+## 7c. Self-safety
+
+Every script orch writes or replaces (job scripts, lane runners, remote agent scripts, the pueue shim, admit.sh, rewritten
+reports) is written to a temp file and renamed into place, never edited in place: a running shell keeps reading its old file.
+`orch check` reports `script:<pid>` when a running shell script's file was changed in place after it started (the shell reads
+its script as it goes, so it would continue at its old byte offset of the new text, which is how a launcher once looped and
+wrote 49,000 ledger rows). The live toolkit is a read-only release copy (section 2), so an agent editing the orch repository
+never changes the toolkit that runs it. Every hook denial is logged in `.orch/denied.log`.
 
 ## 8. Troubleshooting
 
@@ -378,7 +456,11 @@ The fleet scripts are shims over these (example-project `gate-logs/orch-20261031
 | Stop blocked "Do not go idle" | run `orch check`, act, `orch ack`, update the notes |
 | `beads unavailable: ...` | `bd` is missing or `[project] beads` has no `.beads/`; run `bd init` there |
 | `watcher com.orch.watch is not running: run install` | the launchd agent is not loaded |
-| `git has no upstream: set the bare repo on linux1 and push` | the project repo has no upstream branch (the text names linux1 from the original project) |
+| `git has no upstream: add a remote, then orch commit-state` | the project repo's branch has no upstream; `orch commit-state` pushes with `--set-upstream` |
+| `refused: the <p> ledger ... is malformed` / `[ledger:<p>]` | `orch ledger check` lists the problems; `orch ledger repair` deduplicates by run id (backup first) |
+| `no API key: ...` | the provider's `key_keychain` / `key_file` gave no key; `orch doctor` shows which |
+| `[script:<pid>] running script ... was changed after it started` | stop that process and relaunch it; write scripts by rename |
+| `refused: <wt> has conflict markers` / `is N commits behind main` | finish the merge or merge the landing branch first; `--allow-unmerged` overrides |
 | `orch: waiting for admission: MemAvailable A MB (need B = reserve R + working set W), PSI P, load L (limit 1.5 x C cores), disk D GB` (in a job log) | the host has not got that much room yet; it starts by itself when it has |
 | `[old-rule:<host>] N job(s) still wait under the old cap rule` | jobs queued before the measured rule; re-queue them with `orch run`, then stop the old tasks |
 | `(read-only: not the registered orchestrator session ...)` after `orch check` | expected for anyone but the orchestrator: nothing was saved, tuned or stamped |
@@ -394,8 +476,8 @@ the action through.
 
 `install` has been run (links, hooks, launchd); the Codex `/hooks` trust step is still manual.
 
-Not yet verified (see `out/orch-fixes6/REPORT.md` in the example-project gate log for what was):
-- A remote API agent on linux1 end to end with the new lane runner and patch collect (dry-run only).
+Open items and their reasons are tracked in `docs/ISSUES.md`. Not yet verified live:
+- A remote API agent end to end with the new lane runner and patch collect (dry-run only).
 - `watch` starting a new orchestrator (the conditions are tested in code review only), and the context reset.
 - A full herdr-backed agent via `orch launch`, including the startup-dialog answers.
 - Codex's PreToolUse tool names (the handler accepts `Bash`, `shell`, `local_shell` and any tool input with `command`/`cmd`).

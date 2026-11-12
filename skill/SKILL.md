@@ -16,6 +16,9 @@ description: Use when you are the orchestrator of a multi-agent project that has
 - Launch within safe capacity and any owner caps: `orch launch <unit> --kind implement|review|audit|cleanup --tier critical|normal [--host h] [--test-host h]`. `orch capacity` shows room; a full host refuses (a `cleanup` unit is exempt from the load and disk limits). Reviews use a different vendor from the implementer (`--of <unit>`). Each unit needs its own worktree.
 - Answer every board question and blocker `check` reports (`board.sh direct <agent> <text>`); archive cards that are not units with `orch board-close <agent>`.
 - Classify owner instructions: close the beads issue as done, or make it a standing rule with `bd remember`.
+- Keep the backlog in beads (`orch backlog import` after the checklist changes). On `idle-backlog`, write briefs for the listed items and launch them with `--item <id>`. On `landing:<unit>`, gate the finished unit (`orch gate <name> --unit <unit>`) or land it once its gates passed.
+- Resume a stopped unit with `--resume-of <unit>` so it continues that unit's report. Cancel a lane job that outlived its intent with `orch cancel <host>:<task>`; see queues with `orch queue`, never `ssh <host> pueue`.
+- On `ledger:` findings run `orch ledger check`, then `orch ledger repair`; launches are refused until the ledger is valid. On `script:<pid>`, stop that process and relaunch it.
 
 **Forbidden.** No operations by hand: no `rm -r`, `kill`, in-place edits of code or worktrees, loops over worktrees, destructive ssh, `sparse-checkout`, no running tests or builds yourself, no launching agents outside `orch launch`, no using a disabled provider or going past a cap, and no stopping anything because an ssh connection dropped. Stop only a unit's recorded agent with `orch stop` (it ends the unit's whole process tree, detached children included). Never ask the owner for what a rule already says (`bd prime`).
 

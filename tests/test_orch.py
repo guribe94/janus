@@ -150,6 +150,20 @@ class SelfSafety(unittest.TestCase):
             self.assertTrue([k for k, _ in orch.script_findings() if k.startswith(f"script:{p.pid}:")])
         finally: p.kill(); p.wait()
 
+class Register(unittest.TestCase):
+    def test_tree_guard(self):
+        d = Path(tempfile.mkdtemp()); g = lambda *x: subprocess.run(["git", "-C", str(d), *x], capture_output=True)
+        g("init", "-q", "-b", "main"); (d / "a").write_text("x\n"); g("add", "a"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "a")
+        _, cfg = project()
+        self.assertIsNone(orch.tree_guard(cfg, d))
+        (d / "a").write_text("<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")
+        self.assertIn("conflict markers", orch.tree_guard(cfg, d))
+    def test_shim_labels_agent_jobs(self):
+        self.assertIn('add -l "unit:$ORCH_UNIT"', orch.clean_pueue_script({"local": True}))
+    def test_rg_patterns_are_data(self):
+        d, cfg = project()
+        for c in ['rg -n "rm -rf|kill -9" .', "grep -c 'pueue kill' log"]: self.assertIsNone(orch.judge(cfg, c, str(d), orch.edit_ok_dirs(cfg)), c)
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         import re
