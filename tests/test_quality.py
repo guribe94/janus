@@ -180,6 +180,50 @@ class LandReview(unittest.TestCase):
         self.assertEqual(rj["findings"][0]["kind"], "test"); self.assertEqual(rc, 1); self.assertEqual(rj["head"], self.head())
 
 
+class QualityFinding(unittest.TestCase):
+    """ranked gap 8: a finished unit whose diff changed test files but whose report.json names no test it added (or names one
+    without the failure it catches) is listed before it lands. The failure caught: tests with no failure named slipping into a
+    landing unreviewed (the rule every brief header states)."""
+
+    def setUp(self):
+        self.d, self.cfg = project()
+        self.r = self.d / "repo"; self.r.mkdir()
+        self.g("init", "-q", "-b", "main")
+        (self.r / "a").write_text("1\n"); self.g("add", "a"); self.g("commit", "-qm", "base")
+        self.wt = self.d / "repo-wt"
+        self.g("worktree", "add", "-q", "-b", "wk/u", str(self.wt))
+        self.u = {"id": "x-1", "name": "u", "host": "here", "cwd": str(self.wt), "verdict": "VERDICT: DONE"}
+        (self.d / "out/u").mkdir(parents=True)
+        (self.d / "out/u/REPORT.md").write_text("work\nVERDICT: DONE\n")
+
+    def g(self, *a): return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(self.r), *a], capture_output=True, text=True)
+
+    def commit(self, f, body="new\n"):
+        p = self.wt / f; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(body)
+        self.gw("add", f); self.gw("commit", "-qm", f"u: {f}")
+
+    def gw(self, *a):
+        return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(self.wt), *a], capture_output=True, text=True)
+
+    def keys(self): return [k for k, _ in janus.quality_findings(self.cfg, [self.u])]
+
+    def test_flags_test_files_without_named_failures(self):
+        self.assertEqual(self.keys(), [])                                        # nothing changed yet: no finding
+        self.commit("src/a.py")                                                  # a non-test change: not judged
+        (self.d / "out/u/report.json").write_text(json.dumps({"verdict": "DONE", "tests_added": []}))
+        self.assertEqual(self.keys(), [])
+        self.commit("tests/test_u.py")                                           # adds a test file, report.json still lists none
+        self.assertEqual(self.keys(), ["quality:u"])
+        (self.d / "out/u/report.json").write_text(json.dumps({"verdict": "DONE", "tests_added": [{"name": "t", "catches": ""}]}))
+        self.assertEqual(self.keys(), ["quality:u"])                             # an entry without a catches text
+        (self.d / "out/u/report.json").write_text(json.dumps({"verdict": "DONE", "tests_added": [{"name": "t", "catches": "a bad parse crashes main"}]}))
+        self.assertEqual(self.keys(), [])                                        # named failure: clean
+
+    def test_no_report_json_is_not_judged(self):
+        self.commit("tests/test_u.py")
+        self.assertEqual(self.keys(), [])                                        # the report.json rule is prompted, not enforced, without it
+
+
 class Soak(unittest.TestCase):
     """item 6: one soak pass exercises every read path, prints one line each, and writes nothing. The failure caught: a soak
     that mutates the live project it is checking."""
