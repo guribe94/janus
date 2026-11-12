@@ -575,7 +575,7 @@ def ledger_parse(text):
             if r["budget"] is None: r["budget"] = float(f[3])
         elif NUM.match(f[2].strip()) and f[3].startswith("done"):
             r["done"].append(i)
-            if r["cost"] is None: r["cost"] = float(f[2])
+            if r["cost"] is None: r["cost"] = float(f[2]); r["how"] = f[3]
         else: bad.append(f"line {i}: neither a running row nor a done row: {l[:80]!r}")
     for k, r in runs.items():
         if len(r["running"]) > 1: bad.append(f"run {k} ({r['unit']}): {len(r['running'])} running rows (lines {', '.join(map(str, r['running'][:5]))}{'...' if len(r['running']) > 5 else ''})")
@@ -625,7 +625,7 @@ def ledger_done(cfg, pv, run, name, cost, rc):
     with Locked(ledger_path(cfg, pv)):
         r = ledger_read(cfg, pv)[0].get(run)
         if r and r["done"]: return False
-        ledger_append(cfg, pv, [tstamp(), name, cost, f"done rc={rc}", run])
+        ledger_append(cfg, pv, [tstamp(), name, cost, RECONCILED if rc == "unknown" else f"done rc={rc}", run])
     return True
 
 def run_cost(path, budget):
@@ -676,6 +676,26 @@ def model_ok(cfg, m):
             if left < pv.get("budget_per_unit", 0): return False, f"{c['provider']} budget left ${left:.0f}"
     return True, ""
 
+RECONCILED = "done unknown"   # a reconciled run: its agent is gone with no done row; its budget is counted as the upper bound
+
+def unreconciled(cfg, pv, units):
+    """[(run id, unit, budget, why)] of runs with a running row and no done row whose agent is gone: the unit is closed, the run
+    was superseded by a later run of its unit, its unit's agent ended (units carry the state check computed), or the run is
+    over a day old and no unit records it."""
+    au = all_units(cfg); st = {u["name"]: u for u in units}; byrun = {k: u for u in au.values() for k in unit_runs(u)}; out = []
+    for k, r in ledger_read(cfg, pv)[0].items():
+        if r["done"] or not r["running"]: continue
+        u = byrun.get(k) or au.get(r["unit"]); live = st.get(r["unit"])
+        try: age = now() - time.mktime(time.strptime(r["ts"][:19], "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, TypeError): age = 0
+        if not u: why = "no unit records it" if age > 86400 else None
+        elif u.get("status") == "closed" and not live: why = f"its unit {r['unit']} is closed"
+        elif live and live.get("run") and live["run"] != k and k in unit_runs(live): why = f"superseded by run {live['run']}"
+        elif live and live.get("run") == k and live.get("state") in ("done", "failed", "gone"): why = f"its agent ended ({live['state']})"
+        else: why = None
+        if why: out.append((k, r["unit"], r["budget"] or 0.0, why))
+    return out
+
 def cmd_ledger(cfg, a):
     """orch ledger check: every provider ledger, exit 1 when one is malformed. orch ledger repair: keep the first running row
     and the first done row of each run id, drop rows that cannot be parsed, after a backup <ledger>.bak-<time>; the file is
@@ -683,6 +703,18 @@ def cmd_ledger(cfg, a):
     pvs = [(n, pv) for n, pv in cfg.prov.items() if "ledger" in pv and (not a.provider or n == a.provider)]
     if not pvs: raise Err("no provider has a ledger in orch.toml")
     worst = 0
+    if a.action == "reconcile":   # runs whose agent is gone and that have no done row: done unknown, budget as the upper bound
+        if not DRY: refuse_agent("orch ledger reconcile")
+        units = Beads(cfg).units(); hs = probe_all(cfg); ag = herdr_agents(cfg)
+        for u in units: u["state"] = unit_state(u, hs, ag)
+        for n, pv in pvs:
+            rs = unreconciled(cfg, pv, units)
+            if not rs: say(f"{n}: nothing to reconcile"); continue
+            for k, un, b, why in rs:
+                if DRY: say(f"would mark {k} ({un}) {RECONCILED}, ${b:g} counted (its budget, the upper bound): {why}"); continue
+                ok = ledger_done(cfg, pv, k, un, b, "unknown")
+                say(f"{'marked' if ok else 'already done:'} {k} ({un}) {RECONCILED}, ${b:g} counted: {why}")
+        return 0
     for n, pv in pvs:
         p = ledger_path(cfg, pv)
         if a.action == "check":
@@ -1134,6 +1166,9 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
                 F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
                           + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": orch ledger check"))
+            ur = unreconciled(cfg, pv, units)
+            if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (${sum(x[2] for x in ur):.2f} held as running: "
+                             + ", ".join(f"{x[0]} {x[3]}" for x in ur[:3])[:240] + "): orch ledger reconcile"))
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
@@ -2857,7 +2892,8 @@ def budget_findings(cfg, units):
 # report-due at [report] checkpoints, and waste-pause when capped-without-verdict spend passes [report] waste_pause (default
 # 25 %) of the spend of the last recent_h hours: launch and fill are refused until the orchestrator acks waste-pause.
 OUTCOMES = (("verdict", "finished with a verdict"), ("capped-partial", "capped, partial work"), ("capped-nothing", "capped, nothing written"),
-            ("open", "open unit, no verdict yet"), ("no-verdict", "ended without a verdict"), ("unknown", "unknown (no done row)"))
+            ("open", "open unit, no verdict yet"), ("no-verdict", "ended without a verdict"), ("unknown", "unknown (no done row)"),
+            ("reconciled", "agent gone, no done row: reconciled, budget counted as the upper bound"))
 REPORT_DEFAULTS = {"every_h": 4, "at": [], "waste_pause": 25, "recent_h": 24}
 
 def rset(cfg, k): return cfg.c.get("report", {}).get(k, REPORT_DEFAULTS[k])
@@ -2888,7 +2924,8 @@ def run_outcomes(cfg):
             try: aj = json.loads((od / f"api-{k}.json").read_text())
             except Exception: aj = api_out(cfg, u) if k == (u.get("run") or k) else {}
             v = verdict(cfg, {**u, "resume": False}) if u.get("name") else None
-            if v: o = "verdict"
+            if r["done"] and r.get("how") == RECONCILED: o = "reconciled"
+            elif v: o = "verdict"
             elif aj.get("subtype") == "error_max_budget_usd": o = "capped-partial" if work_written(cfg, u, t) else "capped-nothing"
             elif not r["done"]: o = "open" if u["name"] in open_ else "unknown"
             elif u["name"] in open_: o = "open"
@@ -4838,7 +4875,7 @@ def main():
         A("--cwd", required=True), A("--report"), A("--resume-session", help="continue this agent session"), A("--prompt-file", help="the prompt (default: the brief's)"))
     add("park", A("unit"), dry=True)
     add("resume", A("unit"), A("--message", help="resume with this text instead of its jobs' results"), A("--force", action="store_true", help="resume although its jobs have not finished"), dry=True)
-    add("ledger", A("action", choices=["check", "repair"]), A("--provider"), dry=True)
+    add("ledger", A("action", choices=["check", "repair", "reconcile"]), A("--provider"), dry=True)
     add("doctor", A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...>"), dry=True)
     add("queue", A("host", nargs="?"), A("--log", type=int, help="print this task's log"))

@@ -955,6 +955,27 @@ class TidyAll(unittest.TestCase):
         cfg.jput("tidy.json", {"at": int(time.time()), "plan": [list(x) for x in P]})
         self.assertEqual(sorted(k.split(":")[0] for k, _ in orch.tidy_findings(cfg)), ["disk", "tidy"])
 
+class Reconcile(unittest.TestCase):
+    """fixes10 item 7: runs whose agent is gone with no done row are found, marked done unknown (budget as the upper bound),
+    shown by orch report, and no longer raised once reconciled."""
+    def test_reconcile(self):
+        d, cfg = project(); pv = cfg.prov["api"]; L = d / "out/ledger.tsv"; old = "2026-01-01 00:00:00"; new = orch.tstamp()
+        L.write_text("".join(f"{t}\t{u}\trunning\t{b}\t{k}\n" for t, u, b, k in (
+            (new, "closed", 2, "closed.r1"), (new, "live", 1, "live.r1"), (new, "live", 1, "live.r2"), (new, "ended", 3, "ended.r1"),
+            (old, "ghost", 4, "ghost.r1"), (new, "fresh", 5, "fresh.r1"))))
+        cfg._all_units = {"closed": {"name": "closed", "status": "closed", "run": "closed.r1"},
+                          "live": {"name": "live", "status": "in_progress", "run": "live.r2", "runs": ["live.r1", "live.r2"]},
+                          "ended": {"name": "ended", "status": "in_progress", "run": "ended.r1"}}
+        units = [{"name": "live", "run": "live.r2", "runs": ["live.r1", "live.r2"], "state": "working"}, {"name": "ended", "run": "ended.r1", "state": "failed"}]
+        got = {k: why for k, _, _, why in orch.unreconciled(cfg, pv, units)}
+        self.assertEqual(sorted(got), ["closed.r1", "ended.r1", "ghost.r1", "live.r1"], got)
+        for k, un, b, _ in orch.unreconciled(cfg, pv, units): orch.ledger_done(cfg, pv, k, un, b, "unknown")
+        self.assertIn("\t4.0\tdone unknown\tghost.r1", L.read_text())
+        self.assertEqual(orch.unreconciled(cfg, pv, units), []); self.assertEqual(orch.ledger_read(cfg, pv)[1], [])   # valid ledger
+        self.assertAlmostEqual(orch.committed(cfg, pv), 2 + 1 + 1 + 3 + 4 + 5)          # the bound stays counted
+        outs = {k: o for _, k, _, _, o, _ in orch.run_outcomes(cfg)}
+        self.assertEqual(outs["ghost.r1"], "reconciled"); self.assertEqual(outs["live.r2"], "open")
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project).

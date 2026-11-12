@@ -161,7 +161,10 @@ and is idempotent: a second running or done row for a run id is never written, s
 is computed per run id (its done cost, or its budget while it runs). `orch ledger check` reports every problem (exit 1 when
 malformed); `orch ledger repair` keeps the first running and first done row of each run id, drops unparseable rows, writes a
 backup `<ledger>.bak-<time>` first and replaces the file by rename. `orch stop` and `orch close` close a run that ended without
-a done row. Remote API agents get the key over ssh into a fifo only their task reads; `orch collect` records their cost.
+a done row. `orch ledger reconcile [--dry-run]` closes the rest: every run whose agent is gone (its unit closed, the run
+superseded by a later run of its unit, its agent ended, or over a day old with no unit) and that has no done row gets one,
+`done unknown`, with its budget as the cost (the upper bound, so the cap never undercounts); `orch report` lists them as
+reconciled, and `orch check` raises `ledger:<provider>:unreconciled` until it is run. Remote API agents get the key over ssh into a fifo only their task reads; `orch collect` records their cost.
 Project launchers (an older `launcher` key) are no longer used; doctor says so.
 
 **`[models.<name>]`**: `provider`, `vendor`, `kind`. `kind = "api"` is an API agent run by orch (`api_id` is the model id
