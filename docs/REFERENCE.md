@@ -72,9 +72,13 @@ where its tests run, where launch places it.
 when the registered orchestrator is gone. It must match the registered session's kind (`check` reports a mismatch; the
 watcher starts the registered kind, with `args` only when the kinds match). The watcher starts one only when all of these
 hold: `herdr pane list` answered and the registered pane is not in it, the registered session's process (pid and start time,
-recorded at register) is not running, and its transcript has not changed for 20 min. A herdr error or timeout starts nothing.
-It then marks the registration pending, so the new session's first hook event claims it. Every prompt the watcher sends
-starts with `[janus] `.
+recorded at register) is not running, its transcript has not changed for 20 min, and no pending registration is younger than
+the claim window (10 min). While the registered pane is present without an agent, or a pending registration is inside its
+claim window, it starts nothing (one may still be starting; after 3 passes check raises `orchestrator:unregistered`). A pane
+that has shown no agent for 20 min, once the claim window has passed, the process has ended and the transcript is quiet, is
+taken for a crashed agent: the watcher closes the pane, then starts a new one as above. A herdr error or timeout starts
+nothing. After a start it marks the registration pending with the new pane, so the first hook event from that pane within
+the claim window claims it. Every prompt the watcher sends starts with `[janus] `.
 
 **`[hosts.<name>]`**: one per machine. `local = true` for this one; others have `ssh`, `arch`, `root` (where synced
 worktrees, briefs and outputs live) and `bin`. Capacity figures: `ram_gb`, `cores`, `reserve_gb` (kept free),
@@ -466,7 +470,8 @@ hooks still file every prompt as an instruction. Everything that must survive is
 
 **Hand back** by leaving the notes current and running `janus register` in the session you will keep; SessionStart then
 reloads the handoff, rules and check output. The watcher starts a new orchestrator only when the registered pane and process
-are gone and the transcript has been quiet for 20 minutes (section 2), so a live session is never doubled.
+are gone, the transcript has been quiet for 20 minutes and no pending registration is inside its 10-minute claim window; a
+pane left without an agent for 20 minutes is closed first (section 2). A live session, or one still starting, is never doubled.
 
 ## 6. Multiple machines, capacity and network outages
 
