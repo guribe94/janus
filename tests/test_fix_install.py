@@ -472,6 +472,31 @@ class Item3Handover(unittest.TestCase):
         self.assertIn("still", str(e.exception)); self.assertFalse(any("rm -rf" in c for c in calls))
 
 
+class Item3AdmitClock(unittest.TestCase):
+    def test_the_give_up_clock_starts_when_the_job_is_blocked_not_at_enqueue(self):
+        """Catches (finding 3): the give-up clock read JANUS_TQ (the enqueue time), so a job that had queued long behind other
+        work was dropped on its first blocked poll (rc 124, the same as a command's own timeout) without ever running. The clock
+        now counts only the time spent blocked, and a never-admitted job exits 121, distinct from a timed-out command (124)."""
+        import argparse
+        d, cfg = project('\n[capacity]\nmin_disk_gb = 99999\n')
+        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        old = os.environ.get("JANUS_TQ"); os.environ["JANUS_TQ"] = str(int(time.time()) - 7300)   # the job queued 7300 s
+        try: js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
+        finally:
+            if old is None: os.environ.pop("JANUS_TQ", None)
+            else: os.environ["JANUS_TQ"] = old
+        t0 = time.time()
+        p = subprocess.run(["bash"], input=js, text=True, capture_output=True, timeout=60,
+                           env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"})
+        self.assertNotEqual(p.returncode, 124, "a queued job was dropped as if its command had timed out: " + p.stdout + p.stderr)
+        self.assertEqual(p.returncode, 121, p.stdout + p.stderr)
+        self.assertGreaterEqual(time.time() - t0, 2.5, "it was dropped before its blocked clock ran out: " + p.stdout)
+        self.assertNotIn("after 73", p.stdout, "the clock started at enqueue, not at the first blocked poll: " + p.stdout)
+        self.assertIn("blocked (limit 3s", p.stdout, p.stdout)
+
+
 class Item5ReportSync(unittest.TestCase):
     def _remote(self, state="done", via="pueue", **kw):
         d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/home/x"\n')

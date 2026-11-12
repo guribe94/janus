@@ -633,7 +633,8 @@ class DiskFloor(unittest.TestCase):
 class AdmitBound(unittest.TestCase):
     def test_a_blocked_job_says_why_and_gives_up(self):
         """Catches (item 21): a job blocked in admission waited forever with no reason and no bound. It now says why (with
-        numbers) at least every REPORT s and gives up with exit 124 after the lane's bound."""
+        numbers) at least every REPORT s and gives up with exit 121 after the lane's bound (finding 3: 121 = never admitted,
+        distinct from a command's own timeout, 124)."""
         import argparse
         d, cfg = project('\n[capacity]\nmin_disk_gb = 99999\n')
         h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
@@ -642,7 +643,7 @@ class AdmitBound(unittest.TestCase):
         js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
         p = subprocess.run(["bash"], input=js, text=True, capture_output=True, timeout=60,
                            env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"})
-        self.assertEqual(p.returncode, 124, p.stdout + p.stderr)
+        self.assertEqual(p.returncode, 121, p.stdout + p.stderr)
         self.assertGreaterEqual(p.stdout.count("waiting for admission"), 2, p.stdout)
         self.assertIn("disk", p.stdout); self.assertIn("giving up", p.stdout)
 

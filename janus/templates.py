@@ -231,20 +231,29 @@ else   # no flock: a lock dir holding its owner's pid; a dead owner's dir is tak
 gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cut -d' ' -f1 "$f")" 2>/dev/null && return 0; done; return 1; }
 W="$R.wait"; [ "$lane" = gates ] && W="$R.gwait"; echo "$$ $EXP $(date +%%s) $(cap_mb "$CLS" $CAPMB $CAPMB) $(cap_cores "$CLS")" > "$W"
 HELD=; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
-said=; last=0; WAITMAX=${JANUS_ADMIT_MAX_S:-%(waitmax)d}; REPORT=${JANUS_ADMIT_REPORT_S:-60}   # item 21: say why at least every REPORT s, give up after WAITMAX
+said=; last=0; BS=; WAITMAX=${JANUS_ADMIT_MAX_S:-%(waitmax)d}; REPORT=${JANUS_ADMIT_REPORT_S:-60}   # item 21: say why at least every REPORT s; finding 3: give up only after WAITMAX s of being BLOCKED (a yield resets the clock)
 while :; do
+  Y=
   if [ "$lane" = gates ] || ! gates_waiting; then
     lk; CAP_RO=; . "$RD/cap.sh"
     if admit_ok "$CLS"; then
       ahead "$W"   # shorter or older jobs waiting here go first unless this one fits beside them
-      if [ "$NB" -gt 0 ] && { [ $((RC + CC + BCC)) -gt "$CORES" ] || [ $((RM + RAM + MB + BMB)) -gt "$MEMCAP" ]; }; then BLK="yield to $NB shorter or older job(s)"
+      if [ "$NB" -gt 0 ] && { [ $((RC + CC + BCC)) -gt "$CORES" ] || [ $((RM + RAM + MB + BMB)) -gt "$MEMCAP" ]; }; then BLK="yield to $NB shorter or older job(s)"; Y=1
       else echo "$$ $CC $MB $(date +%%s) $CLS" > "$R.res.$$" && mv -f "$R.res.$$" "$R.res"; ulk; break; fi
     fi
     ulk; nowt=$(date +%%s)
     if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): $why"; said=$BLK; last=$nowt; fi
   fi
-  waited=$(( $(date +%%s) - ${TQ:-$(date +%%s)} ))
-  if [ "${WAITMAX:-0}" -gt 0 ] && [ "$waited" -ge "$WAITMAX" ]; then echo "janus: not admitted after ${waited}s (limit ${WAITMAX}s; $CLS; ${BLK:-no reason reported}): $why; giving up (exit 124)"; exit 124; fi
+  # finding 3: the give-up clock starts at the first poll this job is blocked, never at enqueue (TQ); a yield to an older job
+  # means the queue is moving, so it clears the clock. So a job that queued long is not dropped at its first blocked poll.
+  nowt=$(date +%%s)
+  if [ "$Y" = 1 ]; then BS=
+  elif [ -z "$BS" ]; then BS=$nowt; fi
+  waited=0; [ -n "$BS" ] && waited=$((nowt - BS))
+  if [ "${WAITMAX:-0}" -gt 0 ] && [ "$waited" -ge "$WAITMAX" ]; then
+    echo "janus: not admitted after ${waited}s blocked (limit ${WAITMAX}s; $CLS; ${BLK:-no reason reported}): $why; giving up (exit 121)"
+    exit 121   # finding 3: 121 = never admitted (the command never ran; a command's own timeout is 124)
+  fi
   sleep ${JANUS_POLL_S:-15}
 done
 rm -f "$W"; exec 7>&-; trap 'rm -f "$R.res"' EXIT
