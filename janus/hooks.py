@@ -7,6 +7,7 @@ from pathlib import Path
 from janus.beads import Beads
 from janus.context import (Cfg, Err, JANUS_MARK, WAKE, find_root, handoff_path, handoff_stale, now, record_session_proc,
     session_alive, session_root, sh, ts)
+from janus.decisions import session_text as decisions_text
 from janus.memory import memory_text
 from janus.units import main_checkout, own_tree
 
@@ -353,6 +354,8 @@ def cmd_hook(ev):
     if d.get("transcript_path"): cfg.f("transcript").write_text(d["transcript_path"])
     if ev == "SessionStart":   # cached state only: the hook has a 60 s limit, and the check runs as the session's first act (M14)
         parts = [handoff_path(cfg).read_text() if handoff_path(cfg).exists() else "", memory_text(cfg)]   # MEMORY.md (janus-swarm item 2)
+        dt = decisions_text(cfg)
+        if dt: parts.append(dt)
         rc, o, e = sh(["bd", "prime"], cwd=cfg.beads, timeout=20); parts.append(o if rc == 0 else f"(bd prime unavailable: {e.strip()[:80]})")
         parts.append("The Live state above is from the last check. You are the orchestrator: dispatch, monitor, verify, land, clean up, report. "
                      "First run janus check, act on each line, janus ack. See the janus skill.")
