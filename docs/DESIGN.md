@@ -31,6 +31,53 @@ and never does the work by hand. Generic for any project, Claude Code and Codex,
 | watcher | `orch watch` every few minutes (launchd): check, park/resume, orphans, board alerts, wake or restart the orchestrator |
 | `install` | builds a tested read-only release, links it, merges hooks, installs the watcher |
 
+## Package layout (`orchkit/`)
+
+The single stdlib file is split by seam into `orchkit/`, with `orch.py` kept as the entry point; `install`'s release copy
+(`PARTS`) includes the package, so the installed command runs the same code. Dependency direction is lower-to-higher and
+acyclic: a module never imports a higher one, and no module calls `say()` from another layer.
+
+| Module | Holds | State |
+|---|---|---|
+| `orchkit/__init__.py` | `__version__` | moved |
+| `orchkit/context.py` | Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X/herdr, the registered-session process identity, pq/qp/secs/fl/findkey, Locked, atomic_write, ORCH_SELF/FIXTURE_MARK/NUM, and DRY as one shared flag object | moved |
+| `orchkit/templates.py` | the nine shell/Python templates orch writes (PROBE, DIRECT_PROBE, CAP_LIB, ADMIT, STOP_GROUP, CLEAN_PUEUE, UNIT_PROCS, FINGERPRINT, CONDENSE) | moved |
+| `orchkit/beads.py` | `Beads` | moved |
+| `orchkit/cap.py` | CAP_DEFAULTS/capv/cap_nums, cap_lib, class_mb/class_secs, record_history, host_cap/next_free/build_room | moved |
+| `orchkit/probe.py` | probe/probe_all, probe_extra, pueue, margins/room/cap_line | moved |
+| `orchkit/ledger.py` | parse/read/spend/committed/append, reserve_budget/ledger_done, run_cost, settle_run, read_secret/model_ok | moved |
+| `orchkit/units.py` | unit_state, verdict, report_path, herdr_agents, ws_id | moved |
+| `orchkit/board.py` | board_script/dir/board, board_rows/board_questions/learned_posts, board_findings, board_files/board_alerts | moved |
+| `orchkit/findings/`, `orchkit/actions/`, `hooks.py`, `watch.py`, `setup.py`, `cli.py` | the rest of section 7 | not moved yet |
+
+The remaining grouping is **not itself acyclic**: measured on the code still in `orch.py`, the section graph has one
+17-section strongly connected component (check ↔ park/resume ↔ budgets ↔ launch ↔ run/gate ↔ thrash ↔ gate policy ↔
+backlog/landing ↔ report ↔ fill ↔ memory ↔ peers ↔ tidy ↔ briefs ↔ transcripts ↔ hooks). A move-only split of those groups
+therefore needs the item-2 seams first — the `Finding` registry, the `Run` object, and actions that return data instead of
+printing — or the modules call back into the `orch.py` shim. That state is recorded in `out/ds-refactor/REPORT.md`.
+
+## Reuse audit (standard tool vs custom code, per subsystem)
+
+Prefer a tool already required by the skill (pueue, beads, herdr, git, systemd, launchd, flock, or the Python stdlib) over a
+new dependency; keep custom code only where no standard tool fits, with the reason. No new dependency is added by the split.
+
+| Subsystem | Standard tool that fits | Decision |
+|---|---|---|
+| Locking | Python stdlib `fcntl.lockf` (`Locked`, the ledger) and `flock(1)` in the admission script, with a `mkdir` lock fallback for hosts without flock | used |
+| Atomic writes | Python stdlib `os.replace` (temp + rename) in `atomic_write`; `O_APPEND` for the ledger | used, except `Cfg.jput`/`Cfg.touch`, which still write in place (seam 2: the atomic-state test is an expected failure until then) |
+| Config | Python stdlib `tomllib` for `orch.toml` | used |
+| Process supervision | `systemd-run --user --scope` (`MemoryMax`) for jobs already; the ~90-line `enforce` burner killer + `STOP_GROUP` are custom | keep custom only where a cgroup cannot reach; Step 7 deletes the killer in favour of cgroup `CPUQuota`/`MemoryMax` |
+| Job queues | `pueue` (already required; `pueued` per host) | used; `tune_pueue` duplicates admission, so keep one (Step 7) |
+| Scheduling and placement | custom reservations (cores + learned peak memory) and PSI/load back-pressure over pueue | keep custom: no standard tool models this hobby fleet's mixed hosts; Slurm/Condor are far too heavy |
+| Metrics | Python stdlib plus the hosts' own readings (`sysctl`/`vm_stat`, `/proc`) | keep custom: no standard tool reads this fleet's Mac/Linux mix |
+| Transcripts and usage | Python stdlib (jsonl read, `cksum`) and a fixed price table | keep custom; no dependency added |
+| Sandboxing | `podman` (already supported for jobs: `runner = "podman"`) and `systemd-run` scopes | reuse podman for agents (the Tier-4 owner decision), not a new tool |
+| Notifications | `board.sh` (plain files) + herdr prompts + launchd/the systemd timer | used: no daemon, no new dependency |
+| The board | plain files plus a shell tool today; consolidating to Python in `orchkit/board.py` with `board.sh` a thin shim | moving to stdlib Python (board.sh stays a callable path, section 9) |
+| Test runner | Python stdlib `unittest` (`./check`, `tools/check_all.sh`) | used |
+
+New dependencies added: **none**.
+
 ## State (in the project, under `[project] state`, default `.orch/`)
 
 - `HANDOFF.md`: Live state (regenerated by check) + the orchestrator's notes. `history.md` for old notes.
