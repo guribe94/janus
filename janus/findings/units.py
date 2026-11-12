@@ -87,11 +87,18 @@ def unit_changes(cfg, u, units=()):
     if not cwd or not Path(cwd).is_dir() or not own_tree(cfg, u, units or [u]): return "?", []
     br = sh(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])[1].strip() or "?"
     lb = cfg.c.get("landing", {}).get("branch") or "main"
-    mb = sh(["git", "-C", cwd, "merge-base", "HEAD", lb])[1].strip()
-    fs = set(sh(["git", "-C", cwd, "diff", "--relative", "--name-only", mb, "--", "."])[1].split("\n")) if mb else set()
+    # item 10: a tree that has the landing branch merged (or its merge staged) counts the branch's own files as the unit's, so
+    # every such unit overlapped every other (merge-u15 vs merge-pico2: +73 files). Diff against the landing branch's side of the
+    # merge, not the merge base, and drop the branch's files from the status part too.
+    merged = sh(["git", "-C", cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD"])[0] == 0 or sh(["git", "-C", cwd, "merge-base", "--is-ancestor", lb, "HEAD"])[0] == 0
+    base = lb if merged else sh(["git", "-C", cwd, "merge-base", "HEAD", lb])[1].strip()
+    fs = set(sh(["git", "-C", cwd, "diff", "--relative", "--name-only", base, "--", "."])[1].split("\n")) if base else set()
     top = sh(["git", "-C", cwd, "rev-parse", "--show-toplevel"])[1].strip()
-    fs |= {str(Path(top, l[3:].split(" -> ")[-1].strip('"')).relative_to(Path(cwd).resolve())) for l in
-           sh(["git", "-C", cwd, "status", "--porcelain", "-uall", "--", "."])[1].splitlines() if len(l) > 3 and top}
+    names = {l[3:].split(" -> ")[-1].strip('"') for l in sh(["git", "-C", cwd, "status", "--porcelain", "-uall", "--", "."])[1].splitlines() if len(l) > 3}
+    if merged:   # the landing branch's own files are not the unit's change
+        inlb = set(sh(["git", "-C", cwd, "ls-tree", "-r", "--name-only", lb, "--", "."])[1].split("\n"))
+        names = {n for n in names if n not in inlb}
+    fs |= {str(Path(top, n).relative_to(Path(cwd).resolve())) for n in names if top}
     skip = [cfg.state.resolve(), board_dir(cfg).resolve()]   # janus's own files and the board are nobody's change (as in close)
     return br, sorted(f for f in fs if f and not any((Path(cwd) / f).resolve().is_relative_to(x) for x in skip))
 
