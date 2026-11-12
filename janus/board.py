@@ -1,0 +1,94 @@
+"""The message board wrappers: one card schema, one reader (section 7, Step 2).
+
+board_script/board_dir/board, board_rows/board_questions/learned_posts, board_findings, board_files/board_alerts. A project
+may still override paths.board (section 9: board.sh stays a callable path); board_upkeep and cmd_learned stay with their
+callers until the memory/actions split."""
+from janus.context import JANUS_SELF, sh, now, herdr, atomic_write, JANUS_MARK
+import hashlib, os, re, shlex, sys, time
+from pathlib import Path
+
+def board_script(cfg):
+    """The message board script: paths.board (a project's own), else the board.sh shipped next to janus.py (janus-swarm item 6)."""
+    return cfg.p("board") if cfg.paths.get("board") else JANUS_SELF.parent / "board.sh"
+
+def board_shipped(cfg):
+    """(name, text) of the shipped board sent into a remote unit's <root>/bin: the shell path every launcher names, and the
+    Python module it execs next to it. A project's own paths.board script is shipped by itself (no shim)."""
+    return [("board.sh", board_script(cfg).read_text()), ("msgboard.py", (Path(__file__).resolve().parent / "msgboard.py").read_text())]
+
+def board_dir(cfg): return cfg.root / cfg.paths.get("board_dir", "board")
+
+def board(cfg, *args, env=None, timeout=25):
+    """Run the board script with BOARD_DIR set (the shipped board keeps its files there; a project's own script may ignore it).
+    The shipped board's files (.master, .hosts, .notify) exist from the first call: posts never land in an outbox here, and a
+    remote unit's rule names <root>/bin/board.sh (not this machine's path)."""
+    if not cfg.paths.get("board") and not cfg.run.dry: board_files(cfg)   # .master, and .hosts before a remote unit's rule is written
+    return sh([str(board_script(cfg)), *args], env={"BOARD_DIR": str(board_dir(cfg)), **(env or {})}, timeout=timeout)
+
+def board_rows(cfg):
+    """Every open card on the board: {name: {"state", "silent", "gone", "text"}} (audit H8: all cards, not only janus's units)."""
+    rc, o, e = board(cfg, "summary", env={"BOARD_SILENT_MIN": str(cfg.silent // 60)})
+    rows = {}
+    for l in (o.splitlines()[1:] if rc == 0 else []):
+        f = l.split()
+        if len(f) < 3 or l[:1] in (" ", "=", "\t"): continue   # the shipped board's group headings and its needs-answer lines
+        rows[f[0]] = {"state": f[2], "silent": bool(re.search(r"\bSILENT \d+m", l)), "gone": "GONE" in l,
+                      "text": re.sub(r"\s+", " ", l.split(None, 4)[-1] if len(f) > 4 else "")[:140]}
+    return rows
+
+def board_questions(cfg):
+    """Open questions [(id, agent, asked, text)] from the shipped board (board.sh questions); None when the board script has no
+    question ids (a project's own script: its question cards are judged by state)."""
+    rc, o, e = board(cfg, "questions")
+    if rc: return None
+    return [tuple((l.split("\t") + ["", "", ""])[:4]) for l in o.splitlines() if l.strip()]
+
+def learned_posts(cfg):
+    """[(id <agent>:<n>, text)] of every learned post on the board's log (n counts that agent's learned posts, oldest first)."""
+    try: lines = (board_dir(cfg) / "log.md").read_text(errors="replace").splitlines()
+    except OSError: return []
+    n, out = {}, []
+    for l in lines:
+        m = re.match(r"^\S+ \S+ ([A-Za-z0-9._-]+) learned: (.*)$", l)
+        if m: n[m.group(1)] = n.get(m.group(1), 0) + 1; out.append((f"{m.group(1)}:{n[m.group(1)]}", m.group(2)))
+    return out
+
+def board_findings(cfg, names):
+    """question:<id> (stays until answered), learned:<agent>:<n> (until remembered or rejected)."""
+    F = []
+    for q, ag, at, tx in board_questions(cfg) or []:
+        try: age = int((now() - time.mktime(time.strptime(at, "%Y-%m-%d %H:%M"))) / 60)
+        except ValueError: age = 0
+        F.append((f"question:{q}", f"{ag}{'' if ag in names else ' (not a unit)'} asks [{q}] ({age} min): {tx[:160]}; check MEMORY.md (janus memory), then board.sh answer {q} <text>"))
+    done = cfg.jget("learned.json")
+    F += [(f"learned:{i}", f"{i.split(':')[0]} proposes for the session memory: {t[:160]}; janus remember --fact|--decision|--pitfall <text> --learned {i}, or janus learned --reject {i}")
+          for i, t in learned_posts(cfg) if i not in done]
+    return F
+
+def board_files(cfg):
+    bd = board_dir(cfg); bd.mkdir(exist_ok=True)
+    me = next((n for n, h in cfg.hosts.items() if h.get("local")), "local")
+    if not (bd / ".master").exists(): (bd / ".master").write_text(me + "\n")
+    hosts = "".join(f"{n} {h['ssh']} {h['root']}\n" for n, h in cfg.hosts.items() if not h.get("local") and h.get("ssh") and h.get("root"))
+    if not (bd / ".hosts").exists() or (bd / ".hosts").read_text() != hosts: atomic_write(bd / ".hosts", hosts)
+    # with the writer's PATH (the watcher's): the agent whose post runs it may not have herdr on its PATH
+    nt = (f"cd {shlex.quote(str(cfg.root))} && PATH={shlex.quote(os.environ.get('PATH', ''))} JANUS_ROOT={shlex.quote(str(cfg.root))} "
+          f"{shlex.quote(sys.executable)} {shlex.quote(str(JANUS_SELF))} watch --alert\n")
+    if not (bd / ".notify").exists() or (bd / ".notify").read_text() != nt: atomic_write(bd / ".notify", nt)
+
+def board_alerts(cfg, log):
+    """Prompt the orchestrator at once on a new board question or block (janus-swarm item 6): each is told once."""
+    qs = board_questions(cfg)
+    items = [(f"q:{q}", f"QUESTION [{q}] from {ag}: {tx[:200]}") for q, ag, at, tx in (qs or [])]
+    items += [(f"b:{c}:{hashlib.md5(r['text'].encode()).hexdigest()[:8]}", f"BLOCKED {c}: {r['text'][:200]}") for c, r in board_rows(cfg).items()
+              if r["state"] == "blocked" or (qs is None and r["state"] == "question")]
+    seen = cfg.jget("alerted.json"); new = [(k, t) for k, t in items if k not in seen]
+    if not new: return None
+    pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
+    msg = (JANUS_MARK + "Board needs you now: " + " | ".join(t for _, t in new) + ". Check MEMORY.md (janus memory) first; answer with "
+           "board.sh answer <id> <text> (a block: board.sh direct <agent> <text>); janus remember what every agent should know.")
+    if not pane or herdr("agent", "prompt", pane, msg) is None: log(f"board alert not delivered (no orchestrator pane): {msg[:300]}"); return None
+    log(f"board alert: {msg[:600]}"); cfg.jput("alerted.json", {**{k: v for k, v in seen.items() if now() - v < 7 * 86400}, **{k: now() for k, _ in new}})
+    return msg
+
+__all__ = ["board_script", "board_shipped", "board_dir", "board", "board_rows", "board_questions", "learned_posts", "board_findings", "board_files", "board_alerts"]

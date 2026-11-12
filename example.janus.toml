@@ -1,0 +1,212 @@
+# janus.toml: one per project, in the project root; `janus` finds it from any subdirectory. Paths are relative to this file.
+# `janus init` writes this file as a starter (this machine named after its host name); `janus doctor` checks the setup.
+# Everything project-specific lives here, never in janus.py.
+
+[project]
+name = "myproject"
+beads = "."              # directory holding .beads/ (units, instructions, rules, backlog); `bd init` there once
+state = ".janus"          # HANDOFF.md, history.md and janus's bookkeeping
+cycle_min = 15           # a check/ack cycle is overdue after this
+deadline_min = 30        # an unacknowledged problem blocks Stop after this
+silent_min = 30          # an agent with no board post for this long is silent
+reset_tokens = 150000    # context size at which the watcher asks for notes, then /clear
+unreachable_min = 20
+
+[paths]
+briefs = "briefs"        # <briefs>/<unit>.md
+out = "out"              # <out>/<unit>/REPORT.md, api.json, api.err
+worktrees = "worktrees"  # <worktrees>/<unit> is the unit's cwd when it exists
+# board = "bin/board.sh" # a project's own board script; unset: the board.sh shipped with janus (questions with ids, waiting,
+#                         # learned, broadcast, digest; synced to every [hosts.*] with ssh and root)
+# board_dir = "board"     # the board's files (cards, log, questions, peers.md, index.md); janus close never counts them as a
+#                         # unit's uncommitted changes (nor the state dir)
+gate_log = "out/gates.log"   # lines: 'YYYY-MM-DD HH:MM:SS <name> EXIT_x=0 ... RESULT: PASS|FAIL' (janus gate writes them)
+# gate_runner = "bin/run-gate.sh"   # a project script janus gate calls with <name>; default: janus runs out/<name>/tests.sh itself
+# gate_host_env = "JANUS_TEST_HOST"  # the variable `janus gate --host` sets
+# checklist = "STATUS.md"           # the project's status checklist: the orchestrator may edit it; `janus backlog import` reads it
+# state_docs = ["STATE.md"]         # old state docs: `janus init` turns them into a pointer to .janus/HANDOFF.md
+# lane_scripts = ["bin/test.sh"]    # project wrappers that already run tests through janus's lanes (not flagged as local tests)
+# sync_require = ["fixtures"]       # paths that must arrive on a remote host when `janus run` syncs a worktree
+
+[herdr]
+workspace = "myproject"  # herdr workspace label
+
+[orchestrator]           # what the watcher starts when the orchestrator pane is gone
+kind = "claude"          # a herdr agent kind
+args = []
+
+# [git]
+# remote = "origin"      # where pushes go; a branch without an upstream is pushed with --set-upstream
+
+# [backlog]              # `janus backlog import`: unfinished checklist items become beads issues (label backlog)
+# file = "STATUS.md"     # default paths.checklist; markdown table rows or '- [ ] item' lines
+# id_col = "#"           # table header names of the id, title and status columns
+# title_col = "item"
+# status_col = "status"
+# done = ["DONE"]        # statuses (prefixes) that are finished
+# ready = ["READY", "FIX"]   # statuses an agent can start; default every unfinished one. Others wait (on the owner, say)
+# actor_col = "actor"    # optional column: who does the item (agent, owner, hardware, ...); `janus backlog set <id> actor=owner`
+#                        # sets it too. Only agent items (the default) count as idle backlog or are launched by janus fill.
+
+# [landing]              # "finished, not landing" in janus check
+# kinds = ["implement"]  # unit kinds that land (reviews, audits and cleanups do not)
+# finished_min = 30      # a unit with VERDICT DONE this long ago needs a gate, or landing once its gates passed
+# gates_required = 1
+# gate_names = ["{unit}", "land-{unit}", "land-{unit}-*", "{unit}-*"]   # gate names that belong to a unit (plus janus gate --unit)
+# branch = "main"        # where landed work is; default origin's HEAD branch
+# scope_cmd = "bin/gate-steps.sh {unit} {tree}"   # janus gate-scope: prints the tree's gate steps, '[@host ]<step>: <command>'
+# known_failures = "out/known-failures.tsv"       # <test id cols...> TAB <cause> TAB <unit fixing it>; gates with only these pass
+# gate_timeout_min = 120  # a gate's process group is stopped after this long (RESULT: FAIL, EXIT_timeout=124)
+# quick_gate_min = 15     # gates expected under this many minutes use the one-slot gates-quick group
+
+# [tidy]                 # janus tidy [--dry-run]: what orchestration leaves behind, each by a safe rule
+# branches = ["wk/*"]    # branch patterns it may delete when contained in the landing branch (and the remote one at the same commit)
+# remote = "origin"
+# keep_days = 14         # job run files and test roots older than this
+# every_min = 60         # the watcher refreshes the reclaimable list (check: tidy:<n>, disk:<host>)
+# per host: disk_budget_gb = 200; cache_dirs = ["/home/me/build/target"]   # over budget: oldest cache entries go
+
+# Caps exist only when the owner sets them.
+# [caps]
+# total = 6
+# [caps.host]
+# server = 2
+
+# One table per machine. `local = true` is this machine; others are reached over ssh (BatchMode, 5 s timeout).
+[hosts.laptop]
+local = true
+ram_gb = 16
+cores = 10
+reserve_gb = 4           # memory kept free
+agent_gb = 1.5           # per agent
+job_gb = 3               # per pueue job
+min_disk_gb = 20
+# services_gb = 8        # memory other programs use: (ram_gb - services_gb) // job_gb job slots
+# admit_check = "bin/mem-check.sh"   # land lane: a script that must pass before a landing job starts
+# admit_check_env = "FOO=1"          # variables for it
+# legacy_lanes = ""                  # dirs with a pid file of an older lane the land lane waits for
+
+# A Linux build server (uncomment and adjust; `./install --hosts-only` puts pueue there, no sudo):
+# [hosts.server]
+# ssh = "me@server.lan"
+# arch = "x86_64"          # aarch64 or x86_64: picks pueue's static binary
+# ram_gb = 16
+# cores = 8
+# reserve_gb = 3
+# agent_gb = 1.0
+# job_gb = 3               # each job's MemoryMax (runaway guard)
+# cores_per_job = 2        # CPU admission: (running jobs + 1) x cores_per_job <= cores
+# min_disk_gb = 20
+# root = "/home/me/janus"   # synced worktrees, briefs, outputs and job runs live here
+# bin = "/home/me/.local/bin"
+# memory_max = "6G"        # systemd-run MemoryMax for each remote agent
+# run_env = ". $HOME/env.sh"         # shell run before every job
+# job_setup = "make deps"            # shell run in the worktree before every job's command
+# job_log = "/home/me/janus/jobs.log" # a line per job start and end
+# sync_exclude = [".git", "target", ".venv", "node_modules"]   # a leading / anchors an entry to the worktree root
+# worktrees = "/home/me/janus/worktrees"
+# shared = true            # a host shared with others: when memory PSI stays over thrash_psi for thrash_min minutes, the watcher
+# thrash_psi = 40          # stops this project's newest admitted job there and re-queues it elsewhere (never anything not ours)
+# thrash_min = 5
+# agent_env = "export PATH=$HOME/.local/bin:$PATH"   # shell run before a remote agent starts
+# pueue_config = "/data/tools/pueue/pueue.yml"        # when the host keeps pueue's files elsewhere
+# pueue_dir = "/data/tools"                           # a shared server: pueue's files and unit under this dir
+# legacy_probe = 'echo "legacy_wait=$(ls /data/old-queue | wc -l)"; echo legacy_run=0'   # an older job queue, while it drains
+# runner = "podman"        # run each job in a container:
+# [hosts.server.container]
+# image = "localhost/build:1"
+# mount = "/data/work"      # host dir mounted into the container (worktrees live under it)
+# mount_at = "/w"
+# args = ["--userns=keep-id", "-e", "CARGO_HOME=/w/cache/cargo", "-e", "TMPDIR=/w/tmp/{name}"]   # {name} = the worktree, {jid} = the job
+# host_dirs = ["/data/work/tmp/{name}"]   # created before the job
+# usb_args = ["--device", "/dev/bus/usb"]   # janus run --usb
+# usb_lock = "/data/work/usb.lock"
+# clone_base = "/data/work/base"            # a new worktree starts as a reflink copy of this
+# name_prefixes = ["janus-run-"]            # containers whose memory counts as job working set
+
+# API providers. janus runs API agents itself (`janus launch` queues `janus api-run` in pueue): it reads the key from the secret
+# store at run time and gives it only to the agent process, never to pueue, a file or argv.
+[providers.claude_api]
+enabled = true
+cap_usd = 100            # launches are refused when committed spend + the unit's budget would pass this
+budget_per_unit = 15
+ledger = "out/api-ledger.tsv"   # ts, unit, running|cost, budget|done rc=, run id: one running and one done row per run
+key_env = "ANTHROPIC_API_KEY"   # the variable the agent gets
+key_keychain = "janus-api-key"   # macOS: security add-generic-password -s janus-api-key -a "$USER" -w
+key_file = "~/.config/janus/anthropic.env"   # elsewhere: ANTHROPIC_API_KEY=... in a file only you can read (chmod 600)
+# cmd = ["claude", "--bare", "-p", "--model", "{api_id}", "--max-budget-usd", "{budget}", "--output-format", "json",
+#        "--dangerously-skip-permissions", "{prompt}"]   # the default; it must write JSON with total_cost_usd to stdout
+# resume_cmd: how a parked or capped run continues its own session ({session}: session_id, or Codex's thread_id, from its
+# JSON). Default with the default cmd: the same with --resume {session}. Needed when cmd is set, for example for Codex:
+# resume_cmd = ["codex", "exec", "resume", "{session}", "--json", "{prompt}"]
+[providers.codex]
+enabled = true
+
+# kind "api" = an API agent run by janus as a pueue task; claude|codex|opencode = a herdr agent (tmux on remote hosts).
+[models.claude]
+provider = "claude_api"
+vendor = "anthropic"
+kind = "api"
+model = "claude"
+api_id = "<model id>"    # the model id your API key can use
+hosts = ["laptop"]
+[models.codex]
+provider = "codex"
+vendor = "openai"
+kind = "codex"
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[routing]                # ordered; first model whose provider is enabled and within budget
+critical = ["claude"]
+review = ["codex", "claude"]   # skips the implementer's vendor
+normal = ["codex"]
+
+# ---- capacity (janus-fixes8): admission by reservations on every host and lane, never by one reading.
+# Per host (or here as defaults): cores, cores_per_job, ram_gb, services_gb (memory not managed by janus: desktop, system,
+# daemons), job_gb (each job's MemoryMax and its reservation until its class is learned), agent_gb, min_disk_gb,
+# schedulers = ["<regex>"] (other job-running processes: check raises scheduler:<host> while one runs).
+[capacity]
+psi_pause = 10           # memory PSI avg10 over this pauses admission (macOS: the kernel's warn level counts as 50)
+load_pause = 1.25        # load over this x cores ...
+hold_s = 60              # ... held this long pauses admission; running jobs are never killed for it
+history_n = 5            # a job class reserves the max of its last 5 recorded peaks (agents: the median) ...
+margin_pct = 15          # ... plus this margin
+# no_build_kinds = ["review"]   # unit kinds that never hold a build reservation (default: all kinds do)
+# [capacity.classes]     # optional: class name = regex over the job's command (default: its first command words)
+# rust_test = "cargo (test|nextest)"
+
+[fill]                   # janus fill: ready backlog units with an ITEM: <id> brief, by priority, up to capacity and budget
+watcher = false          # true: the watcher runs janus fill when check finds idle-with-backlog (owner: "launch within capacity")
+every_min = 10
+
+[budget]                 # an API unit's default budget: median cost of past runs of its kind and tier + margin_pct
+margin_pct = 30
+min_runs = 3             # fewer past runs: the provider's budget_per_unit
+warn_pct = 80            # check: budget80:<unit> at this share of its budget ...
+report_stale_min = 10    # ... while its report has not changed for this long
+wrapup_usd = 0.5         # a run that ends at its budget cap without a final verdict is resumed once with this, to write its report
+resume_min_usd = 0.1     # a parked unit is resumed (same session) only while this much of its budget is left
+
+[report]                 # janus report (to the owner): backlog completeness, remaining work, spend by outcome
+every_h = 4              # check raises report-due at these checkpoints (every_h hours from midnight, and the times in at)
+# at = ["09:00", "18:00"]  # until `janus report --sent`
+waste_pause = 25         # launch and fill pause while runs capped without a verdict took over this % of the spend ...
+recent_h = 24            # ... of the last recent_h hours, until `janus ack waste-pause "<cause and fix>"`
+
+[collect]                # remote units: the watcher saves out/<unit>/ and the agent's changes as out/<unit>/backup.patch this often;
+backup_min = 30          # stop and close refuse while a remote copy has work janus collect has not brought here (--force overrides)
+
+[enforce]                # warn first (a board direction), stop after grace_min
+grace_min = 5
+stop_burners = true      # a CPU burner's process group (never a group that holds the agent)
+stop_direct = false      # a build or test an agent runs outside the lanes on a remote host (flagged and warned either way)
+
+# [landing] final_gate_host = "<host>"; final_gate = "<command>"   # janus land gates the merged tree there before it squash-lands
+
+# [busy]                   # janus busy <wt>: exit 0 while a janus job, an open unit's own job or one of these processes uses the tree
+# patterns = ["mutants"]   # substrings of local command lines that edit a tree in place while they run (default: mutation testing)
+
+[memory]                 # .janus/MEMORY.md, the session memory every brief starts with (janus remember / forget)
+cap_lines = 30           # check raises memory-long over this many entries
+review_days = 14         # check raises memory-review:<n> for an entry older than this (janus memory --keep <n> re-dates it)
+agent_docs = ["AGENTS.md"]   # the project's agent instructions every brief points at (the root one and one per folder touched)
