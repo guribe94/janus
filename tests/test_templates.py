@@ -55,7 +55,7 @@ class Templates(unittest.TestCase):
         self.sh_n(janus.DIRECT_PROBE % {"rx": "'cargo'"}, "DIRECT_PROBE")
 
     def test_job_templates(self):
-        self.sh_n(janus.ADMIT % {"lane": "jobs", "clsrc": "'cargo test'", "jid": "'j1'", "maxrss": shlex.quote(janus.MAXRSS_PY)}, "ADMIT")
+        self.sh_n(janus.ADMIT % {"lane": "jobs", "clsrc": "'cargo test'", "jid": "'j1'", "maxrss": shlex.quote(janus.MAXRSS_PY), "broad": "''"}, "ADMIT")
         self.sh_n(janus.STOP_GROUP % {"pid": 1, "pgid": 2}, "STOP_GROUP")
         self.sh_n(janus.CLEAN_PUEUE % {"real": "pueue"}, "CLEAN_PUEUE")
         self.sh_n(janus.UNIT_PROCS % {"unit": "u", "roots": "1 2"}, "UNIT_PROCS")

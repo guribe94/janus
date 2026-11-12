@@ -96,6 +96,8 @@ min_disk_gb = 20
 # agent_gb = 1.0
 # job_gb = 3               # each job's MemoryMax (runaway guard)
 # cores_per_job = 2        # CPU admission: (running jobs + 1) x cores_per_job <= cores
+# features = ["gpio"]   # what discovery cannot see, for janus run --needs (os, arch, tools, devices are discovered)
+# devices = ["usb"]
 # min_disk_gb = 20
 # root = "/home/me/janus"   # synced worktrees, briefs, outputs and job runs live here
 # bin = "/home/me/.local/bin"
@@ -171,6 +173,14 @@ load_pause = 1.25        # load over this x cores ...
 hold_s = 60              # ... held this long pauses admission; running jobs are never killed for it
 history_n = 5            # a job class reserves the max of its last 5 recorded peaks (agents: the median) ...
 margin_pct = 15          # ... plus this margin
+# cores_per_job is also each job's CPU ceiling: a job reserves (and is capped at: -j, test threads, CPUQuota, podman --cpus)
+# its class's learned cores, CPU seconds / run time of its last history_n runs, 1 to cores_per_job.
+age_weight = 1           # waiting jobs go shortest expected run time first, minus this x seconds waited (aging)
+expect_s = 600           # the expected run time of a job class with no history
+broad_min = 30           # a jobs-lane run whose class takes this many minutes (median) is whole-suite: it needs --broad <reason>
+overrun_x = 3            # check flags a job running this many times its class's expected run time (overrun:<host>:<job>)
+discover_h = 24          # janus check discovers each host again after this many hours (janus hosts --refresh: now)
+# broad_patterns = ['\bcargo\s+test\b.*\s--workspace\b']   # regexes of whole-suite commands (default: cargo ... --workspace/--all, bare pytest)
 # no_build_kinds = ["review"]   # unit kinds that never hold a build reservation (default: all kinds do)
 # [capacity.classes]     # optional: class name = regex over the job's command (default: its first command words)
 # rust_test = "cargo (test|nextest)"
@@ -225,3 +235,8 @@ agent_docs = ["AGENTS.md"]   # the project's agent instructions every brief poin
 
 [owner]                  # the owner's decision queue (.janus/owner-queue.md): janus ask "<question>", janus answer <n> "<answer>"
 # notify = "osascript -e 'display notification \"<question>\"'"   # run with the question on stdin when one is asked; unset: no notification
+
+# [heartbeat]              # a watchdog on another machine alerts when the watcher stops (heartbeat/ scripts)
+# watchdog = "<host>"      # janus install-host <host> installs it there; each watcher pass beats to it
+# max_age_min = 15
+# alert_cmd = "notify-send janus \"$1\""

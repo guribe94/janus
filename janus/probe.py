@@ -3,7 +3,8 @@
 probe/probe_all (the PROBE script, margins, room, host_cap), probe_extra (old queues, other schedulers, direct builds),
 pueue(), margins/room/cap_line. Unreachable hosts degrade to a finding with the units they held (section 9: keep)."""
 from janus.context import hrun, qp, fl, sh, now, FIXTURE_MARK
-from janus.cap import cap_lib, capv, host_cap
+from janus.cap import cap_lib, capv, host_cap, FACTS
+from janus.platform import HOST_FACTS, parse_facts
 from janus.templates import PROBE, DIRECT_PROBE
 import concurrent.futures as cf, json, shlex
 
@@ -15,7 +16,7 @@ def probe_extra(h):
     (one scheduler per host, janus-fixes8), and on remote hosts builds or tests an agent runs outside the lanes (issue 22)."""
     rd = h["_rd"]
     # old_rule: waiting jobs whose script sources neither runs/cap.sh nor runs/admit.sh (queued before the measured rule; audit H5)
-    w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
+    w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && kill -0 "$(cut -d' ' -f1 "$f")" 2>/dev/null || continue; '
          f'b=${{f##*/}}; echo "waitjob=${{b%.*}}"; case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
          f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"')
     # schedulers (janus.toml, per host): extended regexes for the command lines of other job-running processes (an old queue); each
@@ -54,9 +55,29 @@ def probe(name, h, ro=True, cfg=None):
     except Exception: p["pueue"] = None
     return p
 
+def discover(name, h):
+    """What host h is, found rather than assumed (imp-sched item 1): parse_facts of the read-only HOST_FACTS script, plus the
+    features and devices janus.toml declares for it ([hosts.X] features, devices: what cannot be probed). None: unreachable."""
+    rc, o, e = hrun(h, HOST_FACTS % {"bin": h.get("bin", ""), "root": qp(h.get("root", "$HOME")), "agent_env": h.get("agent_env", "") or ":"}, timeout=30)
+    if rc or "os=" not in o: return None
+    f = parse_facts(o)
+    f["features"] = sorted(set(f["features"]) | set(h.get("features", []))); f["devices"] = sorted(set(f["devices"]) | set(h.get("devices", [])))
+    return {**f, "at": int(now())}
+
+def host_facts(cfg, refresh=False):
+    """{host: facts} from the cache (.janus/hosts-facts.json); a host never discovered, or older than [capacity] discover_h
+    (default 24) when refresh is "stale", or every host when refresh is True, is discovered now (in parallel). A read-only run
+    keeps what it found in memory only. An unreachable host keeps its last facts."""
+    old = cfg.jget(FACTS); ttl = capv(cfg, {}, "discover_h") * 3600
+    todo = [n for n in cfg.hosts if refresh is True or n not in old or (refresh == "stale" and now() - old[n].get("at", 0) > ttl)]
+    if todo:
+        with cf.ThreadPoolExecutor(8) as ex: new = dict(zip(todo, ex.map(lambda n: discover(n, cfg.hosts[n]), todo)))
+        old.update({n: f for n, f in new.items() if f}); cfg.jput(FACTS, old)
+    return {n: old[n] for n in cfg.hosts if n in old}
+
 def probe_all(cfg):
-    with cf.ThreadPoolExecutor(8) as ex:
-        ps = list(ex.map(lambda kv: probe(*kv, ro=cfg.run.ro, cfg=cfg), cfg.hosts.items()))
+    with cf.ThreadPoolExecutor(8) as ex:   # check refreshes the discovery (beside the probes) once it is older than discover_h
+        fut = ex.submit(host_facts, cfg, "stale"); ps = list(ex.map(lambda kv: probe(*kv, ro=cfg.run.ro, cfg=cfg), cfg.hosts.items())); fut.result()
     d = {p["name"]: p for p in ps}
     un = cfg.jget("hosts.json")
     for n, p in d.items():
@@ -99,4 +120,4 @@ def cap_line(cfg, name, p, units):
             f"avail={av} load={p.get('load') or 'unknown'} psi={p.get('cap_psi') or p.get('psi') or '-'} disk={p.get('disk_gb')}G"
             + (f" PAUSED: {hc['pause']}" if hc["pause"] else "") + (f" FULL: {why}" if n < 1 else ""))
 
-__all__ = ["probe_extra", "BUILD_ERE", "pueue", "LIST_KEYS", "probe", "probe_all", "margins", "room", "cap_line"]
+__all__ = ["probe_extra", "BUILD_ERE", "pueue", "LIST_KEYS", "probe", "discover", "host_facts", "probe_all", "margins", "room", "cap_line"]

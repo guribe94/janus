@@ -56,6 +56,7 @@ FAMILIES = {
     "overlap": Family("two running units change the same file", urgent=True),
     "owner-question": Family("a question for the owner waits in .janus/owner-queue.md", urgent=True),
     "parked": Family("a parked unit's job can never finish, or its resume failed", urgent=True),
+    "overrun": Family("a running job is far over its expected run time (its class's history on that host)"),
     "pressure": Family("a host's admission is paused by back-pressure", urgent=True),
     "provider": Family("a unit runs on a disabled provider"),
     "question": Family("an open board question", urgent=True),

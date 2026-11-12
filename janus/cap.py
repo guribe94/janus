@@ -16,10 +16,33 @@ from pathlib import Path
 # same numbers the admission uses. Settings: per host, else [capacity], else the default below.
 
 CAP_DEFAULTS = {"cores": 4, "cores_per_job": 1, "ram_gb": 4, "services_gb": 0, "job_gb": 2, "agent_gb": 1.0, "psi_pause": 10,
-                "load_pause": 1.25, "hold_s": 60, "history_n": 5, "margin_pct": 15, "min_disk_gb": 10}
+                "load_pause": 1.25, "hold_s": 60, "history_n": 5, "margin_pct": 15, "min_disk_gb": 10, "discover_h": 24,
+                "age_weight": 1, "expect_s": 600, "broad_min": 30, "overrun_x": 3}
+# imp-sched item 3 (CPU): a job reserves, and is capped at, its class's learned cores (CPU seconds / run time of its last runs, 1 to
+# cores_per_job); waiting jobs go shortest expected run time first, minus age_weight x seconds waited (aging); expect_s is the
+# expected run time of a class without history; broad_min: a class whose median run is longer needs --broad; overrun_x: check
+# flags a job running longer than that many times its expected run time.
+
+FACTS = "hosts-facts.json"   # the discovered hosts (probe.host_facts); cores and ram_gb default to what was found there
+_facts_cache = {}
+
+def facts(cfg):
+    """{host: facts} as last discovered (read once per change of the cache file)."""
+    p = cfg.f(FACTS)
+    try: k = (str(p), p.stat().st_mtime)
+    except OSError: return {}
+    if k not in _facts_cache: _facts_cache.clear(); _facts_cache[k] = cfg.jget(FACTS)
+    return _facts_cache[k]
 
 def capv(cfg, h, k):
-    return h.get(k, (cfg.capc if cfg else {}).get(k, CAP_DEFAULTS[k]))
+    """A capacity setting of host h: janus.toml [hosts.X], else (cores, ram_gb) what discovery found on it, else [capacity],
+    else the default. No core or memory count is assumed once a host was discovered."""
+    if k in h: return h[k]
+    if cfg and k in ("cores", "ram_gb"):
+        f = next((facts(cfg).get(n) for n, x in cfg.hosts.items() if x is h), None) or {}
+        v = f.get("cores") if k == "cores" else f.get("mem_mb") and round(f["mem_mb"] / 1024, 1)
+        if v: return v
+    return (cfg.capc if cfg else {}).get(k, CAP_DEFAULTS[k])
 
 def cap_nums(cfg, h):
     """The host's capacity in integers: cores, cores per job, memory for reservations (MB), job default/cap (MB), agent (MB)."""
@@ -31,22 +54,26 @@ def cap_lib(cfg, hn, h):
     """runs/cap.sh for host h: the rule above with the host's numbers, its [capacity.classes], and how its jobs are seen
     (systemd scopes janus-<jid>.scope; podman containers by container.name_prefixes; the Mac: process trees)."""
     n = cap_nums(cfg, h); pod = h.get("runner") == "podman"
+    cpus = '  v=$(awk \'/^usage_usec/{print int($2/1000000)}\' "%s/cpu.stat" 2>/dev/null)'
     if pod:
         pre = h.get("container", {}).get("name_prefixes", ["janus-run-"])
         jobids = "podman ps --format '{{.Names}}' | awk '" + " ".join(
             f"/^{re.escape(x)}/ {{" + ("sub(/^janus-run-/, \"\"); " if x == "janus-run-" else "") + "print; next}" for x in pre) + "'"
         sample = ('  i=$(podman ps -q --no-trunc --filter name=janus-run-$2 2>/dev/null | head -1)\n'
                   '  [ -n "$i" ] && v=$(awk \'/^anon /{print int($2/1048576)}\' "$US/libpod-$i.scope/memory.stat" 2>/dev/null)')
+        cpusample = '  i=$(podman ps -q --no-trunc --filter name=janus-run-$1 2>/dev/null | head -1)\n  [ -n "$i" ] &&' + cpus[1:] % "$US/libpod-$i.scope"
     elif h.get("local"):
-        jobids, sample = "true", '  v=$(tree_mb "$1")'
+        jobids, sample, cpusample = "true", '  v=$(tree_mb "$1")', "  :"
     else:
         jobids = "ls -d $AS/janus-*.scope | sed 's#.*/janus-##; s#[.]scope$##'"
         sample = ('  v=$(awk \'/^anon /{print int($2/1048576)}\' "$AS/janus-$2.scope/memory.stat" 2>/dev/null)\n'
                   '  [ -n "$v" ] || v=$(tree_mb "$1")')
+        cpusample = cpus % "$AS/janus-$1.scope"
     cls = "".join(f"  printf '%s\\n' \"$c\" | grep -Eq {shlex.quote(rx)} && {{ echo {shlex.quote(k)}; return; }}\n"
                   for k, rx in (cfg.capc.get("classes", {}) if cfg else {}).items())
     return CAP_LIB % {**n, "name": hn, "psip": capv(cfg, h, "psi_pause"), "loadx": capv(cfg, h, "load_pause"), "hold": int(capv(cfg, h, "hold_s")),
-                      "disk": int(capv(cfg, h, "min_disk_gb")), "jobids": jobids, "sample": sample, "classes": cls}
+                      "disk": int(capv(cfg, h, "min_disk_gb")), "jobids": jobids, "sample": sample, "classes": cls,
+                      "cpusample": cpusample, "agew": capv(cfg, h, "age_weight"), "exps": int(capv(cfg, h, "expect_s"))}
 
 def class_mb(hist, cls, d, cap, hn=5, margin=15):
     """The reservation of a job class from history lines (time, class, peak MB, secs, rc): the same rule as cap_mb in runs/cap.sh."""
@@ -60,6 +87,25 @@ def class_secs(hist, cls):
     """Median run time (s) of a job class from history lines, None without history."""
     s = sorted(int(f[3]) for f in (l.split("\t") for l in hist) if len(f) >= 4 and f[1] == cls and f[3].isdigit())
     return s[len(s) // 2] if s else None
+
+def class_cores(hist, cls, cpj, hn=5):
+    """The cores a job class reserves (and is capped at): the same rule as cap_cores in runs/cap.sh."""
+    r = [int(f[5]) / int(f[3]) for f in (l.split("\t") for l in hist) if len(f) >= 6 and f[1] == cls and f[3].isdigit() and int(f[3]) > 0 and f[5].isdigit() and int(f[5]) > 0][-hn:]
+    return max(1, min(cpj, int(max(r) + 0.5))) if r else cpj
+
+def class_usage(hist, cpj, hn=5):
+    """Per job class, from history lines: runs, expected (median) run time, learned cores, median CPU seconds, queue wait median
+    and 95th percentile (the columns cap_record writes: time, class, peak MB, secs, rc, CPU s, wait s)."""
+    by = {}
+    for f in (l.split("\t") for l in hist):
+        if len(f) >= 5 and f[1] != "agent" and f[3].isdigit(): by.setdefault(f[1], []).append(f)
+    med = lambda v, q=0.5: sorted(v)[min(len(v) - 1, int(len(v) * q))] if v else None
+    out = []
+    for c, fs in sorted(by.items(), key=lambda kv: -len(kv[1])):
+        cpu = [int(f[5]) for f in fs if len(f) >= 7 and f[5].isdigit()]; wait = [int(f[6]) for f in fs if len(f) >= 7 and f[6].isdigit()]
+        out.append({"class": c, "runs": len(fs), "expect_s": class_secs(hist, c), "cores": class_cores(hist, c, cpj, hn),
+                    "cpu_s": med(cpu), "wait_p50": med(wait), "wait_p95": med(wait, 0.95)})
+    return out
 
 def tree_rss_mb(pid):
     """Resident memory (MB) of process pid and its descendants (one ps call)."""
@@ -127,4 +173,4 @@ def build_room(cfg, n, hc, kind="implement"):
     return False, (f"{n} build capacity full: {a} agent(s) for {s} build slot(s) + {s} queue position(s); {hc['rj']} running, "
                    f"{hc['queued']} queued; {when}")
 
-__all__ = ["CAP_DEFAULTS", "capv", "cap_nums", "cap_lib", "class_mb", "class_secs", "tree_rss_mb", "record_history", "host_cap", "next_free", "build_room"]
+__all__ = ["CAP_DEFAULTS", "FACTS", "facts", "capv", "cap_nums", "cap_lib", "class_mb", "class_secs", "class_cores", "class_usage", "tree_rss_mb", "record_history", "host_cap", "next_free", "build_room"]

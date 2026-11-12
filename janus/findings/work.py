@@ -1,12 +1,12 @@
 """Findings about work in flight: failed gates, known failures, finished units not gated or not landed, idle backlog,
 and the project's own git state."""
-import re, sys, time
+import re, time
 from janus.actions.backlog import fill_candidates, fill_plan
 from janus.backlog import backlog_cfg, backlog_issues, item_actors, unit_items
 from janus.beads import Beads
 from janus.context import Err, LE, handoff_path, handoff_stale, now, sh
 from janus.gates import gate_ids, gate_results, kf_active, known_failures, landed
-from janus.platform import launchd_watcher_loaded
+from janus.platform import watcher_loaded, watcher_service
 from janus.probe import room
 from janus.units import report_path
 
@@ -148,5 +148,5 @@ def session_findings(cfg, running):
         if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done, or bd remember --key <subject>: same subject replaces): " + "; ".join(i['title'][:50] for i in ins[:3])))
     except Err: pass
     for s in handoff_stale(cfg, running): F.append(("handoff", s))
-    if sys.platform == "darwin" and not launchd_watcher_loaded(): F.append(("watcher", "watcher com.janus.watch is not running: run install"))
+    if not watcher_loaded(): F.append(("watcher", f"watcher {watcher_service()[1]} ({watcher_service()[0]}) is not running: run install"))
     return F

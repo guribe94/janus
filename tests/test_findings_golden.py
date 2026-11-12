@@ -88,7 +88,7 @@ class Golden(unittest.TestCase):
             def run(self, *a): return [{"id": "g-9", "title": "ready work", "labels": []}] if a[:1] == ("ready",) else []
             def issues(self, label, status="open"): return [{"id": "g-8", "title": "instr: an owner instruction"}] if label == "instruction" else []
         saved = {k: getattr(janus, k) for k in ("Beads", "herdr", "board_rows", "board_questions", "proc_findings", "script_findings",
-                                               "launchd_watcher_loaded", "rule_findings")}
+                                               "watcher_loaded", "rule_findings")}
         real_proc = janus.proc_findings
         try:
             janus.Beads = FakeBeads; janus.herdr = lambda *a, **k: None
@@ -97,7 +97,7 @@ class Golden(unittest.TestCase):
             janus.board_questions = lambda cfg: [("3", "u1", "2026-01-01 00:00", "which branch?")]
             janus.proc_findings = lambda cfg, ps_text=None, viol=None: real_proc(cfg, PS, viol)
             janus.script_findings = lambda: []
-            janus.launchd_watcher_loaded = lambda *a: True
+            janus.watcher_loaded = lambda *a: True
             janus.rule_findings = lambda cfg: []
             F = janus.collect_findings(cfg, hs, FakeBeads(cfg).units(), {}, "bd: no database")
         finally:

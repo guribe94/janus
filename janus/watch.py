@@ -11,6 +11,7 @@ from janus.autopilot import record, tend_autopilot
 from janus.check import run_check
 from janus.reset import orch_tokens, reset_now
 from janus.context import Err, JANUS_MARK, atomic_write, WAKE, handoff_stale, herdr, now, session_alive, sh, ts
+from janus.setup import heartbeat_beat
 
 def cmd_watch(cfg, a):
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
@@ -27,6 +28,7 @@ def watch_pass(cfg, log):
         if (board_dir(cfg) / ".hosts").read_text().strip() or (board_dir(cfg).parent / "board-outbox" / "outbox.log").is_file(): board(cfg, "sync", timeout=180)
     sync()   # the shipped board: merge the hosts' outboxes (their questions alert at once through .notify) before the check
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
+    heartbeat_beat(cfg)   # the watchdog host sees this pass (inert until heartbeat/ ships and [heartbeat] watchdog is set)
     board_alerts(cfg, log)
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (janus-fixes9)
     tend_autopilot(cfg, hs, units, F, log)   # [autopilot] enabled: the ending policy's fixed-rule actions (janus/autopilot.py)

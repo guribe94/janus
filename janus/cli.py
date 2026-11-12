@@ -9,7 +9,7 @@ from janus.hooks import cmd_hook
 from janus.memory import MEM_SECTIONS
 from janus.setup import doctor, init_project
 from janus.actions.backlog import cmd_backlog, cmd_fill
-from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_run, cmd_thrash
+from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_hosts, cmd_run, cmd_thrash
 from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_scope, cmd_land
 from janus.actions.launch import cmd_api_run, cmd_launch
 from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd_park, cmd_resume, cmd_stop
@@ -17,7 +17,7 @@ from janus.actions.swarm import cmd_forget, cmd_index, cmd_introduce, cmd_learne
 from janus.actions.tidy import cmd_tidy
 from janus.check import cmd_ack, cmd_capacity, cmd_check, cmd_status
 from janus.quality import cmd_quality
-from janus.setup import cmd_doctor, cmd_init, cmd_queue, cmd_register, migrate
+from janus.setup import cmd_doctor, cmd_init, cmd_install_host, cmd_queue, cmd_register, migrate
 from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
@@ -33,6 +33,7 @@ def main():
         return p
     A = lambda *n, **k: (n, k)
     add("check", cmd_check, A("--brief", action="store_true"), A("--escalate", action="store_true"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent, ackable, open_since)"))
+    add("hosts", cmd_hosts, A("--refresh", action="store_true", help="discover every host again now"), A("--json", action="store_true"))
     add("capacity", cmd_capacity); add("status", cmd_status); add("watch", cmd_watch, A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"),
         A("--reset", action="store_true", help="the Stop hook's context reset: /clear once the turn ended, then the wake prompt"))
     add("learned", cmd_learned, A("--reject", help="reject learned post <agent>:<n> (check stops listing it)"), A("--why", help="why it is rejected"))
@@ -48,10 +49,12 @@ def main():
     add("ledger", cmd_ledger, A("action", choices=["check", "repair", "reconcile"]), A("--provider"), dry=True)
     add("doctor", cmd_doctor, A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", cmd_backlog, A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...>"), dry=True)
+    add("install-host", cmd_install_host, A("host", help="a host of janus.toml: folders, pueued as a user service, a janus copy, the heartbeat watchdog"), dry=True)
     add("queue", cmd_queue, A("host", nargs="?"), A("--log", type=int, help="print this task's log"))
     add("stop", cmd_stop, A("unit"), A("--force", action="store_true", help="stop although its remote copy has uncollected work"), dry=True)
     add("collect", cmd_collect, A("unit", help="a unit, or <host>:<task id> for a janus run job"), dry=True)
-    add("run", cmd_run, A("--host", required=True), A("--lane", choices=LANES, default="jobs"), A("--unit"), A("--wt", required=True),
+    add("run", cmd_run, A("--host", help="run there (pinned)"), A("--needs", action="append", help="requirements instead of a host: os, arch, features, devices, mem (linux,x86_64,device=usb,mem=4G); placed when a host that meets them has room"),
+        A("--place-wait", action="store_true", help=argparse.SUPPRESS), A("--broad", metavar="REASON", help="a whole-suite run: why it must be whole (it runs at low priority)"), A("--lane", choices=[x for x in LANES if x != "place"], default="jobs"), A("--unit"), A("--wt", required=True),
         A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="a job that needs the host's USB devices (container.usb_args, usb_lock)"),
         A("--priority", type=int, default=0), A("--detach", "--no-wait", dest="no_wait", action="store_true", help="queue, print <host>:<task>, return (agents: then write WAITING <ids> and end the turn)"),
         A("--allow-unmerged", action="store_true", help="run on a tree with a merge in progress, conflict markers or far behind the landing branch"),
