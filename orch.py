@@ -211,7 +211,7 @@ else
  echo "avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"; echo "load=$(cut -d' ' -f1 /proc/loadavg)"
  echo "psi=$(awk '/^some/{sub("avg10=","",$2);print $2}' /proc/pressure/memory 2>/dev/null)"; echo "os=linux"
 fi
-d="%(root)s"; [ -d "$d" ] || d=/; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
+d=%(root)s; [ -d "$d" ] || d=/; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
 %(extra)s
 RD=%(rd)s; CAP_RO=%(ro)s
 %(cap)s
@@ -224,7 +224,7 @@ def probe_extra(h):
     (one scheduler per host, orch-fixes8), and on remote hosts builds or tests an agent runs outside the lanes (issue 22)."""
     rd = h["_rd"]
     # old_rule: waiting jobs whose script sources neither runs/cap.sh nor runs/admit.sh (queued before the measured rule; audit H5)
-    w = (f'g=0; j=0; o=0; ol=; for f in {rd}/*.gwait {rd}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
+    w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
          f'b=${{f##*/}}; echo "waitjob=${{b%.*}}"; case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
          f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"')
     # schedulers (orch.toml, per host): extended regexes for the command lines of other job-running processes (an old queue); each
@@ -261,8 +261,8 @@ def probe(name, h, ro=True, cfg=None):
     """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,
     history), other schedulers, direct builds, pueue status and tmux sessions. ro: the overload tracker is only read."""
     lib = cap_lib(cfg, name, h) if cfg else ""
-    rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": h.get("root", "/"), "pueue": pueue(h), "extra": probe_extra(h),
-                                "rd": shlex.quote(h["_rd"]), "ro": "1" if ro else "", "cap": lib or "cap_report() { :; }"}, timeout=25)
+    rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": qp(h.get("root", "/")), "pueue": pueue(h), "extra": probe_extra(h),
+                                "rd": qp(h["_rd"]), "ro": "1" if ro else "", "cap": lib or "cap_report() { :; }"}, timeout=25)
     if rc: return {"name": name, "ok": False, "err": (e or o).strip().splitlines()[-1][:80] if (e or o).strip() else f"rc {rc}"}
     head, _, rest = o.partition("--pueue\n"); pj, _, tm = rest.partition("--tmux\n")
     p = {"name": name, "ok": True, "tmux": tm.split(), **{k: [] for k in LIST_KEYS}}
@@ -1246,7 +1246,7 @@ def new_tab(cfg, label, cwd):
 def deliver_key(h, fifo, key):
     """Send the key into the task's fifo from a detached ssh with no time limit, so a full agents group queues the task instead
     of failing the launch (M13). The key goes over the pipe only: never a file or argv."""
-    p = subprocess.Popen([*SSH, h["ssh"], f"cat > {fifo}"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    p = subprocess.Popen([*SSH, h["ssh"], f"cat > {qp(fifo)}"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=clean_env())
     p.stdin.write(key.encode() + b"\n"); p.stdin.close()
 
@@ -1270,12 +1270,22 @@ def pq(cmd):
     or a backtick broke a launch, and is an injection)."""
     return shlex.quote(cmd if isinstance(cmd, str) else shlex.join(cmd))
 
+def qp(p):
+    """A path as one shell word: shlex-quoted, except that a leading $HOME/ or ~/ (a remote root or worktree from orch.toml,
+    default $HOME/orch) still expands."""
+    p = str(p)
+    for pre in ("$HOME/", "~/", "${HOME}/"):
+        if p.startswith(pre): return '"$HOME"/' + (shlex.quote(p[len(pre):]) if p[len(pre):] else "")
+    return shlex.quote(p)
+
 def confirm_started(cfg, h, tid, secs=8):
     """Watch a just-queued agent task for a few seconds: (state, detail). "running" or "queued" (waiting for an agents slot) is
-    fine; "died" is a run that ended at once (a broken command line, a missing tool): its exit code and the end of its log."""
+    fine, and "finished" a run that already ended with exit 0; "died" is a run that failed at once (a broken command line, a
+    missing tool): its exit code and the end of its log."""
     t0 = now(); t = None
     while now() - t0 < secs:
         t = task_status(h, tid)
+        if t is not None and task_rc(t) == 0: return "finished", "exit 0"
         if t is not None and task_rc(t) is not None:
             log = hrun(h, f"{pueue(h)} log {int(tid)} --lines 12", timeout=30)[1].strip()
             return "died", f"exit {task_rc(t)}: " + " | ".join(l.strip() for l in log.splitlines()[-8:] if l.strip())[-400:]
@@ -1287,7 +1297,8 @@ def put_script(h, path, text, mode="755"):
     """Write a script on host h by write-then-rename: a script that is running keeps reading its old file (orch-fixes7: a shell
     rereads its script at the old byte offset when the file is edited in place)."""
     if h.get("local"): atomic_write(Path(path), text, int(mode, 8)); return 0, "", ""
-    return X(h, f"mkdir -p \"$(dirname {path})\" && cat > {path}.tmp.$$ && chmod {mode} {path}.tmp.$$ && mv -f {path}.tmp.$$ {path}", inp=text)
+    f, d, m = qp(path), qp(os.path.dirname(str(path)) or "."), "%o" % int(mode, 8)
+    return X(h, f"mkdir -p {d} && cat > {f}.tmp.$$ && chmod {m} {f}.tmp.$$ && mv -f {f}.tmp.$$ {f}", inp=text)
 
 def atomic_write(p, text, mode=0o644):
     p = Path(p); p.parent.mkdir(parents=True, exist_ok=True)
@@ -1297,27 +1308,28 @@ def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, session=None
     """Headless agent as a pueue task on host h. The key goes over ssh stdin into a fifo that only that task reads: never a file,
     argv or pueue's environment."""
     pv = cfg.prov[mc["provider"]]; var, key = read_secret(pv)
-    root = h["root"]; fifo = f"{root}/run/{name}.key"; od = f"{root}/out/{name}"; q = shlex.quote
-    mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p MemoryMax={mm} -- " if mm else ""
+    q = shlex.quote; R = h["root"]; root = qp(R); kf = f"{R}/run/{name}.key"; fifo = qp(kf); od = qp(f"{R}/out/{name}"); sp = f"{R}/run/{name}.sh"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", var): raise Err(f"provider key variable {var!r} is not a variable name")
+    mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {q(f'MemoryMax={mm}')} -- " if mm else ""
     ex = "".join(f"export {k}={q(v)}\n" for k, v in env.items())
-    rd = h["_rd"]; amb = cap_nums(cfg, h)["agmb"]
+    rd = qp(h["_rd"]); amb = int(cap_nums(cfg, h)["agmb"])
     # the agent's reservation (runs/agent-<unit>.res, its pid: exec keeps it) and a sampler that records the agent class's peak
     res = (f"RD={rd}; if [ -f $RD/cap.sh ]; then . $RD/cap.sh; echo \"$$ 0 $(cap_mb agent {amb} 0) $(date +%s) agent\" > $RD/agent-{name}.res\n"
            f"  ( t0=$(date +%s); pk=0; while kill -0 $$ 2>/dev/null; do v=$(tree_mb $$); [ \"${{v:-0}}\" -gt $pk ] && pk=$v; sleep 10; done\n"
            f"    cap_record agent $pk $(( $(date +%s) - t0 )) 0; rm -f $RD/agent-{name}.res ) </dev/null >/dev/null 2>&1 &\nfi\n")
     script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export {var}=$K; unset K\n"
-              f"cd {q(rcwd)} || exit 1\n{res}{sd}{shlex.join(api_argv(pv, mc, budget, prompt, session))} < /dev/null > {od}/api.json 2> {od}/api.err; rc=$?\n"
-              + (f"cp {od}/api.json {od}/api-{run}.json 2>/dev/null\n" if run else "") + "exit $rc\n")
-    if DRY: return X(h, f"mkfifo {fifo}; write {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {q(rcwd)} --print-task-id -- {pq(['sh', f'{root}/run/{name}.sh'])}; key | ssh cat > {fifo}")
+              f"cd {qp(rcwd)} || exit 1\n{res}{sd}{shlex.join(api_argv(pv, mc, budget, prompt, session))} < /dev/null > {od}/api.json 2> {od}/api.err; rc=$?\n"
+              + (f"cp {od}/api.json {od}/{q(f'api-{run}.json')} 2>/dev/null\n" if run else "") + "exit $rc\n")
+    if DRY: return X(h, f"mkfifo {fifo}; write {qp(sp)}; {pueue(h)} add -g agents -l {name} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}; key | ssh cat > {fifo}")
     rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo}")
     if rc: return rc, o, e
-    rc, o, e = put_script(h, f"{root}/run/{name}.sh", script)
+    rc, o, e = put_script(h, sp, script)
     if rc: return rc, o, e
-    rc, o, e = put_script(h, f"{root}/run/bin/pueue", clean_pueue_script(h))
+    rc, o, e = put_script(h, f"{R}/run/bin/pueue", clean_pueue_script(h))
     if rc: return rc, o, e
-    rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {q(rcwd)} --print-task-id -- {pq(['sh', f'{root}/run/{name}.sh'])}")
+    rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}")
     if rc: return rc, o, e
-    deliver_key(h, fifo, key)
+    deliver_key(h, kf, key)
     return 0, o, ""
 
 ORCH_SELF = Path(__file__).resolve()   # the installed release when run as `orch`: a queued task runs the version that queued it
@@ -1398,15 +1410,15 @@ def lane_runner(cfg, hn, h, name, rcwd):
     a = argparse.Namespace(lane="jobs", subdir=None, usb=False, wt=rcwd)
     rd = runs_dir(cfg, h); q = shlex.quote
     crd = in_container(h, rd)   # the runs dir as the job sees it
-    js = job_script(cfg, hn, h, a, name, f"bash {crd}/__JID__.cmd", "__JID__", wd=rcwd, clsrc='"$(cat $R.cmd)"')
-    return ("#!/bin/bash\n# orch lane runner for unit " + name + f" on {hn}: lane <command>\nRD={q(rd)}; mkdir -p $RD\n"
+    js = job_script(cfg, hn, h, a, name, f"bash {qp(crd + '/__JID__.cmd')}", "__JID__", wd=rcwd, clsrc='"$(cat "$R.cmd")"')
+    return ("#!/bin/bash\n# orch lane runner for unit " + name + f" on {hn}: lane <command>\nRD={qp(rd)}; mkdir -p \"$RD\"\n"
             f"det=; [ \"$1\" = --detach ] && {{ det=1; shift; }}\n"
-            f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=$RD/$jid\nprintf '%s\\n' \"$*\" > $R.cmd\n"
-            f"cat > $R.sh <<'ORCH_JOB_EOF'\n{js}ORCH_JOB_EOF\nsed -i \"s/__JID__/$jid/g\" $R.sh\n"
+            f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=\"$RD/$jid\"\nprintf '%s\\n' \"$*\" > \"$R.cmd\"\n"
+            f"cat > \"$R.sh\" <<'ORCH_JOB_EOF'\n{js}ORCH_JOB_EOF\nsed -i \"s/__JID__/$jid/g\" \"$R.sh\"\n"
             f"{pueue(h)} group add -p 1 jobs >/dev/null 2>&1\n"
             f"tid=$(env -i HOME=\"$HOME\" USER=\"$USER\" PATH=\"$PATH\" ${{XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"}} LANG=\"${{LANG:-C.UTF-8}}\" {pueue(h)} add -g jobs -l unit:{name} -w \"$RD\" --print-task-id -- \"bash $(printf %q \"$R.sh\")\") || exit 125\n"
             f"echo \"lane: queued {hn}:$tid ($jid)\" >&2\n[ -n \"$det\" ] && {{ echo \"{hn}:$tid\"; exit 0; }}\n"
-            f"{pueue(h)} wait -q $tid; cat $R.log; exit $(cat $R.rc 2>/dev/null || echo 255)\n")
+            f"{pueue(h)} wait -q $tid; cat \"$R.log\"; exit $(cat \"$R.rc\" 2>/dev/null || echo 255)\n")
 
 PARK_RULE = ("**Never wait for a build or test (orch rule).** Submit it with `{submit}`: it prints the job id (`<host>:<task>`) at once. "
              "Then write a line `WAITING <job ids>` in your report ({report}) and end your turn. Do not poll, sleep or wait for a job: "
@@ -1418,8 +1430,8 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None):
     if local:
         b = build or hn
         return (f"<!-- orch: unit {name} runs on {hn} -->\n" + PARK_RULE.format(
-            submit=f"orch run --detach --host {b} --wt {rcwd} -- '<command>'", report=report or "REPORT.md"))
-    lane = f"{h['root']}/run/{name}.lane"
+            submit=f"orch run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=report or "REPORT.md"))
+    lane = qp(f"{h['root']}/run/{name}.lane")
     return (f"<!-- orch: unit {name} runs on {hn} -->\n**Where you run (orch):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `orch collect` "
             f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
@@ -1505,8 +1517,8 @@ def unit_tab(cfg, u, mname, hn, h):
     if u.get("via") != "pueue" or DRY: return
     try: pane, tab = new_tab(cfg, f"{u['name']} · {mname} · {hn}", cfg.root)
     except Err: return
-    f = f"{pueue(h)} follow {u['task']}"
-    herdr("pane", "run", pane, f if h.get("local") else f"ssh -t {h['ssh']} {shlex.quote(f)}"); u.update(pane=pane, tab=tab)
+    f = f"{pueue(h)} follow {int(u['task'])}"
+    herdr("pane", "run", pane, f if h.get("local") else f"ssh -t {shlex.quote(h['ssh'])} {shlex.quote(f)}"); u.update(pane=pane, tab=tab)
 
 def cmd_launch(cfg, a):
     name = a.unit
@@ -1547,8 +1559,8 @@ def cmd_launch(cfg, a):
         read_secret(cfg.prov[mc["provider"]])   # the secret store answers before anything is reserved or recorded
         ok, w = model_ok(cfg, mname)
         if not ok and "ledger" in w: raise Err(f"refused: {w}")
-    # A resumed unit continues its original report (--report, --resume-of, or a REPORT: / 'continue the same report <path>'
-    # line in the brief); the unit records it, so check and the Stop hook read that report.
+    # A resumed unit continues its original report (--report or --resume-of only, never a path from the brief's prose); the
+    # unit records it, so check and the Stop hook read that report.
     report = resume_report(cfg, a, brief)
     if report and report.exists():
         t = report.read_text().split("\n", 1)
@@ -1568,18 +1580,18 @@ def cmd_launch(cfg, a):
         if not local:
             root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
             env["ORCH_REPORT"] = f"{root}/out/{name}/REPORT.md"
-            X(h, f"mkdir -p {rcwd} {root}/briefs {root}/out/{name} {root}/run {root}/base")
+            X(h, "mkdir -p " + " ".join(qp(x) for x in (rcwd, f"{root}/briefs", f"{root}/out/{name}", f"{root}/run", f"{root}/base")))
             cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
             if DRY: say("+ " + shlex.join(cmd))
             elif sh(cmd, timeout=900)[0]: raise Err("rsync to " + hn + " failed")
             # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
-            X(h, f"rm -rf {root}/base/{name} && cp -a {rcwd} {root}/base/{name}", timeout=300)
+            X(h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
             put_script(h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
             if not DRY: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
             put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["ORCH_REPORT"]) + brief.read_text(), "644")
             if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
                 put_script(h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
-            else: X(h, f"[ -s {root}/out/{name}/REPORT.md ] || echo 'VERDICT: PENDING' > {root}/out/{name}/REPORT.md")
+            else: X(h, f"[ -s {qp(env['ORCH_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['ORCH_REPORT'])}")
         rep = outd / "REPORT.md"
         if not report and not rep.exists() and not DRY: rep.write_text("VERDICT: PENDING\n")
         if local:   # the brief with orch's header (the park rule) as the agent reads it: out/<unit>/<brief name>
@@ -1602,12 +1614,14 @@ def cmd_launch(cfg, a):
             if rc and not DRY: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
             if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
             u.update(via="pueue", task=int(o.strip() or 0))
-            if not DRY:   # launched means started (or queued for a slot), never a run that died at once
+            if not DRY:   # launched means started (or queued for a slot, or already done), never a run that died at once
                 st, why = confirm_started(cfg, h, u["task"])
                 if st == "died":
                     ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "died-at-start")
                     raise Err(f"the run died at once ({why}); nothing is running")
-                say(f"{name}: run {st}" + (" (waiting for an agents slot)" if st == "queued" else ""))
+                u["start_state"] = st
+                say(f"{name}: run {st}" + (" (waiting for an agents slot)" if st == "queued" else " (exit 0)" if st == "finished" else
+                                            "" if st == "running" else f": not confirmed running (pueue {hn}:{u['task']} is {st})"))
             unit_tab(cfg, u, mname, hn, h)
         elif local:
             pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd) if not DRY else ("pane", "tab")
@@ -1631,16 +1645,21 @@ def cmd_launch(cfg, a):
             cli = {"claude": "claude", "codex": "codex", "opencode": "opencode run"}[mc["kind"]]
             e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
             if mc["kind"] == "opencode": e += " OPENCODE_CONFIG_CONTENT=" + shlex.quote(json.dumps({"model": mc["model"]}))
-            mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p MemoryMax={mm} -- " if mm else ""   # fixes5 item 7
-            inner = f"cd {shlex.quote(rcwd)} && exec env {e} {sd}{cli} {' '.join(mc.get('args', []))} {shlex.quote(prompt)}"
+            mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -- " if mm else ""   # fixes5 item 7
+            inner = f"cd {qp(rcwd)} && exec env {e} {sd}{cli} {shlex.join(mc.get('args', []))} {shlex.quote(prompt)}"
             pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
             rc, o, er = X(h, pre + f"tmux new -d -s orch-{name} {shlex.quote(inner)} && tmux display -p -t orch-{name} '#{{pane_pid}}'")
             if rc: raise Err("tmux start failed: " + er.strip()[:100])
             u.update(via="tmux", pid=int(o.strip() or 0))
+            if not DRY:   # launched means the agent's session is alive a moment later (a broken command line ends it at once)
+                time.sleep(3)
+                if hrun(h, pre + f"tmux has-session -t orch-{name}")[0] or not u["pid"]:
+                    raise Err(f"the agent's tmux session orch-{name} ended at once; nothing is running")
+                u["start_state"] = "running"
             if not DRY: agent_res(cfg, hn, h, name, u["pid"])
             if not DRY:
                 pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd)
-                herdr("pane", "run", pane, f"ssh -t {h['ssh']} tmux attach -t orch-{name}"); u.update(pane=pane, tab=tab)
+                herdr("pane", "run", pane, f"ssh -t {shlex.quote(h['ssh'])} tmux attach -t orch-{name}"); u.update(pane=pane, tab=tab)
     except Err as ex:
         if not DRY:
             u["via"] = "failed"; bd.save(u); bd.comment(u["id"], f"{ts()} launch failed: {ex}")
@@ -1652,7 +1671,9 @@ def cmd_launch(cfg, a):
     chk = f"herdr {name}" if u["via"] == "herdr" else f"pueue {hn}:{u['task']}" if u["via"] == "pueue" else f"tmux {hn}:orch-{name}"
     sh([str(cfg.p("board", "bin/board.sh")), "post", name, "status", f"launched ({mname}, {hn})"],
        env={"BOARD_MACHINE": hn, "BOARD_BRIEF": str(brief), "BOARD_CHECK": chk})
-    say(f"launched {name} on {hn} via {u['via']}" + (f" (task {u['task']})" if u.get("task") is not None else ""))
+    st = u.get("start_state", "running" if u["via"] == "herdr" else "unknown")
+    say((f"launched {name} on {hn} via {u['via']}" if st in ("running", "queued", "finished") else f"queued {name} on {hn} via {u['via']}, NOT confirmed running ({st})")
+        + (f" (task {u['task']}{', waiting for an agents slot' if st == 'queued' else ''})" if u.get("task") is not None else ""))
 
 def get_unit(cfg, name):
     bd = Beads(cfg); u = next((u for u in bd.units() if u["name"] == name), None)
@@ -1713,7 +1734,7 @@ def cmd_stop(cfg, a):
     say(f"stop {u['name']} ({via} on {u['host']})")
     roots = task_pid_roots(h, u) if not DRY else ""
     if DRY: say(f"+ pueue kill / tmux kill-session; TERM then KILL every process group of {u['name']} (roots {roots or '-'}, env ORCH_UNIT)"); return
-    if via == "pueue": hrun(h, f"{p} kill {u['task']}")
+    if via == "pueue": hrun(h, f"{p} kill {int(u['task'])}")
     elif via == "tmux": hrun(h, f"tmux kill-session -t orch-{u['name']}")
     # its lane jobs (label unit:<name>) belong to it too
     hrun(h, f"{p} status --json | python3 -c \"import json,sys; [print(i) for i, t in json.load(sys.stdin)['tasks'].items() if t.get('label') == 'unit:{u['name']}' and ('Running' in str(t['status']) or 'Queued' in str(t['status']))]\" | xargs -r {p} kill 2>/dev/null; true")
@@ -1732,7 +1753,7 @@ DIFF_X = " ".join(f"-x {x}" for x in ("target", ".venv", "node_modules", "__pyca
 
 def remote_patch(h, n, fname):
     """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>)."""
-    return X(h, f"cd {shlex.quote(h['root'])} && [ -d base/{n} ] && {{ diff -ruN {DIFF_X} base/{n} worktrees/{n} | sed -e 's#^--- base/{n}/#--- a/#' -e 's#^+++ worktrees/{n}/#+++ b/#' "
+    return X(h, f"cd {qp(h['root'])} && [ -d base/{n} ] && {{ diff -ruN {DIFF_X} base/{n} worktrees/{n} | sed -e 's#^--- base/{n}/#--- a/#' -e 's#^+++ worktrees/{n}/#+++ b/#' "
                 f"-e 's#^diff -ruN .* base/{n}/\\(.*\\) worktrees/{n}/.*#diff --git a/\\1 b/\\1#' > out/{n}/{fname}; true; }}", timeout=300)
 
 # A remote copy's fingerprint: the checksum of the agent's changes and of its output folder (orch's own files left out), the
@@ -1745,7 +1766,7 @@ echo "fp=$d|$o"; echo "n=$n"; echo "p=${p:-0}"'''
 
 def fingerprint(cfg, u):
     h = cfg.hosts[u["host"]]
-    rc, o, e = hrun(h, FINGERPRINT % {"root": shlex.quote(h["root"]), "n": u["name"], "ex": DIFF_X}, timeout=120)
+    rc, o, e = hrun(h, FINGERPRINT % {"root": qp(h["root"]), "n": u["name"], "ex": DIFF_X}, timeout=120)
     if rc: return None
     return dict(l.split("=", 1) for l in o.splitlines() if "=" in l)
 
@@ -1772,7 +1793,7 @@ def cmd_collect(cfg, a):
     remote_patch(h, n, "changes.patch")
     if not save_output(cfg, u): raise Err(f"collect from {u['host']} failed (unreachable?)")   # out/<unit>/, the task log
     st = task_status(h, u["task"]) if u.get("via") == "pueue" and u.get("task") is not None and not DRY else None
-    if not (st and task_rc(st) is None): X(h, f"rm -f {root}/run/{n}.key")   # the key fifo, once no task can still read it (row 52)
+    if not (st and task_rc(st) is None): X(h, f"rm -f {qp(f'{root}/run/{n}.key')}")   # the key fifo, once no task can still read it (row 52)
     mc = cfg.models.get(u.get("model"), {})
     if not DRY and u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("run"):
         cost, reported = run_cost(od / "api.json", None)
@@ -1811,10 +1832,10 @@ def cmd_close(cfg, a):
         root = h["root"]; n = u["name"]
         others = [x["name"] for x in units if x["id"] != u["id"] and x.get("host") == u["host"] and x.get("rcwd") == u.get("rcwd")]
         if others: say(f"keeping {u.get('rcwd')} on {u['host']}: open unit(s) {', '.join(others)} use it")
-        else: X(h, f"cd {shlex.quote(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
+        else: X(h, f"cd {qp(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
     if u.get("via") == "pueue":   # the task's log is kept under out/<unit>/ before the task is removed
         if not DRY: save_task_log(cfg, h, u, u["task"])
-        X(h, f"{pueue(h)} remove {u['task']} 2>/dev/null; true")
+        X(h, f"{pueue(h)} remove {int(u['task'])} 2>/dev/null; true")
     X({"local": True}, f"{shlex.quote(str(cfg.p('board', 'bin/board.sh')))} close {u['name']} 2>/dev/null; true")
     if DRY: return
     if u.get("run") and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"): settle_run(cfg, u, "closed")
@@ -1904,11 +1925,11 @@ def job_result(cfg, hs, ref, agent_host):
     here = cfg.hosts.get(agent_host, {}).get("local")
     if not jid:   # a task without a job script (a gate): its pueue log is the log
         loc = cfg.f("runs") / f"task-{hn}-{tid}.log"; loc.parent.mkdir(exist_ok=True)
-        r = hrun(h, f"{pueue(h)} log {tid} --full", timeout=60)
+        r = hrun(h, f"{pueue(h)} log {int(tid)} --full", timeout=60)
         if r[0] == 0 and not DRY: loc.write_text(r[1])
         return rc, str(loc) if here or h.get("local") else f"{hn}: {pueue(h)} log {tid}"
     if rc is None or t is None:
-        o = hrun(h, f"cat {rd}/{jid}.rc 2>/dev/null")[1].strip()
+        o = hrun(h, f"cat {qp(f'{rd}/{jid}.rc')} 2>/dev/null")[1].strip()
         rc = int(o) if o.lstrip("-").isdigit() else rc
     if hn == agent_host or (h.get("local") and here): return rc, f"{rd}/{jid}.log"
     if here:
@@ -1976,10 +1997,10 @@ def resume_unit(cfg, u, msg, wrapup=False):
 
 def save_task_log(cfg, h, u, tid, remove=False):
     """Keep a pueue task's log under out/<unit>/task-<id>.log (the agent's stdout and stderr), then optionally remove the task."""
-    rc, o, e = hrun(h, f"{pueue(h)} log {tid} --full", timeout=60)
+    rc, o, e = hrun(h, f"{pueue(h)} log {int(tid)} --full", timeout=60)
     if rc == 0 and not DRY:
         od = cfg.p("out", "out") / u["name"]; od.mkdir(parents=True, exist_ok=True); atomic_write(od / f"task-{tid}.log", o)
-        if remove: hrun(h, f"{pueue(h)} remove {tid} 2>/dev/null; true")
+        if remove: hrun(h, f"{pueue(h)} remove {int(tid)} 2>/dev/null; true")
     return rc == 0
 
 def cmd_park(cfg, a):
@@ -1992,11 +2013,11 @@ def cmd_park(cfg, a):
     if DRY: return
     via = u.get("via")
     if via == "pueue":
-        hrun(h, f"{pueue(h)} kill -s SIGTERM {u['task']} 2>/dev/null; true")
+        hrun(h, f"{pueue(h)} kill -s SIGTERM {int(u['task'])} 2>/dev/null; true")
         for _ in range(30):
             if task_rc(task_status(h, u["task"])) is not None: break
             time.sleep(2)
-        else: hrun(h, f"{pueue(h)} kill {u['task']} 2>/dev/null; true")
+        else: hrun(h, f"{pueue(h)} kill {int(u['task'])} 2>/dev/null; true")
         if h.get("local"): settle_run(cfg, u, "parked")
     elif via == "herdr": herdr("pane", "send-keys", u["pane"], "Escape")
     elif via == "tmux": X(h, f"tmux send-keys -t orch-{n} Escape")
@@ -2619,12 +2640,12 @@ def agent_res(cfg, hn, h, name, pid):
     if not pid: return
     mb = class_mb([], "agent", cap_nums(cfg, h)["agmb"], 0)
     write_cap(cfg, hn, h)
-    hrun(h, f"mkdir -p {h['_rd']} && echo '{int(pid)} 0 {mb} {int(now())} agent' > {h['_rd']}/agent-{name}.res")
+    hrun(h, f"mkdir -p {qp(h['_rd'])} && echo '{int(pid)} 0 {int(mb)} {int(now())} agent' > {qp(h['_rd'] + f'/agent-{name}.res')}")
 
 def ensure_lanes(h, cfg=None):
     p = pueue(h); n = slots(h, cfg)
     g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1} if h.get("local") else {})
-    return "; ".join(f"{p} group add -p {k} {g_} >/dev/null 2>&1" for g_, k in g.items()) + "; true"
+    return "; ".join(f"{p} group add -p {int(k)} {g_} >/dev/null 2>&1" for g_, k in g.items()) + "; true"
 
 def runs_dir(cfg, h): return h["_rd"]
 
@@ -2632,7 +2653,7 @@ def write_cap(cfg, hn, h):
     """Write runs/cap.sh on host h (write-then-rename): waiting jobs pick up the current rule at their next poll."""
     rd = h["_rd"]
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True); atomic_write(Path(rd) / "cap.sh", cap_lib(cfg, hn, h)); return 0, "", ""
-    return hrun(h, f"mkdir -p {rd} && cat > {rd}/.cap.sh.$$ && mv -f {rd}/.cap.sh.$$ {rd}/cap.sh", inp=cap_lib(cfg, hn, h))
+    d = qp(rd); return hrun(h, f"mkdir -p {d} && cat > {d}/.cap.sh.$$ && mv -f {d}/.cap.sh.$$ {d}/cap.sh", inp=cap_lib(cfg, hn, h))
 
 ADMIT = r'''# Admission (orch-fixes8): by reservations, rule in $RD/cap.sh (re-read each poll). One job is judged at a time under the lock;
 # an admitted job writes its reservation ($R.res) before the lock is released. A jobs-lane job yields while a gates job waits.
@@ -2643,18 +2664,18 @@ else   # no flock: a lock dir holding its owner's pid; a dead owner's dir is tak
   lk() { until mkdir "$RD/admit.d" 2>/dev/null; do o=$(cat "$RD/admit.d/pid" 2>/dev/null); [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null && rm -rf "$RD/admit.d"; sleep 1; done; echo $$ > "$RD/admit.d/pid"; HELD=1; }
   ulk() { rm -rf "$RD/admit.d"; HELD=; }; fi
 gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && return 0; done; return 1; }
-W=$R.wait; [ $lane = gates ] && W=$R.gwait; echo $$ > $W
-HELD=; trap 'rm -f $W $R.res; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; trap 'rm -f $W $R.res; [ -n "$HELD" ] && rm -rf "$RD/admit.d"; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
+W="$R.wait"; [ "$lane" = gates ] && W="$R.gwait"; echo $$ > "$W"
+HELD=; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
 said=
 while :; do
-  if [ $lane = gates ] || ! gates_waiting; then
+  if [ "$lane" = gates ] || ! gates_waiting; then
     lk; CAP_RO=; . "$RD/cap.sh"
-    if admit_ok "$CLS"; then echo "$$ $CPJ $MB $(date +%%s) $CLS" > $R.res.$$ && mv -f $R.res.$$ $R.res; ulk; break; fi
+    if admit_ok "$CLS"; then echo "$$ $CPJ $MB $(date +%%s) $CLS" > "$R.res.$$" && mv -f "$R.res.$$" "$R.res"; ulk; break; fi
     ulk; [ "$said" = "$BLK" ] || { echo "orch: waiting for admission ($CLS; $BLK): $why"; said=$BLK; }
   fi
   sleep ${ORCH_POLL_S:-15}
 done
-rm -f $W; exec 7>&-; trap 'rm -f $R.res' EXIT
+rm -f "$W"; exec 7>&-; trap 'rm -f "$R.res"' EXIT
 echo "orch: admitted ($CLS, reserves $CPJ cores and $MB MB): $why"
 run_sampled() {  # run "$@", sample its memory every 5 s, then add class, peak MB, seconds and exit code to $RD/history.tsv
   t0=$(date +%%s); "$@" & pid=$!; peak=0
@@ -2688,9 +2709,9 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     synced worktree of that name. Per host (orch.toml): run_env (shell run first), job_setup (shell run in the worktree before
     the command), job_log (a line per job start/end), and for runner = "podman" the [hosts.<h>.container] settings."""
     q = shlex.quote; rd = h["_rd"]; sub = a.subdir or "."; sub_ = lambda x: str(x).replace("{name}", name).replace("{jid}", jid)
-    head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={q(rd)}; R=$RD/{jid}\nexport ORCH_WRAP={jid}   # orch run inside records the jobs it queues under this (cancel follows them)\n"
+    head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={qp(rd)}; R=\"$RD\"/{q(jid)}\nexport ORCH_WRAP={q(jid)}   # orch run inside records the jobs it queues under this (cancel follows them)\n"
     setup = h.get("job_setup", ""); log = h.get("job_log", h.get("fleet_log", "/dev/null"))
-    adm = ADMIT % {"lane": a.lane, "clsrc": clsrc or q(cmd), "jid": jid}
+    adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid)}
     if h.get("local"):
         pre = ""
         if a.lane == "land":   # the local landing lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
@@ -2702,28 +2723,28 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
         body = f"{pre}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n 10 bash -c {q(cmd)}\n"
     else:
         cap = int(h.get("job_gb", 2) * 1024)
-        scope = f"systemd-run --user --scope -q --unit=orch-{jid} -p MemoryMax={cap}M --"
+        scope = f"systemd-run --user --scope -q {q('--unit=orch-' + jid)} -p MemoryMax={cap}M --"
         if h.get("runner") == "podman":   # the job runs in the host's container settings, capped at job_gb
             c = ctr(h)
             if not c.get("image"): raise Err(f"host {hn}: runner podman needs [hosts.{hn}.container] image")
-            inner = (f"({setup}) && " if setup else "") + f"cd {sub} && {cmd}"
+            inner = (f"({setup}) && " if setup else "") + f"cd {q(sub)} && {cmd}"
             hw = " ".join(map(q, map(sub_, c.get("usb_args", [])))) + " " if a.usb else ""
             hw_ = wd or remote_wt(h, name); cw = in_container(h, hw_)
             args = " ".join(q(sub_(x)) for x in c.get("args", []))
-            body = (f"[ -d {hw_} ] || {{ echo 'orch: no worktree {hw_} on {hn}'; exit 2; }}\n"
+            body = (f"[ -d {qp(hw_)} ] || {{ echo {q(f'orch: no worktree {hw_} on {hn}')}; exit 2; }}\n"
                     + "".join(f"mkdir -p {q(sub_(d))}\n" for d in c.get("host_dirs", []))
-                    + (f"exec 8>{c['usb_lock']}; flock 8\n" if a.usb and c.get("usb_lock") else "") + adm +
-                    f"printf '%s orch-run start [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {log}\n"
-                    f"run_sampled {scope} nice -n 15 ionice -c 3 podman run --rm --init --name orch-run-{jid} {hw}"
-                    f"--memory={cap}m --memory-swap={cap}m --cpus={c.get('cpus', h.get('cores_per_job', 2))} -v {c['mount']}:{c['mount_at']} -w {cw} {args} "
-                    f"{c['image']} bash -c {q(inner)}; rc=$?\n"
-                    f"printf '%s orch-run end [%s] {jid} exit %s\\n' \"$(date '+%F %T')\" {name} $rc >> {log}\nexit $rc\n")
+                    + (f"exec 8>{qp(c['usb_lock'])}; flock 8\n" if a.usb and c.get("usb_lock") else "") + adm +
+                    f"printf '%s orch-run start [%s] %s %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} {q(cmd)} >> {qp(log)}\n"
+                    f"run_sampled {scope} nice -n 15 ionice -c 3 podman run --rm --init --name {q('orch-run-' + jid)} {hw}"
+                    f"--memory={cap}m --memory-swap={cap}m --cpus={q(str(c.get('cpus', h.get('cores_per_job', 2))))} -v {qp(c['mount'])}:{q(c['mount_at'])} -w {qp(cw)} {args} "
+                    f"{q(c['image'])} bash -c {q(inner)}; rc=$?\n"
+                    f"printf '%s orch-run end [%s] %s exit %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} $rc >> {qp(log)}\nexit $rc\n")
         else:
             wd = wd or remote_wt(h, name)
-            body = (f"{h.get('run_env', '')}\ncd {wd} && " + (f"({setup}) && " if setup else "") + f"cd {q(sub)} || exit $?\n" + adm +
-                    f"printf '%s orch-run [%s] {jid} %s\\n' \"$(date '+%F %T')\" {name} {q(cmd)} >> {log}\n"
+            body = (f"{h.get('run_env', '')}\ncd {qp(wd)} && " + (f"({setup}) && " if setup else "") + f"cd {q(sub)} || exit $?\n" + adm +
+                    f"printf '%s orch-run [%s] %s %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} {q(cmd)} >> {qp(log)}\n"
                     f"run_sampled {scope} nice -n 10 bash -c {q(cmd)}\n")
-    return head + "main() {\n" + body + "}\nmain 2>&1 | tee -a $R.log\nrc=${PIPESTATUS[0]}; echo $rc > $R.rc; exit $rc\n"
+    return head + "main() {\n" + body + "}\nmain 2>&1 | tee -a \"$R.log\"\nrc=${PIPESTATUS[0]}; echo $rc > \"$R.rc\"; exit $rc\n"
 
 def sync_wt(cfg, hn, h, src, name):
     """Sync a worktree to the host: --checksum and no -t (a changed file gets the transfer time as its mtime, so cargo never
@@ -2734,14 +2755,14 @@ def sync_wt(cfg, hn, h, src, name):
     ex = [y for x in h.get("sync_exclude", [".git", "target", ".venv", "node_modules"]) for y in ("--exclude", x)]
     dst = remote_wt(h, name)
     if h.get("runner") == "podman" and ctr(h).get("clone_base"):
-        rc, o, e = hrun(h, f"[ -d {dst} ] || cp -a --reflink=always {ctr(h)['clone_base']} {dst}", timeout=300)
+        rc, o, e = hrun(h, f"[ -d {qp(dst)} ] || cp -a --reflink=always {qp(ctr(h)['clone_base'])} {qp(dst)}", timeout=300)
         if rc: raise Err(f"reflink clone on {hn} failed: {(e or o).strip()[-120:]}")
     rdst = dst.replace("$HOME/", "")   # rsync resolves a relative path under the remote home
     cmd = ["rsync", "-rlpgoD", "--checksum", "--delete", "-e", " ".join(SSH), *ex, f"{src}/", f"{h['ssh']}:{rdst}/"]
     r = subprocess.run(cmd)
     if r.returncode: raise Err(f"rsync to {hn} failed (exit {r.returncode})")
     for x in cfg.paths.get("sync_require", []):
-        if (Path(src) / x).exists() and hrun(h, f"test -e {dst}/{x}")[0]: raise Err(f"{x} did not arrive on {hn}")
+        if (Path(src) / x).exists() and hrun(h, f"test -e {qp(dst + '/' + x)}")[0]: raise Err(f"{x} did not arrive on {hn}")
 
 def task_status(h, tid):
     rc, o, e = hrun(h, f"{pueue(h)} status --json", timeout=30)
@@ -2761,21 +2782,21 @@ def finish_job(cfg, hn, h, tid, jid, quiet=False):
     """Wait for the task (retrying through ssh drops), print its log, return its exit code."""
     miss = 0
     while True:
-        if h.get("local"): rc = subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {tid}"]).returncode
-        else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h)} wait -q {tid}"], stdin=subprocess.DEVNULL).returncode
+        if h.get("local"): rc = subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {int(tid)}"]).returncode
+        else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h)} wait -q {int(tid)}"], stdin=subprocess.DEVNULL).returncode
         t = task_status(h, tid)
         if task_rc(t) is not None: break
         miss = miss + 1 if t is None and rc != 255 else 0
         if miss >= 5:   # the task is gone (removed or cleaned): its rc file, else give up (M16)
-            r2, o2, _ = hrun(h, f"cat {runs_dir(cfg, h)}/{jid}.rc 2>/dev/null")
+            r2, o2, _ = hrun(h, f"cat {qp(f'{runs_dir(cfg, h)}/{jid}.rc')} 2>/dev/null")
             if o2.strip().lstrip("-").isdigit(): return int(o2.strip())
             print(f"orch: {hn} task {tid} is gone and left no exit code", file=sys.stderr); return 255
         print(f"orch: {hn} task {tid} not done yet (wait exit {rc}); retrying", file=sys.stderr); time.sleep(30 if rc == 255 or t is None else 5)
     rd = runs_dir(cfg, h)
     if not quiet:
         if h.get("local"): subprocess.run(["cat", f"{rd}/{jid}.log"])
-        else: subprocess.run([*LSSH, h["ssh"], f"cat {rd}/{jid}.log"], stdin=subprocess.DEVNULL)
-    rc, o, e = hrun(h, f"cat {rd}/{jid}.rc 2>/dev/null")
+        else: subprocess.run([*LSSH, h["ssh"], f"cat {qp(f'{rd}/{jid}.log')}"], stdin=subprocess.DEVNULL)
+    rc, o, e = hrun(h, f"cat {qp(f'{rd}/{jid}.rc')} 2>/dev/null")
     try: return int(o.strip())
     except ValueError: return task_rc(t)
 
@@ -2797,12 +2818,12 @@ def cmd_run(cfg, a):
     if not h.get("local"): sync_wt(cfg, hn, h, src, name)
     rd = runs_dir(cfg, h)
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True)
-    rc, o, e = hrun(h, f"mkdir -p {rd} && cat > {rd}/{jid}.sh && {ensure_lanes(h, cfg)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
+    rc, o, e = hrun(h, f"mkdir -p {qp(rd)} && cat > {qp(f'{rd}/{jid}.sh')} && {ensure_lanes(h, cfg)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
     if not rc: rc, o, e = write_cap(cfg, hn, h)
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
     label = f"unit:{unit}" if unit else f"run:{name}"   # unit:<name>: check reports it once that unit is closed (M3)
-    rc, o, e = hrun(h, f"{pueue(h)} add -g {a.lane} -l {shlex.quote(label)} -w {shlex.quote(rd)} --print-task-id"
-                       + (f" -o {int(a.priority)}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- {pq(['bash', f'{rd}/{jid}.sh'])}")
+    rc, o, e = hrun(h, f"{pueue(h)} add -g {shlex.quote(a.lane)} -l {shlex.quote(label)} -w {qp(rd)} --print-task-id"
+                       + (f" -o {int(a.priority)}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- {pq('bash ' + qp(f'{rd}/{jid}.sh'))}")
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
     tid = o.strip()
     wrap = os.environ.get("ORCH_WRAP")   # queued from inside another orch job or gate (a wrapper): record it, so cancel follows (row 49)

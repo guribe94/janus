@@ -144,6 +144,79 @@ class Resume(unittest.TestCase):
                                 capture_output=True, text=True).stdout.rstrip("\n")      # what pueue stores as the command
         self.assertEqual(subprocess.run(["sh", "-c", stored], capture_output=True, text=True).stdout.rstrip("\n"), odd)
 
+class LaunchQuoting(unittest.TestCase):
+    """Defect 18:35 (row 56): launch built the agent's shell command with an unquoted report path that held '(' and a backtick;
+    sh failed at once and launch still said 'launched'. Here real launches run from a project path with '(', a backtick, a
+    quote and spaces, through a private pueued: the agent gets the --report path intact; a run that dies at once fails."""
+    def setUp(self):
+        import shutil
+        if not shutil.which("pueued") or not shutil.which("pueue"): self.skipTest("pueue not installed")
+        self.pd = Path(tempfile.mkdtemp(prefix="oq", dir="/tmp"))   # short: a unix socket path has a length limit
+        (self.pd / "p.yml").write_text(f"shared:\n  pueue_directory: {self.pd}/d\n  runtime_directory: {self.pd}/r\n"
+                                       f"  use_unix_socket: true\n  unix_socket_path: {self.pd}/s.sock\n")
+        (self.pd / "d").mkdir(); (self.pd / "r").mkdir()
+        subprocess.run(["pueued", "-c", str(self.pd / "p.yml"), "-d"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        for _ in range(50):
+            if (self.pd / "s.sock").exists(): break
+            time.sleep(0.1)
+        self.real = (orch.Beads, orch.herdr)
+
+    def tearDown(self):
+        orch.Beads, orch.herdr = self.real
+        subprocess.run(["pueue", "-c", str(self.pd / "p.yml"), "shutdown"], capture_output=True, timeout=20)
+
+    def test_odd_path_launches_and_dead_run_is_not_launched(self):
+        import argparse, io, contextlib
+        d = Path(tempfile.mkdtemp(prefix="orch t (`B it's ")); (d / "out").mkdir(); (d / "briefs").mkdir()
+        fake = d / "agent dir (`x)" / "fake.py"; fake.parent.mkdir()
+        fake.write_text("import json, os, sys\nr = os.environ['ORCH_REPORT']\nopen(r, 'a').write('agent saw ' + r + '\\nVERDICT: DONE\\n')\n"
+                        "print(json.dumps({'total_cost_usd': 0.01, 'subtype': 'success'}))\n")
+        prov = lambda n, cmd: (f'[providers.{n}]\nenabled = true\ncap_usd = 10\nbudget_per_unit = 1\nledger = "out/ledger-{n}.tsv"\n'
+                               f'key_file = {json.dumps(str(d / "key.env"))}\ncmd = {json.dumps(cmd)}\n')
+        (d / "orch.toml").write_text(f'[project]\nname = "t"\n[hosts.here]\nlocal = true\npueue_config = "{self.pd}/p.yml"\n'
+            + prov("api", [sys.executable, str(fake), "{prompt}"]) + prov("bad", [str(d / "no such agent"), "{prompt}"])
+            + '[models.m]\nprovider = "api"\nkind = "api"\napi_id = "x"\n[models.bad]\nprovider = "bad"\nkind = "api"\napi_id = "x"\n')
+        k = d / "key.env"; k.write_text("ANTHROPIC_API_KEY=abc123\n"); k.chmod(0o600)
+        cfg = orch.Cfg(d)
+        (d / "out/orig").mkdir(); rep = d / "out/orig/REPORT.md"; rep.write_text("VERDICT: BLOCKED\nold\n")
+        for n in ("u", "dead"): (d / f"briefs/{n}.md").write_text(f"Continue the same report /x/(`B/out/{n}/REPORT.md\n")   # prose: ignored
+        saved = {}
+        class FakeBeads:   # no beads database in a temp project
+            def __init__(self, cfg): pass
+            def units(self): return []
+            def create(self, title, *a): return title
+            def run(self, *a): return []
+            def save(self, u): saved[u["name"]] = dict(u)
+            def comment(self, *a): pass
+        orch.Beads = FakeBeads; orch.herdr = lambda *a, **k: None   # never the live herdr session
+        hs = {"here": {"name": "here", "ok": True, "avail_mb": "64000", "disk_gb": "100", "load": "0"}}
+        ns = lambda unit, model, report=None: argparse.Namespace(unit=unit, kind="implement", tier="normal", host="here", model=model,
+            brief=None, cwd=str(d), budget=0.5, test_host=None, allow_main=True, of=None, report=report, resume_of=None, item=None, probes=hs)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out): orch.cmd_launch(cfg, ns("u", "m", report=str(rep)))
+        self.assertIn("launched u", out.getvalue())
+        tid = saved["u"]["task"]
+        subprocess.run(["pueue", "-c", str(self.pd / "p.yml"), "wait", "-q", str(tid)], timeout=60)
+        self.assertEqual(orch.task_rc(orch.task_status(cfg.hosts["here"], tid)), 0)
+        self.assertIn(f"agent saw {rep.resolve()}\nVERDICT: DONE", rep.read_text())   # the --report path arrived intact
+        self.assertTrue(rep.read_text().startswith("VERDICT: PENDING"))              # the resumed report restarted as PENDING
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(orch.Err) as e: orch.cmd_launch(cfg, ns("dead", "bad"))
+        self.assertIn("died at once", str(e.exception)); self.assertNotIn("launched dead", out.getvalue())
+        self.assertEqual(saved["dead"]["via"], "failed")
+        self.assertIn("died-at-start", (d / "out/ledger-bad.tsv").read_text())
+        # orch run in the same odd tree (job script, admission, runs dir under the odd root): the job runs and its code returns
+        wt = d / "wt (`q) x"; wt.mkdir(); (wt / "f it's").write_text("hi\n")
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(wt), subdir=None, usb=False, priority=0, no_wait=False,
+                               allow_unmerged=False, command=["--", "cat", "f it's"])
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()): rc = orch.cmd_run(cfg, r)
+        self.assertEqual(rc, 0)
+        # a remote host whose root has the same characters: every generated script parses
+        cfg.hosts["far"] = {"ssh": "nowhere", "root": "$HOME/o (`r) it's", "_rd": "$HOME/o (`r) it's/runs"}
+        for txt in (orch.lane_runner(cfg, "far", cfg.hosts["far"], "u", "$HOME/o (`r) it's/worktrees/u"),
+                    orch.job_script(cfg, "far", cfg.hosts["far"], r, "wt (`q) x", "cat x", "j-1")):
+            self.assertEqual(subprocess.run(["bash", "-n"], input=txt, text=True, capture_output=True).returncode, 0, txt)
+
 class SelfSafety(unittest.TestCase):
     def test_in_place_edit_flagged_rename_not(self):
         d = Path(tempfile.mkdtemp()); s = d / "loop.sh"; s.write_text("#!/bin/bash\nsleep 30\necho done\n")
