@@ -828,6 +828,29 @@ class Thrash(unittest.TestCase):
             hs["far"]["psi"] = "5"; orch.tend_thrash(cfg, hs, [], lambda m: None); self.assertNotIn("far", cfg.jget("thrash.json"))
         finally: orch.cancel_job, orch.cmd_run, orch.host_cap, orch.board = saved
 
+class RemoteBrief(unittest.TestCase):
+    """fixes10 item 4: every absolute path a brief names reaches a remote agent: its tree's paths become its copy's, files under
+    the project root are copied to <root>/ctx/<unit>/, other paths must exist on the host, else the launch is refused."""
+    def test_paths_rewritten_copied_or_refused(self):
+        r = Path(tempfile.mkdtemp(prefix="orch-rem-"))
+        d, cfg = project(f'\n[hosts.far]\nssh = "nowhere"\nroot = "{r}"\n'); h = cfg.hosts["far"]
+        wt = d / "wt"; (wt / "src").mkdir(parents=True); (d / "out/rev").mkdir(parents=True); (d / "out/rev/REPORT.md").write_text("x\n")
+        real = orch.hrun; orch.hrun = lambda h, script, **k: real({"local": True}, script, **k)
+        try:
+            text = (f"Worktree `{wt}`, run `python3 {wt}/src/x.py`. Findings: {d}/out/rev/REPORT.md. B = `{d}`. Write {d}/out/u/REPORT.md.\n"
+                    f"Shell is /bin/sh; see https://example.com/a/b and $HOME/x and <root>/bin/board.sh and s/a/b/.\n")
+            t2, copy, notes = orch.brief_plan(cfg, h, "u", wt, text)
+            self.assertIn(f"`{r}/worktrees/u`", t2); self.assertIn(f"python3 {r}/worktrees/u/src/x.py", t2)
+            self.assertIn(f"{r}/ctx/u/out/rev/REPORT.md", t2); self.assertEqual(copy, [(str((d / "out/rev/REPORT.md").resolve()), "out/rev/REPORT.md")])
+            self.assertIn(f"Write {r}/out/u/REPORT.md", t2); self.assertIn(f"B = `{r}/ctx/u`", t2); self.assertTrue(notes)
+            self.assertIn("/bin/sh;", t2); self.assertIn("https://example.com/a/b", t2); self.assertIn("<root>/bin/board.sh", t2)
+            self.assertNotIn(str(d), t2)
+            t3, copy, _ = orch.brief_plan(cfg, h, "u", wt, f"B = `{d}`. Read B/out/rev/REPORT.md and B/out/none.md.")
+            self.assertEqual([x for _, x in copy], ["out/rev/REPORT.md"])   # relative to the named root: copied, B points at ctx
+            with self.assertRaises(orch.Err) as e: orch.brief_plan(cfg, h, "u", wt, text + f"Also {d.parent}/elsewhere-xyz/f.md and /no/such/path.\n")
+            self.assertIn("/no/such/path", str(e.exception)); self.assertIn("elsewhere-xyz", str(e.exception))
+        finally: orch.hrun = real
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project)."""
