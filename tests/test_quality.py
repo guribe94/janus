@@ -328,6 +328,24 @@ class QualifyRoute(unittest.TestCase):
         self.assertEqual(janus.first_review_pass(cfg), {"m1": (1, 1)})
 
 
+class DeferredLaunch(unittest.TestCase):
+    """S3 first-collection-means-working: an owner deferral labelled on the instruction stops a unit it names from being started
+    silently. The failure caught: starting work the owner deferred until after a milestone."""
+
+    def test_a_deferral_naming_the_unit_or_its_item_refuses(self):
+        d, cfg = project()
+        class B:
+            def __init__(s, c): pass
+            def issues(s, label, status="open"):
+                return [{"id": "g-1", "title": "defer u (item:x) until after first collection", "labels": ["deferral"]}]
+        real = janus.Beads; janus.Beads = B
+        try:
+            self.assertIn("deferred", janus.deferred_block(cfg, "u", None) or "")       # the unit is named
+            self.assertIn("deferred", janus.deferred_block(cfg, "other", "item:x") or "")   # its item is named
+            self.assertIsNone(janus.deferred_block(cfg, "other", "item:y"))
+        finally: janus.Beads = real
+
+
 class Soak(unittest.TestCase):
     """item 6: one soak pass exercises every read path, prints one line each, and writes nothing. The failure caught: a soak
     that mutates the live project it is checking."""

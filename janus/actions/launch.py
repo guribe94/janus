@@ -31,6 +31,19 @@ def cmd_qualify(cfg, a):
     q = cfg.jget("qualified.json"); q[a.model] = {"pass": not a.fail, "at": ts(), "note": a.note or ""}; cfg.jput("qualified.json", q)
     return 0, [f"{a.model}: qualification {'failed' if a.fail else 'passed'} ({a.note or 'no note'})"]
 
+def deferred_block(cfg, name, item=None):
+    """Why a launch of this unit is refused (None when it is not): an open owner instruction labelled `deferral` names the unit
+    or its backlog item. The owner deferred that work (S3 first-collection-means-working: a deferral is not silently started), so
+    ask before starting it."""
+    try: ins = Beads(cfg).issues("instruction")
+    except Err: return None
+    for i in ins:
+        if "deferral" not in (i.get("labels") or []): continue
+        t = (i.get("title") or "")
+        if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", t) or (item and re.search(rf"(?<![\w-]){re.escape(str(item))}(?![\w-])", t)):
+            return f"deferred by the owner: {t.strip()[:160]} (finish what it waits on, or ask the owner to lift it)"
+    return None
+
 def pick_model(cfg, tier, kind, of_vendor, host=None):
     lst = cfg.route.get("review" if kind == "review" else tier, [])
     why = []
@@ -404,6 +417,10 @@ def cmd_launch(cfg, a):
     if wp: raise Err(f"refused (waste pause): {wp}")
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
+    if a.kind == "implement":   # a deferred item is not started without asking (S3 first-collection-means-working)
+        _it = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
+        db = deferred_block(cfg, name, _it)
+        if db: raise Err(f"refused: {db}")
     of = next((u for u in units if u["name"] == (a.of or name)), None)
     if a.model:   # an explicit model passes the same enabled and budget checks as a routed one (M1)
         if a.model not in cfg.models: raise Err(f"unknown model {a.model}")
