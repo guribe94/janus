@@ -527,6 +527,11 @@ the reason (uncommitted changes, stash, changed files not on the landing branch)
 - `[landing] quick_gate_min`: a gate expected (median of its own last runs, else of its family `land-*-<suffix>`) under this
   many minutes, or queued with `--quick`, goes to the one-slot `gates-quick` group, so short gates never wait behind long ones.
 
+**Test fixtures never trip live findings.** `tests/test_orch.py` puts every fixture (temp projects, scripts, daemons) under one
+temporary root named `orch-test-fixture-*` and sets `ORCH_IN_TESTS` for itself. A live `orch check` (or the watcher) skips any
+process whose command line holds that mark (local test/build runs, CPU burners, changed scripts, scheduler and remote
+direct-build probes), so running `./check` beside a live project raises nothing there; the suite still sees its own fixtures.
+
 ## 7c. Self-safety
 
 Every script orch writes or replaces (job scripts, lane runners, remote agent scripts, the pueue shim, cap.sh, rewritten
