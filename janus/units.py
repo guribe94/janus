@@ -45,7 +45,14 @@ def verdict(cfg, u):
         jp = p.with_name("report.json")
         if jp.exists(): mt = max(mt, jp.stat().st_mtime)
         if mt < u.get("started", 0) or (t and "PENDING" in t[0]): return None
-    last = next((l for l in reversed(t) if l.startswith("VERDICT:")), None)   # the report's last VERDICT line decides
+    # finding 1 (high): the LAST of the report's VERDICT: lines and its plain WAITING park lines decides. A park line after the
+    # last VERDICT line means parked, never finished, whatever earlier DONE lines (or a stale report.json) say; the janus brief
+    # header tells every agent to park by writing a bare `WAITING <job ids>` line, so this must hold for every unit, not only a
+    # resumed one (units.py:41-47 read line 1 only for a resumed unit; a park line is the decisive signal).
+    vi = next((i for i in range(len(t) - 1, -1, -1) if t[i].startswith("VERDICT:")), None)
+    pi = next((i for i in range(len(t) - 1, -1, -1) if WAIT_RX.match(t[i])), None)
+    if pi is not None and (vi is None or pi > vi): return None
+    last = t[vi] if vi is not None else None                                  # the report's last VERDICT line decides
     if last is not None and NONFINAL.search(last): return None                # ends parked/pending: not finished
     v, present = verdict_line(j)
     if present: return v

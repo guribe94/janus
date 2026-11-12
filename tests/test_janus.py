@@ -776,7 +776,9 @@ class Park(unittest.TestCase):
         self.assertEqual(janus.job_state(hs, "here:9")[0], "queued")
         self.assertEqual(janus.job_state(hs, "here:5")[0], "gone")
         self.assertEqual(sorted(janus.unit_jobs(cfg, hs, "u")), ["here:8", "here:9"])
-        r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\n"); self.assertEqual(janus.verdict(cfg, u), "VERDICT: DONE")
+        # finding 1 (fix-install3): a park line after the last VERDICT line means parked; a closing VERDICT: DONE after it is
+        r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\n"); self.assertIsNone(janus.verdict(cfg, u))
+        r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\nVERDICT: DONE\n"); self.assertEqual(janus.verdict(cfg, u), "VERDICT: DONE")
 
     def test_wrapup_once_when_capped_without_verdict(self):
         """item 2: a run that ended at its budget cap with no final verdict is wrapped up once; not with a verdict, not twice."""

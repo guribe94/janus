@@ -345,6 +345,33 @@ class Item2VerdictEnding(unittest.TestCase):
         self.assertEqual(u.get("_park"), ["here:9"]); self.assertNotIn("unit:u1:finished", [k for k, _ in F])
 
 
+class Item1ParkedAfterDone(unittest.TestCase):
+    def test_a_park_line_after_a_done_verdict_means_parked(self):
+        """Catches (finding 1, high): units.verdict read the last VERDICT: DONE while a plain WAITING park line followed it, so a
+        unit sent more work (janus resume --message) was judged finished and its still-running job was cancelled as an orphan."""
+        d, cfg = project(); (d / "out/u1").mkdir(parents=True)
+        (d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\n## phase 1\nVERDICT: DONE - items 1-6\n## phase 2\nmore work\nWAITING here:9\n")
+        self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0}
+        hs = {"here": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}},
+                                               "9": {"status": {"Running": {}}, "label": "unit:u1@" + janus.project_id(cfg)}}})}
+        F, _ = janus.unit_findings(cfg, hs, [u], {})
+        self.assertEqual(u.get("_park"), ["here:9"]); self.assertEqual(u.get("state"), "parked")
+        self.assertNotIn("unit:u1:finished", [k for k, _ in F])
+        self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [u])], [], "the parked unit's job was orphaned (cancelled)")
+
+    def test_the_last_of_verdict_line_and_park_line_decides(self):
+        """Catches (finding 1, high): the rule is 'the last of {VERDICT line, WAITING line} decides' for EVERY unit; a closing
+        VERDICT: DONE after an earlier park line is finished (no false park), and a park line after it is parked."""
+        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
+        p.write_text("VERDICT: PENDING\nWAITING here:9\nVERDICT: DONE - all items\n")
+        self.assertEqual(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), "VERDICT: DONE - all items")
+        p.write_text("VERDICT: DONE - all items\nWAITING here:9\n")
+        self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
+        p.write_text("VERDICT: DONE - all items\nWAITING here:9\nVERDICT: DONE - all done\n")
+        self.assertEqual(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), "VERDICT: DONE - all done")
+
+
 class Item3Handover(unittest.TestCase):
     def _close(self, cfg):
         return janus.cmd_close(cfg, type("A", (), {"unit": "u1", "force": True, "handover": True, "reason": "handover"})())
