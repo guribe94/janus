@@ -420,6 +420,10 @@ orch runs `tests.sh` itself and appends `<date> <time> <name> EXIT_tests=<rc> RE
 hosts' `gates` lanes. `--unit` (default `$ORCH_UNIT`) records the gate on the unit for the landing check. `--wait` prints the
 RESULT line, exit 0 on PASS. **`orch cancel <host>:<task>`** kills and removes an orch job that outlived its intent.
 **`orch queue [host] [--log N]`** prints each host's pueue status (or a task's log), read-only.
+**`orch busy <wt>`** exits 0 (and says why) while the tree is in use: an orch job queued or running on it (any host; a host
+that does not answer counts as busy), an open unit's own job when the unit's cwd is that tree, or a local process matching
+`[busy] patterns` (default: mutation testing, which edits sources in place) that runs in or names it; 1 when it is free. A
+periodic WIP snapshot runs it first and skips the commit while it exits 0.
 
 Project scripts may wrap these (test shims, queue workers); list them in `paths.lane_scripts` so a test they run is not
 reported as running outside the lanes.

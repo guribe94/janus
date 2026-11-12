@@ -211,11 +211,35 @@ class LaunchQuoting(unittest.TestCase):
                                allow_unmerged=False, command=["--", "cat", "f it's"])
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()): rc = orch.cmd_run(cfg, r)
         self.assertEqual(rc, 0)
+        self.assertEqual(orch.busy_reasons(cfg, wt, ps=""), [])                  # row 53: its job ended, the tree is free
+        r.no_wait = True; r.command = ["--", "sleep", "20"]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()): orch.cmd_run(cfg, r)
+        why = orch.busy_reasons(cfg, wt, ps="")
+        self.assertEqual(len(why), 1, why); self.assertRegex(why[0], "is (running|queued)")
+        self.assertEqual(orch.busy_reasons(cfg, d / "briefs", ps=""), [])         # another tree is not busy
+        subprocess.run(["pueue", "-c", str(self.pd / "p.yml"), "reset", "--force"], capture_output=True, timeout=20); time.sleep(1)
+        self.assertEqual(orch.busy_reasons(cfg, wt, ps=""), [])
         # a remote host whose root has the same characters: every generated script parses
         cfg.hosts["far"] = {"ssh": "nowhere", "root": "$HOME/o (`r) it's", "_rd": "$HOME/o (`r) it's/runs"}
         for txt in (orch.lane_runner(cfg, "far", cfg.hosts["far"], "u", "$HOME/o (`r) it's/worktrees/u"),
                     orch.job_script(cfg, "far", cfg.hosts["far"], r, "wt (`q) x", "cat x", "j-1")):
             self.assertEqual(subprocess.run(["bash", "-n"], input=txt, text=True, capture_output=True).returncode, 0, txt)
+
+class Busy(unittest.TestCase):
+    def test_busy_jobs_units_and_mutation_runs(self):
+        """row 53: orch busy <wt> holds while an orch job, an open unit's own job or a mutation run uses the tree."""
+        d, cfg = project(); wt = d / "wt"; wt.mkdir(); b = cfg.f("runs") / "busy"; b.mkdir(parents=True)
+        (b / "j1").write_text(f"here:5\t{wt}\n"); (b / "j2").write_text(f"here:6\t{wt}\n"); (b / "j3").write_text(f"gone:1\t{wt}\n")
+        cfg.hosts["gone"] = {"ssh": "nowhere"}
+        hs = {"here": {"ok": True, "pueue": {"tasks": {"5": {"status": {"Running": {}}}, "6": {"status": {"Done": {"result": "Success"}}}}}},
+              "gone": {"ok": False}}
+        why = orch.busy_reasons(cfg, wt, hs=hs, ps="")
+        self.assertEqual(len(why), 2, why); self.assertIn("here:5", why[0]); self.assertIn("unreachable", why[1])
+        self.assertFalse((b / "j2").exists())                                   # an ended job's record is dropped
+        self.assertEqual(orch.busy_reasons(cfg, d / "other", hs=hs, ps=""), [])
+        (b / "j1").unlink(); (b / "j3").unlink()
+        why = orch.busy_reasons(cfg, wt, hs=hs, ps=f"4242 cargo mutants --in-place -d {wt}\n4343 vim {wt}/x\n")
+        self.assertEqual(len(why), 1, why); self.assertTrue(why[0].startswith("process 4242 (cargo mutants"), why)   # vim is no mutation run
 
 class Close(unittest.TestCase):
     def test_close_counts_only_the_units_subtree(self):

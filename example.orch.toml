@@ -186,3 +186,6 @@ stop_burners = true      # a CPU burner's process group (never a group that hold
 stop_direct = false      # a build or test an agent runs outside the lanes on a remote host (flagged and warned either way)
 
 # [landing] final_gate_host = "<host>"; final_gate = "<command>"   # orch land gates the merged tree there before it squash-lands
+
+# [busy]                   # orch busy <wt>: exit 0 while an orch job, an open unit's own job or one of these processes uses the tree
+# patterns = ["mutants"]   # substrings of local command lines that edit a tree in place while they run (default: mutation testing)
