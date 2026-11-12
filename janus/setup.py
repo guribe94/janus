@@ -6,7 +6,7 @@ from janus.actions.jobs import remote_wt
 from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, wait_shell
 from janus.board import board_dir, board_script
-from janus.context import (Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, atomic_write, clean_env, herdr, hrun, now, projects, qp,
+from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, atomic_write, clean_env, herdr, hrun, now, pending_age, projects, qp,
     record_session_proc, say, session_alive, sh, slug, ts)
 from janus.hooks import session_start_text
 from janus.ledger import ledger_read, read_secret, spend
@@ -106,11 +106,12 @@ def takeover(cfg):
     present = pane in {p.get("pane_id") for p in pl.get("panes", [])}
     st = _orch_state(pane) if present else None
     # A session was just started (session = pending:<ts>) and has not claimed the registration yet: never start a second one
-    # beside it (the panel's second-orchestrator hole; the claim window is 10 min, hooks.py). After it, the pending claim is
+    # beside it (the panel's second-orchestrator hole; the claim window is CLAIM_WINDOW, context.py). After it, the pending claim is
     # stale and a fresh start is correct.
     sess = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
-    if present and sess.startswith("pending:") and now() - float(sess.split(":", 2)[1] or 0) < 600:
-        raise Err(f"takeover: a session was started {int(now() - float(sess.split(':', 2)[1] or 0))} s ago (pending, pane {pane}) and has not "
+    age = pending_age(sess)
+    if present and age is not None and age < CLAIM_WINDOW:
+        raise Err(f"takeover: a session was started {int(age)} s ago (pending, pane {pane}) and has not "
                   "registered yet: nothing started (two orchestrators must not run)")
     if not present and session_alive(cfg) is not True:
         say(f"takeover: the registered orchestrator is gone (pane {pane} absent, its process ended)"); return

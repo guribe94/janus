@@ -146,6 +146,15 @@ def record_session_proc(cfg, t=None):
     p, st = session_proc(t)
     if p: atomic_write(cfg.f("session_pid"), f"{p}\t{st}\n")
 
+# A pending registration (session = pending:<ts>[:<pane>], from janus register without an id, janus resume or the watcher's
+# start) is claimable by a hook for CLAIM_WINDOW seconds; after it nothing can claim it, so it no longer blocks a start.
+CLAIM_WINDOW = 600
+
+def pending_age(sess):
+    """Seconds since a pending registration was made, or None when sess is not pending."""
+    parts = (sess or "").split(":", 2)
+    return now() - int(parts[1]) if parts[0] == "pending" and len(parts) > 1 and parts[1].isdigit() else None
+
 def session_alive(cfg, t=None):
     """True while the registered session's process still runs (same pid and start time). None when nothing is recorded."""
     try: p, st = cfg.f("session_pid").read_text().rstrip("\n").split("\t")

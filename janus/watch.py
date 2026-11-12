@@ -10,7 +10,7 @@ from janus.board import board, board_alerts, board_dir, board_files
 from janus.autopilot import record, tend_autopilot
 from janus.check import run_check
 from janus.reset import orch_tokens, reset_now
-from janus.context import Err, JANUS_MARK, WAKE, WAKE_CLEAR, atomic_write, handoff_stale, herdr, now, session_alive, sh, ts
+from janus.context import CLAIM_WINDOW, Err, JANUS_MARK, WAKE, WAKE_CLEAR, atomic_write, handoff_stale, herdr, now, pending_age, session_alive, sh, ts
 from janus.setup import heartbeat_beat
 
 def cmd_watch(cfg, a):
@@ -63,20 +63,30 @@ def watch_pass(cfg, log):
     ag = herdr("agent", "get", pane) if pane and present else None
     if present and ag is None: log(f"herdr agent get {pane} failed: nothing started"); return
     sess = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
+    age = pending_age(sess); fresh = age is not None and age < CLAIM_WINDOW
+    alive = session_alive(cfg)
+    tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
+    quiet = now() - (os.path.getmtime(tr) if tr and os.path.exists(tr) else 0) > 20 * 60
+    w = cfg.jget("orch_wait.json")
     if present and (ag or {}).get("agent"): cfg.f("orch_wait.json").unlink(missing_ok=True)
-    elif present or sess.startswith("pending:"):
+    elif present and not fresh and not alive and quiet and now() - (w.get("since") or now()) >= 20 * 60:
+        # self-healing (re-check N1): the recorded pane has shown no agent for 20 min, nothing can claim a registration, the
+        # registered process ended and its transcript is quiet: the agent exited and left its shell. Close the pane, then the
+        # normal restart below.
+        log(f"pane {pane} has had no agent for {int((now() - w['since']) / 60)} min, process ended, transcript quiet: closing it")
+        if herdr("pane", "close", pane) is None: log(f"herdr pane close {pane} failed: nothing started"); return
+        cfg.f("orch_wait.json").unlink(missing_ok=True); present = False
+    elif present or fresh:
         # never a second orchestrator next to one that may be starting (panel-eng F2): its pane still exists, or the session it
-        # was started for has not registered yet. Logged each pass; check raises orchestrator:unregistered after ORCH_WAIT passes.
-        w = cfg.jget("orch_wait.json"); why = f"pane {pane} exists but herdr shows no agent in it" if present else "the started orchestrator has not registered (session pending)"
+        # was started for can still claim the registration (CLAIM_WINDOW). Logged each pass; check raises orchestrator:unregistered
+        # after ORCH_WAIT passes.
+        why = f"pane {pane} exists but herdr shows no agent in it" if present else "the started orchestrator has not registered (session pending)"
         cfg.jput("orch_wait.json", {"since": w.get("since") or int(now()), "passes": w.get("passes", 0) + 1, "why": why})
         log(f"orchestrator not seen ({why}): nothing started, pass {w.get('passes', 0) + 1}"); return
     if not present or not (ag or {}).get("agent"):
         # A new orchestrator only when every sign says the registered one is gone (H4, fixes5 item 1): its pane is absent from
         # a successful pane list, its process (pid and start time recorded at register) is not running, and its transcript has
         # not changed for 20 min.
-        alive = session_alive(cfg)
-        tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
-        quiet = now() - (os.path.getmtime(tr) if tr and os.path.exists(tr) else 0) > 20 * 60
         if alive or not quiet:
             log(f"pane {pane or '-'} not found, but the registered session is {'still running' if alive else 'writing its transcript'}: nothing started"); return
         if not (F or running): return
