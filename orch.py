@@ -762,7 +762,11 @@ def board_script(cfg):
     return cfg.p("board") if cfg.paths.get("board") else ORCH_SELF.parent / "board.sh"
 def board_dir(cfg): return cfg.root / cfg.paths.get("board_dir", "board")
 def board(cfg, *args, env=None, timeout=25):
-    """Run the board script with BOARD_DIR set (the shipped board keeps its files there; a project's own script may ignore it)."""
+    """Run the board script with BOARD_DIR set (the shipped board keeps its files there; a project's own script may ignore it).
+    The shipped board's folder is the coordinating board (.master) from the first call, so posts never land in an outbox here."""
+    if not cfg.paths.get("board") and not DRY and not (board_dir(cfg) / ".master").exists():
+        board_dir(cfg).mkdir(parents=True, exist_ok=True)
+        (board_dir(cfg) / ".master").write_text(next((n for n, h in cfg.hosts.items() if h.get("local")), "local") + "\n")
     return sh([str(board_script(cfg)), *args], env={"BOARD_DIR": str(board_dir(cfg)), **(env or {})}, timeout=timeout)
 
 def board_rows(cfg):
@@ -817,16 +821,21 @@ def board_upkeep(cfg, units):
     """The shipped board's own files (a writer only): .master (this machine's host name), .hosts (other hosts from orch.toml,
     for sync and rule) and .notify (a new question or block runs `orch watch --alert` at once); cards of closed units archived."""
     if cfg.ro or DRY or cfg.paths.get("board"): return
+    board_files(cfg)
+    names = {u["name"] for u in units}; au = all_units(cfg)
+    for c in (board_dir(cfg) / "agents").glob("*.md") if (board_dir(cfg) / "agents").is_dir() else []:
+        if c.stem not in names and au.get(c.stem, {}).get("status") == "closed": board(cfg, "close", c.stem)
+
+def board_files(cfg):
     bd = board_dir(cfg); bd.mkdir(exist_ok=True)
     me = next((n for n, h in cfg.hosts.items() if h.get("local")), "local")
     if not (bd / ".master").exists(): (bd / ".master").write_text(me + "\n")
     hosts = "".join(f"{n} {h['ssh']} {h['root']}\n" for n, h in cfg.hosts.items() if not h.get("local") and h.get("ssh") and h.get("root"))
     if not (bd / ".hosts").exists() or (bd / ".hosts").read_text() != hosts: atomic_write(bd / ".hosts", hosts)
-    nt = f"cd {shlex.quote(str(cfg.root))} && ORCH_ROOT={shlex.quote(str(cfg.root))} {shlex.quote(sys.executable)} {shlex.quote(str(ORCH_SELF))} watch --alert\n"
+    # with the writer's PATH (the watcher's): the agent whose post runs it may not have herdr on its PATH
+    nt = (f"cd {shlex.quote(str(cfg.root))} && PATH={shlex.quote(os.environ.get('PATH', ''))} ORCH_ROOT={shlex.quote(str(cfg.root))} "
+          f"{shlex.quote(sys.executable)} {shlex.quote(str(ORCH_SELF))} watch --alert\n")
     if not (bd / ".notify").exists() or (bd / ".notify").read_text() != nt: atomic_write(bd / ".notify", nt)
-    names = {u["name"] for u in units}; au = all_units(cfg)
-    for c in (bd / "agents").glob("*.md") if (bd / "agents").is_dir() else []:
-        if c.stem not in names and au.get(c.stem, {}).get("status") == "closed": board(cfg, "close", c.stem)
 
 def board_alerts(cfg, log):
     """Prompt the orchestrator at once on a new board question or block (orch-swarm item 6): each is told once."""
@@ -3492,8 +3501,8 @@ def unit_changes(cfg, u, units=()):
         for l in o.splitlines():
             m = re.match(rf"Files base/{re.escape(n)}/(.+) and worktrees/{re.escape(n)}/.+ differ$", l) or re.match(rf"Only in (?:base|worktrees)/{re.escape(n)}/?(.*): (.+)$", l)
             if m: fs.append(m.group(1) if m.lastindex == 1 else str(Path(m.group(1)) / m.group(2)) if m.group(1) else m.group(2))
-        rc, b, _ = hrun(h, f"git -C {qp(h['root'] + '/base/' + n)} rev-parse --abbrev-ref HEAD 2>/dev/null")
-        return (b.strip() or "?"), sorted(set(fs))
+        b = sh(["git", "-C", u["cwd"], "rev-parse", "--abbrev-ref", "HEAD"])[1].strip() if u.get("cwd") and Path(u["cwd"]).is_dir() else ""
+        return (b or "?"), sorted(set(fs))   # the copy carries no .git: the branch of the worktree it was sent from
     cwd = u.get("cwd")
     if not cwd or not Path(cwd).is_dir() or not own_tree(cfg, u, units or [u]): return "?", []
     br = sh(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])[1].strip() or "?"
@@ -4173,11 +4182,15 @@ URGENT = ("unit:", "board:", "question:", "overlap:", "orphan:", "host:", "margi
 def cmd_watch(cfg, a):
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
     if getattr(a, "alert", False): board_alerts(cfg, log); return   # board.sh .notify: a new question or block, at once
-    if not cfg.paths.get("board") and (board_dir(cfg) / ".hosts").is_file() and (board_dir(cfg) / ".hosts").read_text().strip():
-        board(cfg, "sync", timeout=180)   # the shipped board: merge the hosts' outboxes, push the board (peers, index) to them
+    def sync():   # the shipped board only, when there are other hosts (or posts this machine made before it was the board)
+        if cfg.paths.get("board") or DRY: return
+        board_files(cfg)
+        if (board_dir(cfg) / ".hosts").read_text().strip() or (board_dir(cfg).parent / "board-outbox" / "outbox.log").is_file(): board(cfg, "sync", timeout=180)
+    sync()   # the shipped board: merge the hosts' outboxes (their questions alert at once through .notify) before the check
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     board_alerts(cfg, log)
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (orch-fixes9)
+    sync()   # push what this pass wrote (peers.md, directions) to every host
     for r, why in orphan_jobs(cfg, hs, units):   # nothing whose owner is gone keeps running or waiting (item 3)
         try: log(f"orphan {r} ({why}): " + "; ".join(cancel_job(cfg, r)))
         except Err as e: log(f"orphan {r} ({why}): not cancelled: {e}")
