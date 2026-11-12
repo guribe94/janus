@@ -969,6 +969,24 @@ class Item4Localtest(unittest.TestCase):
         false_pos = [c for c in not_test if janus.test_command(c)]
         self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
 
+    def test_the_reviews_finding_8_residues(self):
+        """Catches (finding 8, fix-install6): localtest still missed real runs behind a runner's own option that takes a value or
+        a flag (`uv run --extra dev pytest`, `uv run -n pytest tests`, `uv run -- pytest`) and cargo's own options (`cargo --color
+        always test`, `cargo -C dir test`); and it flagged non-test ps lines that lost their quotes (`janus ack ... "gate failed;
+        pytest ..."`, `git commit -m "run (pytest -q) ..."`) and a Python script's own `-m` argument (`python3 tool.py -m pytest`,
+        `python3 -c 'print(1)' -m pytest`)."""
+        caught = ["uv run --extra dev pytest", "uv run -n pytest tests", "uv run -- pytest", "uv run --group dev pytest",
+                  "uv run --no-sync pytest", "cargo --color always test", "cargo -C dir test", "uv run -m pytest",
+                  "python3 -X dev -m pytest", "python3 -W ignore -m pytest", "uv run --frozen pytest -q",
+                  "uv run --with pytest-xdist pytest", "uv run --project p pytest tests", "poetry run -q pytest"]
+        missed = [c for c in caught if not janus.test_command(c)]
+        self.assertEqual(missed, [], f"a real test run was not judged one: {missed}")
+        not_test = ["janus ack unit:x gate failed; pytest tests/a exit 1", "git commit -m run (pytest -q) before push",
+                    "python3 tool.py -m pytest", "python3 -c 'print(1)' -m pytest", "uv run --with pytest ipython",
+                    "python3 -m pytest_watch", "uv pip install pytest", "cargo --version", "hatch run docs:build", "just fmt:check"]
+        false_pos = [c for c in not_test if janus.test_command(c)]
+        self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
+
 
 class Item5HandoverOrder(unittest.TestCase):
     def test_a_handover_is_refused_before_the_successor_starts(self):

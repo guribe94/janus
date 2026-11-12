@@ -28,7 +28,12 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 OPTS_WITH_ARG = {"-n", "-u", "-g", "-p", "-c", "-o", "-e", "-t", "-s", "-k", "-C", "-L", "-P", "-I", "-d", "-a", "-i",
                  "--signal", "--kill-after", "--user", "--group", "--max-args", "--max-procs", "--delimiter", "--arg-file",
                  "--replace", "--eof", "--lines", "--with", "--project", "--python", "--directory"}
-CARGO_OPT_ARG = {"--config", "--target", "--target-dir", "--features", "--manifest-path", "--profile", "--jobs", "-j", "-Z"}
+CARGO_OPT_ARG = {"--config", "--target", "--target-dir", "--features", "--manifest-path", "--profile", "--jobs", "-j", "-Z", "--color", "-C"}
+# The runner's OWN options that take a value, after `uv run`/`poetry run` (finding 8, fix-install6): `-n`/`-q`/`-v`/`--frozen`/...
+# are flags for these runners, so they are NOT in this set (the generic OPTS_WITH_ARG's `-n` would swallow the command word).
+RUN_OPT_ARG = {"--extra", "--group", "--with", "--project", "--python", "--directory", "--env-file", "--config-file",
+               "--index", "--index-url", "--extra-index-url", "--find-links", "--constraint", "--override", "--resolution",
+               "--prerelease", "--no-binary", "--only-binary", "--package", "--script", "-p"}
 
 def _segments(c):
     """The commands in c, each a list of words: quoting and backslash escapes are honoured, so a ; or | inside a quoted
@@ -44,6 +49,8 @@ def _segments(c):
         elif ch in "'\"": q = ch
         elif ch == "\\": esc = True
         elif ch in ";&|()\n":
+            if ch in "()" and not w and cur:
+                continue   # a paren inside a command (an unquoted ps rendering of a quoted message): not a subshell, not a separator
             if ch == "&" and (i > 0 and c[i - 1] == ">" or i + 1 < len(c) and c[i + 1] == ">"):
                 w += ch   # the `&` of a redirect, not a separator
             else:
@@ -80,18 +87,29 @@ def _test_argv(w, depth):
             return j is not None and test_command(" ".join(w[j + 1:]), depth + 1)
         if b == "eval": return test_command(" ".join(w[i + 1:]), depth + 1)
         if PY_RUN.match(b):   # python -m pytest / python -mpytest, or a Python-app console script (.../Python .../bin/pytest)
-            rest = w[i + 1:]
-            for k, x in enumerate(rest):
-                if re.fullmatch(r"-m\S+", x): return bool(TEST_RUN.match(os.path.basename(x[2:])))
+            rest = w[i + 1:]; k = 0
+            while k < len(rest) and rest[k].startswith("-"):
+                x = rest[k]
+                if x == "-c": return False   # python -c <code>: the rest are the code's arguments (finding 8)
                 if x == "-m": return bool(k + 1 < len(rest) and TEST_RUN.match(os.path.basename(rest[k + 1])))
-            first = next((x for x in rest if not x.startswith("-")), None)   # the script, never a later word (finding 3)
+                if re.fullmatch(r"-m\S+", x): return bool(TEST_RUN.match(os.path.basename(x[2:])))
+                k += 2 if x in ("-X", "-W", "-Q") and k + 1 < len(rest) else 1   # these take a value before the script
+            first = rest[k] if k < len(rest) else None   # the script, never a later word (finding 3/8: `python3 tool.py -m pytest`)
             return bool(first and TEST_RUN.match(os.path.basename(first)))
         if b in ("uv", "poetry", "pipenv", "pdm", "hatch", "rye", "bundle", "just"):
             j = _after_opts(w, i)   # the runner and its own options (`uv --no-cache run ...`)
             if j < len(w) and w[j] in ("run", "exec", "x"):
-                j = _after_opts(w, j)   # `run`'s OWN options too (finding 3: `uv run --frozen pytest`, `uv run --with X pytest`)
-                if j < len(w) and not w[j].startswith("-") and ":" in os.path.basename(w[j]):
-                    return _test_argv([os.path.basename(w[j]).split(":", 1)[1], *w[j + 1:]], depth + 1)   # hatch run env:cmd
+                rest = w[j + 1:]; k = 0   # `run`'s OWN options too (finding 3/8: `uv run --extra dev pytest`, `uv run -n pytest`)
+                while k < len(rest):
+                    x = rest[k]
+                    if x == "--": k += 1; break
+                    if x in ("-m", "--module"):   # `uv run -m pytest`: the module is the command
+                        return bool(k + 1 < len(rest) and TEST_RUN.match(os.path.basename(rest[k + 1])))
+                    if x.startswith("-"): k += 2 if x in RUN_OPT_ARG and k + 1 < len(rest) else 1; continue
+                    break
+                if k < len(rest):
+                    c0 = os.path.basename(rest[k])
+                    return _test_argv([c0.split(":", 1)[1], *rest[k + 1:]], depth + 1) if ":" in c0 else _test_argv(rest[k:], depth + 1)
             i = j; continue
         if b == "rustup":
             j = _after_opts(w, i)
@@ -114,8 +132,12 @@ def test_command(c, depth=0):
     interpreter's -m or console script) is cargo/a cargo subcommand, pytest, npm/pnpm test or xcodebuild ... test. Item 23: a
     line that merely *mentions* pytest (an orchestrator's `janus ack ... "pytest"`, a commit message) is not a test run.
     Finding 4: a word inside a quoted argument never starts a command, and a real run behind uv/poetry/rustup/xargs/arch/flock/
-    node/a shell shim is judged one."""
-    return any(_test_argv(w, depth) for w in _segments(c))
+    node/a shell shim is judged one. Finding 8 (fix-install6): a ps line that lost its quotes (`janus ack ... "gate failed;
+    pytest ..."`, `git commit -m "run (pytest -q) ..."`) is not judged -- when the line's FIRST command is janus/git, the rest is
+    that tool's arguments, not a command (a real run goes through `janus run`, already excluded by via_lane)."""
+    segs = _segments(c)
+    if segs and os.path.basename(segs[0][0]) in ("janus", "janus.py", "git"): return False
+    return any(_test_argv(w, depth) for w in segs)
 
 VIA_LANE = re.compile(r"janus(\.py)? (run|gate)\b|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")   # plus paths.lane_scripts (project wrappers)
 
