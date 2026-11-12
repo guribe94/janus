@@ -1263,6 +1263,26 @@ def api_argv(pv, mc, budget, prompt, session=None):
         else: t = [*API_CMD[:3], "--resume", "{session}", *API_CMD[3:]]
     return [x.format(api_id=mc.get("api_id", mc.get("model", "")), model=mc.get("model", ""), budget=budget, prompt=prompt, session=session or "") for x in t]
 
+def pq(cmd):
+    """The command part of `pueue add -- <command>`, as one word of the caller's shell. pueue joins its arguments with spaces and
+    runs the result with sh -c, so a command must reach it already shell-quoted: cmd is a list of words (quoted here) or shell
+    text, and the whole is quoted once more for the caller's shell. Never `-- {words}` unquoted (a path with a space, a quote
+    or a backtick broke a launch, and is an injection)."""
+    return shlex.quote(cmd if isinstance(cmd, str) else shlex.join(cmd))
+
+def confirm_started(cfg, h, tid, secs=8):
+    """Watch a just-queued agent task for a few seconds: (state, detail). "running" or "queued" (waiting for an agents slot) is
+    fine; "died" is a run that ended at once (a broken command line, a missing tool): its exit code and the end of its log."""
+    t0 = now(); t = None
+    while now() - t0 < secs:
+        t = task_status(h, tid)
+        if t is not None and task_rc(t) is not None:
+            log = hrun(h, f"{pueue(h)} log {int(tid)} --lines 12", timeout=30)[1].strip()
+            return "died", f"exit {task_rc(t)}: " + " | ".join(l.strip() for l in log.splitlines()[-8:] if l.strip())[-400:]
+        time.sleep(1)
+    k = (t or {}).get("status"); k = k if isinstance(k, str) else next(iter(k or {}), "unknown")
+    return {"Running": "running", "Queued": "queued"}.get(k, str(k).lower()), ""
+
 def put_script(h, path, text, mode="755"):
     """Write a script on host h by write-then-rename: a script that is running keeps reading its old file (orch-fixes7: a shell
     rereads its script at the old byte offset when the file is edited in place)."""
@@ -1288,14 +1308,14 @@ def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, session=None
     script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export {var}=$K; unset K\n"
               f"cd {q(rcwd)} || exit 1\n{res}{sd}{shlex.join(api_argv(pv, mc, budget, prompt, session))} < /dev/null > {od}/api.json 2> {od}/api.err; rc=$?\n"
               + (f"cp {od}/api.json {od}/api-{run}.json 2>/dev/null\n" if run else "") + "exit $rc\n")
-    if DRY: return X(h, f"mkfifo {fifo}; write {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {rcwd} --print-task-id -- sh {root}/run/{name}.sh; key | ssh cat > {fifo}")
+    if DRY: return X(h, f"mkfifo {fifo}; write {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {q(rcwd)} --print-task-id -- {pq(['sh', f'{root}/run/{name}.sh'])}; key | ssh cat > {fifo}")
     rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo}")
     if rc: return rc, o, e
     rc, o, e = put_script(h, f"{root}/run/{name}.sh", script)
     if rc: return rc, o, e
     rc, o, e = put_script(h, f"{root}/run/bin/pueue", clean_pueue_script(h))
     if rc: return rc, o, e
-    rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {q(rcwd)} --print-task-id -- sh {root}/run/{name}.sh")
+    rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {q(rcwd)} --print-task-id -- {pq(['sh', f'{root}/run/{name}.sh'])}")
     if rc: return rc, o, e
     deliver_key(h, fifo, key)
     return 0, o, ""
@@ -1384,7 +1404,7 @@ def lane_runner(cfg, hn, h, name, rcwd):
             f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=$RD/$jid\nprintf '%s\\n' \"$*\" > $R.cmd\n"
             f"cat > $R.sh <<'ORCH_JOB_EOF'\n{js}ORCH_JOB_EOF\nsed -i \"s/__JID__/$jid/g\" $R.sh\n"
             f"{pueue(h)} group add -p 1 jobs >/dev/null 2>&1\n"
-            f"tid=$(env -i HOME=\"$HOME\" USER=\"$USER\" PATH=\"$PATH\" ${{XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"}} LANG=\"${{LANG:-C.UTF-8}}\" {pueue(h)} add -g jobs -l unit:{name} -w $RD --print-task-id -- bash $R.sh) || exit 125\n"
+            f"tid=$(env -i HOME=\"$HOME\" USER=\"$USER\" PATH=\"$PATH\" ${{XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"}} LANG=\"${{LANG:-C.UTF-8}}\" {pueue(h)} add -g jobs -l unit:{name} -w \"$RD\" --print-task-id -- \"bash $(printf %q \"$R.sh\")\") || exit 125\n"
             f"echo \"lane: queued {hn}:$tid ($jid)\" >&2\n[ -n \"$det\" ] && {{ echo \"{hn}:$tid\"; exit 0; }}\n"
             f"{pueue(h)} wait -q $tid; cat $R.log; exit $(cat $R.rc 2>/dev/null || echo 255)\n")
 
@@ -1443,17 +1463,16 @@ def choose(cfg, a, brief, mc, units, hs):
     if not best: raise Err("refused, no room (" + "; ".join(dict.fromkeys(notes)) + ")")
     return best
 
-RESUME_RX = re.compile(r"^REPORT:\s*`?(\S+?)`?\s*$|continue (?:the same|its|the original) report:?\s+`?(\S+?REPORT\.md)", re.M | re.I)
-
 def resume_report(cfg, a, brief):
-    """The report a resumed unit continues: --report, else out/<--resume-of>/REPORT.md, else a 'REPORT: <path>' or 'Continue the
-    same report <path>' line in the brief. None for a new unit (it writes out/<unit>/REPORT.md)."""
+    """The report a resumed unit continues: --report, else out/<--resume-of>/REPORT.md. None for a new unit (it writes
+    out/<unit>/REPORT.md). Never parsed from the brief's prose (a path cut out of prose broke a launch, orch-fixes9); the path
+    must be a REPORT file whose folder exists."""
     p = a.report or (str(cfg.p("out", "out") / a.resume_of / "REPORT.md") if a.resume_of else None)
-    if not p and brief.is_file():
-        m = RESUME_RX.search(brief.read_text()); p = m and (m.group(1) or m.group(2))
     if not p: return None
-    p = Path(os.path.expanduser(p)); p = p if p.is_absolute() else cfg.root / p
-    return None if p == cfg.p("out", "out") / a.unit / "REPORT.md" else p.resolve()
+    p = Path(os.path.expanduser(p)); p = (p if p.is_absolute() else cfg.root / p).resolve()
+    if a.resume_of and not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", a.resume_of): raise Err(f"--resume-of {a.resume_of!r} is not a unit name")
+    if not p.parent.is_dir(): raise Err(f"report {p}: its folder does not exist")
+    return None if p == (cfg.p("out", "out") / a.unit / "REPORT.md").resolve() else p
 
 def report_path(cfg, u): return Path(u["report"]) if u.get("report") else cfg.p("out", "out") / u["name"] / "REPORT.md"
 
@@ -1577,12 +1596,18 @@ def cmd_launch(cfg, a):
             if local:
                 cmd = shlex.join([sys.executable, str(ORCH_SELF), "api-run", name, "--run", run, "--model", mname, "--budget", str(budget),
                                   "--brief", rbrief, "--cwd", rcwd, "--report", env["ORCH_REPORT"]])
-                rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {cmd}", env=env)
+                rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {pq(cmd)}", env=env)
             else:
                 rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, run=run)
             if rc and not DRY: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
             if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
             u.update(via="pueue", task=int(o.strip() or 0))
+            if not DRY:   # launched means started (or queued for a slot), never a run that died at once
+                st, why = confirm_started(cfg, h, u["task"])
+                if st == "died":
+                    ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "died-at-start")
+                    raise Err(f"the run died at once ({why}); nothing is running")
+                say(f"{name}: run {st}" + (" (waiting for an agents slot)" if st == "queued" else ""))
             unit_tab(cfg, u, mname, hn, h)
         elif local:
             pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd) if not DRY else ("pane", "tab")
@@ -1933,13 +1958,17 @@ def resume_unit(cfg, u, msg, wrapup=False):
         if not DRY: atomic_write(pf, text)
         cmd = shlex.join([sys.executable, str(ORCH_SELF), "api-run", name, "--run", run, "--model", u["model"], "--budget", str(budget),
                           "--brief", u.get("rbrief") or u["brief"], "--cwd", u["rcwd"], "--report", report, "--resume-session", sid, "--prompt-file", str(pf)])
-        rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(u['rcwd'])} --print-task-id -- {cmd}", env=env)
+        rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(u['rcwd'])} --print-task-id -- {pq(cmd)}", env=env)
     else:
         rc, o, e = api_remote(cfg, h, name, mc, u.get("rbrief") or f"{h['root']}/briefs/{name}.md", u["rcwd"], budget, text, env, session=sid, run=run)
     if rc:
         if not DRY: ledger_done(cfg, pv, run, name, 0, "resume-failed")
         raise Err(f"{name}: resume failed: {(e or o).strip()[:120]}")
     if DRY: return f"{name}: would resume session {sid} as run {run} (${budget:g})"
+    st, why = confirm_started(cfg, h, int(o.strip() or 0))
+    if st == "died":
+        ledger_done(cfg, pv, run, name, 0, "died-at-start")
+        raise Err(f"{name}: the resumed run died at once ({why})")
     if old is not None: save_task_log(cfg, h, u, old, remove=True)   # the finished task's log is kept, then the task removed
     u.update(task=int(o.strip() or 0), run=run, runs=[*unit_runs(u), run], resumes=u.get("resumes", 0) + 1, resumed_at=int(now()))
     if wrapup: u["wrapup"] = run
@@ -2772,8 +2801,8 @@ def cmd_run(cfg, a):
     if not rc: rc, o, e = write_cap(cfg, hn, h)
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
     label = f"unit:{unit}" if unit else f"run:{name}"   # unit:<name>: check reports it once that unit is closed (M3)
-    rc, o, e = hrun(h, f"{pueue(h)} add -g {a.lane} -l {shlex.quote(label)} -w {rd} --print-task-id"
-                       + (f" -o {a.priority}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- bash {rd}/{jid}.sh")
+    rc, o, e = hrun(h, f"{pueue(h)} add -g {a.lane} -l {shlex.quote(label)} -w {shlex.quote(rd)} --print-task-id"
+                       + (f" -o {int(a.priority)}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- {pq(['bash', f'{rd}/{jid}.sh'])}")
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
     tid = o.strip()
     wrap = os.environ.get("ORCH_WRAP")   # queued from inside another orch job or gate (a wrapper): record it, so cancel follows (row 49)
@@ -2929,7 +2958,7 @@ def cmd_gate(cfg, a):
         except Err as e: say(f"note: gate not recorded on {unit}: {e}")
     X(h, ensure_lanes(h, cfg))
     tok = f"gate-{re.sub(r'[^A-Za-z0-9_-]', '_', a.name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"   # cancel follows the jobs it queues
-    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l gate:{a.name} -w {shlex.quote(str(cfg.root))} --print-task-id -o {a.priority} -- env ORCH_WRAP={tok} {run}")
+    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l {shlex.quote('gate:' + a.name)} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env ORCH_WRAP={tok} {run}')}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
     if DRY: return
     tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid}")
