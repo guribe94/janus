@@ -8,7 +8,7 @@ from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, wait_shell
 from janus.beads import Beads
 from janus.board import board_dir, board_script
-from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, Run, atomic_write, clean_env, herdr, hrun, now, pending_age, projects, qp,
+from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, Run, atomic_write, clean_env, herdr, hrun, now, pending_age, qp,
     record_session_proc, say, session_alive, sh, slug, ts)
 from janus.hooks import session_start_text
 from janus.ledger import ledger_read, read_secret, spend
@@ -640,7 +640,9 @@ def doctor(cfg, a):
         r(False, f"no janus.toml in {Path.cwd()} or a parent", "janus init"); return 1
     say(f"-- project {cfg.name} ({cfg.root})")
     pl = Path.home() / ".config/janus/projects"
-    listed = any(p.resolve() == cfg.root.resolve() for p in projects())   # item 4: equivalent paths match, and the message follows the fact
+    try: entries = [Path(x) for x in pl.read_text().split()]   # the file the watcher actually reads (install)
+    except OSError: entries = []
+    listed = any(p.resolve() == cfg.root.resolve() for p in entries)   # equivalent paths match, and the message follows the fact
     r(listed or None, f"project {'listed in' if listed else 'not listed in'} {pl}" + ("" if listed else " (the watcher will not visit it)"),
       f"run ./install --project {cfg.root}")
     if not cfg.hosts: r(False, "no [hosts.*] in janus.toml", "add [hosts.<this machine>] local = true")
