@@ -360,6 +360,21 @@ class Park(unittest.TestCase):
         self.assertFalse(orch.wrap_due(cfg, {**u, "state": "working"}))
         (o / "api.json").write_text(json.dumps({"subtype": "success"})); self.assertFalse(orch.wrap_due(cfg, u))
 
+    def test_orphan_jobs(self):
+        """item 3: a job whose owner is gone: closed unit, ended agent not parked, ended wrapper; never an idle herdr agent's or a
+        parked unit's job."""
+        d, cfg = project(); run = lambda: {"status": {"Running": {}}}
+        hs = {"here": {"ok": True, "pueue": {"tasks": {
+            "1": {**run(), "label": "unit:closed"}, "2": {**run(), "label": "unit:api"}, "3": {**run(), "label": "unit:idle"},
+            "4": {**run(), "label": "unit:parked"}, "5": {**run(), "label": "run:x"}, "6": {"status": {"Done": {"result": "Success"}}, "label": "unit:closed"}}}}}
+        units = [{"name": "api", "via": "pueue", "state": "done"}, {"name": "idle", "via": "herdr", "state": "idle"},
+                 {"name": "parked", "via": "pueue", "state": "parked", "_park": ["here:4"]}]
+        wd = d / ".orch/runs/wrap"; wd.mkdir(parents=True); (wd / "w-1").write_text("here:5 x-1\n")   # its wrapper is not running
+        got = dict(orch.orphan_jobs(cfg, hs, units))
+        self.assertEqual(sorted(got), ["here:1", "here:2", "here:5"], got)
+        self.assertEqual(orch.stop_job_cmd({"runner": "podman"}, "j1").split(";")[0], "podman stop -t 5 orch-run-j1 >/dev/null 2>&1")
+        self.assertIn("orch-j1.scope", orch.stop_job_cmd({}, "j1"))
+
     def test_resume_argv_and_no_ack(self):
         mc = {"api_id": "x"}
         a = orch.api_argv({}, mc, 1, "go", "S1")

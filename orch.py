@@ -1020,6 +1020,10 @@ def collect_findings(cfg, hs, units, ag, bd_err):
                           "resume it with a larger --budget (--resume-of keeps its report)"))
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}"))
+    seen = {k for k, _ in F}
+    for r, why in orphan_jobs(cfg, hs, units):   # the watcher cancels these (item 3); check only reports them
+        k = f"orphan:job:{r}"
+        if k not in seen: F.append((k, f"orphan job {r}: {why}; the watcher cancels it (orch cancel {r})"))
     cfg.jput("running.json", {"n": running})
     if cfg.caps.get("total") is not None and len(units) > cfg.caps["total"]: F.append(("cap:total", f"{len(units)} agents over total cap {cfg.caps['total']}"))
     for n, c in cfg.caps.get("host", {}).items():
@@ -2455,7 +2459,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     synced worktree of that name. Per host (orch.toml): run_env (shell run first), job_setup (shell run in the worktree before
     the command), job_log (a line per job start/end), and for runner = "podman" the [hosts.<h>.container] settings."""
     q = shlex.quote; rd = h["_rd"]; sub = a.subdir or "."; sub_ = lambda x: str(x).replace("{name}", name).replace("{jid}", jid)
-    head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={q(rd)}; R=$RD/{jid}\n"
+    head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={q(rd)}; R=$RD/{jid}\nexport ORCH_WRAP={jid}   # orch run inside records the jobs it queues under this (cancel follows them)\n"
     setup = h.get("job_setup", ""); log = h.get("job_log", h.get("fleet_log", "/dev/null"))
     adm = ADMIT % {"lane": a.lane, "clsrc": clsrc or q(cmd), "jid": jid}
     if h.get("local"):
@@ -2572,6 +2576,10 @@ def cmd_run(cfg, a):
                        + (f" -o {a.priority}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- bash {rd}/{jid}.sh")
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
     tid = o.strip()
+    wrap = os.environ.get("ORCH_WRAP")   # queued from inside another orch job or gate (a wrapper): record it, so cancel follows (row 49)
+    if wrap and re.fullmatch(r"[\w.-]+", wrap):
+        wd = cfg.f("runs") / "wrap"; wd.mkdir(parents=True, exist_ok=True)
+        with open(wd / wrap, "a") as f: f.write(f"{hn}:{tid} {jid}\n")
     print(f"orch: queued {hn}:{tid} ({a.lane}, {label}) job {jid}; collect with: orch collect {hn}:{tid}", file=sys.stderr)
     if a.no_wait: say(f"{hn}:{tid}"); return
     return finish_job(cfg, hn, h, tid, jid)
@@ -2592,15 +2600,78 @@ def tree_guard(cfg, wt):
     return None
 
 def cmd_cancel(cfg, a):
-    """Cancel an orch job (<host>:<task>) that outlived its intent (issue 36): pueue kill and remove, its runs files kept."""
-    hn, _, tid = a.job.partition(":")
+    """Cancel an orch job (<host>:<task>) that outlived its intent (issue 36): see cancel_job."""
+    for l in cancel_job(cfg, a.job, force=a.force): say(l)
+
+WRAP_RX = re.compile(r"\bORCH_WRAP=([\w.-]+)")
+
+def wrap_token(t):
+    """The token under which a task records the jobs it queues: its job id (job scripts), or ORCH_WRAP=<token> (gates)."""
+    m = WRAP_RX.search((t or {}).get("command", "")); return m.group(1) if m else job_of(t)
+
+def wrapped_jobs(cfg, tok):
+    try: return [l.split()[0] for l in (cfg.f("runs") / "wrap" / tok).read_text().splitlines() if l.strip()]
+    except OSError: return []
+
+def stop_job_cmd(h, jid):
+    """Shell that stops what a job left behind, by name: its podman container (runner podman) or its systemd scope (Linux)."""
+    if not jid or h.get("local"): return ""
+    if h.get("runner") == "podman": return f"podman stop -t 5 orch-run-{jid} >/dev/null 2>&1; "
+    return f"systemctl --user stop orch-{jid}.scope >/dev/null 2>&1; "
+
+def cancel_job(cfg, ref, force=False, depth=0):
+    """Cancel job <host>:<task>: its files are saved here first (runs/<jid>.*; refused when that fails, unless force: nothing is
+    removed before it is collected), then pueue kill and remove, then its container or scope is stopped by name, and every job
+    it queued itself (a wrapper: a gate or a job whose script ran orch run; row 49) is cancelled the same way."""
+    hn, _, tid = ref.partition(":")
     if hn not in cfg.hosts or not tid.isdigit(): raise Err("expected <host>:<task id>")
     h = cfg.hosts[hn]; t = task_status(h, tid)
     if t is None: raise Err(f"no task {tid} on {hn}")
     if t.get("group") not in LANES and not str(t.get("label", "")).startswith(("unit:", "run:", "gate:")): raise Err(f"{hn}:{tid} is not an orch lane job ({t.get('label')}); stop units with orch stop")
-    if DRY: say(f"+ {pueue(h)} kill {tid}; remove"); return
-    hrun(h, f"{pueue(h)} kill {tid} 2>/dev/null; sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true")
-    say(f"cancelled {hn}:{tid} ({t.get('label')}); its log stays in {runs_dir(cfg, h)}")
+    jid = job_of(t); tok = wrap_token(t); inner = wrapped_jobs(cfg, tok) if tok else []; out = []
+    if DRY:
+        out.append(f"+ save {hn}:{tid}'s files; {stop_job_cmd(h, jid)}{pueue(h)} kill {tid}; remove" + (f"; then follow its jobs {', '.join(inner)}" if inner else ""))
+    else:
+        if jid and not h.get("local"):
+            loc = cfg.f("runs"); loc.mkdir(exist_ok=True)
+            r = sh(["rsync", "-a", "-e", " ".join(SSH), f"{h['ssh']}:{runs_dir(cfg, h)}/{jid}.*", f"{loc}/"], timeout=300)
+            if r[0] and not force: raise Err(f"refused: {hn}:{tid}'s files could not be saved here ({r[2].strip()[-80:]}); --force cancels anyway")
+        elif not jid: save_task_log(cfg, h, {"name": f"_cancelled/{hn}-{tid}"}, tid)
+        hrun(h, f"{pueue(h)} kill {tid} 2>/dev/null; {stop_job_cmd(h, jid)}sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true", timeout=60)
+        out.append(f"cancelled {hn}:{tid} ({t.get('label')}); its files are in {cfg.f('runs') if jid and not h.get('local') else runs_dir(cfg, h) if jid else cfg.p('out', 'out') / '_cancelled'}")
+    for r in inner:
+        if depth > 3: break
+        try:
+            st = task_rc(task_status(cfg.hosts[r.split(':')[0]], r.split(':')[1])) if r.split(":")[0] in cfg.hosts else 0
+            if st is None: out += cancel_job(cfg, r, force, depth + 1)
+        except Err as e: out.append(f"{r}: {e}")
+    return out
+
+def agent_ended(u):
+    """The unit's agent is gone: an API run ended, a tmux session or herdr agent is gone (an idle herdr agent is alive)."""
+    return u.get("state") == "gone" if u.get("via") == "herdr" else u.get("state") in ENDED
+
+def orphan_jobs(cfg, hs, units):
+    """Jobs whose owner is gone (item 3): [(ref, why)]. A lane job of a closed unit, or of an open unit whose agent ended and is
+    not parked; a job a wrapper queued (row 49) whose wrapper is no longer queued or running here."""
+    names = {u["name"]: u for u in units}; out = []
+    for hn, p in hs.items():
+        for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items():
+            lab = t.get("label") or ""
+            if task_rc(t) is not None or not lab.startswith("unit:"): continue
+            u = names.get(lab[5:])
+            if not u: out.append((f"{hn}:{tid}", f"its unit {lab[5:]} is closed"))
+            elif agent_ended(u) and not u.get("_park") and not u.get("parked"): out.append((f"{hn}:{tid}", f"its unit {u['name']}'s agent ended ({u['state']}) and is not parked"))
+    live = {wrap_token(t) for p in hs.values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values() if task_rc(t) is None}
+    try: recs = list((cfg.f("runs") / "wrap").iterdir())
+    except OSError: recs = []
+    for f in recs:
+        if f.name in live: continue
+        for r in wrapped_jobs(cfg, f.name):
+            st = job_state(hs, r)[0]
+            if st in ("queued", "admission", "running") and r not in {x for x, _ in out}: out.append((r, f"its wrapper {f.name} has ended"))
+            # records of wrappers that ended long ago and whose jobs are done are cleared by the watcher
+    return out
 
 def job_of(t):
     m = re.search(r"/runs/([^/ ]+)\.sh", (t or {}).get("command", ""))
@@ -2655,7 +2726,8 @@ def cmd_gate(cfg, a):
             if a.name not in u.get("gates", []): u["gates"] = [*u.get("gates", []), a.name]; bd.save(u)
         except Err as e: say(f"note: gate not recorded on {unit}: {e}")
     X(h, ensure_lanes(h, cfg))
-    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l gate:{a.name} -w {shlex.quote(str(cfg.root))} --print-task-id -o {a.priority} -- {run}")
+    tok = f"gate-{re.sub(r'[^A-Za-z0-9_-]', '_', a.name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"   # cancel follows the jobs it queues
+    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l gate:{a.name} -w {shlex.quote(str(cfg.root))} --print-task-id -o {a.priority} -- env ORCH_WRAP={tok} {run}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
     if DRY: return
     tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid}")
@@ -3293,6 +3365,12 @@ def cmd_watch(cfg, a):
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (orch-fixes9)
+    for r, why in orphan_jobs(cfg, hs, units):   # nothing whose owner is gone keeps running or waiting (item 3)
+        try: log(f"orphan {r} ({why}): " + "; ".join(cancel_job(cfg, r)))
+        except Err as e: log(f"orphan {r} ({why}): not cancelled: {e}")
+    live = {wrap_token(t) for p in hs.values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values() if task_rc(t) is None}
+    for f in (cfg.f("runs") / "wrap").glob("*") if (cfg.f("runs") / "wrap").is_dir() else []:   # finished wrappers' records, after a day
+        if f.name not in live and now() - f.stat().st_mtime > 86400 and all(job_state(hs, r)[0] in ("done", "gone") for r in wrapped_jobs(cfg, f.name)): f.unlink()
     # [fill] watcher = true (owner autonomy: "launch within capacity"): launch ready backlog units up to capacity, at most every
     # [fill] every_min (default 10) minutes, only when check found something that fits (idle-with-backlog)
     fc = cfg.c.get("fill", {})
@@ -3380,7 +3458,7 @@ def main():
     add("gate", A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $ORCH_UNIT)"), A("--priority", type=int, default=10),
         A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"),
         A("--allow-unmerged", action="store_true", help="gate a tree mid-merge, with conflict markers or far behind the landing branch"), dry=True)
-    add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), dry=True)
+    add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", A("--max", type=int, help="launch at most this many"), dry=True)
     add("land", A("unit"), A("--no-gate", action="store_true", help="skip the final gate (it is still refused mid-merge)"),
         A("--no-dispatch", action="store_true", help="on a conflict, only say what merge unit to dispatch"), dry=True)
