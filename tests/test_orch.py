@@ -423,6 +423,36 @@ class Report(unittest.TestCase):
         self.assertIn("report-due", [k for k, _ in orch.report_findings(cfg, [])])
         cfg.touch("report_sent"); self.assertNotIn("report-due", [k for k, _ in orch.report_findings(cfg, [])])
 
+class FalseFindings(unittest.TestCase):
+    """item 7: findings that were false."""
+    def test_localtest_skips_a_shim_whose_child_is_orch_run(self):
+        d, cfg = project(); cfg._viol = []
+        shim = " 10     1    10   0.0    01:00 sh -c run-tests.sh cargo test -p x\n"
+        self.assertIn("localtest:10", [k for k, _ in orch.proc_findings(cfg, shim)])          # a build outside the lanes: flagged
+        child = shim + " 11    10    10   0.0    00:59 python3 /x/orch.py run --host h --wt /w -- cargo test -p x\n"
+        self.assertNotIn("localtest:10", [k for k, _ in orch.proc_findings(cfg, child)])     # its child is orch run: a lane call
+
+    def test_git_dirty_ignores_state_files(self):
+        d, cfg = project(); g = lambda *x: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *x], capture_output=True)
+        (d / ".orch/acks.json").write_text("{}"); g("init", "-q"); g("add", "-A"); g("commit", "-qm", "a")
+        (d / ".orch/acks.json").write_text('{"x": 1}'); (d / ".orch/open.json").write_text("{}")   # an ack, a check: orch's own
+        self.assertNotIn("git:dirty", [k for k, _ in orch.git_findings(cfg)])
+        (d / ".orch/history.md").write_text("notes\n")                                       # the orchestrator's notes count
+        self.assertIn("git:dirty", [k for k, _ in orch.git_findings(cfg)])
+
+    def test_idle_lane_uses_the_admission_verdict(self):
+        """row 48: jobs admitted inside their scripts (waiting there) are held by admission: the lane is not idle."""
+        d, cfg = project('\n[capacity]\nmin_disk_gb = 100000\n'); h = cfg.hosts["here"]
+        p = orch.probe("here", h, ro=True, cfg=cfg)
+        self.assertIn("disk", p["cap_admit"])                      # the admission's own verdict: blocked by the disk floor
+        p["pueue"] = {"groups": {"jobs": {"status": "Running", "parallel_tasks": 4}}, "tasks": {
+            "1": {"group": "jobs", "status": {"Running": {}}, "label": "unit:u"}, "2": {"group": "jobs", "status": {"Queued": {}}, "label": "unit:u"}}}
+        p["wait_jobs"] = "1"
+        self.assertEqual([k for k, _ in orch.lane_findings(cfg, {"here": p}) if k.startswith("idle:")], [])
+        p["wait_jobs"] = "0"; p["cap_admit"] = "yes"   # nothing held by admission, it would admit one, pueue's limit holds the queue: idle
+        p["pueue"]["groups"]["jobs"]["parallel_tasks"] = 1
+        self.assertIn("idle:here:jobs", [k for k, _ in orch.lane_findings(cfg, {"here": p})])
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         import re
