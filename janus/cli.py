@@ -6,6 +6,7 @@ from janus.actions.jobs import LANES
 from janus.context import Cfg, Err, Run, find_root, projects, say, session_root
 from janus.decisions import cmd_answer, cmd_ask, cmd_decide, cmd_decisions
 from janus.hooks import cmd_hook
+from janus.issue import cmd_issue
 from janus.memory import MEM_SECTIONS
 from janus.setup import doctor, init_project
 from janus.actions.backlog import cmd_backlog, cmd_fill
@@ -22,7 +23,7 @@ from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
 WRITERS = {"ack", "launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
-           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report"}
+           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue"}
 
 def cmd_resume(cfg, a):
     """janus resume: a parked unit when one is named, else the orchestration itself (janus/setup.cmd_resume_orch): continue it
@@ -39,7 +40,7 @@ def main():
         if dry: p.add_argument("--dry-run", action="store_true")
         return p
     A = lambda *n, **k: (n, k)
-    add("check", cmd_check, A("--brief", action="store_true"), A("--escalate", action="store_true"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent, ackable, open_since)"))
+    add("check", cmd_check, A("--brief", action="store_true"), A("--escalate", action="store_true"), A("--acked", action="store_true", help="list the findings a live ack is hiding (key, decision, age, ttl)"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent, ackable, open_since)"))
     add("hosts", cmd_hosts, A("--refresh", action="store_true", help="discover every host again now"), A("--json", action="store_true"))
     add("capacity", cmd_capacity); add("status", cmd_status); add("watch", cmd_watch, A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"),
         A("--reset", action="store_true", help="the Stop hook's context reset: /clear once the turn ended, then the wake prompt"))
@@ -102,6 +103,8 @@ def main():
         A("--topic", help="the regex each reads in the other's transcript (default: a path named in --why)"), dry=True)
     add("quality", cmd_quality, A("action", choices=["lint", "review"], help="lint: a brief alone; review: the pre-landing review"),
         A("arg", nargs="?", help="lint: a brief path or unit name; review: the unit"), A("--override", help="review: accept the findings with this reason"), dry=True)
+    add("issue", cmd_issue, A("text", help="what happened, in generic terms (no project, host or person)"),
+        A("--evidence", help="a path, commit sha or job the row points at"), A("--key", help="a finding key the row is for; a row for the same key is written once"), dry=True)
     add("soak", cmd_soak, A("--minutes", type=float, default=1.0, help="run this many minutes (0: one pass)"),
         A("--live", action="store_true", help="also run one watcher pass (default: read-only)"))
     add("transcript", cmd_transcript, A("unit"), A("--grep", help="only the lines matching this regex (case-insensitive)"), A("--tail", type=int, default=40, help="the last N lines (0: all)"))
