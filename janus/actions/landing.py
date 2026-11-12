@@ -35,7 +35,7 @@ def cmd_gate_exec(cfg, a):
     for w in ("failed", "passed"): (od / f"{w}.txt").unlink(missing_ok=True)
     t0 = now(); lim = (a.timeout_min or 0) * 60 or None
     c = a.command[1:] if a.command[:1] == ["--"] else a.command
-    p = subprocess.Popen(["sh", "-c", c[0] if len(c) == 1 else shlex.join(c)], start_new_session=True)
+    p = subprocess.Popen(["sh", "-c", "--", c[0] if len(c) == 1 else shlex.join(c)], start_new_session=True)
     try: rc = p.wait(timeout=lim)
     except subprocess.TimeoutExpired:
         try: os.killpg(p.pid, signal.SIGTERM); p.wait(timeout=20)

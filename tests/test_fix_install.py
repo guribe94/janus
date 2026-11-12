@@ -528,6 +528,14 @@ class Item26GateExec(unittest.TestCase):
         self.assertLess(time.time() - t0, 15)
         self.assertIn("land-u2-x EXIT_timeout=124 RESULT: FAIL", (d / "out/gates.log").read_text())
 
+    def test_a_gate_command_that_starts_with_a_dash_runs_intact(self):
+        """Catches (finding 8): the wrapper ran `sh -c <cmd>`; when the command string starts with `-` (`-v x=1 true`), sh read
+        it as its OWN option and died with 'sh: - : invalid option' (exit 2) -- no gate step ran at all."""
+        d, _ = project()
+        r = self.gate_exec(d, "land-u3-x", "--timeout-min", "0", "--", "-v x=1 true; printf ran > out/marker")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual((d / "out/marker").read_text(), "ran")
+
 
 class FakeBeads:
     """A beads stand-in for a launch fixture: no database, no unit ever recorded."""
