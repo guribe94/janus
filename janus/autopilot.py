@@ -82,6 +82,7 @@ def relaunch(cfg, u, cause, log):
 def ending(cfg, u):
     """Why a finished unit is relaunched: 'capped' (its wrap-up run ended too), 'crashed' (ended with no verdict), or None."""
     if not agent_ended(u) or u.get("_park") or u.get("parked") or u.get("relaunched") or u.get("via") in ("failed", "starting"): return None
+    if u.get("resumable") or u.get("resume_limit"): return None   # budget-follow item 7: resumed in its own session, or left to the orchestrator
     if u.get("wrapup") and u.get("wrapup") == u.get("run") and not str(u.get("verdict") or "").startswith("VERDICT: DONE"): return "capped"
     if u.get("verdict"): return None
     if api_out(cfg, u).get("subtype") == "error_max_budget_usd": return None   # wrap_due: tend_parked wraps it up first

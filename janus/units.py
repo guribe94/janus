@@ -189,7 +189,7 @@ def unit_spent(cfg, u, wrapup=False):
     if "ledger" not in pv: return 0.0
     runs = ledger_read(cfg, pv)[0]
     return sum((r["cost"] or 0.0) if r["done"] else budget_of(cfg, r["budget"] or 0.0) for k in unit_runs(u)
-               if (r := runs.get(k)) and (wrapup or k != u.get("wrapup")))
+               if (r := runs.get(k)) and (wrapup or (k != u.get("wrapup") and k not in u.get("wrapups", []))))
 
 def api_out(cfg, u):
     try: return json.loads((cfg.p("out", "out") / u["name"] / "api.json").read_text())

@@ -204,9 +204,11 @@ OUTCOMES = (("verdict", "finished with a verdict"), ("capped-partial", "capped, 
 
 def unit_need(cfg, u):
     """Dollars an open API unit still needs to finish: its budget minus what its runs used (a still-open run counts at its
-    budget, so a unit in its first run needs nothing more); 0 once it has a final verdict."""
-    if cfg.models.get(u.get("model"), {}).get("kind") != "api" or not u.get("budget") or verdict(cfg, u): return 0.0
-    return max(0.0, round(u["budget"] - unit_spent(cfg, u), 2))
+    budget, so a unit in its first run needs nothing more); 0 once it has a final verdict. A unit stopped by its budget and
+    recorded resumable (item 7) needs the new budget it was recorded with, whatever its wrap-up wrote."""
+    if cfg.models.get(u.get("model"), {}).get("kind") != "api" or not u.get("budget"): return 0.0
+    if u.get("resumable"): return max(0.0, round(u["budget"] - unit_spent(cfg, u), 2), float(u["resumable"].get("need") or 0))   # item 7
+    return 0.0 if verdict(cfg, u) else max(0.0, round(u["budget"] - unit_spent(cfg, u), 2))
 
 def finish_reserve(cfg, provider, units=None, but=()):
     """(dollars, {unit: dollars}): what the provider's open units still need to finish, without the units named in but. Each
@@ -222,6 +224,12 @@ def finish_reserve(cfg, provider, units=None, but=()):
 def names_some(need, n=4):
     L = sorted(need, key=lambda k: -need[k])
     return ", ".join(f"{k} ${need[k]:.2f}" for k in L[:n]) + (f", {len(L) - n} more" if len(L) > n else "")
+
+def fits_cap(cfg, mc, name, budget, units=None, but=()):
+    """Whether a $budget run of unit name fits under its provider's cap beside the other open units' reserve (True: no cap)."""
+    pv = cfg.prov.get(mc.get("provider"), {})
+    if not pv.get("cap_usd") or "ledger" not in pv: return True
+    return committed(cfg, pv) + finish_reserve(cfg, mc["provider"], units, (name, *but))[0] + reserved(cfg, budget) <= pv["cap_usd"]
 
 def finish_refusal(cfg, mc, name, budget, units=None, but=()):
     """Why a new $budget run of the provider is refused for the finish reserve (None: it fits, or no cap is set)."""
