@@ -394,6 +394,34 @@ class Item10GiveUpResidues(unittest.TestCase):
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("a gates job is waiting", out, out)
 
+    def test_the_gate_yield_names_the_gates_own_cause_and_does_not_repeat(self):
+        """Catches (finding H): the yield line repeated on every poll in which the host's load figure changed (the whole
+        admission line was the compare key), and the cause shown was this job's own admission view, not the gate's."""
+        import argparse
+        d, cfg = project('\n[capacity]\nmin_disk_gb = 0\n')
+        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
+        rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True)
+        (rd / "cap.sh").write_text(
+            'cap_class() { echo "$1"; }\ncap_secs() { echo 60; }\ncap_mb() { echo 256; }\ncap_cores() { echo 1; }\n'
+            'admit_ok() { n=$(cat "$RD/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$RD/n";\n'
+            '  case "$1" in gate) why="GATECAUSE$n"; return 1;; *) why="JOBCAUSE$n"; return 0;; esac; }\n')
+        gate = subprocess.Popen(["sleep", "30"])
+        (rd / "g.gwait").write_text(f"{gate.pid} 60 {int(time.time())} 256 1\n")
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-4")
+        p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "3600"})
+        p.stdin.write(js); p.stdin.close()
+        try:
+            out, _ = p.communicate(timeout=30)
+        finally:
+            gate.kill(); p.kill()
+        self.assertEqual(p.returncode, 121, out)
+        self.assertIn("GATECAUSE", out, "the gate's own admission cause was not named: " + out)
+        self.assertNotIn("JOBCAUSE", out, "this job's own admission view was shown: " + out)
+        self.assertEqual(out.count("janus: waiting for admission"), 1, "the yield line repeated as the figures changed: " + out)
+
 
 class Item8ResumeDryRun(unittest.TestCase):
     def test_dry_run_says_would_prompt(self):
