@@ -6,7 +6,7 @@ import json, os, re, shlex, sys
 from pathlib import Path
 from janus.beads import Beads
 from janus.reset import stop_reset
-from janus.context import (Cfg, Err, atomic_write, JANUS_MARK, find_root, handoff_path, handoff_stale, note_event, now, record_session_proc,
+from janus.context import (CLAIM_WINDOW, Cfg, Err, atomic_write, JANUS_MARK, find_root, handoff_path, handoff_stale, note_event, now, pending_age, record_session_proc,
     session_alive, session_root, sh, ts)
 from janus.decisions import session_text as decisions_text
 from janus.memory import memory_text
@@ -405,7 +405,7 @@ def cmd_hook(ev):
     if not sid: return
     # The project is the one whose registered session this is, wherever the session's shell is (H3). Only a pending
     # registration (janus register without a session id, or the watcher's new orchestrator) is claimed from the cwd, within
-    # 10 min. The watcher records the pane it started the new orchestrator in (pending:<ts>:<pane>, panel-eng F5): only a hook
+    # CLAIM_WINDOW (10 min). The watcher records the pane it started the new orchestrator in (pending:<ts>:<pane>, panel-eng F5): only a hook
     # in that pane claims it. No pane recorded (janus register): the old behaviour. No variable (JANUS_ROLE) takes a
     # registration over (H4).
     root = session_root(sid)
@@ -413,8 +413,8 @@ def cmd_hook(ev):
         root = find_root(d.get("cwd"))
         if not root: return
         cfg = Cfg(root); reg = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
-        parts = reg.split(":", 2); ts = parts[1] if len(parts) > 1 else ""; pane = parts[2] if len(parts) > 2 else ""
-        if not (parts[:1] == ["pending"] and ts.isdigit() and now() - int(ts) < 600): return
+        parts = reg.split(":", 2); pane = parts[2] if len(parts) > 2 else ""; age = pending_age(reg)
+        if age is None or age >= CLAIM_WINDOW: return
         if pane and os.environ.get("HERDR_PANE_ID") != pane: return
         atomic_write(cfg.f("session"), sid); atomic_write(cfg.f("session_kind"), hook_kind(d) + "\n")
         record_session_proc(cfg)
