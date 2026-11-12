@@ -1,6 +1,6 @@
 # Issue register
 
-Every problem met with the orchestrating skill, fixed at its root cause in the skill (generic, shareable). The live part is
+Every problem met with the janus skill, fixed at its root cause in the skill (generic, shareable). The live part is
 the open-risks table below; everything fixed is kept as history in the changelog at the end, so a maintainer can tell a known
 risk from a closed one. Status: **fixed (round)** = fixed in code, with the proof named; **verify** = believed fixed, still to
 be seen working live; **open** = not fixed yet, with the reason. First filled 2026-11-11 (orch-fixes7) from the owner's
@@ -13,13 +13,13 @@ register.
 | 1 | Agents run with the owner's full identity: no sandbox, `--dangerously-*` permissions, the API key in their environment | an isolation decision (separate user or container) is the owner's; the key-injection proxy and the agent-side hook policy are not built |
 | 2 | `check` and the watcher both mutate state with no writer lock; `jput`/`touch` are not atomic | a kill during a state write silently resets acks, open problems, the Stop counter and learned posts; `tests/test_state.py` pins the atomic fix as an expected failure |
 | 3 | An interactive agent cannot park: its Stop hook demands a verdict where parking needs a `WAITING` line and no verdict | the park-aware Stop predicate is not built; API agents escape only because `--bare` skips hooks |
-| 4 | `orch close` does not refuse while the unit's jobs still run | closing deletes the tree under a queued job; results land in a removed tree |
-| 5 | Abandoned runs pin budget until `orch ledger reconcile` is run | no automatic age/no-live-task settle; the live project held ~$24 of a $255 cap |
+| 4 | `janus close` does not refuse while the unit's jobs still run | closing deletes the tree under a queued job; results land in a removed tree |
+| 5 | Abandoned runs pin budget until `janus ledger reconcile` is run | no automatic age/no-live-task settle; the live project held ~$24 of a $255 cap |
 | 6 | Gates are unmodeled: no per-step timing, retry budget or full affected-scope selection | `gate-scope`, `known_failures` and `gate_timeout_min` landed; the model does not |
 | 7 | The orchestrator is the throughput ceiling (60 ready items with no brief) | no brief-writer loop; a cheap model writing briefs from the checklist is not built |
 | 8 | CPU is reserved by a per-host scalar, never measured or bound (`-j`/`CARGO_BUILD_JOBS` not set, no CPU-seconds) | memory is learned per class; CPU is guessed |
-| 9 | No utilisation or queue-wait metrics | "use every machine" is unprovable; `orch report` reports dollars, not cores or waits |
-| 10 | `orch land` blocks the caller for the length of a gate and never pushes the landing branch | a Bash timeout strands a half-landed branch; a landing can sit only on the Mac with every check silent |
+| 9 | No utilisation or queue-wait metrics | "use every machine" is unprovable; `janus report` reports dollars, not cores or waits |
+| 10 | `janus land` blocks the caller for the length of a gate and never pushes the landing branch | a Bash timeout strands a half-landed branch; a landing can sit only on the Mac with every check silent |
 | 11 | The hooks do not stop hand-run builds/tests (only destructive operations) | the role's core rule is detected after the fact; nothing denies `cargo test` by hand |
 | 12 | Board posts and `learned` proposals flow into `MEMORY.md` and every brief with no provenance | an unauthenticated channel into all future agents; no "treat as data" framing |
 

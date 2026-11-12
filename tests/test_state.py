@@ -1,6 +1,6 @@
 """State files survive a crash mid-write (section 7, Step 0 / seam 2).
 
-Cfg.jput writes straight to the file today (orch.py:52-53), so a kill during the write leaves truncated JSON and jget silently
+Cfg.jput writes straight to the file today (janus.py:52-53), so a kill during the write leaves truncated JSON and jget silently
 returns {} — every ack, open problem, the 3-strike Stop counter and learned.json reset without a word. This test injects a crash
 into the write of a new value and asserts the previous value is still on disk. It is an expected failure until jput writes a temp
 file and renames it (the writer-lock/atomic-state seam); then it flips to a real guard. Standard library only; no network."""
@@ -8,20 +8,20 @@ import json, os, tempfile, textwrap, unittest
 from pathlib import Path
 from unittest import mock
 
-from orchload import load
+from janusload import load
 
-orch = load()
+janus = load()
 
 
 def project():
-    d = Path(tempfile.mkdtemp(prefix="orch-test-"))
-    (d / "orch.toml").write_text(textwrap.dedent('''
+    d = Path(tempfile.mkdtemp(prefix="janus-test-"))
+    (d / "janus.toml").write_text(textwrap.dedent('''
         [project]
         name = "t"
         [hosts.here]
         local = true
         '''))
-    return d, orch.Cfg(d)
+    return d, janus.Cfg(d)
 
 
 class State(unittest.TestCase):
@@ -47,7 +47,7 @@ class State(unittest.TestCase):
 class UnitRecord(unittest.TestCase):
     def test_v1_record_migrates_to_v2(self):
         """A v1 record (launch wrote only run; a resume added runs) reads as v2: every run id in runs, the current one last."""
-        r = lambda notes: orch.unit_record({"notes": json.dumps(notes) if isinstance(notes, dict) else notes})
+        r = lambda notes: janus.unit_record({"notes": json.dumps(notes) if isinstance(notes, dict) else notes})
         self.assertEqual(r({"run": "u.1"}), {"run": "u.1", "runs": ["u.1"], "v": 2})
         self.assertEqual(r({"run": "u.r2.9", "runs": ["u.1"]})["runs"], ["u.1", "u.r2.9"])
         self.assertEqual(r({"v": 2, "run": "x", "runs": ["x"], "host": "h"}), {"v": 2, "run": "x", "runs": ["x"], "host": "h"})
