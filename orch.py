@@ -62,7 +62,9 @@ SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.I)
 
 def clean_env(extra=None):
     e = {k: os.environ[k] for k in ENV_KEEP if k in os.environ}
-    e["PATH"] = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:/usr/local/bin:" + e.get("PATH", "/usr/bin:/bin")
+    # /usr/sbin and /sbin always: launchd gives the watcher a PATH without them, and the macOS probe's sysctl lives there
+    # (issue 3: the probe read 0.0 GB and an empty load under the watcher)
+    e["PATH"] = os.path.expanduser("~/.local/bin") + ":/opt/homebrew/bin:/usr/local/bin:" + e.get("PATH", "/usr/bin:/bin") + ":/usr/bin:/bin:/usr/sbin:/sbin"
     return {**e, **{k: str(v) for k, v in (extra or {}).items()}}
 
 def sh(cmd, cwd=None, inp=None, timeout=25, env=None, clean=False):
@@ -190,7 +192,7 @@ class Beads:
     def comment(self, i, text): sh(["bd", "comments", "add", i, text], cwd=self.cfg.beads)
 
 # ---------------------------------------------------------------- hosts: one probe per host
-PROBE = r'''PATH="$HOME/.local/bin:%(bin)s:$PATH"
+PROBE = r'''PATH="$HOME/.local/bin:%(bin)s:$PATH:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ "$(uname)" = Darwin ]; then
  # Two readings, the larger wins: the kernel's free level (memory_pressure's "free percentage", read straight from sysctl, no
  # tool run under load) and vm_stat's free + inactive + speculative + purgeable pages. Under load one of them can read 0
@@ -280,7 +282,8 @@ def room(cfg, name, p, units, cleanup=False):
 def cap_line(cfg, name, p, units):
     if not p["ok"]: return f"{name} UNREACHABLE ({p['err']})"
     n, why = room(cfg, name, p, units)
-    return (f"{name} room={n} avail={fl(p.get('avail_mb')) / 1024:.1f}G load={p.get('load')} psi={p.get('psi') or '-'} "
+    av = f"{fl(p.get('avail_mb')) / 1024:.1f}G" if p.get("avail_mb") else "unknown(probe gave no memory reading)"
+    return (f"{name} room={n} avail={av} load={p.get('load') or 'unknown'} psi={p.get('psi') or '-'} "
             f"disk={p.get('disk_gb')}G agents={sum(1 for u in units if u.get('host') == name)}" + (f" FULL: {why}" if n < 1 else ""))
 
 # ---------------------------------------------------------------- the API ledger (orch owns it) and the secret store
@@ -674,6 +677,11 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}"))
         elif st in ("done", "failed", "gone", "idle"):
             F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
+            try: aj = json.loads((cfg.p("out", "out") / u["name"] / "api.json").read_text())
+            except Exception: aj = {}
+            if str(aj.get("subtype", "")).startswith("error") and not v:   # issue 32: out of budget (or turns) before the report
+                F.append((f"unit:{u['name']}:budget", f"{u['name']} stopped by its limit ({aj.get('subtype')}, ${aj.get('total_cost_usd', '?')}) without a final verdict: "
+                          "resume it with a larger --budget (--resume-of keeps its report)"))
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}"))
     cfg.jput("running.json", {"n": running})
@@ -688,6 +696,10 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if "ledger" in pv:
             bad = ledger_read(cfg, pv)[1]
             if bad: F.append((f"ledger:{n}", f"{n} ledger {pv['ledger']} is malformed ({len(bad)} problem(s): {bad[0][:90]}); every launch is refused: orch ledger check, orch ledger repair"))
+            runs = ledger_read(cfg, pv)[0]; odd = [k for k, r in runs.items() if r["done"] and r["budget"] and r["cost"] > 2 * r["budget"] + 1]
+            if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
+                F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
+                          + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": orch ledger check"))
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs)
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
@@ -812,6 +824,7 @@ def cmd_ack(cfg, a):
 
 def cmd_register(cfg, a):
     """The only way to change the registered orchestrator session (with the watcher's pending claim for a new one it started)."""
+    if os.environ.get("ORCH_ROLE") == "agent": raise Err("refused: an agent (ORCH_ROLE=agent) cannot register as the orchestrator (issue 2)")
     sid = a.session or next((os.environ[k] for k in ("ORCH_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID") if os.environ.get(k)), None)
     kind = "codex" if os.environ.get("CODEX_THREAD_ID") and not os.environ.get("CLAUDECODE") else "claude"
     old = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
@@ -819,8 +832,10 @@ def cmd_register(cfg, a):
     if DRY: say(f"+ register {sid or 'pending'} ({kind})"); return
     cfg.f("session").write_text(sid or f"pending:{int(now())}"); cfg.f("session_kind").write_text(kind + "\n")
     if sid: record_session_proc(cfg)
-    pid = os.environ.get("HERDR_PANE_ID") or (herdr("pane", "current") or {}).get("pane", {}).get("pane_id")
+    # the caller's own pane only (HERDR_PANE_ID): `herdr pane current` is the focused pane, which is often another (issue 2)
+    pid = os.environ.get("HERDR_PANE_ID")
     if pid: cfg.f("pane").write_text(pid)
+    else: say("note: no HERDR_PANE_ID, so no pane recorded (the watcher then judges by the session's process and transcript)")
     cfg.touch("last_cycle"); cfg.touch("last_ack")
     say("registered " + (sid or "(pending: the next hook event from this session claims it)") + f" ({kind})")
     if cfg.c.get("orchestrator", {}).get("kind", "claude") != kind:
@@ -850,7 +865,8 @@ def pick_model(cfg, tier, kind, of_vendor, host=None):
 
 def agent_prompt(cfg, unit, brief, hn):
     rc, o, e = sh([str(cfg.p("board", "bin/board.sh")), "rule", unit, "mac" if cfg.hosts[hn].get("local") else hn])
-    return (f"Read {brief} and carry out every instruction exactly. Keep REPORT.md (path in the brief) current: line 1 'VERDICT: PENDING' "
+    return (f"Read {brief} and carry out every instruction exactly. Keep REPORT.md (path in the brief) current after every step (a run "
+            f"stopped by its budget must leave its state written): line 1 'VERDICT: PENDING' "
             f"until done, then end with 'VERDICT: DONE' (or BLOCKED) and the real exit codes. {o.strip()}")
 
 def wait_shell(pane, unit):
@@ -948,6 +964,8 @@ def cmd_api_run(cfg, a):
 CLEAN_PUEUE = r'''#!/bin/sh
 # pueue with an allow-listed environment (written by orch): a task never stores the caller's ANTHROPIC_API_KEY or tokens
 real=%(real)s
+# an agent's own `pueue add` gets its unit's label, so orch check never calls it an orphan (issue 24)
+if [ "$1" = add ] && [ -n "$ORCH_UNIT" ]; then case " $* " in *" -l "*|*" --label "*|*" --label="*) ;; *) shift; set -- add -l "unit:$ORCH_UNIT" "$@";; esac; fi
 exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" PATH="$PATH" LANG="${LANG:-C.UTF-8}" SHELL="${SHELL:-/bin/sh}" \
   TMPDIR="${TMPDIR:-/tmp}" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} ${XDG_CONFIG_HOME:+XDG_CONFIG_HOME="$XDG_CONFIG_HOME"} ${ORCH_UNIT:+ORCH_UNIT="$ORCH_UNIT"} ${ORCH_ROLE:+ORCH_ROLE="$ORCH_ROLE"} "$real" "$@"
 '''
@@ -1665,6 +1683,8 @@ def cmd_run(cfg, a):
     src = str(Path(a.wt).resolve()); name = Path(src).name
     if not Path(src).is_dir(): raise Err(f"worktree {src} not found")
     unit = a.unit or os.environ.get("ORCH_UNIT")
+    why = tree_guard(cfg, src)
+    if why and not a.allow_unmerged: raise Err(f"refused: {src} {why} (--allow-unmerged to run anyway)")
     jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
     if DRY: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
     if not h.get("local"): sync_wt(cfg, hn, h, src, name)
@@ -1682,6 +1702,32 @@ def cmd_run(cfg, a):
     print(f"orch: queued {hn}:{tid} ({a.lane}, {label}) job {jid}; collect with: orch collect {hn}:{tid}", file=sys.stderr)
     if a.no_wait: say(f"{hn}:{tid}"); return
     return finish_job(cfg, hn, h, tid, jid)
+
+def tree_guard(cfg, wt):
+    """Why a tree must not be built or gated (issues 33, 41): a merge in progress, conflict markers in changed files, or more
+    than [landing] max_behind (default 10) commits behind the landing branch. None when fine or not a git tree."""
+    g = lambda *x: sh(["git", "-C", str(wt), *x])
+    if g("rev-parse", "--git-dir")[0]: return None
+    if g("rev-parse", "-q", "--verify", "MERGE_HEAD")[0] == 0: return "has a merge in progress (MERGE_HEAD)"
+    rc, o, e = g("diff", "--name-only", "--diff-filter=U")
+    if o.strip(): return f"has unmerged files: {' '.join(o.split()[:3])}"
+    rc, o, e = g("grep", "-n", "-I", "-E", "^(<<<<<<<|>>>>>>>) ", "--", ".")
+    if rc == 0 and o.strip(): return f"has conflict markers ({o.splitlines()[0][:80]})"
+    br = cfg.c.get("landing", {}).get("branch") or "main"; mx = cfg.c.get("landing", {}).get("max_behind", 10)
+    rc, o, e = g("rev-list", "--count", f"HEAD..{br}")
+    if rc == 0 and o.strip().isdigit() and int(o) > mx: return f"is {o.strip()} commits behind {br} (max {mx}): merge {br} first"
+    return None
+
+def cmd_cancel(cfg, a):
+    """Cancel an orch job (<host>:<task>) that outlived its intent (issue 36): pueue kill and remove, its runs files kept."""
+    hn, _, tid = a.job.partition(":")
+    if hn not in cfg.hosts or not tid.isdigit(): raise Err("expected <host>:<task id>")
+    h = cfg.hosts[hn]; t = task_status(h, tid)
+    if t is None: raise Err(f"no task {tid} on {hn}")
+    if t.get("group") not in LANES and not str(t.get("label", "")).startswith(("unit:", "run:", "gate:")): raise Err(f"{hn}:{tid} is not an orch lane job ({t.get('label')}); stop units with orch stop")
+    if DRY: say(f"+ {pueue(h)} kill {tid}; remove"); return
+    hrun(h, f"{pueue(h)} kill {tid} 2>/dev/null; sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true")
+    say(f"cancelled {hn}:{tid} ({t.get('label')}); its log stays in {runs_dir(cfg, h)}")
 
 def job_of(t):
     m = re.search(r"/runs/([^/ ]+)\.sh", (t or {}).get("command", ""))
@@ -2336,9 +2382,11 @@ def main():
     add("run", A("--host", required=True), A("--lane", choices=LANES, default="jobs"), A("--unit"), A("--wt", required=True),
         A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="a job that needs the host's USB devices (container.usb_args, usb_lock)"),
         A("--priority", type=int, default=0), A("--no-wait", action="store_true", help="queue, print <host>:<task>, return"),
+        A("--allow-unmerged", action="store_true", help="run on a tree with a merge in progress, conflict markers or far behind the landing branch"),
         A("command", nargs=argparse.REMAINDER), dry=True)
     add("gate", A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $ORCH_UNIT)"), A("--priority", type=int, default=10),
         A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"), dry=True)
+    add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), dry=True)
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
     add("commit-state", A("-m", "--message", default="orch: state"), dry=True)
     add("ack", A("problem"), A("decision"))
