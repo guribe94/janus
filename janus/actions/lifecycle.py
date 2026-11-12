@@ -253,7 +253,7 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
         return f"{name}: " + ("prompted in its herdr pane" if not cfg.run.dry else "would prompt in its herdr pane")
     if via == "tmux":
         tm = shlex.quote(unit_tmux(u)); X(cfg, h, f"tmux send-keys -t {tm} -l {shlex.quote(text)} && tmux send-keys -t {tm} Enter")
-        return f"{name}: resumed in tmux {unit_tmux(u)} on {u['host']}"
+        return f"{name}: " + (f"resumed in tmux {unit_tmux(u)} on {u['host']}" if not cfg.run.dry else f"would resume in tmux {unit_tmux(u)} on {u['host']} (dry run)")
     if via != "pueue" or mc.get("kind") != "api": raise Err(f"{name}: a unit run via {via} cannot be resumed")
     pv = cfg.prov[mc["provider"]]; od = cfg.p("out", "out") / name
     sid = session_of(cfg, u)
