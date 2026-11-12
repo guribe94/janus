@@ -31,7 +31,8 @@ def unreconciled(cfg, pv, units):
     return out
 
 def parked_findings(cfg, hs, u, pk):
-    """parked:<unit>: a job it waits on can never finish; parked:<unit>:resume: its jobs finished but the resume failed."""
+    """parked:<unit>: a job it waits on can never finish; parked:<unit>:resume: its jobs finished but the resume failed;
+    parked:<unit>:finished: its jobs finished and it is still parked (item 27, the watcher resumes it on its next pass)."""
     js = {j: job_state(hs, j)[0] for j in pk}; F = []
     if any(x in ("paused", "stashed", "locked") for x in js.values()):
         F.append((f"parked:{u['name']}", f"{u['name']} is parked on {', '.join(f'{j} {x}' for j, x in js.items())}: a job that is not queued or running never resumes it: start or re-queue that job, or janus resume --force"))
@@ -39,6 +40,12 @@ def parked_findings(cfg, hs, u, pk):
     if re_ and all(x in ("done", "gone") for x in js.values()):
         F.append((f"parked:{u['name']}:resume", f"{u['name']}'s jobs finished but it cannot be resumed ({re_.get('why', '')[:160]}): "
                   f"janus launch --resume-of {u['name']} with a new budget, or janus close {u['name']}"))
+    elif all(x in ("done", "gone") for x in js.values()):
+        # item 27: its jobs all finished and it is still parked. Only the watcher's next pass would wake it, and check said
+        # nothing about it, so an orchestrator reading check could not see the unit waiting (or wake it). Seen live:
+        # test-exec-race2 sat parked on linux1:182-184 with no resume_error yet, and check was silent.
+        F.append((f"parked:{u['name']}:finished", f"{u['name']}'s job(s) {', '.join(pk)} finished and it is still parked (no verdict): "
+                  f"the watcher resumes it on its next pass; janus resume {u['name']} wakes it now"))
     return F
 
 def budget_findings(cfg, units):
