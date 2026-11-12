@@ -296,6 +296,7 @@ def rewrite_config(path, dry=False):
 # the loop. A loop started with a relative script path is told apart by the process's own cwd (finding 6).
 OLD_ORCH_LOOPS = ("fleet-loops", "handoff-queue", "orch-backup", "wip-snapshot", "watch-stream")
 OLD_ORCH_SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+OLD_ORCH_WRAPS = ("sudo", "doas", "nohup", "setsid", "env", "command", "exec", "caffeinate")   # finding 4: a loop started through one
 
 def _sh_words(cmd):
     """The words of a command line, honouring quotes and backslashes (a script named inside an argument stays one word)."""
@@ -322,24 +323,34 @@ def _proc_cwd(pid):
             if l.startswith("n"): return Path(l[1:])
     return None
 
-def _old_orch_script(pid, w, r):
-    """True when the shell words w run this project's own old loop as their own script: <root>/bin/<loop>.sh, a relative
+def _script_is_ours(script, rest, pid, r):
+    """True when `script` (with its following words `rest`) is this project's own old loop: <root>/bin/<loop>.sh, a relative
     bin/<loop>.sh from a process whose cwd is under the root, or <root>/orch.py watch."""
-    if not w or os.path.basename(w[0]) not in OLD_ORCH_SHELLS or not r: return False
-    i = 1
-    while i < len(w) and w[i].startswith("-"):
-        if "c" in w[i][1:]: return False   # a shell shim whose command string merely names the script (an agent's own shell)
-        i += 1
-    if i >= len(w): return False
-    script = w[i]; base = os.path.basename(script)
+    base = os.path.basename(script)
     if base == "orch.py":
-        return w[i + 1:i + 2] == ["watch"] and Path(script).is_absolute() and Path(script).resolve() == (r / "orch.py")
+        return rest[:1] == ["watch"] and Path(script).is_absolute() and Path(script).resolve() == (r / "orch.py")
     name = base[:-3] if base.endswith(".sh") else base
     if name not in OLD_ORCH_LOOPS: return False
     if Path(script).is_absolute(): return Path(script).resolve() == r / "bin" / f"{name}.sh"
     if script not in (f"bin/{name}.sh", f"./bin/{name}.sh"): return False
     cw = _proc_cwd(pid)
     return bool(cw) and (cw.resolve() == r or cw.resolve().is_relative_to(r))
+
+def _old_orch_script(pid, w, r):
+    """True when the shell words w run this project's own old loop as their own script: <root>/bin/<loop>.sh, a relative
+    bin/<loop>.sh from a process whose cwd is under the root, or <root>/orch.py watch. Finding 4: a loop started through a
+    wrapper (sudo/nohup/env/...) is the loop too; a job waiter or a `sh -c ...` that merely names the script is not."""
+    if not w or not r: return False
+    i = 0
+    while i < len(w) and (os.path.basename(w[i]) in OLD_ORCH_WRAPS or re.match(r"^[A-Za-z_]\w*=", w[i])): i += 1
+    if i >= len(w): return False
+    if _script_is_ours(w[i], w[i + 1:], pid, r): return True   # run directly: `sudo <root>/bin/fleet-loops.sh`
+    if os.path.basename(w[i]) not in OLD_ORCH_SHELLS: return False
+    j = i + 1
+    while j < len(w) and w[j].startswith("-"):
+        if "c" in w[j][1:]: return False   # a shell shim whose command string merely names the script (an agent's own shell)
+        j += 1
+    return j < len(w) and _script_is_ours(w[j], w[j + 1:], pid, r)
 
 def old_orch_procs(ps_text=None, root=None):
     """[(pid, command)] of this machine's running old-orch standing loops (item 14; finding 6): a shell whose own script is
@@ -351,14 +362,21 @@ def old_orch_procs(ps_text=None, root=None):
             if len(f) == 2 and f[0].isdigit() and _old_orch_script(int(f[0]), _sh_words(f[1]), r)]
 
 def live_children(pid):
-    """pids of the process's living children: a handoff-queue worker mid-handoff has its child gate running."""
+    """pids of the process's living children that are real work: a handoff-queue worker mid-handoff has its child gate running.
+    Finding 4: a standing loop idles in `sleep 30` (its only child), which is not work, so TERMing the loop is safe and
+    --retire stops the loops it exists for."""
     rc, o, e = run(["pgrep", "-P", str(pid)], timeout=10)
-    return [int(x) for x in o.split()] if rc == 0 and o.strip() else []
+    if rc or not o.strip(): return []
+    kids = [int(x) for x in o.split()]
+    rc, o, e = run(["ps", "-o", "pid=,comm=", "-p", ",".join(map(str, kids))], timeout=10)
+    if rc or not o.strip(): return kids
+    return [int(l.split()[0]) for l in o.splitlines() if l.strip() and os.path.basename(l.split(None, 1)[1]) != "sleep"]
 
 def retire_old_orch(dry=False, retire=False, ps_text=None, root=None):
     """Item 14: list the old orch's standing processes (the full command line, so the owner can tell a loop from a waiter) and,
     only with the owner's explicit yes (--retire), stop them (TERM). Finding 6: a process that still holds a live child (a
-    handoff-queue worker mid-handoff, whose child gate TERM would orphan) is listed and left alone."""
+    handoff-queue worker mid-handoff, whose child gate TERM would orphan) is listed and left alone. Finding 4: an idle loop's
+    `sleep` child is not work, so the loop is stopped (not kept)."""
     procs = old_orch_procs(ps_text, root)
     if not procs: return []
     out = [f"old orch process {p} still running: {c}" for p, c in procs]

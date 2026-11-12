@@ -330,18 +330,42 @@ class Item6RetireMatch(unittest.TestCase):
 
     def test_retire_keeps_a_mid_handoff_worker_whose_child_gate_runs(self):
         """Catches (finding 6): TERM to a handoff-queue.sh worker mid-handoff orphaned its child gate; the worker is listed but
-        kept while it has a live child."""
+        kept while it has a live child that is real work."""
         ps = (" 101 /bin/zsh /w/proj/bin/fleet-loops.sh\n"
               " 102 /bin/zsh /w/proj/bin/handoff-queue.sh w1 /w/proj/out/handoff-queue\n")
         kills = []
         def fake_run(cmd, **k):
             if cmd[:1] == ["pgrep"]: return 0, ("999\n" if cmd[-1] == "102" else ""), ""
+            if cmd[:1] == ["ps"]: return 0, "999 bash\n", ""
             kills.append(list(cmd)); return 0, "", ""
         real = janus.run; janus.run = fake_run
         try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
         finally: janus.run = real
         self.assertEqual(kills, [["kill", "-TERM", "101"]], "a mid-handoff worker was TERMed, orphaning its child gate")
         self.assertTrue(any("102" in l and "child" in l for l in out), out)
+
+    def test_retire_stops_an_idle_loop_whose_only_child_is_its_sleep(self):
+        """Catches (finding 4): --retire kept EVERY loop with a living child, and a loop that idles in `sleep 30` always has
+        one, so --retire never stopped the loops it exists for."""
+        ps = " 301 /bin/zsh /w/proj/bin/fleet-loops.sh far\n"
+        kills = []
+        def fake_run(cmd, **k):
+            if cmd[:1] == ["pgrep"]: return 0, ("777\n" if cmd[-1] == "301" else ""), ""
+            if cmd[:1] == ["ps"]: return 0, "777 sleep\n", ""
+            kills.append(list(cmd)); return 0, "", ""
+        real = janus.run; janus.run = fake_run
+        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
+        finally: janus.run = real
+        self.assertEqual(kills, [["kill", "-TERM", "301"]], "an idle loop with only a sleep child was kept")
+
+    def test_a_wrapped_loop_is_matched_but_not_a_wrapped_waiter(self):
+        """Catches (finding 4): a loop started through sudo/nohup/env was not listed at all (over-strict matching)."""
+        root = "/Users/x/proj"
+        ps = (" 401 sudo /Users/x/proj/bin/fleet-loops.sh far\n"
+              " 402 nohup /Users/x/proj/bin/orch-backup.sh 30\n"
+              " 403 env FOO=1 /bin/zsh /Users/x/proj/bin/watch-stream.sh\n"
+              " 404 env FOO=1 /usr/bin/python3 /x/janus.py run -- wt -- bash /Users/x/proj/bin/handoff-queue.sh\n")
+        self.assertEqual([p for p, _ in janus.old_orch_procs(ps, root)], [401, 402, 403])
 
 
 class Item15ReadyWork(unittest.TestCase):
