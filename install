@@ -4,7 +4,7 @@ Usage: install [--dry-run] [--project DIR] [--no-hosts] [--hosts-only] [--releas
   (DIR holds orch.toml; default: current directory or a parent)
 
 Releases (orch-fixes7): orch.py, skill/, example.orch.toml and tests/ are copied into ~/.local/share/orch/releases/<version>/
-(read-only), the copy is tested there (tests/test_orch.py against the copy, `--help`, a hook call), and only then
+(read-only), the copy is tested there (every tests/test_*.py against the copy, `--help`, a hook call), and only then
 ~/.local/share/orch/current is switched to it with one atomic rename. ~/.local/bin/orch -> current/orch.py and the skill links
 -> current/skill, so orch.py and the skill change together and nothing ever points at the working tree: an edit in progress
 is never live. A developer runs the checks (./check) and then ./install --release-only to make a change live."""
@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent; HOME = Path.home()
 ap = argparse.ArgumentParser(); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--project"); ap.add_argument("--no-hosts", action="store_true"); ap.add_argument("--hosts-only", action="store_true")
 ap.add_argument("--release-only", "--pin-only", action="store_true", help="only build, test and switch to a new release of orch.py and the skill")
 ap.add_argument("--rollback", action="store_true", help="switch current back to the previous release")
-ap.add_argument("--skip-tests", action="store_true", help="skip tests/test_orch.py (the parse, --help and hook smoke tests still run)")
+ap.add_argument("--skip-tests", action="store_true", help="skip tests/test_*.py (the parse, --help and hook smoke tests still run)")
 A = ap.parse_args(); DRY = A.dry_run
 EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch", "Stop": None}
 ORCH = HOME / ".local/bin/orch"
@@ -60,10 +60,10 @@ def smoke(d):
     for args, inp in ((["--help"], None), (["hook", "PreToolUse"], "{}"), (["hook", "Stop"], "{}")):
         r = subprocess.run(py + args, input=inp, capture_output=True, text=True)
         if r.returncode: return f"orch.py {' '.join(args)} failed: {r.stderr.strip()[-300:]}"
-    if not A.skip_tests and (d / "tests/test_orch.py").is_file():
-        r = subprocess.run([sys.executable, "-m", "unittest", "-q", "tests.test_orch"], cwd=d, capture_output=True, text=True,
+    if not A.skip_tests and (d / "tests").is_dir():   # every tests/test_*.py, against the copy (tests/orchload.py loads its orchkit)
+        r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-q", "-s", "tests", "-p", "test_*.py"], cwd=d, capture_output=True, text=True,
                            env={**os.environ, "ORCH_PY": str(d / "orch.py"), "PYTHONDONTWRITEBYTECODE": "1"})
-        if r.returncode: return "tests/test_orch.py failed:\n" + (r.stderr or r.stdout)[-1500:]
+        if r.returncode: return "tests failed:\n" + (r.stderr or r.stdout)[-1500:]
     return None
 
 def release():

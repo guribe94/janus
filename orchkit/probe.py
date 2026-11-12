@@ -5,9 +5,11 @@ pueue(), margins/room/cap_line. Unreachable hosts degrade to a finding with the 
 from orchkit.context import hrun, qp, fl, sh, now, FIXTURE_MARK
 from orchkit.cap import cap_lib, capv, host_cap
 from orchkit.templates import PROBE, DIRECT_PROBE
-import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
-from pathlib import Path
+import concurrent.futures as cf, json, shlex
 
+# Remote lane enforcement (issue 22): processes on a Linux host whose environment carries ORCH_UNIT (an agent and what it starts),
+# whose command is a build or test, and that do not run under pueued (a lane job): printed as direct=<pid> <pgid> <unit> <secs> <cmd>.
+# Only the topmost such process of a tree is printed; a call of the unit's lane runner (<root>/run/<unit>.lane) is the lane.
 def probe_extra(h):
     """Running orch jobs still waiting in their admission (per lane), the old scripts' queue, other job schedulers on the host
     (one scheduler per host, orch-fixes8), and on remote hosts builds or tests an agent runs outside the lanes (issue 22)."""

@@ -1,12 +1,13 @@
 """Config, state, processes and the low-level services every other module builds on (section 7, Step 1).
 
 Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X, the registered session's process identity, the shared quoting and
-small helpers (pq/qp/secs/findkey), Locked and atomic_write. No module imports orch or a higher layer. Run is what one
+small helpers (pq/qp/secs/findkey/slug), Locked and atomic_write, the HANDOFF.md notes state (handoff_path/notes_state/
+handoff_stale) and refuse_agent (what only the orchestrator may do). No module imports orch or a higher layer. Run is what one
 invocation is (dry, read-only, what it read once), carried as cfg.run (section 7, seam 2)."""
+import hashlib, json, os, re, shlex, time, tomllib
 from dataclasses import dataclass
-import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
-from orchkit.platform import herdr, ps_table, secs   # re-exported: the OS/tool adapter (owner direction 2026-11-11)
+from orchkit.platform import herdr, ps_table, run, secs   # re-exported: the OS/tool adapter (owner direction 2026-11-11)
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
@@ -77,6 +78,9 @@ class Cfg:
         try: return self.f(n).stat().st_mtime
         except OSError: return 0
 
+# Every process orch queues (pueue add) or starts on the Mac gets this allow-listed environment plus explicit ORCH_* values,
+# never the caller's: pueue stores a task's whole environment in its state file, so a caller's ANTHROPIC_API_KEY, messaging
+# token or HERDR_PANE_ID would be written to disk (audit H1, M2).
 ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SSH_AUTH_SOCK", "TZ", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME")
 
 SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.I)
@@ -90,12 +94,7 @@ def clean_env(extra=None):
 
 def sh(cmd, cwd=None, inp=None, timeout=25, env=None, clean=False):
     """Run a command. clean=True: an allow-listed environment plus env (see clean_env), never the caller's."""
-    try:
-        r = subprocess.run(cmd, cwd=cwd, input=inp, capture_output=True, text=True, timeout=timeout,
-                           env=clean_env(env) if clean else ({**os.environ, **env} if env else None))
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError: return 127, "", f"{cmd[0]}: not installed"
-    except subprocess.TimeoutExpired: return 124, "", f"{cmd[0]}: timeout"
+    return run(cmd, cwd=cwd, inp=inp, timeout=timeout, env=clean_env(env) if clean else ({**os.environ, **env} if env else None))
 
 def hrun(h, script, timeout=25, inp=None, env=None):
     """Run a shell script on host h (local or over ssh). Locally it gets a clean environment (clean_env) plus env; over ssh only
@@ -208,4 +207,27 @@ ORCH_SELF = Path(__file__).resolve().parent.parent / "orch.py"   # the installed
 
 ORCH_MARK = "[orch] "   # every prompt orch itself sends starts with this, so UserPromptSubmit never files it as an instruction (M4)
 
-__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "SECRET_ENV", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "ORCH_SELF", "ORCH_MARK"]
+def handoff_path(cfg): return cfg.f("HANDOFF.md")
+
+def notes_state(cfg):
+    """Updated-time of the notes part: tracked by hash, so regenerating the live part never refreshes it."""
+    t = handoff_path(cfg).read_text() if handoff_path(cfg).exists() else ""
+    notes = t.split(LE, 1)[-1] if LE in t else NOTES0
+    h = hashlib.md5(notes.encode()).hexdigest(); s = cfg.jget("notes.json")
+    if s.get("hash") != h: s = {"hash": h, "ts": now() if not cfg.run.ro else s.get("ts", now())}; cfg.jput("notes.json", s)
+    return s["ts"], notes.count("\n")
+
+def handoff_stale(cfg, running):
+    t, lines = notes_state(cfg); r = []
+    if t < cfg.mtime("changed") or (running and now() - t > cfg.cycle): r.append("handoff stale: update the Orchestrator notes in .orch/HANDOFF.md")
+    if lines > 150: r.append(f"handoff notes are {lines} lines; move old ones to .orch/history.md")
+    return r
+
+DIFF_X = " ".join(f"-x {x}" for x in ("target", ".venv", "node_modules", "__pycache__", ".git"))
+
+def slug(t): return re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:40]
+
+def refuse_agent(what):
+    if os.environ.get("ORCH_ROLE") == "agent": raise Err(f"refused: {what} is the orchestrator's (an agent proposes with board.sh post <you> learned <text>)")
+
+__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "SECRET_ENV", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "ORCH_SELF", "ORCH_MARK", "handoff_path", "notes_state", "handoff_stale", "DIFF_X", "slug", "refuse_agent"]

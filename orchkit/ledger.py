@@ -5,8 +5,16 @@ settle_run, read_secret/model_ok. Every row is written once under the fcntl lock
 idempotency). unreconciled() stays with its callers until the findings split (it reads budgets/park helpers)."""
 from orchkit.context import NUM, Locked, Err, say, now
 from orchkit.platform import keychain_get
-import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
+import json, os, time
 from pathlib import Path
+
+# One TSV per provider ([providers.<p>] ledger), one row per event:  ts  unit  running|<cost>  <budget>|done rc=<x>  <run id>.
+# Every run id has exactly one `running` row (its budget, written when the budget is reserved) and at most one `done` row
+# (its cost; the whole budget when the run never reported one). Every write takes the ledger's lock (<ledger>.lock, an fcntl
+# lock: the lock zsh's `zsystem flock` takes too) and is idempotent: a second running or done row for a run id is never
+# written, so a retry, a re-run or a looping launcher cannot duplicate rows (orch-fixes7: a launcher edited while it ran
+# looped and appended ~49,000 done rows; the cap check summed them all). Spend is computed per run id: its done cost, or its
+# budget while it runs. A malformed ledger refuses every new run until `orch ledger repair`.
 
 def ledger_path(cfg, pv): return cfg.root / pv["ledger"]
 
