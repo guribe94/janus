@@ -853,14 +853,20 @@ class RemoteBrief(unittest.TestCase):
 
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
-        """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project)."""
+        """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project).
+        The forbidden names are not in this public repo: one regex per line in a local untracked file, $ORCH_LEAK_WORDS or
+        $XDG_CONFIG_HOME/orch/leak-words (default ~/.config/orch/leak-words); '#' lines are comments."""
         import re
-        bad = re.compile(r"collection-rig|slurp|asgard|midgard|fable|vegtam|/Users/|/srv/|d435|orch-anthropic-api|claude-(opus|sonnet|haiku)", re.I)
+        src = Path(os.environ.get("ORCH_LEAK_WORDS") or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "orch/leak-words")
+        if not src.is_file(): self.skipTest(f"no leak-words file ({src}): the leak check needs the local list of names the skill must not contain")
+        words = [l.strip() for l in src.read_text().splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        if not words: self.skipTest(f"{src} lists no words")
+        bad = re.compile("|".join(f"(?:{w})" for w in words), re.I)
         here = ORCH_PY.parent; me = Path(__file__).resolve()
-        for f in [ORCH_PY, here / "install", here / "board.sh", me, here / "README.md", here / "example.orch.toml",
-                  *sorted((here / "skill").glob("*")), *sorted((here / "docs").glob("*.md"))]:
+        for f in [ORCH_PY, here / "install", here / "board.sh", here / "check", me, here / "README.md", here / "example.orch.toml",
+                  *sorted((here / "skill").glob("*")), *sorted((here / "docs").glob("*.md")), *sorted((here / "launchd").glob("*"))]:
             if f.is_file():
-                hits = [f"{f.name}:{i}" for i, l in enumerate(f.read_text().splitlines(), 1) if bad.search(l) and not (f == me and "bad = re.compile" in l)]
+                hits = [f"{f.name}:{i}" for i, l in enumerate(f.read_text(errors="replace").splitlines(), 1) if bad.search(l)]
                 self.assertEqual(hits, [], f"project details in {f}")
 
 if __name__ == "__main__": unittest.main()
