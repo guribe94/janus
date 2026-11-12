@@ -584,6 +584,18 @@ class Item1ParkedAfterDone(unittest.TestCase):
         p.write_text("VERDICT: DONE - all items\nWAITING here:9\nVERDICT: DONE - all done\n")
         self.assertEqual(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), "VERDICT: DONE - all done")
 
+    def test_a_park_word_line_with_ids_janus_cannot_read_is_not_a_park(self):
+        """Catches (finding 5): ANY line starting with the park word counted as a park, so a finished report with a prose
+        `**WAITING** jobs: none.` line, or a park line naming a host janus does not know (`mac:9`) or a bare `9`, lost its
+        verdict -- and a capped unit was resumed once for a wrap-up it did not need."""
+        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
+        for tail in ("**WAITING** jobs: none.\n", "- WAITING mac:9 (resumed, exit 0)\n", "WAITING 9\n"):
+            p.write_text("VERDICT: PENDING\nall done\nVERDICT: DONE - all items\n" + tail)
+            self.assertEqual(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), "VERDICT: DONE - all items", tail)
+        p.write_text("VERDICT: PENDING\nVERDICT: DONE - all items\nWAITING here:9\n")
+        self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
+        self.assertIn("last line", janus.PARK_RULE, "the brief header must say the closing VERDICT line is the last line")
+
 
 class Item2ResumeGuard(unittest.TestCase):
     """Finding 2 (medium-high): `janus resume <u> --message ...` had no guard: it started a second agent beside a running one
