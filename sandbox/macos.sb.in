@@ -1,0 +1,37 @@
+(version 1)
+;; macos.sb.in - the sandbox-exec profile template for sandbox/run on macOS.
+;;
+;; This is a template, not a runnable profile: sandbox/run reads it, replaces the two markers below with one
+;; rule per path (each path escaped and fully quoted) and passes the result to `sandbox-exec -p`. Never feed
+;; this file to sandbox-exec as-is.
+;;
+;; Policy (see docs/SANDBOX.md):
+;;   - everything is denied by default;
+;;   - reads are allowed broadly, then the keychain dirs and the caller's deny list are carved back out
+;;     (a later rule wins, so the deny lines after `allow file-read*` take effect);
+;;   - writes are allowed only where the runner says: the agent's worktree, its output folder, its temp dir,
+;;     the tool caches it needs and the runtime's own state dir, plus the standard streams;
+;;   - the network stays open (a known limit: this sandbox limits reads and writes, not the network).
+
+(deny default)
+
+;; A shell, its children and the agent runtime need these to start and run at all. This is not a process
+;; jail: the point of this sandbox is to bound reads and writes, not to isolate processes.
+(allow process*)
+(allow sysctl-read)
+(allow mach-lookup)
+
+;; The network stays open (a known limit; see docs/SANDBOX.md).
+(allow network*)
+
+;; Read broadly, then remove the keychain dirs and the deny list. Order matters: the last matching rule wins.
+(allow file-read*)
+@DENY_READ@
+
+;; Writes: the standard streams and terminal, then only the paths the runner allows.
+(allow file-write* (literal "/dev/null"))
+(allow file-write* (literal "/dev/stdout"))
+(allow file-write* (literal "/dev/stderr"))
+(allow file-write* (literal "/dev/tty"))
+(allow file-write* (subpath "/dev/fd"))
+@ALLOW_WRITE@
