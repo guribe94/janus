@@ -2,7 +2,7 @@
 
 unit_state (from the live source it runs in), verdict (a resumed report only counts a verdict written after the resume
 started; PENDING is not a verdict), report_path, herdr_agents, ws_id (the workspace agents run in)."""
-from orchkit.context import herdr, DRY
+from orchkit.context import herdr
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
 
@@ -42,7 +42,7 @@ def ws_id(cfg, create=False):
     r = herdr("workspace", "list") or {}
     for w in r.get("workspaces", []):
         if w.get("label") == lab: return w["workspace_id"]
-    if create and not DRY:
+    if create and not cfg.run.dry:
         r = herdr("workspace", "create", "--label", lab, "--no-focus") or {}
         return r.get("workspace", {}).get("workspace_id")
 

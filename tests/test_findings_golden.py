@@ -66,7 +66,7 @@ class Golden(unittest.TestCase):
         (d / "out/gates.log").write_text(f"{t} g1 EXIT_tests=1 RESULT: FAIL\n{t} g2 EXIT_tests=1 RESULT: FAIL\n")
         (d / "out/ledger.tsv").write_text("2026-01-01 00:00:00\tu1\trunning\t2\tu1.1\ngarbage\n")   # malformed; $2 committed of a $1 cap
         (d / "out/u2").mkdir(); (d / "out/u2/api.json").write_text(json.dumps({"subtype": "error_max_turns", "total_cost_usd": 0.1}))
-        cfg = orch.Cfg(d); cfg.ro = True   # a reader: nothing is enforced, tuned or written
+        cfg = orch.Cfg(d); cfg.run.ro = True   # a reader: nothing is enforced, tuned or written
         cfg.f("tidy.json").write_text(json.dumps({"at": int(time.time()), "plan": [["disk", "far", "12 GB over", 0], ["run-files", "here", "x", 5]]}))
         cfg.f("MEMORY.md").write_text("# Session memory\n\n## Facts\n- 2020-01-01 a fact (source: gone/file.md)\n")
         bd = d / "board"; bd.mkdir(); (bd / "log.md").write_text("2026-01-01 00:00 u1 learned: x is y\n")

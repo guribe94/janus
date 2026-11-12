@@ -3,7 +3,7 @@
 parse/read/spend/committed/append, reserve_budget/ledger_done (one row per run under Locked; idempotent), run_cost,
 settle_run, read_secret/model_ok. Every row is written once under the fcntl lock (section 9: keep the lock and per-run
 idempotency). unreconciled() stays with its callers until the findings split (it reads budgets/park helpers)."""
-from orchkit.context import NUM, DRY, Locked, Err, say, now
+from orchkit.context import NUM, Locked, Err, say, now
 from orchkit.platform import keychain_get
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
@@ -58,7 +58,7 @@ def reserve_budget(cfg, mc, name, budget, run=None):
     """Under the ledger's lock: refuse when the ledger is malformed or the budget would pass the cap, else write the run's one
     running row. Idempotent: a run id that already has its running row is returned as it is. Returns the run id."""
     pv = cfg.prov[mc["provider"]]; run = run or f"{name}.{os.getpid()}.{int(now())}"
-    if DRY: return run
+    if cfg.run.dry: return run
     with Locked(ledger_path(cfg, pv)):
         runs, bad, _ = ledger_read(cfg, pv)
         if bad: raise Err(f"refused: the {mc['provider']} ledger {pv['ledger']} is malformed ({bad[0]}; {len(bad)} problem(s)): run orch ledger check, then orch ledger repair")
@@ -73,7 +73,7 @@ def reserve_budget(cfg, mc, name, budget, run=None):
 
 def ledger_done(cfg, pv, run, name, cost, rc):
     """Write the run's one done row (idempotent: nothing when it already has one). Returns True when written."""
-    if DRY: return False
+    if cfg.run.dry: return False
     with Locked(ledger_path(cfg, pv)):
         r = ledger_read(cfg, pv)[0].get(run)
         if r and r["done"]: return False

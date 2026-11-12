@@ -54,7 +54,7 @@ def probe(name, h, ro=True, cfg=None):
 
 def probe_all(cfg):
     with cf.ThreadPoolExecutor(8) as ex:
-        ps = list(ex.map(lambda kv: probe(*kv, ro=cfg.ro, cfg=cfg), cfg.hosts.items()))
+        ps = list(ex.map(lambda kv: probe(*kv, ro=cfg.run.ro, cfg=cfg), cfg.hosts.items()))
     d = {p["name"]: p for p in ps}
     un = cfg.jget("hosts.json")
     for n, p in d.items():

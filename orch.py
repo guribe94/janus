@@ -126,14 +126,14 @@ def cmd_ledger(cfg, a):
     if not pvs: raise Err("no provider has a ledger in orch.toml")
     worst = 0
     if a.action == "reconcile":   # runs whose agent is gone and that have no done row: done unknown, budget as the upper bound
-        if not DRY: refuse_agent("orch ledger reconcile")
+        if not cfg.run.dry: refuse_agent("orch ledger reconcile")
         units = Beads(cfg).units(); hs = probe_all(cfg); ag = herdr_agents(cfg)
         for u in units: u["state"] = unit_state(u, hs, ag)
         for n, pv in pvs:
             rs = unreconciled(cfg, pv, units)
             if not rs: say(f"{n}: nothing to reconcile"); continue
             for k, un, b, why in rs:
-                if DRY: say(f"would mark {k} ({un}) {RECONCILED}, ${b:g} counted (its budget, the upper bound): {why}"); continue
+                if cfg.run.dry: say(f"would mark {k} ({un}) {RECONCILED}, ${b:g} counted (its budget, the upper bound): {why}"); continue
                 ok = ledger_done(cfg, pv, k, un, b, "unknown")
                 say(f"{'marked' if ok else 'already done:'} {k} ({un}) {RECONCILED}, ${b:g} counted: {why}")
         return 0
@@ -146,7 +146,7 @@ def cmd_ledger(cfg, a):
             for x in bad[:20] + notes[:10]: say("  " + x)
             if len(bad) > 20: say(f"  ... {len(bad) - 20} more")
             worst = max(worst, 1 if bad else 0); continue
-        if DRY: say(f"+ back up {p}, keep the first running and done row per run id, write-then-rename"); continue
+        if cfg.run.dry: say(f"+ back up {p}, keep the first running and done row per run id, write-then-rename"); continue
         with Locked(p):
             for _ in range(5):
                 try: raw = p.read_bytes()
@@ -191,7 +191,7 @@ def cmd_learned(cfg, a):
 def board_upkeep(cfg, units):
     """The shipped board's own files (a writer only): .master (this machine's host name), .hosts (other hosts from orch.toml,
     for sync and rule) and .notify (a new question or block runs `orch watch --alert` at once); cards of closed units archived."""
-    if cfg.ro or DRY or cfg.paths.get("board"): return
+    if cfg.run.ro or cfg.run.dry or cfg.paths.get("board"): return
     board_files(cfg)
     names = {u["name"] for u in units}; au = all_units(cfg)
     for c in (board_dir(cfg) / "agents").glob("*.md") if (board_dir(cfg) / "agents").is_dir() else []:
@@ -232,7 +232,7 @@ def notes_state(cfg):
     t = handoff_path(cfg).read_text() if handoff_path(cfg).exists() else ""
     notes = t.split(LE, 1)[-1] if LE in t else NOTES0
     h = hashlib.md5(notes.encode()).hexdigest(); s = cfg.jget("notes.json")
-    if s.get("hash") != h: s = {"hash": h, "ts": now() if not cfg.ro else s.get("ts", now())}; cfg.jput("notes.json", s)
+    if s.get("hash") != h: s = {"hash": h, "ts": now() if not cfg.run.ro else s.get("ts", now())}; cfg.jput("notes.json", s)
     return s["ts"], notes.count("\n")
 
 def handoff_stale(cfg, running):
@@ -449,7 +449,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
                           "resume it (orch resume --message, or --resume-of keeps its report)"))
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}: stop it, or relaunch it on an enabled model"))
-    cfg._hs = hs; F += peer_findings(cfg, units)   # peers.md, overlap:<a>:<b> (orch-swarm item 4)
+    F += peer_findings(cfg, units, hs)   # peers.md, overlap:<a>:<b> (orch-swarm item 4)
     board_upkeep(cfg, units)
     seen = {k for k, _ in F}
     for r, why in orphan_jobs(cfg, hs, units):   # the watcher cancels these (item 3); check only reports them
@@ -487,7 +487,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     if sys.platform == "darwin" and not launchd_watcher_loaded(): F.append(("watcher", "watcher com.orch.watch is not running: run install"))
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap: launch on another provider, or ask the owner to raise the cap"))
-    if not cfg.ro and not DRY: F = enforce(cfg, F, viol)
+    if not cfg.run.ro and not cfg.run.dry: F = enforce(cfg, F, viol)
     return [finding(k, t) for k, t in F]
 
 def git_findings(cfg):
@@ -541,7 +541,7 @@ def write_handoff(cfg, live):
     p = handoff_path(cfg); t = p.read_text() if p.exists() else ""
     notes = t.split(LE, 1)[1] if LE in t else "\n" + NOTES0
     new = f"# HANDOFF: {cfg.name}\n{LB}\n{live}\n{LE}{notes}"
-    if new != t and not cfg.ro: p.write_text(new)
+    if new != t and not cfg.run.ro: p.write_text(new)
 
 def live_acks(cfg, keys=None):
     """Acks still in force. keys: the findings seen now; an ack whose finding is gone is dropped (only a writer saves that)."""
@@ -552,13 +552,13 @@ def run_check(cfg, cycle=True, writer=None):
     """Returns (findings not acknowledged, live text, probes, units). writer (default: the caller is the registered orchestrator,
     or the watcher) regenerates the Live part of HANDOFF.md, saves acks and open problems and sets pueue limits; anyone else
     only reads. The cycle stamp (last_cycle) is touched only for the orchestrator's own check."""
-    cfg.ro = not (writer if writer is not None else is_orchestrator(cfg))
+    cfg.run.ro = not (writer if writer is not None else is_orchestrator(cfg))
     hs = probe_all(cfg); bd_err = None; units = []
     try: units = Beads(cfg).units()
     except Err as e: bd_err = str(e)
     ag = herdr_agents(cfg)
     F = collect_findings(cfg, hs, units, ag, bd_err)
-    if not cfg.ro: tune_pueue(cfg, hs, units)
+    if not cfg.run.ro: tune_pueue(cfg, hs, units)
     acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
     F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)
     op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
@@ -571,13 +571,13 @@ def cmd_check(cfg, a):
     op = cfg.jget("open.json")
     if a.escalate: F = [(k, t) for k, t in F if now() - op.get(k, now()) > cfg.deadline]
     if a.json:
-        say(json.dumps({"read_only": cfg.ro, "findings": [{**f.data(), "open_since": int(op.get(f.key, now()))} for f in F]}, indent=1)); return
+        say(json.dumps({"read_only": cfg.run.ro, "findings": [{**f.data(), "open_since": int(op.get(f.key, now()))} for f in F]}, indent=1)); return
     if a.brief and len(F) > 8: F = F[:8] + [("more", f"+{len(F) - 8} more: run orch check")]
     for k, t in F: say(f"[{k}] {t}")
-    if cfg.ro: say("(read-only: not the registered orchestrator session, so nothing was saved, tuned or stamped)")
+    if cfg.run.ro: say("(read-only: not the registered orchestrator session, so nothing was saved, tuned or stamped)")
 
 def cmd_capacity(cfg, a):
-    cfg.ro = True; hs = probe_all(cfg)
+    cfg.run.ro = True; hs = probe_all(cfg)
     try: units = Beads(cfg).units()
     except Err: units = []
     ag = herdr_agents(cfg)
@@ -592,7 +592,7 @@ def cmd_board_close(cfg, a):
     try: open_units = {u["name"] for u in Beads(cfg).units()}
     except Err as e: raise Err(f"beads unavailable, so it cannot tell whether {a.agent} is an open unit: {e}")
     if a.agent in open_units: raise Err(f"{a.agent} is an open unit: use orch close {a.agent}")
-    if DRY: say(f"+ board.sh close {a.agent}"); return
+    if cfg.run.dry: say(f"+ board.sh close {a.agent}"); return
     rc, o, e = board(cfg, "close", a.agent)
     if rc: raise Err(f"board.sh close {a.agent}: {(e or o).strip()[:120]}")
     cfg.touch("changed"); say(f"board card {a.agent} archived")
@@ -618,7 +618,7 @@ def cmd_register(cfg, a):
     kind = "codex" if os.environ.get("CODEX_THREAD_ID") and not os.environ.get("CLAUDECODE") else "claude"
     old = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
     if old and sid and old != sid and session_alive(cfg): say(f"note: replacing registered session {old}, whose process is still alive")
-    if DRY: say(f"+ register {sid or 'pending'} ({kind})"); return
+    if cfg.run.dry: say(f"+ register {sid or 'pending'} ({kind})"); return
     cfg.f("session").write_text(sid or f"pending:{int(now())}"); cfg.f("session_kind").write_text(kind + "\n")
     if sid: record_session_proc(cfg)
     # the caller's own pane only (HERDR_PANE_ID): `herdr pane current` is the focused pane, which is often another (issue 2)
@@ -710,12 +710,12 @@ def confirm_started(cfg, h, tid, secs=8):
     k = (t or {}).get("status"); k = k if isinstance(k, str) else next(iter(k or {}), "unknown")
     return {"Running": "running", "Queued": "queued"}.get(k, str(k).lower()), ""
 
-def put_script(h, path, text, mode="755"):
+def put_script(cfg, h, path, text, mode="755"):
     """Write a script on host h by write-then-rename: a script that is running keeps reading its old file (orch-fixes7: a shell
     rereads its script at the old byte offset when the file is edited in place)."""
     if h.get("local"): atomic_write(Path(path), text, int(mode, 8)); return 0, "", ""
     f, d, m = qp(path), qp(os.path.dirname(str(path)) or "."), "%o" % int(mode, 8)
-    return X(h, f"mkdir -p {d} && cat > {f}.tmp.$$ && chmod {m} {f}.tmp.$$ && mv -f {f}.tmp.$$ {f}", inp=text)
+    return X(cfg, h, f"mkdir -p {d} && cat > {f}.tmp.$$ && chmod {m} {f}.tmp.$$ && mv -f {f}.tmp.$$ {f}", inp=text)
 
 
 def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, session=None, run=None):
@@ -734,12 +734,12 @@ def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, session=None
     script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export {var}=$K; unset K\n"
               f"cd {qp(rcwd)} || exit 1\n{res}{sd}{shlex.join(api_argv(pv, mc, budget, prompt, session))} < /dev/null > {od}/api.json 2> {od}/api.err; rc=$?\n"
               + (f"cp {od}/api.json {od}/{q(f'api-{run}.json')} 2>/dev/null\n" if run else "") + "exit $rc\n")
-    if DRY: return X(h, f"mkfifo {fifo}; write {qp(sp)}; {pueue(h)} add -g agents -l {name} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}; key | ssh cat > {fifo}")
+    if cfg.run.dry: return X(cfg, h, f"mkfifo {fifo}; write {qp(sp)}; {pueue(h)} add -g agents -l {name} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}; key | ssh cat > {fifo}")
     rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo}")
     if rc: return rc, o, e
-    rc, o, e = put_script(h, sp, script)
+    rc, o, e = put_script(cfg, h, sp, script)
     if rc: return rc, o, e
-    rc, o, e = put_script(h, f"{R}/run/bin/pueue", clean_pueue_script(h))
+    rc, o, e = put_script(cfg, h, f"{R}/run/bin/pueue", clean_pueue_script(h))
     if rc: return rc, o, e
     rc, o, e = hrun(h, f"{pueue(h)} add -g agents -l {name} -w {qp(rcwd)} --print-task-id -- {pq('sh ' + qp(sp))}")
     if rc: return rc, o, e
@@ -759,7 +759,7 @@ def cmd_api_run(cfg, a):
     hn = next((n for n, h in cfg.hosts.items() if h.get("local")), "local")
     try: var, key = read_secret(pv)
     except Err as e: ledger_done(cfg, pv, run, name, 0, "no-key"); raise
-    shim = cfg.f("bin"); put_script({"local": True}, str(shim / "pueue"), clean_pueue_script({"local": True}))
+    shim = cfg.f("bin"); put_script(cfg, {"local": True}, str(shim / "pueue"), clean_pueue_script({"local": True}))
     env = clean_env({"ORCH_ROLE": "agent", "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root), "ORCH_REPORT": a.report or str(od / "REPORT.md"), "BOARD_DIR": str(board_dir(cfg)), var: key})
     env["PATH"] = f"{shim}:{env['PATH']}"   # the agent's own `pueue add` never stores the key in pueue's state file
     prompt = Path(a.prompt_file).read_text() if a.prompt_file else agent_prompt(cfg, name, a.brief, hn, a.report or str(od / "REPORT.md"))
@@ -949,7 +949,7 @@ def past_dialogs(name, pane):
 
 def unit_tab(cfg, u, mname, hn, h):
     """One labelled tab per running unit (<unit> · <model> · <host>) that follows its pueue log (fixes5 item 3)."""
-    if u.get("via") != "pueue" or DRY: return
+    if u.get("via") != "pueue" or cfg.run.dry: return
     try: pane, tab = new_tab(cfg, f"{u['name']} · {mname} · {hn}", cfg.root)
     except Err: return
     f = f"{pueue(h)} follow {int(u['task'])}"
@@ -1004,14 +1004,14 @@ def cmd_launch(cfg, a):
     report = resume_report(cfg, a, brief)
     if report and report.exists():
         t = report.read_text().split("\n", 1)
-        if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not DRY: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
+        if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not cfg.run.dry: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
     u = {"host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
     if report: u["report"] = str(report); u["resume"] = True
     item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
     if item: u["item"] = item
-    if DRY: say(f"+ bd create unit:{name}; bd update --status in_progress")
+    if cfg.run.dry: say(f"+ bd create unit:{name}; bd update --status in_progress")
     else:
         u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
         bd.run("update", u["id"], "--status", "in_progress"); bd.save(u)
@@ -1021,45 +1021,45 @@ def cmd_launch(cfg, a):
         if not local:
             root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
             env["ORCH_REPORT"] = f"{root}/out/{name}/REPORT.md"
-            rc_, o_, _ = X(h, "mkdir -p " + " ".join(qp(x) for x in (rcwd, f"{root}/briefs", f"{root}/out/{name}", f"{root}/run", f"{root}/base"))
+            rc_, o_, _ = X(cfg, h, "mkdir -p " + " ".join(qp(x) for x in (rcwd, f"{root}/briefs", f"{root}/out/{name}", f"{root}/run", f"{root}/base"))
                            + f" && cd {qp(rcwd)} && pwd -P")
             if rc_ == 0 and o_.strip().startswith("/"): u["rcwd_abs"] = o_.strip().splitlines()[-1]   # the transcript folder's name (#4)
             cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
-            if DRY: say("+ " + shlex.join(cmd))
+            if cfg.run.dry: say("+ " + shlex.join(cmd))
             elif sh(cmd, timeout=900)[0]: raise Err("rsync to " + hn + " failed")
             # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
-            X(h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
-            put_script(h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
-            if not cfg.paths.get("board"): put_script(h, f"{root}/bin/board.sh", board_script(cfg).read_text())   # the shipped board there (outbox)
-            if not DRY: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
+            X(cfg, h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
+            put_script(cfg, h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
+            if not cfg.paths.get("board"): put_script(cfg, h, f"{root}/bin/board.sh", board_script(cfg).read_text())   # the shipped board there (outbox)
+            if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
             ship_context(cfg, h, name, bcopy)
-            put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["ORCH_REPORT"]) + btext, "644")
+            put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["ORCH_REPORT"]) + btext, "644")
             if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
-                put_script(h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
-            else: X(h, f"[ -s {qp(env['ORCH_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['ORCH_REPORT'])}")
+                put_script(cfg, h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
+            else: X(cfg, h, f"[ -s {qp(env['ORCH_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['ORCH_REPORT'])}")
         rep = outd / "REPORT.md"
-        if not report and not rep.exists() and not DRY: rep.write_text("VERDICT: PENDING\n")
+        if not report and not rep.exists() and not cfg.run.dry: rep.write_text("VERDICT: PENDING\n")
         if local:   # the brief with orch's header (the park rule) as the agent reads it: out/<unit>/<brief name>
             rbrief = str(outd / (brief.name if (outd / brief.name).resolve() != brief.resolve() else "orch-" + brief.name))
-            if not DRY: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["ORCH_REPORT"]) + brief.read_text())
+            if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["ORCH_REPORT"]) + brief.read_text())
         u["rbrief"] = rbrief
         prompt = agent_prompt(cfg, name, rbrief, hn, env["ORCH_REPORT"])
         u["rcwd"] = rcwd
         if mc["kind"] == "api":
-            X(h, ensure_lanes(h, cfg))
-            if local and not DRY: write_cap(cfg, hn, h)
+            X(cfg, h, ensure_lanes(h, cfg))
+            if local and not cfg.run.dry: write_cap(cfg, hn, h)
             # the budget is reserved (cap check and the run's running row, under the ledger's lock) before anything is queued
             run = reserve_budget(cfg, mc, name, budget); u["run"] = run
             if local:
                 cmd = shlex.join([sys.executable, str(ORCH_SELF), "api-run", name, "--run", run, "--model", mname, "--budget", str(budget),
                                   "--brief", rbrief, "--cwd", rcwd, "--report", env["ORCH_REPORT"]])
-                rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {pq(cmd)}", env=env)
+                rc, o, e = X(cfg, h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {pq(cmd)}", env=env)
             else:
                 rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, run=run)
-            if rc and not DRY: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
+            if rc and not cfg.run.dry: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
             if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
             u.update(via="pueue", task=int(o.strip() or 0))
-            if not DRY:   # launched means started (or queued for a slot, or already done), never a run that died at once
+            if not cfg.run.dry:   # launched means started (or queued for a slot, or already done), never a run that died at once
                 st, why = confirm_started(cfg, h, u["task"])
                 if st == "died":
                     ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "died-at-start")
@@ -1069,9 +1069,9 @@ def cmd_launch(cfg, a):
                                             "" if st == "running" else f": not confirmed running (pueue {hn}:{u['task']} is {st})"))
             unit_tab(cfg, u, mname, hn, h)
         elif local:
-            pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd) if not DRY else ("pane", "tab")
+            pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd) if not cfg.run.dry else ("pane", "tab")
             u.update(pane=pane, tab=tab)
-            if not DRY:
+            if not cfg.run.dry:
                 wait_shell(pane, name)
                 envs = {**env, **({"OPENCODE_CONFIG_CONTENT": json.dumps({"model": mc["model"]})} if mc["kind"] == "opencode" else {})}
                 # the pane's shell inherited herdr's environment: drop what must not reach an agent, then set the unit's own
@@ -1093,25 +1093,25 @@ def cmd_launch(cfg, a):
             mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -- " if mm else ""   # fixes5 item 7
             inner = f"cd {qp(rcwd)} && exec env {e} {sd}{cli} {shlex.join(mc.get('args', []))} {shlex.quote(prompt)}"
             pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
-            rc, o, er = X(h, pre + f"tmux new -d -s orch-{name} {shlex.quote(inner)} && tmux display -p -t orch-{name} '#{{pane_pid}}'")
+            rc, o, er = X(cfg, h, pre + f"tmux new -d -s orch-{name} {shlex.quote(inner)} && tmux display -p -t orch-{name} '#{{pane_pid}}'")
             if rc: raise Err("tmux start failed: " + er.strip()[:100])
             u.update(via="tmux", pid=int(o.strip() or 0))
-            if not DRY:   # launched means the agent's session is alive a moment later (a broken command line ends it at once)
+            if not cfg.run.dry:   # launched means the agent's session is alive a moment later (a broken command line ends it at once)
                 time.sleep(3)
                 if hrun(h, pre + f"tmux has-session -t orch-{name}")[0] or not u["pid"]:
                     raise Err(f"the agent's tmux session orch-{name} ended at once; nothing is running")
                 u["start_state"] = "running"
-            if not DRY: agent_res(cfg, hn, h, name, u["pid"])
-            if not DRY:
+            if not cfg.run.dry: agent_res(cfg, hn, h, name, u["pid"])
+            if not cfg.run.dry:
                 pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd)
                 herdr("pane", "run", pane, f"ssh -t {shlex.quote(h['ssh'])} tmux attach -t orch-{name}"); u.update(pane=pane, tab=tab)
     except Err as ex:
-        if not DRY:
+        if not cfg.run.dry:
             u["via"] = "failed"; bd.save(u); bd.comment(u["id"], f"{ts()} launch failed: {ex}")
             bd.run("close", u["id"], "--reason", "launch failed")
             if u.get("tab"): herdr("tab", "close", u["tab"])
         raise
-    if DRY: return
+    if cfg.run.dry: return
     bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); cfg.touch("changed")
     chk = f"herdr {name}" if u["via"] == "herdr" else f"pueue {hn}:{u['task']}" if u["via"] == "pueue" else f"tmux {hn}:orch-{name}"
     board(cfg, "post", name, "status", f"launched ({mname}, {hn})",
@@ -1167,8 +1167,8 @@ def ship_context(cfg, h, name, copy):
     """Copy the brief's files under the project root to <root>/ctx/<unit>/ on the host (one rsync, relative paths kept)."""
     if not copy: return
     ctx = f"{h['root']}/ctx/{name}"
-    if DRY: say(f"+ copy to {h.get('ssh')}:{ctx}/: " + ", ".join(r for _, r in copy)); return
-    X(h, f"mkdir -p {qp(ctx)}")
+    if cfg.run.dry: say(f"+ copy to {h.get('ssh')}:{ctx}/: " + ", ".join(r for _, r in copy)); return
+    X(cfg, h, f"mkdir -p {qp(ctx)}")
     lst = "".join(r + "\n" for _, r in copy)
     rc, o, e = sh(["rsync", "-a", "-r", "--files-from=-", "-e", " ".join(SSH), f"{cfg.root.resolve()}/", f"{h['ssh']}:{ctx}/"], inp=lst, timeout=600)
     if rc: raise Err(f"copying the brief's files to {h.get('ssh')} failed: {(e or o).strip()[-160:]}")
@@ -1217,11 +1217,11 @@ def task_pid_roots(h, u):
 
 def cmd_stop(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; via = u.get("via"); p = pueue(h)
-    why = None if a.force else uncollected(cfg, u)
+    why = None if a.force or cfg.run.dry else uncollected(cfg, u)
     if why: raise Err(f"refused: {u['name']}: {why}")
     say(f"stop {u['name']} ({via} on {u['host']})")
-    roots = task_pid_roots(h, u) if not DRY else ""
-    if DRY: say(f"+ pueue kill / tmux kill-session; TERM then KILL every process group of {u['name']} (roots {roots or '-'}, env ORCH_UNIT)"); return
+    roots = task_pid_roots(h, u) if not cfg.run.dry else ""
+    if cfg.run.dry: say(f"+ pueue kill / tmux kill-session; TERM then KILL every process group of {u['name']} (roots {roots or '-'}, env ORCH_UNIT)"); return
     if via == "pueue": hrun(h, f"{p} kill {int(u['task'])}")
     elif via == "tmux": hrun(h, f"tmux kill-session -t orch-{u['name']}")
     # its lane jobs (label unit:<name>) belong to it too
@@ -1239,9 +1239,9 @@ def cmd_stop(cfg, a):
 
 DIFF_X = " ".join(f"-x {x}" for x in ("target", ".venv", "node_modules", "__pycache__", ".git"))
 
-def remote_patch(h, n, fname):
+def remote_patch(cfg, h, n, fname):
     """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>)."""
-    return X(h, f"cd {qp(h['root'])} && [ -d base/{n} ] && {{ diff -ruN {DIFF_X} base/{n} worktrees/{n} | sed -e 's#^--- base/{n}/#--- a/#' -e 's#^+++ worktrees/{n}/#+++ b/#' "
+    return X(cfg, h, f"cd {qp(h['root'])} && [ -d base/{n} ] && {{ diff -ruN {DIFF_X} base/{n} worktrees/{n} | sed -e 's#^--- base/{n}/#--- a/#' -e 's#^+++ worktrees/{n}/#+++ b/#' "
                 f"-e 's#^diff -ruN .* base/{n}/\\(.*\\) worktrees/{n}/.*#diff --git a/\\1 b/\\1#' > out/{n}/{fname}; true; }}", timeout=300)
 
 # A remote copy's fingerprint: the checksum of the agent's changes and of its output folder (orch's own files left out), the
@@ -1257,7 +1257,7 @@ def uncollected(cfg, u):
     """Why removing or stopping a remote unit now would lose work (None when nothing would): its copy has changes or output
     that differ from what orch collect last brought here, or its host cannot be asked."""
     h = cfg.hosts.get(u.get("host"), {})
-    if h.get("local") or u.get("via") in ("failed", "starting") or DRY: return None
+    if h.get("local") or u.get("via") in ("failed", "starting"): return None
     kv = fingerprint(cfg, u)
     if kv is None: return f"cannot read its copy on {u['host']} (unreachable?), so cannot tell whether work would be lost"
     if kv.get("fp") == u.get("collected"): return None
@@ -1273,19 +1273,19 @@ def cmd_collect(cfg, a):
     root = h["root"]; n = u["name"]; od = cfg.p("out", "out") / n
     # The agent's changes come back as a patch against the tree it was sent (base/<unit>), never as an rsync over the Mac
     # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree.
-    remote_patch(h, n, "changes.patch")
+    remote_patch(cfg, h, n, "changes.patch")
     if not save_output(cfg, u): raise Err(f"collect from {u['host']} failed (unreachable?)")   # out/<unit>/, the task log
-    if not DRY and not save_transcript(cfg, u): say(f"note: no transcript of {n} saved (none found on {u['host']})")   # out/<unit>/transcript.md
-    st = task_status(h, u["task"]) if u.get("via") == "pueue" and u.get("task") is not None and not DRY else None
-    if not (st and task_rc(st) is None): X(h, f"rm -f {qp(f'{root}/run/{n}.key')}")   # the key fifo, once no task can still read it (row 52)
+    if not cfg.run.dry and not save_transcript(cfg, u): say(f"note: no transcript of {n} saved (none found on {u['host']})")   # out/<unit>/transcript.md
+    st = task_status(h, u["task"]) if u.get("via") == "pueue" and u.get("task") is not None and not cfg.run.dry else None
+    if not (st and task_rc(st) is None): X(cfg, h, f"rm -f {qp(f'{root}/run/{n}.key')}")   # the key fifo, once no task can still read it (row 52)
     mc = cfg.models.get(u.get("model"), {})
-    if not DRY and u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("run"):
+    if not cfg.run.dry and u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("run"):
         cost, reported = run_cost(od / "api.json", None)
         if reported: ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], n, cost, "collected")   # idempotent: once per run id
-    if not DRY and u.get("report"): say(f"report -> {u['report']}")
-    kv = fingerprint(cfg, u) if not DRY else None
+    if not cfg.run.dry and u.get("report"): say(f"report -> {u['report']}")
+    kv = fingerprint(cfg, u) if not cfg.run.dry else None
     if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
-    if not DRY: bd.comment(u["id"], f"{ts()} collected from {u['host']}"); cfg.touch("changed")
+    if not cfg.run.dry: bd.comment(u["id"], f"{ts()} collected from {u['host']}"); cfg.touch("changed")
     p = od / "changes.patch"
     say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
 
@@ -1323,23 +1323,23 @@ def cmd_close(cfg, a):
         if rc == 0 and o.strip() != "0" and not a.force and not state_repo: raise Err("unpushed commits; push first, or --force")
     elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
         raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
-    why = None if a.force else uncollected(cfg, u)
+    why = None if a.force or cfg.run.dry else uncollected(cfg, u)
     if why: raise Err(f"refused: {u['name']}: {why}")
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
     if u.get("tab") or u.get("pane"):
-        if DRY: say(f"+ herdr tab close {u.get('tab') or u.get('pane')}")
+        if cfg.run.dry: say(f"+ herdr tab close {u.get('tab') or u.get('pane')}")
         elif u.get("tab"): herdr("tab", "close", u["tab"])
         else: herdr("pane", "close", u["pane"])
     if not h.get("local"):
         root = h["root"]; n = u["name"]
         others = [x["name"] for x in units if x["id"] != u["id"] and x.get("host") == u["host"] and x.get("rcwd") == u.get("rcwd")]
         if others: say(f"keeping {u.get('rcwd')} on {u['host']}: open unit(s) {', '.join(others)} use it")
-        else: X(h, f"cd {qp(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
+        else: X(cfg, h, f"cd {qp(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
     if u.get("via") == "pueue":   # the task's log is kept under out/<unit>/ before the task is removed
-        if not DRY: save_task_log(cfg, h, u, u["task"])
-        X(h, f"{pueue(h)} remove {int(u['task'])} 2>/dev/null; true")
-    X({"local": True}, f"BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} close {u['name']} 2>/dev/null; true")
-    if DRY: return
+        if not cfg.run.dry: save_task_log(cfg, h, u, u["task"])
+        X(cfg, h, f"{pueue(h)} remove {int(u['task'])} 2>/dev/null; true")
+    X(cfg, {"local": True}, f"BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} close {u['name']} 2>/dev/null; true")
+    if cfg.run.dry: return
     if u.get("run") and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"): settle_run(cfg, u, "closed")
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
     say("closed")
@@ -1408,9 +1408,7 @@ def tidy_host(cfg, n, h, units, au):
         if f[0] == "copy" and len(f) >= 2 and f[1] not in open_:
             u = au.get(f[1])
             if u and u.get("status") == "closed" and u.get("host") == n:
-                d0 = DRY.value; DRY.value = False
-                try: why = uncollected(cfg, {**u, "via": u.get("via") if u.get("via") not in ("failed", "starting") else "x"})
-                finally: DRY.value = d0
+                why = uncollected(cfg, {**u, "via": u.get("via") if u.get("via") not in ("failed", "starting") else "x"})
                 if why: continue
                 P.append(("remote-copy", f"{n}:{f[1]}", "its unit is closed and its copy holds nothing uncollected", int(fl(f[2]) if len(f) > 2 else 0)))
         elif f[0] == "runfiles" and len(f) > 1 and int(f[1] or 0): P.append(("run-files", n, f"{f[1]} job run file(s) older than {tset(cfg, 'keep_days')} days", 0))
@@ -1531,16 +1529,16 @@ def tidy_do(cfg, kind, t):
     return 1, f"unknown kind {kind}"
 
 def cmd_tidy(cfg, a):
-    if not DRY: refuse_agent("orch tidy")   # --dry-run only reads
+    if not cfg.run.dry: refuse_agent("orch tidy")   # --dry-run only reads
     units = Beads(cfg).units(); kept = []; au = all_units(cfg)
     P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg)
     for n, h in cfg.hosts.items(): P += tidy_host(cfg, n, h, units, au)
     for d, why in kept: say(f"kept worktree {d}: {why}")
-    if not DRY and not cfg.ro: cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P if x[0] == "disk"]})
+    if not cfg.run.dry and not cfg.run.ro: cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P if x[0] == "disk"]})
     if not [x for x in P if x[0] != "disk"]: say("nothing to tidy" + "".join(f"; {x[1]}: {x[2]}" for x in P if x[0] == "disk")); return
     for kind, t, why, mb in P:
         if kind == "disk": say(f"disk {t}: {why}"); continue
-        if DRY: say(f"would remove {kind} {t}: {why}" + (f" ({mb} MB)" if mb else "")); continue
+        if cfg.run.dry: say(f"would remove {kind} {t}: {why}" + (f" ({mb} MB)" if mb else "")); continue
         rc, e = tidy_do(cfg, kind, t)
         say(f"{'removed' if rc == 0 else 'NOT removed'} {kind} {t}: {why}" + (f" ({(e or '').strip()[:120]})" if rc else ""))
 
@@ -1626,7 +1624,7 @@ def job_result(cfg, hs, ref, agent_host):
     if not jid:   # a task without a job script (a gate): its pueue log is the log
         loc = cfg.f("runs") / f"task-{hn}-{tid}.log"; loc.parent.mkdir(exist_ok=True)
         r = hrun(h, f"{pueue(h)} log {int(tid)} --full", timeout=60)
-        if r[0] == 0 and not DRY: loc.write_text(r[1])
+        if r[0] == 0 and not cfg.run.dry: loc.write_text(r[1])
         return rc, str(loc) if here or h.get("local") else f"{hn}: {pueue(h)} log {tid}"
     if rc is None or t is None:
         o = hrun(h, f"cat {qp(f'{rd}/{jid}.rc')} 2>/dev/null")[1].strip()
@@ -1652,10 +1650,10 @@ def resume_unit(cfg, u, msg, wrapup=False):
     """Continue the unit's own agent session with msg (see above). The caller saves u. Returns a line saying what was done."""
     name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); text = ORCH_MARK + msg
     if via == "herdr":
-        if not DRY: herdr("agent", "prompt", name, text)
+        if not cfg.run.dry: herdr("agent", "prompt", name, text)
         return f"{name}: prompted in its herdr pane"
     if via == "tmux":
-        X(h, f"tmux send-keys -t orch-{name} -l {shlex.quote(text)} && tmux send-keys -t orch-{name} Enter")
+        X(cfg, h, f"tmux send-keys -t orch-{name} -l {shlex.quote(text)} && tmux send-keys -t orch-{name} Enter")
         return f"{name}: resumed in tmux orch-{name} on {u['host']}"
     if via != "pueue" or mc.get("kind") != "api": raise Err(f"{name}: a unit run via {via} cannot be resumed")
     pv = cfg.prov[mc["provider"]]; od = cfg.p("out", "out") / name
@@ -1676,16 +1674,16 @@ def resume_unit(cfg, u, msg, wrapup=False):
     env = {"ORCH_ROLE": "agent", "ORCH_REPORT": report, "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root)}
     if local:
         pf = od / f"resume-{k}.md"
-        if not DRY: atomic_write(pf, text)
+        if not cfg.run.dry: atomic_write(pf, text)
         cmd = shlex.join([sys.executable, str(ORCH_SELF), "api-run", name, "--run", run, "--model", u["model"], "--budget", str(budget),
                           "--brief", u.get("rbrief") or u["brief"], "--cwd", u["rcwd"], "--report", report, "--resume-session", sid, "--prompt-file", str(pf)])
-        rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(u['rcwd'])} --print-task-id -- {pq(cmd)}", env=env)
+        rc, o, e = X(cfg, h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(u['rcwd'])} --print-task-id -- {pq(cmd)}", env=env)
     else:
         rc, o, e = api_remote(cfg, h, name, mc, u.get("rbrief") or f"{h['root']}/briefs/{name}.md", u["rcwd"], budget, text, env, session=sid, run=run)
     if rc:
-        if not DRY: ledger_done(cfg, pv, run, name, 0, "resume-failed")
+        if not cfg.run.dry: ledger_done(cfg, pv, run, name, 0, "resume-failed")
         raise Err(f"{name}: resume failed: {(e or o).strip()[:120]}")
-    if DRY: return f"{name}: would resume session {sid} as run {run} (${budget:g})"
+    if cfg.run.dry: return f"{name}: would resume session {sid} as run {run} (${budget:g})"
     st, why = confirm_started(cfg, h, int(o.strip() or 0))
     if st == "died":
         ledger_done(cfg, pv, run, name, 0, "died-at-start")
@@ -1698,7 +1696,7 @@ def resume_unit(cfg, u, msg, wrapup=False):
 def save_task_log(cfg, h, u, tid, remove=False):
     """Keep a pueue task's log under out/<unit>/task-<id>.log (the agent's stdout and stderr), then optionally remove the task."""
     rc, o, e = hrun(h, f"{pueue(h)} log {int(tid)} --full", timeout=60)
-    if rc == 0 and not DRY:
+    if rc == 0 and not cfg.run.dry:
         od = cfg.p("out", "out") / u["name"]; od.mkdir(parents=True, exist_ok=True); atomic_write(od / f"task-{tid}.log", o)
         if remove: hrun(h, f"{pueue(h)} remove {int(tid)} 2>/dev/null; true")
     return rc == 0
@@ -1710,7 +1708,7 @@ def cmd_park(cfg, a):
     hs = probe_all(cfg); jobs = unit_jobs(hs, n)
     if not jobs: raise Err(f"{n} has no queued or running job of its own: nothing to wait for (orch stop {n} to stop it)")
     say(f"park {n}: its jobs {', '.join(jobs)} keep running; it resumes when they finish")
-    if DRY: return
+    if cfg.run.dry: return
     via = u.get("via")
     if via == "pueue":
         hrun(h, f"{pueue(h)} kill -s SIGTERM {int(u['task'])} 2>/dev/null; true")
@@ -1720,7 +1718,7 @@ def cmd_park(cfg, a):
         else: hrun(h, f"{pueue(h)} kill {int(u['task'])} 2>/dev/null; true")
         if h.get("local"): settle_run(cfg, u, "parked")
     elif via == "herdr": herdr("pane", "send-keys", u["pane"], "Escape")
-    elif via == "tmux": X(h, f"tmux send-keys -t orch-{n} Escape")
+    elif via == "tmux": X(cfg, h, f"tmux send-keys -t orch-{n} Escape")
     u["parked"] = {"jobs": jobs, "since": int(now()), "by": "orch park"}; bd.save(u)
     bd.comment(u["id"], f"{ts()} parked on {', '.join(jobs)}"); cfg.touch("changed"); say(f"parked {n}")
 
@@ -1735,7 +1733,7 @@ def cmd_resume(cfg, a):
         msg = resume_message(cfg, hs, u, jobs)
     else: raise Err(f"{u['name']} is not parked: give --message")
     say(resume_unit(cfg, u, msg))
-    if DRY: return
+    if cfg.run.dry: return
     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
     bd.comment(u["id"], f"{ts()} resumed"); cfg.touch("changed")
 
@@ -1744,7 +1742,7 @@ def save_output(cfg, u):
     key fifo) and keep its pueue task's log; a resumed unit's report also goes back to its original path. True when done."""
     h = cfg.hosts[u["host"]]; n = u["name"]; od = cfg.p("out", "out") / n
     cmd = ["rsync", "-a", "--exclude", "*.key", "-e", " ".join(SSH), f"{h['ssh']}:{h['root']}/out/{n}/", str(od) + "/"]
-    if DRY: say("+ " + shlex.join(cmd)); return True
+    if cfg.run.dry: say("+ " + shlex.join(cmd)); return True
     od.mkdir(parents=True, exist_ok=True)
     if sh(cmd, timeout=600)[0]: return False
     if u.get("via") == "pueue" and u.get("task") is not None: save_task_log(cfg, h, u, u["task"])
@@ -1757,7 +1755,7 @@ def refresh_remote(cfg, u, bd, log):
     if cfg.hosts[u["host"]].get("local") or u.get("via") in ("failed", "starting"): return
     fin = u.get("state") in ENDED
     if not ((fin and u.get("saved") != u.get("task")) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60): return
-    remote_patch(cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
+    remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
     if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed"); return
     u["saved_at"] = int(now())
     if fin: u["saved"] = u.get("task")
@@ -1878,7 +1876,7 @@ def cmd_backlog(cfg, a):
         x = backlog_issues(cfg).get(f"backlog:{a.args[0]}")
         if not x: raise Err(f"no backlog item {a.args[0]} in beads (orch backlog import first)")
         v = slug(a.args[1][6:]) or "agent"; labels = [l for l in (x.get("labels") or []) if not l.startswith("actor:")] + ([f"actor:{v}"] if v != "agent" else [])
-        if DRY: say(f"+ bd update {x['id']} --set-labels {','.join(labels)}"); return
+        if cfg.run.dry: say(f"+ bd update {x['id']} --set-labels {','.join(labels)}"); return
         Beads(cfg).run("update", x["id"], "--set-labels", ",".join(labels)); cfg.touch("changed"); say(f"{a.args[0]}: actor {v}"); return
     items = backlog_items(cfg)
     if items is None: raise Err("no checklist: set [backlog] file (or paths.checklist) in orch.toml")
@@ -1890,7 +1888,7 @@ def cmd_backlog(cfg, a):
     for i, t, st, d, rd in items:
         ref = f"backlog:{i}"; labels = ["backlog", "status:" + (slug(st) or "none")] + (["backlog-ready"] if rd else [])
         x = ex.get(ref); title = f"backlog: {i} {t}"[:150]
-        if DRY: say(f"+ {ref}: {'close' if d and x else 'skip' if d else 'update' if x else 'create'} ({st[:30]})"); continue
+        if cfg.run.dry: say(f"+ {ref}: {'close' if d and x else 'skip' if d else 'update' if x else 'create'} ({st[:30]})"); continue
         if d:
             if x and x.get("status") != "closed": bd.run("close", x["id"], "--reason", f"checklist: {st[:60]}"); n["closed"] += 1
             continue
@@ -1902,7 +1900,7 @@ def cmd_backlog(cfg, a):
         if sorted(x.get("labels") or []) != sorted(labels) or x.get("title") != title:
             bd.run("update", x["id"], "--title", title, "--set-labels", ",".join(labels)); n["updated"] += 1
         else: n["same"] += 1
-    if not DRY: cfg.touch("backlog_imported"); cfg.touch("changed")
+    if not cfg.run.dry: cfg.touch("backlog_imported"); cfg.touch("changed")
     say(f"backlog: {len(items)} checklist items; " + ", ".join(f"{v} {k}" for k, v in n.items()))
 
 def unit_items(cfg, units):
@@ -2026,7 +2024,7 @@ def bset(cfg, k): return cfg.c.get("budget", {}).get(k, BUDGET_DEFAULTS[k])
 
 def all_units(cfg):
     """Every unit ever recorded (open and closed): {name: meta}; the latest record of a name wins."""
-    if getattr(cfg, "_all_units", None) is None:
+    if cfg.run.all_units is None:
         try:
             r = Beads(cfg).run("list", "--label", "unit", "--all", "-n", "0")
             r = r.get("issues", r) if isinstance(r, dict) else r
@@ -2038,8 +2036,8 @@ def all_units(cfg):
             try: m = json.loads(i.get("notes") or "{}")
             except Exception: m = {}
             out[t[5:]] = {**m, "id": i["id"], "name": t[5:], "status": i.get("status")}
-        cfg._all_units = out
-    return cfg._all_units
+        cfg.run.all_units = out
+    return cfg.run.all_units
 
 def cost_history(cfg, provider):
     """{(kind, tier): [cost of each finished run]} of a provider, oldest first."""
@@ -2072,7 +2070,7 @@ def token_cost(usage, w, rate):
 
 def learned_rates(cfg):
     """{model id: $ per weighted token}, from the modelUsage of the newest finished api.json files (cost / weighted tokens)."""
-    if getattr(cfg, "_rates", None) is not None: return cfg._rates
+    if cfg.run.rates is not None: return cfg.run.rates
     w = bset(cfg, "token_weights"); acc = {}
     fs = sorted(cfg.p("out", "out").glob("*/api.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:60]
     for f in fs:
@@ -2081,8 +2079,8 @@ def learned_rates(cfg):
         for m, x in mu.items():
             wt = token_cost(x, w, 1.0)
             if wt > 0 and isinstance(x.get("costUSD"), (int, float)): a = acc.setdefault(m, [0.0, 0.0]); a[0] += x["costUSD"]; a[1] += wt
-    cfg._rates = {m: c / wt for m, (c, wt) in acc.items() if wt}
-    return cfg._rates
+    cfg.run.rates = {m: c / wt for m, (c, wt) in acc.items() if wt}
+    return cfg.run.rates
 
 def transcript_of(cfg, u):
     """The Claude Code transcript of a local API unit: under ~/.claude/projects/<its cwd>, started after the unit, whose first
@@ -2336,17 +2334,17 @@ def fill_plan(cfg, hs, units, limit=None):
 def cmd_fill(cfg, a):
     """Launch ready backlog units that have briefs, highest priority first, until every host's reservations or the budget are
     used, and no further. --dry-run lists what it would launch now and why it stops there."""
-    if DRY: cfg.ro = True   # a dry run changes nothing anywhere (the probe leaves the hosts' reservation files alone)
+    if cfg.run.dry: cfg.run.ro = True   # a dry run changes nothing anywhere (the probe leaves the hosts' reservation files alone)
     hs = probe_all(cfg); units = Beads(cfg).units(); ag = herdr_agents(cfg)
     for u in units: u["state"] = unit_state(u, hs, ag)
     wp = waste_paused(cfg)
     if wp: say(f"fill: PAUSED: {wp}"); return 1
     plan, stops = fill_plan(cfg, hs, units, a.max)
-    say(f"fill: {len(plan)} unit(s) fit now" + (" (dry run: nothing launched)" if DRY else ""))
+    say(f"fill: {len(plan)} unit(s) fit now" + (" (dry run: nothing launched)" if cfg.run.dry else ""))
     for name, item, m, hn, b, budget, why, kind, tier, f in plan:
         say(f"  {name} [{item}] {kind}/{tier} model {m} on {hn}, builds on {b}" + (f", ${budget:g}" if budget is not None else "") + f": {why}")
     say("stops: " + "; ".join(dict.fromkeys(stops)))
-    if DRY: return 0
+    if cfg.run.dry: return 0
     rc = 0
     for name, item, m, hn, b, budget, why, kind, tier, f in plan:
         la = argparse.Namespace(unit=name, kind=kind, tier=tier, host=None, model=m, brief=str(f), cwd=None, budget=None, test_host=None,
@@ -2522,7 +2520,7 @@ def cmd_run(cfg, a):
     why = tree_guard(cfg, src, behind=a.lane in ("gates", "land"))   # behind main matters for gates and landing only (item 5)
     if why and not a.allow_unmerged: raise Err(f"refused: {src} {why} (--allow-unmerged to run anyway)")
     jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
-    if DRY: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
+    if cfg.run.dry: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
     if not h.get("local"): sync_wt(cfg, hn, h, src, name)
     rd = runs_dir(cfg, h)
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True)
@@ -2534,7 +2532,7 @@ def cmd_run(cfg, a):
                        + (f" -o {int(a.priority)}" if a.priority else (" -o 10" if a.lane == "gates" else "")) + f" -- {pq('bash ' + qp(f'{rd}/{jid}.sh'))}")
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
     tid = o.strip()
-    if not DRY:   # the tree this job uses, for orch busy (row 53): one line per job, dropped once the job has ended
+    if not cfg.run.dry:   # the tree this job uses, for orch busy (row 53): one line per job, dropped once the job has ended
         bd_ = cfg.f("runs") / "busy"; bd_.mkdir(parents=True, exist_ok=True); (bd_ / jid).write_text(f"{hn}:{tid}\t{src}\n")
         js = cfg.f("runs") / "jobs"; js.mkdir(parents=True, exist_ok=True)   # what it ran, so a thrash stop can re-queue it (item 3)
         (js / f"{jid}.json").write_text(json.dumps({"host": hn, "task": tid, "lane": a.lane, "unit": unit, "wt": src, "cmd": cmd,
@@ -2588,7 +2586,7 @@ def busy_reasons(cfg, wt, hs=None, ps=None):
         hn, _, tid = ref.partition(":"); p = hs.get(hn) or {}
         t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid)
         if p.get("ok") and (t is None or task_rc(t) is not None):
-            if not DRY: f.unlink(missing_ok=True)   # ended or removed: the record goes
+            if not cfg.run.dry: f.unlink(missing_ok=True)   # ended or removed: the record goes
             continue
         if src.resolve() == wt or wt in src.resolve().parents:
             st = t["status"] if p.get("ok") else None; st = st if isinstance(st, str) else next(iter(st or {}), "")
@@ -2616,7 +2614,7 @@ def proc_cwd(pid):
 
 def cmd_busy(cfg, a):
     """orch busy <wt>: exit 0 (and say why) while a job or a mutation run uses the tree, 1 when it is free (row 53)."""
-    cfg.ro = True   # read-only on every host (the probe leaves the overload tracker alone)
+    cfg.run.ro = True   # read-only on every host (the probe leaves the overload tracker alone)
     why = busy_reasons(cfg, a.wt)
     for w in why: say(f"busy: {w}")
     if not why: say(f"free: no orch job, unit job or [busy] process uses {Path(a.wt).resolve()}")
@@ -2652,7 +2650,7 @@ def cancel_job(cfg, ref, force=False, depth=0):
     if t is None: raise Err(f"no task {tid} on {hn}")
     if t.get("group") not in LANES and not str(t.get("label", "")).startswith(("unit:", "run:", "gate:")): raise Err(f"{hn}:{tid} is not an orch lane job ({t.get('label')}); stop units with orch stop")
     jid = job_of(t); tok = wrap_token(t); inner = wrapped_jobs(cfg, tok) if tok else []; out = []
-    if DRY:
+    if cfg.run.dry:
         out.append(f"+ save {hn}:{tid}'s files; {stop_job_cmd(h, jid)}{pueue(h)} kill {tid}; remove" + (f"; then follow its jobs {', '.join(inner)}" if inner else ""))
     else:
         if jid and not h.get("local"):
@@ -2751,11 +2749,11 @@ def thrash_findings(cfg):
 
 def cmd_thrash(cfg, a):
     """Shared hosts' memory pressure and what the watcher does (--dry-run: says what it would do, changes nothing)."""
-    if DRY: cfg.ro = True
+    if cfg.run.dry: cfg.run.ro = True
     hs = probe_all(cfg); units = Beads(cfg).units()
     for u in units: u["state"] = unit_state(u, hs, {})
     if not any(h.get("shared") for h in cfg.hosts.values()): say("no host has shared = true"); return
-    for l in tend_thrash(cfg, hs, units, lambda m: None, dry=DRY or cfg.ro) or ["nothing to do"]: say(l)
+    for l in tend_thrash(cfg, hs, units, lambda m: None, dry=cfg.run.dry or cfg.run.ro) or ["nothing to do"]: say(l)
 
 def agent_ended(u):
     """The unit's agent is gone: an API run ended, a tmux session or herdr agent is gone (an idle herdr agent is alive)."""
@@ -2935,7 +2933,7 @@ def scope_script(cfg, unit, tree, steps):
 def cmd_gate_scope(cfg, a):
     bd, u = get_unit(cfg, a.unit); name = a.name or f"land-{a.unit}"
     steps = scope_steps(cfg, a.unit, u["cwd"]); txt = scope_script(cfg, a.unit, u["cwd"], steps)
-    if DRY: say(txt.rstrip()); say(f"(dry run: would write out/{name}/tests.sh; then orch gate {name} --unit {a.unit})"); return
+    if cfg.run.dry: say(txt.rstrip()); say(f"(dry run: would write out/{name}/tests.sh; then orch gate {name} --unit {a.unit})"); return
     t = cfg.p("out", "out") / name / "tests.sh"; t.parent.mkdir(parents=True, exist_ok=True); atomic_write(t, txt); t.chmod(0o755)
     est = gate_estimate(cfg, name)
     say(f"wrote {t}: {len(steps)} step(s) ({', '.join(n + ('@' + h if h else '') for h, n, _ in steps)})"
@@ -2966,16 +2964,16 @@ def cmd_gate(cfg, a):
             if why and not a.allow_unmerged: raise Err(f"refused: {unit}'s tree {u0['cwd']} {why} (--allow-unmerged to gate anyway)")
         except Err as e:
             if str(e).startswith("refused"): raise
-    if unit and not DRY:
+    if unit and not cfg.run.dry:
         try:
             bd, u = get_unit(cfg, unit)
             if a.name not in u.get("gates", []): u["gates"] = [*u.get("gates", []), a.name]; bd.save(u)
         except Err as e: say(f"note: gate not recorded on {unit}: {e}")
-    X(h, ensure_lanes(h, cfg))
+    X(cfg, h, ensure_lanes(h, cfg))
     tok = f"gate-{re.sub(r'[^A-Za-z0-9_-]', '_', a.name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"   # cancel follows the jobs it queues
-    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g {group} -l {shlex.quote('gate:' + a.name)} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env ORCH_WRAP={tok} {run}')}")
+    rc, o, e = X(cfg, h, f"env {pre} {pueue(h)} add -g {group} -l {shlex.quote('gate:' + a.name)} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env ORCH_WRAP={tok} {run}')}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
-    if DRY: return
+    if cfg.run.dry: return
     tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid} in {group}"
                          + (f" (expected {est:g} min)" if est is not None else "") + (f", limit {lim} min" if lim else ""))
     if not a.wait: return
@@ -3068,7 +3066,7 @@ def cmd_land(cfg, a):
     say(f"land {a.unit}: {branch} in {wt}, {ahead} commit(s) ahead of {br} ({base[:9]}), {behind} behind")
     # 1. merge the current landing branch (dry run: merge-tree only)
     rc, o, e = git(wt, "merge-tree", "--write-tree", "--name-only", "HEAD", br)
-    if rc not in (0, 1) and not DRY:   # git before 2.38 has no merge-tree --write-tree: a trial merge, always aborted (tree clean)
+    if rc not in (0, 1) and not cfg.run.dry:   # git before 2.38 has no merge-tree --write-tree: a trial merge, always aborted (tree clean)
         rc2, o2, e2 = git(wt, "merge", "--no-commit", "--no-ff", br, timeout=600)
         cf_ = git(wt, "diff", "--name-only", "--diff-filter=U")[1]; git(wt, "merge", "--abort")
         if rc2 and not cf_.strip(): raise Err(f"git merge-tree and a trial merge failed: {(e or o).strip()[:80]}; {(e2 or o2).strip()[:80]}")
@@ -3078,7 +3076,7 @@ def cmd_land(cfg, a):
         files = [l for l in o.split("\n\n")[0].splitlines()[1:] if l.strip()][:20] or ["(see git merge)"]   # tree id, then the conflicted paths
         say(f"STOP: merging {br} conflicts in {len(files)} file(s): {', '.join(files[:6])}")
         m = f"merge-{a.unit}"[:32]
-        if a.no_dispatch or DRY: say(f"{'would dispatch' if DRY else 'dispatch with'}: orch launch {m} --kind implement --cwd {wt} (brief {cfg.p('briefs', 'briefs') / (m + '.md')})"); return 3
+        if a.no_dispatch or cfg.run.dry: say(f"{'would dispatch' if cfg.run.dry else 'dispatch with'}: orch launch {m} --kind implement --cwd {wt} (brief {cfg.p('briefs', 'briefs') / (m + '.md')})"); return 3
         bp = cfg.p("briefs", "briefs") / f"{m}.md"
         if not bp.exists(): atomic_write(bp, MERGE_BRIEF.format(m=m, br=br, unit=a.unit, branch=branch, wt=wt, tier=(u.get("tier") or "normal").upper(),
                                                               item=u.get("item") or a.unit, files="\n".join(f"- `{f}`" for f in files)))
@@ -3087,7 +3085,7 @@ def cmd_land(cfg, a):
                                            dry_run=False, share_with=a.unit))
         return 3
     if behind:
-        if DRY: say(f"+ git -C {wt} merge --no-edit {br}  (merge-tree: clean)")
+        if cfg.run.dry: say(f"+ git -C {wt} merge --no-edit {br}  (merge-tree: clean)")
         else:
             rc, o, e = git(wt, "merge", "--no-edit", br, timeout=600)
             if rc: git(wt, "merge", "--abort"); raise Err(f"git merge {br} failed although merge-tree was clean: {(e or o).strip()[-160:]}; aborted")
@@ -3098,13 +3096,13 @@ def cmd_land(cfg, a):
     elif not gh or not gc: raise Err("set [landing] final_gate_host and final_gate (the command that gates a merged tree) in orch.toml, or --no-gate")
     else:
         ra = argparse.Namespace(host=gh, lane="gates", unit=a.unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False, allow_unmerged=False, command=[gc])
-        if DRY: say(f"+ orch run --host {gh} --lane gates --unit {a.unit} --wt {wt} -- {gc}"); 
+        if cfg.run.dry: say(f"+ orch run --host {gh} --lane gates --unit {a.unit} --wt {wt} -- {gc}"); 
         else:
             grc = cmd_run(cfg, ra)
             if grc: raise Err(f"final gate on {gh} failed (exit {grc}): not landed; the merge stays committed in {wt}")
             say(f"final gate on {gh}: PASS")
     # 3. squash-land: tree of the gated HEAD, parent = the landing tip that was merged
-    if DRY: say(f"+ git commit-tree HEAD^{{tree}} -p {base[:9]}; move {br} (ff-only in its checkout); {ahead} commit(s) squashed"); return 0
+    if cfg.run.dry: say(f"+ git commit-tree HEAD^{{tree}} -p {base[:9]}; move {br} (ff-only in its checkout); {ahead} commit(s) squashed"); return 0
     if git(wt, "rev-parse", br)[1].strip() != base: raise Err(f"{br} moved while {a.unit} was gated: run orch land {a.unit} again (it merges the new tip)")
     tree = git(wt, "rev-parse", "HEAD^{tree}")[1].strip()
     subj = git(wt, "log", "--format=%s", f"{base}..HEAD", "--no-merges")[1].splitlines()
@@ -3132,7 +3130,7 @@ SECRETS[-1] = re.compile(SECRETS[-1].pattern, re.M)
 
 def cmd_commit_state(cfg, a):
     """Stage everything, scan exactly what is staged (L9), commit and push; unstage again if a secret is found."""
-    if DRY: say("+ orch index; git add -A; scan staged files; git commit; git push"); return
+    if cfg.run.dry: say("+ orch index; git add -A; scan staged files; git commit; git push"); return
     write_index(cfg)   # out/INDEX.md is committed with the state (orch-swarm item 3)
     rc, o, e = sh(["git", "add", "-A"], cwd=cfg.root, timeout=120)
     if rc: raise Err("git add failed: " + e.strip()[:80])
@@ -3214,7 +3212,7 @@ def cmd_transcript(cfg, a):
 def save_transcript(cfg, u):
     """out/<unit>/transcript.md: the whole condensed transcript (collect; it outlives the remote copy)."""
     rc, txt = read_transcript(cfg, u, "", 0)
-    if rc == 0 and txt and not DRY: atomic_write(cfg.p("out", "out") / u["name"] / "transcript.md", txt + "\n")
+    if rc == 0 and txt and not cfg.run.dry: atomic_write(cfg.p("out", "out") / u["name"] / "transcript.md", txt + "\n")
     return rc == 0
 
 # ---------------------------------------------------------------- peers (orch-swarm item 4)
@@ -3272,7 +3270,7 @@ def transcript_where(cfg, u):
     if not esc: return f"{u['host']}: orch transcript {u['name']} (its folder name depends on that host's $HOME)"
     return f"{u['host']}:~/.claude/projects/{esc}/" + (f"{sid}.jsonl" if sid else "(newest .jsonl)")
 
-def peer_rows(cfg, units):
+def peer_rows(cfg, units, hs):
     """One row per running unit: name, host, model, branch, files changed, step, jobs it waits on, report, transcript."""
     live = [u for u in units if u.get("state") not in ENDED + ("failed",) or u.get("_park")]
     with cf.ThreadPoolExecutor(8) as ex: ch = list(ex.map(lambda u: unit_changes(cfg, u, units), live))
@@ -3280,7 +3278,7 @@ def peer_rows(cfg, units):
     for u, (br, fs) in zip(live, ch):
         c = card_fields(cfg, u["name"])
         rows.append({"name": u["name"], "host": u.get("host"), "model": u.get("model"), "branch": br, "files": fs, "state": u.get("state"),
-                     "step": c.get("step") or c.get("state") or "-", "jobs": u.get("_park") or unit_jobs(getattr(cfg, "_hs", {}), u["name"]),
+                     "step": c.get("step") or c.get("state") or "-", "jobs": u.get("_park") or unit_jobs(hs, u["name"]),
                      "report": str(report_path(cfg, u)) if cfg.hosts.get(u.get("host"), {}).get("local") else f"{u['host']}:{cfg.hosts[u['host']].get('root')}/out/{u['name']}/REPORT.md",
                      "transcript": transcript_where(cfg, u)})
     return rows
@@ -3294,11 +3292,11 @@ def peers_text(rows):
     if not rows: L.append("- none running")
     return "\n".join(L) + "\n"
 
-def peer_findings(cfg, units):
+def peer_findings(cfg, units, hs):
     """Writes the board folder's peers.md (a writer only: the board sync then carries it to every host) and returns
     overlap:<a>:<b> for two running units that change the same file."""
-    rows = peer_rows(cfg, units); F = []
-    if not cfg.ro and not DRY and board_dir(cfg).is_dir(): atomic_write(board_dir(cfg) / "peers.md", peers_text(rows))
+    rows = peer_rows(cfg, units, hs); F = []
+    if not cfg.run.ro and not cfg.run.dry and board_dir(cfg).is_dir(): atomic_write(board_dir(cfg) / "peers.md", peers_text(rows))
     for i, a in enumerate(rows):
         for b in rows[i + 1:]:
             both = sorted(set(a["files"]) & set(b["files"]))
@@ -3307,13 +3305,13 @@ def peer_findings(cfg, units):
     return F
 
 def cmd_peers(cfg, a):
-    cfg.ro = True; hs = probe_all(cfg); cfg._hs = hs
+    cfg.run.ro = True; hs = probe_all(cfg)
     try: units = Beads(cfg).units()
     except Err as e: raise Err(f"beads unavailable: {e}")
     for u in units:
         u["state"] = unit_state(u, hs, {}) if u.get("via") != "herdr" else unit_state(u, hs, herdr_agents(cfg))
         if not verdict(cfg, u) and u["state"] in ENDED: u["_park"] = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
-    say(peers_text(peer_rows(cfg, units)).rstrip())
+    say(peers_text(peer_rows(cfg, units, hs)).rstrip())
 
 # ---------------------------------------------------------------- reports index (orch-swarm item 3)
 RESULT_RX = re.compile(r"^\W*(result|summary|outcome|conclusion)s?\b\W*", re.I)
@@ -3340,7 +3338,7 @@ def write_index(cfg):
     rows.sort(reverse=True)
     text = (f"# Reports index ({ts()}; orch index, regenerated at orch commit-state)\n"
             + "".join(f"- {n} | {v} | {r or '-'} | {rp}\n" for _, n, v, r, rp in rows))
-    if not DRY and not cfg.ro:
+    if not cfg.run.dry and not cfg.run.ro:
         atomic_write(od / "INDEX.md", text)
         if board_dir(cfg).is_dir(): atomic_write(board_dir(cfg) / "index.md", text)
     return len(rows)
@@ -3401,7 +3399,7 @@ def cmd_remember(cfg, a):
     key = slug(a.key) if a.key else None
     old = [e for e in es if key and e[2] == key]
     new = (MEM_SECTIONS[kind], time.strftime("%Y-%m-%d"), key, text, a.source)
-    if DRY: say(f"+ remember {mem_line(new)}" + (f" (replaces {len(old)} on [{key}])" if old else "")); return
+    if cfg.run.dry: say(f"+ remember {mem_line(new)}" + (f" (replaces {len(old)} on [{key}])" if old else "")); return
     for e in old: memory_history(cfg, e, "replaced")
     memory_write(cfg, [e for e in es if e not in old] + [new])
     if a.learned: learned_mark(cfg, a.learned, "remembered")
@@ -3412,7 +3410,7 @@ def cmd_forget(cfg, a):
     es = memory_read(cfg); q = a.text.strip()
     hit = [es[int(q) - 1]] if q.isdigit() and 0 < int(q) <= len(es) else [e for e in es if e[3] == q] or [e for e in es if q in e[3] or q == e[2]]
     if len(hit) != 1: raise Err(f"{'no' if not hit else len(hit)} entries match {q!r}" + ("; give its number (orch memory) or more text" if hit else ""))
-    if DRY: say(f"+ forget {mem_line(hit[0])}"); return
+    if cfg.run.dry: say(f"+ forget {mem_line(hit[0])}"); return
     memory_history(cfg, hit[0], "forgotten"); memory_write(cfg, [e for e in es if e != hit[0]])
     cfg.touch("changed"); say(f"forgotten (moved to {cfg.f('memory-history.md').name}): {hit[0][3]}")
 
@@ -3422,7 +3420,7 @@ def cmd_memory(cfg, a):
         refuse_agent("orch memory --keep")
         if not (0 < a.keep <= len(es)): raise Err(f"no entry {a.keep}")
         e = es[a.keep - 1]; es[a.keep - 1] = (e[0], time.strftime("%Y-%m-%d"), *e[2:])
-        if not DRY: memory_write(cfg, es)
+        if not cfg.run.dry: memory_write(cfg, es)
         say(f"kept (re-dated): {e[3]}"); return
     for i, e in enumerate(es, 1): say(f"{i:3} {e[0][:-1].lower():8} {mem_line(e)[2:]}")
     if not es: say(f"(no entries in {memory_path(cfg)})")
@@ -3457,7 +3455,7 @@ def rule_findings(cfg):
 def learned_mark(cfg, lid, how):
     """Record that learned post <agent>:<n> was remembered or rejected (check then stops listing it)."""
     lid = lid.removeprefix("learned:"); d = cfg.jget("learned.json"); d[lid] = {"how": how, "t": int(now())}
-    if not DRY: cfg.f("learned.json").write_text(json.dumps(d))
+    if not cfg.run.dry: cfg.f("learned.json").write_text(json.dumps(d))
 
 def memory_findings(cfg):
     es = memory_read(cfg); F = []
@@ -3486,7 +3484,7 @@ def init_project(root, a):
     host = (os.uname().nodename.split(".")[0].lower() or "local").replace(" ", "-")
     text = ex.read_text().replace('name = "myproject"', f'name = "{name}"').replace('workspace = "myproject"', f'workspace = "{name}"')
     text = text.replace("[hosts.laptop]", f"[hosts.{host}]").replace('hosts = ["laptop"]', f'hosts = ["{host}"]')
-    if DRY: print(text); return 0
+    if a.dry_run: print(text); return 0
     atomic_write(t, text)
     for d in (".orch", "briefs", "out"): (root / d).mkdir(exist_ok=True)
     say(f"wrote {t} (this machine is [hosts.{host}]); created .orch/, briefs/, out/")
@@ -3501,7 +3499,7 @@ def cmd_init(cfg, a):
         if not p.is_file(): continue
         t = p.read_text(); ptr = f"Moved: the current state and handoff are in {cfg.state.name}/HANDOFF.md (orch check regenerates it). Old text: {cfg.state.name}/history-{p.name}\n"
         if t == ptr: say(f"{x}: already a pointer"); continue
-        if DRY: say(f"+ keep {x} in {cfg.state.name}/history-{p.name}; write the pointer"); continue
+        if cfg.run.dry: say(f"+ keep {x} in {cfg.state.name}/history-{p.name}; write the pointer"); continue
         k = cfg.f(f"history-{p.name}")
         k.write_text((k.read_text() if k.exists() else "") + f"\n\n<!-- {ts()} moved from {x} -->\n" + t)
         atomic_write(p, ptr); say(f"{x}: now a pointer (old text in {k})")
@@ -3955,7 +3953,7 @@ def cmd_watch(cfg, a):
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
     if getattr(a, "alert", False): board_alerts(cfg, log); return   # board.sh .notify: a new question or block, at once
     def sync():   # the shipped board only, when there are other hosts (or posts this machine made before it was the board)
-        if cfg.paths.get("board") or DRY: return
+        if cfg.paths.get("board") or cfg.run.dry: return
         board_files(cfg)
         if (board_dir(cfg) / ".hosts").read_text().strip() or (board_dir(cfg).parent / "board-outbox" / "outbox.log").is_file(): board(cfg, "sync", timeout=180)
     sync()   # the shipped board: merge the hosts' outboxes (their questions alert at once through .notify) before the check
@@ -4091,12 +4089,11 @@ def main():
         try: cmd_hook(a.event)
         except Exception as e: print(f"orch hook: {e}", file=sys.stderr)
         return 0
-    DRY.value = getattr(a, "dry_run", False)
     root = find_root(os.getcwd()) if a.cmd in ("init", "doctor") else find_root()   # never $ORCH_ROOT for setup commands
     if a.cmd == "init" and not root: return init_project(Path.cwd(), a)
     if a.cmd == "doctor" and not root: return doctor(None, a)
     if not root: print("orch: no orch.toml here or in a parent (orch init writes a starter one)", file=sys.stderr); return 2
-    try: cfg = Cfg(root)
+    try: cfg = Cfg(root, Run(dry=getattr(a, "dry_run", False)))
     except (tomllib.TOMLDecodeError, OSError) as e: print(f"orch: {root / 'orch.toml'}: {e}", file=sys.stderr); return 2
     try: r = globals()["cmd_" + a.cmd.replace("-", "_")](cfg, a)
     except Err as e: print(f"orch: {e}", file=sys.stderr); return 1
