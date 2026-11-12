@@ -106,6 +106,17 @@ def land_disk_floor(cfg, h):
     else 5 -- the land lane's own default: a landing is a short local merge, so it keeps 5 rather than admission's 10."""
     return h["min_disk_gb"] if "min_disk_gb" in h else (cfg.capc.get("min_disk_gb") if cfg and "min_disk_gb" in cfg.capc else 5)
 
+def guarded_setup(h):
+    """The host's job_setup, run only in a tree it belongs to (soak item 34): a tree without the folder the setup works in (a job in
+    another repository's checkout) skips it with a note, where it used to exit 1 for every job. The folder is job_setup_in, else
+    the one a leading `cd <dir> &&` of the setup names; a setup that names none runs everywhere, as before."""
+    setup = h.get("job_setup", "")
+    m = re.match(r"\s*cd\s+([\w./-]+)\s*&&", setup)
+    need = h.get("job_setup_in") or (m.group(1) if m else "")
+    if not (setup and need): return setup
+    note = shlex.quote("janus: job_setup skipped: no " + need + "/ in this tree (not the project's own)")
+    return f"if [ -d {shlex.quote(need)} ]; then {setup}; else echo {note}; fi"
+
 def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     """The bash script pueue runs on the host. Output is tee'd to <runs>/<jid>.log, the exit code written to <jid>.rc.
     Every lane on every host (the Mac too, register item 5) waits for admission by reservations (ADMIT, runs/cap.sh), holds
@@ -119,7 +130,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
             + ("" if clsrc else f"printf '%s\\n' {q(cmd)} > \"$R.cmd\"\n")   # item 32: what the job's shape is computed from (the probe reads it too)
             + f"export JANUS_WRAP={q(jid)}   # janus run inside records the jobs it queues under this (cancel follows them)\n")
     broad = bool(getattr(a, "broad", None)); nice = 19 if broad else 10   # a broad run (--broad) runs at the lowest CPU priority
-    setup = h.get("job_setup", ""); log = h.get("job_log", "/dev/null")
+    setup = guarded_setup(h); log = h.get("job_log", "/dev/null")
     adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
                    "waitmax": int(lane_age(cfg, a.lane) * 60)}   # item 21: give up after the lane's age limit
     if h.get("local"):

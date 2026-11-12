@@ -106,6 +106,7 @@ min_disk_gb = 20
 # memory_max = "6G"        # systemd-run MemoryMax for each remote agent
 # run_env = ". $HOME/env.sh"         # shell run before every job
 # job_setup = "make deps"            # shell run in the worktree before every job's command
+# job_setup_in = "deps"              # run it only in a tree holding this folder (default: the dir of a leading `cd <dir> &&`)
 # job_log = "/home/me/janus/jobs.log" # a line per job start and end
 # sync_exclude = [".git", "target", ".venv", "node_modules"]   # a leading / anchors an entry to the worktree root
 # worktrees = "/home/me/janus/worktrees"

@@ -88,7 +88,7 @@ API agents) and `pueue_config`. For `janus run` (section 6a): `services_gb` (mea
 `legacy_probe` (shell printing `legacy_wait=<n>` and `legacy_run=<n>` for an older job queue, shown by `janus check` while it
 drains) with `legacy_slots`, `runner = "podman"` with a `[hosts.<h>.container]` table (image, mount, mount_at, args,
 usb_args, usb_lock, host_dirs, clone_base, name_prefixes, cpus), `worktrees`, `job_log`, `run_env` (shell run before every
-job), `job_setup` (shell run in the worktree before the command), `sync_exclude`, `cores_per_job` (CPU admission), and on the
+job), `job_setup` (shell run in the worktree before the command; skipped, with a note, in a tree without the folder it `cd`s into, or `job_setup_in`: a job in another repository's checkout is not broken by it), `sync_exclude`, `cores_per_job` (CPU admission), and on the
 local machine `admit_check`/`admit_check_env` and `legacy_lanes` (dirs with a pid file of an older lane the land lane waits
 for). Optional `[lanes.<lane>] age_min` overrides a lane's age limit. `example.janus.toml` shows every key.
 
