@@ -3,7 +3,7 @@ transcript; the watcher's tend_parked (resume a parked unit when its jobs finish
 import os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import collect_job, job_of, job_state, runs_dir, save_task_log, task_rc, task_status, unit_jobs
-from janus.actions.launch import api_remote, confirm_started
+from janus.actions.launch import api_remote, confirm_started, cwd_taken
 from janus.autopilot import forget, record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
@@ -312,18 +312,30 @@ def cmd_park(cfg, a):
     bd.comment(u["id"], f"{ts()} parked on {', '.join(jobs)}"); say(f"parked {n}")
 
 def cmd_resume(cfg, a):
-    """Resume a unit's own session now: parked (its jobs' results, when they finished), or with --message."""
+    """Resume a unit's own session now: parked (its jobs' results, when they finished), or with --message.
+
+    Finding 2: never a second agent beside a running one, and never a job marked handled while it still runs, so the unit's
+    next park line still names it (the guard covers --message too, and --force overrides only the 'not finished' refusal)."""
     bd, u = get_unit(cfg, a.unit); hs = probe_all(cfg)
     jobs = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
     if a.message: msg = a.message
-    elif jobs:
-        left = [j for j in jobs if job_state(hs, j)[0] not in ("done", "gone")]
-        if left and not a.force: raise Err(f"{u['name']} waits on {', '.join(left)}, not finished (--force to resume now)")
-        msg = resume_message(cfg, hs, u, jobs)
+    elif jobs: msg = resume_message(cfg, hs, u, jobs)
     else: raise Err(f"{u['name']} is not parked: give --message")
+    # finding 2: the tree is another open unit's cwd: never put a unit back into the tree its successor now works in (H9).
+    cwd = Path(u["cwd"]).resolve() if u.get("cwd") else None
+    shared, _ = cwd_taken(cfg, bd.units(), cwd, u["name"]) if cwd else ([], None)
+    if shared: raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}: resume {u['name']} in a tree of its own (H9)")
+    if not a.force:
+        st = unit_state(u, hs, herdr_agents(cfg))
+        if st in ("working", "queued", "blocked"):
+            raise Err(f"{u['name']}'s agent is still {st}: stop it first (janus stop {u['name']}), or --force to resume now")
+        left = [j for j in jobs if job_state(hs, j)[0] not in ("done", "gone")]
+        if left: raise Err(f"{u['name']} waits on {', '.join(left)}, not finished (--force to resume now)")
     say(resume_unit(cfg, u, msg, budget=getattr(a, "budget", None)))
     if cfg.run.dry: return
-    u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
+    done = [j for j in jobs if job_state(hs, j)[0] in ("done", "gone")]   # finding 2: a running job is never marked handled
+    if done: u["handled_jobs"] = [*u.get("handled_jobs", []), *done]
+    u.pop("parked", None); bd.save(u)
     bd.comment(u["id"], f"{ts()} resumed")
 
 def save_output(cfg, u):
