@@ -115,6 +115,16 @@ class Autopilot(unittest.TestCase):
         janus.tend_autopilot(self.cfg, {}, [u2], [], log.append); self.assertEqual(len(self.launched), 1, "acted on a held unit")
         self.assertIsNone(janus.ending(self.cfg, self.unit(verdict="VERDICT: DONE")))
 
+    def test_a_crashed_remote_unit_is_not_relaunched_and_the_finding_names_its_patch(self):
+        """Catches (panel-eng F4): a crashed remote unit relaunched from this machine's tree, without the code it wrote (kept
+        only in its remote tree and out/<unit>/changes.patch), and the orchestrator not told where that code is."""
+        d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/tmp/x"\n[autopilot]\nenabled = true\n')
+        u = self.unit(host="far", collected_at=time.time() + 60)
+        janus.tend_autopilot(cfg, {}, [u], [], lambda m: None)
+        self.assertEqual(self.launched, [], "a remote unit was relaunched from this machine's tree")
+        F = dict(janus.autopilot_findings(cfg, [u]))
+        self.assertIn("out/u1/changes.patch", F.get("unit:u1:relaunch", ""), F)
+
     def test_off_by_default_and_question_answered_only_from_an_exact_memory_subject(self):
         """Catches: the autopilot acting without the owner's opt-in, and answering a question memory does not settle."""
         d, cfg = project()

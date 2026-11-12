@@ -86,6 +86,20 @@ def ending(cfg, u):
     if api_out(cfg, u).get("subtype") == "error_max_budget_usd": return None   # wrap_due: tend_parked wraps it up first
     return "crashed"
 
+def autopilot_findings(cfg, units):
+    """unit:<n>:relaunch: with the autopilot on, a remote unit that crashed or was capped is not relaunched automatically (a
+    relaunch would start from this machine's tree, without its code): the finding names the patch its changes are kept in."""
+    if not apc(cfg, "enabled"): return []
+    F = []
+    for u in units:
+        if cfg.hosts.get(u.get("host"), {}).get("local") or held(cfg, u["name"]): continue
+        why = ending(cfg, u)
+        if why:
+            n = u["name"]; p = cfg.p("out", "out") / n / "changes.patch"; get = "" if p.is_file() else f" (janus collect {n} writes it)"
+            F.append((f"unit:{n}:relaunch", f"{n} {why} on {u.get('host')}; the autopilot relaunches only local units. Its changes are kept in "
+                      f"{p}{get}: relaunch it with that patch applied first (git apply --3way in the new unit's tree), or close it"))
+    return F
+
 def answer_from_memory(cfg, log):
     """An open board question that names a MEMORY.md subject exactly ([key] or the key as a whole word): answered with it."""
     es = [e for e in memory_read(cfg) if e[2]]
@@ -187,7 +201,10 @@ def tend_autopilot(cfg, hs, units, F, log):
                 out = quiet(cmd_collect, cfg, argparse.Namespace(unit=u["name"]))
                 u["collected_at"] = int(now()); record(cfg, f"unit:{u['name']}", f"collect:{u.get('run')}", out, u); log(f"autopilot: collected {u['name']}")
             why = ending(cfg, u)
-            if why: relaunch(cfg, u, why, log)
+            if why and remote:   # its code lives only in its remote tree and changes.patch: the orchestrator decides (F4)
+                if record(cfg, f"unit:{u['name']}", f"remote-left:{u.get('run')}", f"{why} on {u.get('host')}: not relaunched (remote); see the unit:{u['name']}:relaunch finding", u):
+                    log(f"autopilot: {u['name']} {why} on {u.get('host')}: left to the orchestrator (remote unit)")
+            elif why: relaunch(cfg, u, why, log)
         except Err as e: log(f"autopilot: {u['name']}: {e}")
     for step in (lambda: answer_from_memory(cfg, log), lambda: requeue_stuck(cfg, hs, units, F, log),
                  lambda: move_off_down_hosts(cfg, hs, units, log), lambda: archive_cards(cfg, units, log)):

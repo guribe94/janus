@@ -5,6 +5,7 @@ the Live part of HANDOFF.md (a writer only: the registered orchestrator or the w
 import contextlib, json, re
 from janus.actions.jobs import slots
 from janus.backlog import ready_work
+from janus.autopilot import autopilot_findings
 from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
 from janus.context import DECISION_ACKS, Err, LB, note_event, LE, NOTES0, atomic_write, handoff_path, hrun, is_orchestrator, now, say, ts
@@ -43,6 +44,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     F += host_findings(cfg, hs, units, viol) + pane_findings(cfg, units, ag)
     F += board_findings(cfg, names) + card_findings(cfg, names) + note_findings(cfg)
     UF, running = unit_findings(cfg, hs, units, ag); F += UF
+    F += autopilot_findings(cfg, units)   # unit:<n>:relaunch: a remote unit the autopilot leaves to the orchestrator (fix-core F4)
     F += peer_findings(cfg, units, hs)   # peers.md, overlap:<a>:<b> (janus-swarm item 4)
     F += related_findings(cfg, units, hs)   # related:<a>:<b> when two running units' work meets (imp-awareness)
     board_upkeep(cfg, units)
