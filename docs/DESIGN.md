@@ -138,7 +138,7 @@ and within capacity, budget and caps exactly like `janus launch`.
 
 | Situation (finding) | Automatic action | Limits |
 |---|---|---|
-| Capped: an API run ended at its budget cap without a verdict (`budget`, `wrap_due`) | wrap-up resume once (`[budget] wrapup_usd`), then relaunch with `--resume-of <unit>` and its report, budget from history | at most `[autopilot] relaunch_max` (2) per unit; the waste pause stops it |
+| Capped: an API run ended at its budget cap without a verdict (`budget`, `wrap_due`) | wrap-up resume once (`[budget] wrapup_usd` plus its context reload), then the unit is recorded resumable: its money is kept under the cap and it is resumed in its own session and tree, before any new unit, when the cap has room (budget from history plus the reload) | at most `[autopilot] relaunch_max` (2) new budgets per unit, then `unit:<u>:resume-limit` |
 | Crashed or gone: the agent ended without a verdict (`unit:<u>:finished` no verdict, `board:<a>:gone`) | relaunch from its report (`--resume-of`), same host when it has room, else another | as above; never when its remote copy is uncollected (collect first) |
 | Question whose answer is in memory (`question:<id>`) | answer with the MEMORY.md entry it matches (subject key or exact rule), cite it | only exact subject matches; anything else waits for the orchestrator |
 | Job stuck or orphaned (`orphan:job`, `age:`, `parked:<u>` on a job not queued or running) | cancel (files saved), re-queue the recorded job (`.janus/runs/jobs`) on a host with room | once per job; a job that failed twice is reported, not re-queued |
@@ -148,7 +148,7 @@ and within capacity, budget and caps exactly like `janus launch`.
 | Thrash on a shared host (`thrash:`) | already automatic (fixes10 item 3) | |
 
 Built (imp-autopilot): the capped, crashed/gone, question, stuck-job and host-down rows, collect and card archiving, behind
-`[autopilot] enabled`. Not built: moving waiting jobs to an idle lane (`idle:...:vs`) and tidy on a schedule (the watcher only
+`[autopilot] enabled` (on by default in a project with a spending cap). Not built: moving waiting jobs to an idle lane (`idle:...:vs`) and tidy on a schedule (the watcher only
 refreshes tidy's list). A gone herdr agent counts as crashed when its unit has no verdict; an orphan job is cancelled, not
 re-queued (its owner is gone).
 

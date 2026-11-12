@@ -29,4 +29,7 @@ On `question:<id>` or a "Board needs you now" prompt: look in `janus memory`, `j
 ## Launching
 `janus launch <unit> --kind implement|review|audit|cleanup --tier critical|normal [--test-host h]`. A brief holds `TIER:`, `SCOPE:` (or `Your modules:`), the report path (`REPORT.md`), `DONE-WHEN:` (or `PROOF:`); nothing else is required. Reviews use another vendor (`--of <unit>`). Resume a stopped unit with `--resume-of <unit>`. Use every host: act on idle-host and idle-backlog lines.
 
+## Budget
+Open units finish before new ones start: janus keeps the rest of each open unit's budget under the provider's `cap_usd` and refuses launches that would take it. On `spend:<p>:reserve` or `spend:<p>:short`, `janus ask` the owner at once about the cap (with a recommendation), before it is reached; launch nothing new. A `unit:<u>:resumable` unit was stopped by its budget: the watcher resumes it first, in its own session, when there is room; give it room or close it, never relaunch it as new. On `ledger:<p>:recost`: `janus ledger recost --dry-run`, then without. Before you leave work unattended, `unattended:off` must be absent or acked with the owner's reason.
+
 Every other finding and its command: docs/REFERENCE.md "Findings and their actions". herdr syntax: the herdr skill.
