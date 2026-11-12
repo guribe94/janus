@@ -184,9 +184,9 @@ def cmd_learned(cfg, a):
     if a.reject:
         refuse_agent("orch learned --reject")
         if not any(i == a.reject.removeprefix("learned:") for i, _ in learned_posts(cfg)): raise Err(f"no learned post {a.reject}")
-        learned_mark(cfg, a.reject, "rejected" + (f": {a.why}" if a.why else "")); say(f"rejected {a.reject}"); return
+        learned_mark(cfg, a.reject, "rejected" + (f": {a.why}" if a.why else "")); return 0, [f"rejected {a.reject}"]
     done = cfg.jget("learned.json")
-    for i, t in learned_posts(cfg): say(f"{i:24} {done.get(i, {}).get('how', 'open'):10} {t}")
+    return 0, [f"{i:24} {done.get(i, {}).get('how', 'open'):10} {t}" for i, t in learned_posts(cfg)]
 
 def board_upkeep(cfg, units):
     """The shipped board's own files (a writer only): .master (this machine's host name), .hosts (other hosts from orch.toml,
@@ -569,12 +569,12 @@ def run_check(cfg, cycle=True, writer=None):
 def cmd_check(cfg, a):
     F, live, hs, units = run_check(cfg)
     op = cfg.jget("open.json")
-    if a.escalate: F = [(k, t) for k, t in F if now() - op.get(k, now()) > cfg.deadline]
+    if a.escalate: F = [f for f in F if now() - op.get(f.key, now()) > cfg.deadline]
     if a.json:
-        say(json.dumps({"read_only": cfg.run.ro, "findings": [{**f.data(), "open_since": int(op.get(f.key, now()))} for f in F]}, indent=1)); return
-    if a.brief and len(F) > 8: F = F[:8] + [("more", f"+{len(F) - 8} more: run orch check")]
-    for k, t in F: say(f"[{k}] {t}")
-    if cfg.run.ro: say("(read-only: not the registered orchestrator session, so nothing was saved, tuned or stamped)")
+        return 0, [json.dumps({"read_only": cfg.run.ro, "findings": [{**f.data(), "open_since": int(op.get(f.key, now()))} for f in F]}, indent=1)]
+    L = [f"[{k}] {t}" for k, t in F]
+    if a.brief and len(L) > 8: L = L[:8] + [f"[more] +{len(L) - 8} more: run orch check"]
+    return 0, L + (["(read-only: not the registered orchestrator session, so nothing was saved, tuned or stamped)"] if cfg.run.ro else [])
 
 def cmd_capacity(cfg, a):
     cfg.run.ro = True; hs = probe_all(cfg)
@@ -582,10 +582,10 @@ def cmd_capacity(cfg, a):
     except Err: units = []
     ag = herdr_agents(cfg)
     for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no agent or build position
-    for n, p in hs.items(): say(cap_line(cfg, n, p, units))
+    return 0, [cap_line(cfg, n, p, units) for n, p in hs.items()]
 
 def cmd_status(cfg, a):
-    F, live, *_ = run_check(cfg, cycle=False); say(live)
+    F, live, *_ = run_check(cfg, cycle=False); return 0, [live]
 
 def cmd_board_close(cfg, a):
     """Archive a board card that is not an open unit (cards from other launchers); an open unit is closed with orch close."""
@@ -2231,7 +2231,7 @@ def report_findings(cfg, units):
 def cmd_report(cfg, a):
     """The owner's status report: backlog completeness and remaining work, spend by outcome, the waste rule, open units.
     --brief: the summary lines only. --sent: record that it was sent (clears report-due until the next checkpoint)."""
-    if a.sent: cfg.touch("report_sent"); say("report marked sent"); return 0
+    if a.sent: cfg.touch("report_sent"); return 0, ["report marked sent"]
     L = [f"orch report: {cfg.name}, {ts()}"]
     items = backlog_items(cfg)
     if items is not None:
@@ -2257,8 +2257,7 @@ def cmd_report(cfg, a):
         us = Beads(cfg).units()
         L.append(f"Open units: {len(us)}" + ("" if a.brief else ": " + ", ".join(u["name"] for u in us)[:300]))
     except Err as e: L.append(f"Open units: unavailable ({e})")
-    for l in L: say(l)
-    return 0
+    return 0, L
 
 def Counter_(it):
     c = {}
@@ -2616,9 +2615,7 @@ def cmd_busy(cfg, a):
     """orch busy <wt>: exit 0 (and say why) while a job or a mutation run uses the tree, 1 when it is free (row 53)."""
     cfg.run.ro = True   # read-only on every host (the probe leaves the overload tracker alone)
     why = busy_reasons(cfg, a.wt)
-    for w in why: say(f"busy: {w}")
-    if not why: say(f"free: no orch job, unit job or [busy] process uses {Path(a.wt).resolve()}")
-    return 0 if why else 1
+    return (0, [f"busy: {w}" for w in why]) if why else (1, [f"free: no orch job, unit job or [busy] process uses {Path(a.wt).resolve()}"])
 
 def cmd_cancel(cfg, a):
     """Cancel an orch job (<host>:<task>) that outlived its intent (issue 36): see cancel_job."""
@@ -2845,8 +2842,7 @@ def judge_gate(cfg, name, rc):
 def cmd_gate_judge(cfg, a):
     r, new, known = judge_gate(cfg, a.name, a.rc)
     extra = (f" KNOWN={len(known)}" if known else "") + (f" NEW={','.join(new[:20])[:400]}" if new and new != [f"exit {a.rc}"] else "")
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {a.name} EXIT_tests={a.rc}{extra} RESULT: {r}")
-    return 0 if r == "PASS" else 1
+    return 0 if r == "PASS" else 1, [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {a.name} EXIT_tests={a.rc}{extra} RESULT: {r}"]
 
 def known_failure_findings(cfg, names):
     """known-failure:<id>: a known failure no open unit fixes (failures on main are fixed at their root cause, owner rule);
@@ -3207,7 +3203,7 @@ def cmd_transcript(cfg, a):
         L = saved.read_text().splitlines()
         if a.grep: L = [l for l in L if re.search(a.grep, l, re.I)]
         txt = f"(saved copy {saved})\n" + "\n".join(L[-a.tail:] if a.tail > 0 else L); rc = 0
-    say(txt); return 0 if rc == 0 else 1
+    return 0 if rc == 0 else 1, [txt]
 
 def save_transcript(cfg, u):
     """out/<unit>/transcript.md: the whole condensed transcript (collect; it outlives the remote copy)."""
@@ -3311,7 +3307,7 @@ def cmd_peers(cfg, a):
     for u in units:
         u["state"] = unit_state(u, hs, {}) if u.get("via") != "herdr" else unit_state(u, hs, herdr_agents(cfg))
         if not verdict(cfg, u) and u["state"] in ENDED: u["_park"] = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
-    say(peers_text(peer_rows(cfg, units, hs)).rstrip())
+    return 0, [peers_text(peer_rows(cfg, units, hs)).rstrip()]
 
 # ---------------------------------------------------------------- reports index (orch-swarm item 3)
 RESULT_RX = re.compile(r"^\W*(result|summary|outcome|conclusion)s?\b\W*", re.I)
@@ -3421,9 +3417,8 @@ def cmd_memory(cfg, a):
         if not (0 < a.keep <= len(es)): raise Err(f"no entry {a.keep}")
         e = es[a.keep - 1]; es[a.keep - 1] = (e[0], time.strftime("%Y-%m-%d"), *e[2:])
         if not cfg.run.dry: memory_write(cfg, es)
-        say(f"kept (re-dated): {e[3]}"); return
-    for i, e in enumerate(es, 1): say(f"{i:3} {e[0][:-1].lower():8} {mem_line(e)[2:]}")
-    if not es: say(f"(no entries in {memory_path(cfg)})")
+        return 0, [f"kept (re-dated): {e[3]}"]
+    return 0, [f"{i:3} {e[0][:-1].lower():8} {mem_line(e)[2:]}" for i, e in enumerate(es, 1)] or [f"(no entries in {memory_path(cfg)})"]
 
 def mem_source_gone(cfg, s):
     """True when a cited source is a path that no longer exists (a sha or a job id is not checked here)."""
@@ -3576,10 +3571,12 @@ def doctor(cfg, a):
 
 def cmd_queue(cfg, a):
     """Read-only: each host's pueue status (or one task's log), so the orchestrator never needs ssh <host> pueue by hand."""
+    L = []
     for n, h in cfg.hosts.items():
         if a.host and n != a.host: continue
         rc, o, e = hrun(h, f"{pueue(h)} " + (f"log {int(a.log)}" if a.log is not None else "status"), timeout=30)
-        say(f"== {n}" + ("" if rc == 0 else f" (exit {rc}: {(e or o).strip()[-100:]})")); say(o.rstrip())
+        L += [f"== {n}" + ("" if rc == 0 else f" (exit {rc}: {(e or o).strip()[-100:]})"), o.rstrip()]
+    return 0, L
 
 # ---------------------------------------------------------------- hooks (Claude Code and Codex share one format)
 # PreToolUse shell rules (audit H2, M5). The command is parsed, not pattern-matched: heredoc bodies are data unless fed to a
@@ -4097,6 +4094,8 @@ def main():
     except (tomllib.TOMLDecodeError, OSError) as e: print(f"orch: {root / 'orch.toml'}: {e}", file=sys.stderr); return 2
     try: r = globals()["cmd_" + a.cmd.replace("-", "_")](cfg, a)
     except Err as e: print(f"orch: {e}", file=sys.stderr); return 1
-    return r if isinstance(r, int) else 0
+    rc, lines = r if isinstance(r, tuple) else (r if isinstance(r, int) else 0, [])   # a read-only command returns its lines
+    for l in lines: say(l)
+    return rc
 
 if __name__ == "__main__": sys.exit(main())
