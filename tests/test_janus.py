@@ -1006,4 +1006,31 @@ class Generic(unittest.TestCase):
                 hits = [f"{f.name}:{i}" for i, l in enumerate(f.read_text(errors="replace").splitlines(), 1) if bad.search(l)]
                 self.assertEqual(hits, [], f"project details in {f}")
 
+class Migrate(unittest.TestCase):
+    """janus migrate: one-time, idempotent move of a project and the toolkit install from orch to janus."""
+    def test_moves_config_state_hooks_and_watcher_once(self):
+        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "orch.toml").write_text("[project]\nname = 't'\n")
+        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("old notes\n")
+        home = Path(tempfile.mkdtemp(prefix="janus-home-"))
+        (home / ".claude").mkdir()
+        (home / ".claude/settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/u/.local/bin/orch hook Stop"}]}]}}))
+        (home / "Library/LaunchAgents").mkdir(parents=True); (home / "Library/LaunchAgents/com.orch.watch.plist").write_text("old plist\n")
+        calls = []; real_run = janus.run; janus.run = lambda *a, **k: (calls.append(a[0][0]), 0, "", "")[1:]
+        old_home = os.environ.get("HOME"); os.environ["HOME"] = str(home)
+        try:
+            self.assertEqual(janus.migrate(str(d)), 0)
+            self.assertTrue((d / "janus.toml").is_file()); self.assertFalse((d / "orch.toml").exists())
+            self.assertTrue((d / ".janus/HANDOFF.md").is_file()); self.assertFalse((d / ".orch").exists())
+            cmd = json.loads((home / ".claude/settings.json").read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]
+            self.assertIn("janus hook Stop", cmd); self.assertNotIn("/orch hook", cmd)
+            if sys.platform == "darwin":
+                self.assertFalse((home / "Library/LaunchAgents/com.orch.watch.plist").exists())
+                self.assertTrue((home / "Library/LaunchAgents/com.janus.watch.plist").is_file()); self.assertIn("launchctl", calls)
+            self.assertEqual(janus.migrate(str(d)), 0)   # idempotent: nothing left to do, still exit 0
+            self.assertTrue((d / "janus.toml").is_file())
+        finally:
+            janus.run = real_run
+            if old_home is None: os.environ.pop("HOME", None)
+            else: os.environ["HOME"] = old_home
+
 if __name__ == "__main__": unittest.main()

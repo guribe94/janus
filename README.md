@@ -1,9 +1,9 @@
 # janus: an orchestrator that is held to its role
 
 `janus` is a small toolkit for running a multi-agent project (several AI coding agents, on one or more machines) from one
-"orchestrator" AI session. It is one Python file (`janus.py`, standard library only, Python 3.11+), a skill
-(`skill/SKILL.md`), an installer and a launchd watcher. It is glue over standard tools: beads (`bd`), pueue, tmux, herdr,
-ssh, rsync and git.
+"orchestrator" AI session. It is one standard-library Python package (`janus/`) with a thin `janus.py` entry point
+(Python 3.11+), a skill (`skill/SKILL.md`), an installer and a launchd watcher. It is glue over standard tools: beads (`bd`),
+pueue, tmux, herdr, ssh, rsync and git.
 
 ## 1. What it is, and the problem it solves
 
@@ -69,9 +69,10 @@ hosts in janus.toml), `--release-only` (only build, test and switch to a new rel
 `--rollback` (switch back to the previous release), `--skip-tests`. On Linux, install writes a systemd user timer
 `janus-watch.timer` (every 5 min) instead of the launchd agent.
 
-**Releases: nothing live ever points at the working tree.** `install` copies `janus.py`, `skill/`, `example.janus.toml` and
-`tests/` into `~/.local/share/janus/releases/<date>-<content hash>/` (files made read-only), runs the checks on that copy
-(parse, `--help`, hook calls, `tests/test_orch.py`), and only when they pass switches `~/.local/share/janus/current` to it with
+**Releases: nothing live ever points at the working tree.** `install` copies `janus.py`, the `janus/` package, `board.sh`,
+`skill/`, `example.janus.toml`, `launchd/` and `tests/` into `~/.local/share/janus/releases/<date>-<content hash>/` (files made
+read-only), runs the checks on that copy (the package imports, parse, `--help`, hook calls, every `tests/test_*.py`), and only
+when they pass switches `~/.local/share/janus/current` to it with
 one atomic rename. `~/.local/bin/janus` points at `current/janus.py` and the skill links at `current/skill`, so the toolkit and the
 skill change together, at one instant, to a tested copy. A queued `janus api-run` task names the release it was queued from, so
 a new release never changes a running task. The five newest releases are kept.
@@ -290,6 +291,10 @@ by hand is denied.
 **`janus init`**: in a folder without a janus.toml, writes a commented starter one (from `example.janus.toml`, this machine
 named after its host name) and creates `.janus/`, `briefs/` and `out/`. In a project that has one, turns the old state docs in
 `paths.state_docs` into a one-line pointer to `.janus/HANDOFF.md`, keeping their text in `.janus/history-<name>`.
+
+**`janus migrate [project]`**: moves an existing project (and the toolkit install) from the old name to janus, once and
+idempotently: `orch.toml` -> `janus.toml`, `.orch/` -> `.janus/`, the hook commands a previous install wrote, and the watcher.
+Run it in the project (or pass the path) after updating the toolkit.
 
 **`janus doctor [--no-hosts]`**: checks a setup end to end and names the fix for each problem: tools (git, ssh, rsync, bd,
 pueue and pueued, herdr, tmux, each model's CLI), the installed release and skill links, the hooks, the watcher, the config
@@ -541,7 +546,7 @@ with what is reclaimable.
 - `[landing] quick_gate_min`: a gate expected (median of its own last runs, else of its family `land-*-<suffix>`) under this
   many minutes, or queued with `--quick`, goes to the one-slot `gates-quick` group, so short gates never wait behind long ones.
 
-**Test fixtures never trip live findings.** `tests/test_orch.py` puts every fixture (temp projects, scripts, daemons) under one
+**Test fixtures never trip live findings.** `tests/test_janus.py` puts every fixture (temp projects, scripts, daemons) under one
 temporary root named `janus-test-fixture-*` and sets `JANUS_IN_TESTS` for itself. A live `janus check` (or the watcher) skips any
 process whose command line holds that mark (local test/build runs, CPU burners, changed scripts, scheduler and remote
 direct-build probes), so running `./check` beside a live project raises nothing there; the suite still sees its own fixtures.
