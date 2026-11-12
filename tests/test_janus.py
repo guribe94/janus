@@ -648,8 +648,8 @@ class AdmitBound(unittest.TestCase):
         self.assertIn("disk", p.stdout); self.assertIn("giving up", p.stdout)
 
     def test_the_caller_reports_a_slow_admission_and_keeps_waiting(self):
-        """Catches (item 21; finding 7): the caller's pueue wait had no timeout and no output; a task that has not STARTED is
-        reported with the host's admission reason (a running one is not)."""
+        """Catches (item 21; finding 9): the caller's pueue wait had no timeout and no output; a task the host's admission is
+        holding is reported with the admission reason, whatever its pueue status."""
         d, cfg = project(); h = cfg.hosts["here"]
         real_run = subprocess.run; n = [0]
         def fake_run(cmd, **k):
@@ -668,7 +668,7 @@ class AdmitBound(unittest.TestCase):
             with contextlib.redirect_stderr(out): rc = janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
         finally: subprocess.run = real_run; janus.task_status, janus.probe = real
         self.assertEqual(rc, 0)
-        self.assertIn("still waiting", out.getvalue()); self.assertIn("disk", out.getvalue())
+        self.assertIn("held by admission", out.getvalue()); self.assertIn("disk", out.getvalue())
 
     def test_a_blocked_admission_is_a_finding_with_the_reason(self):
         """Catches (item 21): a job held in admission raised no finding naming why."""
