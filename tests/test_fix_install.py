@@ -726,6 +726,36 @@ class Item5ReportSync(unittest.TestCase):
         self.assertEqual(got, ["u1"])
 
 
+class Item9LandFloor(unittest.TestCase):
+    def test_the_land_lane_floor_honours_the_host_and_defaults_to_five(self):
+        """Catches (finding 9): the land lane's disk floor default went from its own 5 GB to admission's 10, so a landing waits
+        on a Mac with 5-9 GB free; the host's `[hosts.<h>] min_disk_gb` (the Mac's 5) must win, then `[capacity]`, then 5."""
+        import argparse
+        d, cfg = project(); h = cfg.hosts["here"]
+        r = argparse.Namespace(host="here", lane="land", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
+        self.assertIn('[ "$d" -ge 5 ]', js, "the land lane no longer defaults to its own 5 GB floor")
+        h["min_disk_gb"] = 7
+        self.assertIn('[ "$d" -ge 7 ]', janus.job_script(cfg, "here", h, r, "u", "true", "j-2"), "the host's own floor was ignored")
+        h.pop("min_disk_gb"); cfg.capc["min_disk_gb"] = 9
+        self.assertIn('[ "$d" -ge 9 ]', janus.job_script(cfg, "here", h, r, "u", "true", "j-3"), "[capacity] min_disk_gb was ignored")
+
+    def test_the_land_lane_gives_up_with_a_message(self):
+        """Catches (finding 9): the land lane's disk wait had no bound and printed once, so a nearly-full volume hung the landing
+        silently (item 21's bound covers ADMIT, not this wait)."""
+        import argparse
+        d, cfg = project('\n[capacity]\nmin_disk_gb = 99999\n')
+        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
+        r = argparse.Namespace(host="here", lane="land", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
+        p = subprocess.run(["bash"], input=js, text=True, capture_output=True, timeout=60,
+                           env={**os.environ, "JANUS_LAND_MAX_S": "3", "JANUS_LAND_REPORT_S": "1", "JANUS_LAND_POLL_S": "1"})
+        self.assertEqual(p.returncode, 121, p.stdout + p.stderr)
+        self.assertIn("land lane waiting", p.stdout); self.assertIn("giving up", p.stdout); self.assertIn("floor 99999", p.stdout)
+
+
 class Item9BudgetHistory(unittest.TestCase):
     def test_budget_counts_capped_cheap_and_tidied_runs(self):
         """Catches (finding 9): capped runs (which show the budget was too small), a finished run whose report was tidied, and
