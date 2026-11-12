@@ -595,6 +595,22 @@ class Memory(unittest.TestCase):
         rh = orch.brief_header(cfg, "far", {"root": "/r", "ssh": "x"}, "u2", "/r/worktrees/u2", False)
         self.assertIn("tests run on linux only", rh); self.assertIn("/r/board/peers.md", rh)
 
+class Peers(unittest.TestCase):
+    def test_peers_file_and_overlap(self):
+        d, cfg = project(); (d / "board").mkdir(); cfg.ro = False
+        g = lambda *a, cwd: subprocess.run(["git", *a], cwd=cwd, capture_output=True, check=True)
+        repo = d / "repo"; repo.mkdir(); g("init", "-q", "-b", "main", cwd=repo); (repo / "a.txt").write_text("a\n"); (repo / "b.txt").write_text("b\n")
+        g("add", ".", cwd=repo); g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init", cwd=repo)
+        units = []
+        for i, f in (("1", "a.txt"), ("2", "a.txt"), ("3", "b.txt")):
+            w = d / f"wt{i}"; g("worktree", "add", "-q", "-b", f"u{i}", str(w), cwd=repo); (w / f).write_text("changed\n")
+            units.append({"id": i, "name": f"u{i}", "host": "here", "model": "m", "cwd": str(w), "state": "working"})
+        F = orch.peer_findings(cfg, units)
+        self.assertEqual([k for k, _ in F], ["overlap:u1:u2"])
+        txt = (d / "board/peers.md").read_text()
+        self.assertIn("u3 | host here", txt); self.assertIn("branch u1", txt); self.assertIn("files: a.txt", txt)
+        units[1]["state"] = "done"; self.assertEqual(orch.peer_findings(cfg, units), [])   # a finished unit is no peer
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         import re

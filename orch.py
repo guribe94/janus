@@ -1032,6 +1032,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
                           "resume it (orch resume --message, or --resume-of keeps its report)"))
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}"))
+    cfg._hs = hs; F += peer_findings(cfg, units)   # peers.md, overlap:<a>:<b> (orch-swarm item 4)
     seen = {k for k, _ in F}
     for r, why in orphan_jobs(cfg, hs, units):   # the watcher cancels these (item 3); check only reports them
         k = f"orphan:job:{r}"
@@ -3283,6 +3284,91 @@ def push_cmd(repo, cfg=None):
         rem = "origin" if "origin" in rs or not rs else rs[0]
     return ["git", "push", "--set-upstream", rem, "HEAD"]
 
+# ---------------------------------------------------------------- peers (orch-swarm item 4)
+def card_fields(cfg, name):
+    """The board card's fields ({state, step, ...}) of an agent, {} without a card."""
+    try: return dict(m.groups() for m in re.finditer(r"^- (\w+): ?(.*)$", (board_dir(cfg) / "agents" / f"{name}.md").read_text(), re.M))
+    except OSError: return {}
+
+def unit_changes(cfg, u, units=()):
+    """(branch, [files changed so far]) of a unit's tree: locally its commits since it left the landing branch plus uncommitted
+    and untracked files; on a remote host the files that differ from the tree it was sent (base/<unit>). A shared tree (the
+    project root, another open unit's cwd) has none of its own."""
+    h = cfg.hosts.get(u.get("host"), {})
+    if not h.get("local"):
+        if u.get("via") in ("failed", "starting") or "root" not in h: return "?", []
+        n = u["name"]
+        rc, o, e = hrun(h, f"cd {qp(h['root'])} && [ -d base/{n} ] && diff -rq {DIFF_X} base/{n} worktrees/{n} 2>/dev/null; true", timeout=60)
+        fs = []
+        for l in o.splitlines():
+            m = re.match(rf"Files base/{re.escape(n)}/(.+) and worktrees/{re.escape(n)}/.+ differ$", l) or re.match(rf"Only in (?:base|worktrees)/{re.escape(n)}/?(.*): (.+)$", l)
+            if m: fs.append(m.group(1) if m.lastindex == 1 else str(Path(m.group(1)) / m.group(2)) if m.group(1) else m.group(2))
+        rc, b, _ = hrun(h, f"git -C {qp(h['root'] + '/base/' + n)} rev-parse --abbrev-ref HEAD 2>/dev/null")
+        return (b.strip() or "?"), sorted(set(fs))
+    cwd = u.get("cwd")
+    if not cwd or not Path(cwd).is_dir() or not own_tree(cfg, u, units or [u]): return "?", []
+    br = sh(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])[1].strip() or "?"
+    lb = cfg.c.get("landing", {}).get("branch") or "main"
+    mb = sh(["git", "-C", cwd, "merge-base", "HEAD", lb])[1].strip()
+    fs = set(sh(["git", "-C", cwd, "diff", "--relative", "--name-only", mb, "--", "."])[1].split("\n")) if mb else set()
+    top = sh(["git", "-C", cwd, "rev-parse", "--show-toplevel"])[1].strip()
+    fs |= {str(Path(top, l[3:].split(" -> ")[-1].strip('"')).relative_to(Path(cwd).resolve())) for l in
+           sh(["git", "-C", cwd, "status", "--porcelain", "-uall", "--", "."])[1].splitlines() if len(l) > 3 and top}
+    skip = [cfg.state.resolve(), board_dir(cfg).resolve()]   # orch's own files and the board are nobody's change (as in close)
+    return br, sorted(f for f in fs if f and not any((Path(cwd) / f).resolve().is_relative_to(x) for x in skip))
+
+def transcript_where(cfg, u):
+    """Where the unit's agent transcript is (for peers.md): a local path, or <host>:<path> on the host that ran it."""
+    h = cfg.hosts.get(u.get("host"), {}); sid = api_out(cfg, u).get("session_id")
+    if h.get("local"):
+        f = transcript_of(cfg, u) if not sid else next(iter((Path.home() / ".claude/projects").glob(f"*/{sid}.jsonl")), None)
+        return str(f) if f else "-"
+    esc = re.sub(r"[^A-Za-z0-9-]", "-", u.get("rcwd") or "")
+    return f"{u['host']}:~/.claude/projects/{esc}/" + (f"{sid}.jsonl" if sid else "(newest .jsonl)")
+
+def peer_rows(cfg, units):
+    """One row per running unit: name, host, model, branch, files changed, step, jobs it waits on, report, transcript."""
+    live = [u for u in units if u.get("state") not in ENDED + ("failed",) or u.get("_park")]
+    with cf.ThreadPoolExecutor(8) as ex: ch = list(ex.map(lambda u: unit_changes(cfg, u, units), live))
+    rows = []
+    for u, (br, fs) in zip(live, ch):
+        c = card_fields(cfg, u["name"])
+        rows.append({"name": u["name"], "host": u.get("host"), "model": u.get("model"), "branch": br, "files": fs, "state": u.get("state"),
+                     "step": c.get("step") or c.get("state") or "-", "jobs": u.get("_park") or unit_jobs(getattr(cfg, "_hs", {}), u["name"]),
+                     "report": str(report_path(cfg, u)) if cfg.hosts.get(u.get("host"), {}).get("local") else f"{u['host']}:{cfg.hosts[u['host']].get('root')}/out/{u['name']}/REPORT.md",
+                     "transcript": transcript_where(cfg, u)})
+    return rows
+
+def peers_text(rows):
+    L = [f"# Peers ({ts()}; written by orch check and the watcher; one line per running unit)"]
+    for r in rows:
+        fs = ", ".join(r["files"][:12]) + (f" (+{len(r['files']) - 12} more)" if len(r["files"]) > 12 else "")
+        L.append(f"- {r['name']} | host {r['host']} | {r['model']} | branch {r['branch']} | {r['state']} | step: {r['step'][:80]} | "
+                 f"waits on: {', '.join(r['jobs']) or '-'} | files: {fs or '-'} | report {r['report']} | transcript {r['transcript']}")
+    if not rows: L.append("- none running")
+    return "\n".join(L) + "\n"
+
+def peer_findings(cfg, units):
+    """Writes the board folder's peers.md (a writer only: the board sync then carries it to every host) and returns
+    overlap:<a>:<b> for two running units that change the same file."""
+    rows = peer_rows(cfg, units); F = []
+    if not cfg.ro and not DRY and board_dir(cfg).is_dir(): atomic_write(board_dir(cfg) / "peers.md", peers_text(rows))
+    for i, a in enumerate(rows):
+        for b in rows[i + 1:]:
+            both = sorted(set(a["files"]) & set(b["files"]))
+            if both: F.append((f"overlap:{a['name']}:{b['name']}", f"{a['name']} and {b['name']} both change {', '.join(both[:4])}"
+                               + (f" (+{len(both) - 4})" if len(both) > 4 else "") + ": tell them (board.sh direct), or land one first"))
+    return F
+
+def cmd_peers(cfg, a):
+    cfg.ro = True; hs = probe_all(cfg); cfg._hs = hs
+    try: units = Beads(cfg).units()
+    except Err as e: raise Err(f"beads unavailable: {e}")
+    for u in units:
+        u["state"] = unit_state(u, hs, {}) if u.get("via") != "herdr" else unit_state(u, hs, herdr_agents(cfg))
+        if not verdict(cfg, u) and u["state"] in ENDED: u["_park"] = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
+    say(peers_text(peer_rows(cfg, units)).rstrip())
+
 # ---------------------------------------------------------------- reports index (orch-swarm item 3)
 RESULT_RX = re.compile(r"^\W*(result|summary|outcome|conclusion)s?\b\W*", re.I)
 
@@ -3984,7 +4070,7 @@ def main():
     g = m.add_mutually_exclusive_group(required=True)
     for k in MEM_SECTIONS: g.add_argument(f"--{k}", action="store_true")
     add("forget", A("text", help="the entry's number (orch memory), its subject, or its text"), dry=True)
-    add("index", dry=True)
+    add("index", dry=True); add("peers")
     add("memory", A("--keep", type=int, help="re-date entry N after review (it stays)"), dry=True)
     add("init", A("--name", help="project name for a new orch.toml (default: the folder's name)"), dry=True)
     add("board-close", A("agent", help="a board card that is not an open unit"), dry=True)
