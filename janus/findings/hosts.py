@@ -37,8 +37,8 @@ RUN_OPT_ARG = {"--extra", "--group", "--with", "--project", "--python", "--direc
 
 def _segments(c):
     """The commands in c, each a list of words: quoting and backslash escapes are honoured, so a ; or | inside a quoted
-    argument (an ack or a commit message) never starts a new command (finding 4), and the `&` of a redirect (`2>&1`, `&>log`) is
-    part of its word, never a separator (finding 4, fix-install6)."""
+    argument (an ack or a commit message) never starts a new command (finding 4), and the `&` of a redirect (`2>&1`, `&>log`,
+    `<&3`) and the `|` of a clobber redirect (`>|`) are part of their word, never a separator (finding 4, fix-install6, finding E)."""
     segs, cur, w, q, esc = [], [], "", None, False
     for i, ch in enumerate(c):
         if esc: w += ch; esc = False; continue
@@ -51,8 +51,10 @@ def _segments(c):
         elif ch in ";&|()\n":
             if ch in "()" and not w and cur:
                 continue   # a paren inside a command (an unquoted ps rendering of a quoted message): not a subshell, not a separator
-            if ch == "&" and (i > 0 and c[i - 1] == ">" or i + 1 < len(c) and c[i + 1] == ">"):
-                w += ch   # the `&` of a redirect, not a separator
+            if ch == "&" and (i > 0 and c[i - 1] in "<>" or i + 1 < len(c) and c[i + 1] == ">"):
+                w += ch   # the `&` of a redirect (`2>&1`, `&>log`, `<&3`), not a separator
+            elif ch == "|" and i > 0 and c[i - 1] == ">":
+                w += ch   # the `|` of a clobber redirect (`>|`), not a pipe (finding E)
             else:
                 if w: cur.append(w); w = ""
                 if cur: segs.append(cur); cur = []
