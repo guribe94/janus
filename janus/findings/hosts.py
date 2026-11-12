@@ -49,7 +49,11 @@ def proc_findings(cfg, ps_text=None, viol=None):
             if viol is not None: viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
                               "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": env_unit(p)})
         if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc) and not lane_below(p):
-            F.append((f"localtest:{p}", f"test/build run on this machine outside the pueue lanes (pid {p}, {et}): {c[:70]}; use janus run"))
+            u = env_unit(p) if viol is not None else None   # an agent's (JANUS_UNIT): warned once, then stopped (enforce)
+            F.append((f"localtest:{p}", f"test/build run on this machine outside the pueue lanes (pid {p}, {et}){' by ' + u if u else ''}: {c[:70]}; use janus run"
+                      + ("; it is stopped after [enforce] grace_min" if u else "")))
+            if u: viol.append({"key": f"localtest:{p}", "kind": "direct", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
+                               "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": u})
     return F
 
 def env_unit(pid):
@@ -63,18 +67,24 @@ def env_unit(pid):
 # holds an agent (claude, codex) or pueued, only the process and its descendants are stopped, never the agent.
 def enforce(cfg, F, viol):
     """Warn, then stop (janus-fixes8; register items 22, 23). The first time a violation is seen its unit gets a board direction;
-    when it is still there [enforce] grace_min (default 5) later, a CPU burner's process group is stopped (stop_burners,
-    default true) and a remote direct build's (stop_direct, default false: flagged and warned only). Running lane jobs are
-    never touched. Only the registered orchestrator's check and the watcher act; anyone else only reports."""
+    when it is still there [enforce] grace_min (default 5) later, its process group is stopped: a CPU burner's (stop_burners,
+    default true) and an agent's direct build or test, here or on a remote host (stop_direct, default true since imp-autopilot).
+    One warning per unit: a unit warned in the last day gets no second one, its next violation is stopped at once.
+    Running lane jobs are never touched. Only the registered orchestrator's check and the watcher act; anyone else only reports."""
     ec = cfg.c.get("enforce", {}); grace = ec.get("grace_min", 5) * 60; st = cfg.jget("enforce.json"); new = {}; notes = {}
+    wu = {k: t for k, t in (st.get("_units") or {}).items() if now() - t < 86400}   # unit -> when it got its one warning
     for v in viol:
-        s = st.get(v["key"]) or {}; stop_ok = ec.get("stop_burners", True) if v["kind"] == "burner" else ec.get("stop_direct", False)
+        s = st.get(v["key"]) or {}; stop_ok = ec.get("stop_burners", True) if v["kind"] == "burner" else ec.get("stop_direct", True)
         u = v.get("unit")
+        if not s.get("warned") and u in wu and stop_ok:   # already warned once: no second warning, stopped at once
+            s = {"warned": wu[u] - grace, "unit": u}
         if not s.get("warned"):
             if u: board(cfg, "direct", u, f"janus: your process {v['pid']} ({v['kind']}) on {v['host']} breaks the lane rule: "
                       + ("stop it now and run builds and tests through the lane" if v["kind"] == "direct" else "stop this CPU burner now") +
                       (f"; janus stops it at {ts(now() + grace)}" if stop_ok else ""))
-            s = {"warned": now(), "unit": u}; notes[v["key"]] = f"warned {u or 'no unit'} at {ts()}" + (f"; stops at {ts(now() + grace)}" if stop_ok else "")
+            s = {"warned": now(), "unit": u}
+            if u: wu[u] = now()
+            notes[v["key"]] = f"warned {u or 'no unit'} at {ts()}" + (f"; stops at {ts(now() + grace)}" if stop_ok else "")
         elif stop_ok and not s.get("stopped") and now() - s["warned"] >= grace:
             h = cfg.hosts[v["host"]]
             rc, o, e = hrun(h, STOP_GROUP % {"pid": v["pid"], "pgid": v["pgid"] if v["pgid"] != v.get("agent_pgid") else 0}, timeout=30)
@@ -86,7 +96,7 @@ def enforce(cfg, F, viol):
                 if x and x.get("id"): Beads(cfg).comment(x["id"], f"{ts()} janus stopped {v['kind']} pid {v['pid']} on {v['host']} after one warning")
         else: notes[v["key"]] = (f"warned at {ts(s['warned'])}" + (f"; stopped at {ts(s['stopped'])}" if s.get("stopped") else f"; stops at {ts(s['warned'] + grace)}" if stop_ok else ""))
         new[v["key"]] = s
-    cfg.jput("enforce.json", new)
+    cfg.jput("enforce.json", {**new, "_units": wu})
     return [(k, t + (f" [{notes[k]}]" if k in notes else "")) for k, t in F]
 
 SCRIPT_RX = re.compile(r"^(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\s+(?:-\S+\s+)*(/\S+)")

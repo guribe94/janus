@@ -5,7 +5,8 @@ parser, never replace it (section 9)."""
 import json, os, re, shlex, sys
 from pathlib import Path
 from janus.beads import Beads
-from janus.context import (Cfg, Err, JANUS_MARK, WAKE, find_root, handoff_path, handoff_stale, now, record_session_proc,
+from janus.reset import stop_reset
+from janus.context import (Cfg, Err, atomic_write, JANUS_MARK, WAKE, find_root, handoff_path, handoff_stale, note_event, now, record_session_proc,
     session_alive, session_root, sh, ts)
 from janus.decisions import session_text as decisions_text
 from janus.memory import memory_text
@@ -347,11 +348,11 @@ def cmd_hook(ev):
         if not root: return
         cfg = Cfg(root); reg = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
         if not (reg.startswith("pending:") and now() - int(reg[8:] or 0) < 600): return
-        cfg.f("session").write_text(sid); cfg.f("session_kind").write_text(hook_kind(d) + "\n")
+        atomic_write(cfg.f("session"), sid); atomic_write(cfg.f("session_kind"), hook_kind(d) + "\n")
         record_session_proc(cfg)
     else: cfg = Cfg(root)
     if session_alive(cfg) is not True: record_session_proc(cfg)
-    if d.get("transcript_path"): cfg.f("transcript").write_text(d["transcript_path"])
+    if d.get("transcript_path"): atomic_write(cfg.f("transcript"), d["transcript_path"])
     if ev == "SessionStart":   # cached state only: the hook has a 60 s limit, and the check runs as the session's first act (M14)
         parts = [handoff_path(cfg).read_text() if handoff_path(cfg).exists() else "", memory_text(cfg)]   # MEMORY.md (janus-swarm item 2)
         dt = decisions_text(cfg)
@@ -365,7 +366,7 @@ def cmd_hook(ev):
         janus_own = pr.startswith((JANUS_MARK, "janus cycle:", WAKE, "You are the orchestrator. " + WAKE)) or pr in ("/clear", "/compact") or pr.startswith("/")
         if pr and not janus_own and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
             try:
-                i = Beads(cfg).create("instr: " + re.sub(r"\s+", " ", pr)[:70], "instruction", pr[:4000]); cfg.touch("changed")
+                i = Beads(cfg).create("instr: " + re.sub(r"\s+", " ", pr)[:70], "instruction", pr[:4000]); note_event(cfg, "instruction")
                 ctx(ev, f"Filed as instruction {i}: close it as done, or make it a standing rule with bd remember \"<rule>\" --key <subject> "
                     "(a rule on a subject that already has one replaces it: use that rule's key, bd memories); if it affects several agents, also janus remember --decision.")
             except Err: pass
@@ -378,7 +379,9 @@ def cmd_hook(ev):
         n = cfg.jget("stops.json"); c = n.get(sid, 0) + 1 if d.get("stop_hook_active") else 0; n[sid] = c; cfg.jput("stops.json", n)
         if c >= 3: return
         op = cfg.jget("open.json"); late = [k for k, t in op.items() if now() - t > cfg.deadline]
-        stale = handoff_stale(cfg, cfg.jget("running.json").get("n", 0) > 0)
+        stale = handoff_stale(cfg)   # stale only after a real event (launch, close, landing, instruction, decision)
+        # a Stop that passes is the safe boundary for the context reset (janus/reset.py); a blocked one logs why it waits
+        stop_reset(cfg, ", ".join(([f"late findings {', '.join(late[:3])}"] if late else []) + (["notes stale"] if stale else [])) or None)
         if late or stale:
             block("Do not go idle: " + ("unacknowledged past deadline: " + ", ".join(late[:6]) + ". Run janus check, act, janus ack. " if late else "") + " ".join(stale))
 

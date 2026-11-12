@@ -5,7 +5,7 @@ from janus.backlog import backlog_items, item_actors, unit_items
 from janus.beads import Beads
 from janus.board import board, board_dir, learned_posts
 from janus.budgets import OUTCOMES, rset, run_outcomes, waste_paused, waste_state
-from janus.context import Err, Locked, NUM, atomic_write, now, refuse_agent, say, slug, ts
+from janus.context import Err, Locked, NUM, atomic_write, note_event, now, refuse_agent, say, slug, ts
 from janus.findings.awareness import introduced_recently, related_cases
 from janus.findings.units import peer_rows, peers_text, unreconciled
 from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, spend
@@ -166,7 +166,8 @@ def cmd_remember(cfg, a):
     for e in old: memory_history(cfg, e, "replaced")
     memory_write(cfg, [e for e in es if e not in old] + [new])
     if a.learned: learned_mark(cfg, a.learned, "remembered")
-    cfg.touch("changed"); say(f"remembered ({MEM_SECTIONS[kind]})" + (f", replacing the older entry on [{key}]" if old else "") + f": {text}")
+    if kind == "decision": note_event(cfg, "decision")
+    say(f"remembered ({MEM_SECTIONS[kind]})" + (f", replacing the older entry on [{key}]" if old else "") + f": {text}")
 
 def cmd_forget(cfg, a):
     refuse_agent("janus forget")
@@ -175,7 +176,7 @@ def cmd_forget(cfg, a):
     if len(hit) != 1: raise Err(f"{'no' if not hit else len(hit)} entries match {q!r}" + ("; give its number (janus memory) or more text" if hit else ""))
     if cfg.run.dry: say(f"+ forget {mem_line(hit[0])}"); return
     memory_history(cfg, hit[0], "forgotten"); memory_write(cfg, [e for e in es if e != hit[0]])
-    cfg.touch("changed"); say(f"forgotten (moved to {cfg.f('memory-history.md').name}): {hit[0][3]}")
+    say(f"forgotten (moved to {cfg.f('memory-history.md').name}): {hit[0][3]}")
 
 def cmd_memory(cfg, a):
     es = memory_read(cfg)

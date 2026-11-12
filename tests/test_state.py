@@ -2,9 +2,9 @@
 
 Cfg.jput writes straight to the file today (janus.py:52-53), so a kill during the write leaves truncated JSON and jget silently
 returns {} — every ack, open problem, the 3-strike Stop counter and learned.json reset without a word. This test injects a crash
-into the write of a new value and asserts the previous value is still on disk. It is an expected failure until jput writes a temp
-file and renames it (the writer-lock/atomic-state seam); then it flips to a real guard. Standard library only; no network."""
-import json, os, tempfile, textwrap, unittest
+into the write of a new value and asserts the previous value is still on disk (jput writes a temp file and renames it). The
+writer test pins the one writer lock: a second writer process waits, then is refused. Standard library only; no network."""
+import json, os, subprocess, sys, tempfile, textwrap, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -25,7 +25,6 @@ def project():
 
 
 class State(unittest.TestCase):
-    @unittest.expectedFailure
     def test_jput_keeps_the_old_value_when_the_write_dies(self):
         d, cfg = project()
         cfg.jput("x.json", {"a": 1})
@@ -42,6 +41,19 @@ class State(unittest.TestCase):
             with self.assertRaises(OSError):
                 cfg.jput("x.json", {"a": 2})
         self.assertEqual(json.loads(p.read_text()), {"a": 1}, "a crash mid-write left the state file truncated")
+        self.assertEqual([x.name for x in p.parent.iterdir() if x.name.endswith(".tmp")], [], "the dead write left its temp file")
+
+    def test_one_writer_at_a_time(self):
+        """Catches: the watcher and the orchestrator's check (or a command) mutating state at once (double resume, lost acks)."""
+        d, cfg = project()
+        with cfg.writer():
+            with cfg.writer(): pass   # re-entrant: the watcher's pass runs the writer check inside its own lock
+            code = ("import sys; sys.path.insert(0, %r); from janus.context import Cfg, Err; from pathlib import Path\n"
+                    "try:\n with Cfg(Path(%r)).writer(wait=0.5): print('got it')\nexcept Err as e: print('refused', e)") % (str(Path(janus.__file__).parent), str(d))
+            out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30).stdout
+            self.assertIn("refused", out, "a second writer took the state lock while the first held it")
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30).stdout
+        self.assertIn("got it", out, "the lock was not released")
 
 
 class UnitRecord(unittest.TestCase):

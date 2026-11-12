@@ -4,7 +4,7 @@ Templates live in janus/templates.py; the renders here exercise each one with sa
 The renderers themselves (cap_lib, clean_pueue_script, job_script, scope_script, tidy_host, gate) stay with their concern;
 this test is the honest minimum the seam promises: a template that no longer parses fails here, not on a host at runtime.
 Standard library only; no network, no API spend."""
-import os, subprocess, sys, tempfile, textwrap, unittest
+import os, shlex, subprocess, sys, tempfile, textwrap, unittest
 from pathlib import Path
 
 from janusload import load
@@ -55,7 +55,7 @@ class Templates(unittest.TestCase):
         self.sh_n(janus.DIRECT_PROBE % {"rx": "'cargo'"}, "DIRECT_PROBE")
 
     def test_job_templates(self):
-        self.sh_n(janus.ADMIT % {"lane": "jobs", "clsrc": "'cargo test'", "jid": "'j1'"}, "ADMIT")
+        self.sh_n(janus.ADMIT % {"lane": "jobs", "clsrc": "'cargo test'", "jid": "'j1'", "maxrss": shlex.quote(janus.MAXRSS_PY)}, "ADMIT")
         self.sh_n(janus.STOP_GROUP % {"pid": 1, "pgid": 2}, "STOP_GROUP")
         self.sh_n(janus.CLEAN_PUEUE % {"real": "pueue"}, "CLEAN_PUEUE")
         self.sh_n(janus.UNIT_PROCS % {"unit": "u", "roots": "1 2"}, "UNIT_PROCS")

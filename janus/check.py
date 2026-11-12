@@ -2,12 +2,12 @@
 
 collect_findings returns registered Findings (findings/__init__.py); run_check filters acks, records open problems and writes
 the Live part of HANDOFF.md (a writer only: the registered orchestrator or the watcher)."""
-import json, re
+import contextlib, json, re
 from janus.actions.jobs import slots
 from janus.backlog import ready_work
 from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
-from janus.context import Err, LB, LE, NOTES0, handoff_path, hrun, is_orchestrator, now, say, ts
+from janus.context import DECISION_ACKS, Err, LB, note_event, LE, NOTES0, atomic_write, handoff_path, hrun, is_orchestrator, now, say, ts
 from janus.decisions import decision_findings
 from janus.findings import ackable, finding, live_acks
 from janus.findings.hosts import (enforce, host_findings, lane_findings, orphan_job_findings, pane_findings, proc_findings,
@@ -20,6 +20,7 @@ from janus.findings.units import (budget_findings, cap_findings, card_findings, 
 from janus.findings.work import (backlog_findings, gate_findings, git_findings, known_failure_findings, landing_findings,
     orchestrator_findings, session_findings)
 from janus.ledger import committed
+from janus.reset import context_findings
 from janus.probe import cap_line, probe_all, pueue, room
 from janus.units import all_units, herdr_agents, unit_state
 
@@ -47,7 +48,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     F += orphan_job_findings(cfg, hs, units, {k for k, _ in F})
     cfg.jput("running.json", {"n": running})
     F += cap_findings(cfg, units)
-    F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg) + tidy_findings(cfg)
+    F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg) + tidy_findings(cfg) + context_findings(cfg)
     F += test_signal_findings(cfg)
     F += lane_findings(cfg, hs, units)
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg, viol=viol) + script_findings()
@@ -90,24 +91,25 @@ def write_handoff(cfg, live):
     p = handoff_path(cfg); t = p.read_text() if p.exists() else ""
     notes = t.split(LE, 1)[1] if LE in t else "\n" + NOTES0
     new = f"# HANDOFF: {cfg.name}\n{LB}\n{live}\n{LE}{notes}"
-    if new != t and not cfg.run.ro: p.write_text(new)
+    if new != t and not cfg.run.ro: atomic_write(p, new)
 
 def run_check(cfg, cycle=True, writer=None):
     """Returns (findings not acknowledged, live text, probes, units). writer (default: the caller is the registered orchestrator,
     or the watcher) regenerates the Live part of HANDOFF.md, saves acks and open problems and sets pueue limits; anyone else
     only reads. The cycle stamp (last_cycle) is touched only for the orchestrator's own check."""
     cfg.run.ro = not (writer if writer is not None else is_orchestrator(cfg))
-    hs = probe_all(cfg); bd_err = None; units = []
-    try: units = Beads(cfg).units()
-    except Err as e: bd_err = str(e)
-    ag = herdr_agents(cfg)
-    F = collect_findings(cfg, hs, units, ag, bd_err)
-    if not cfg.run.ro: tune_pueue(cfg, hs, units)
-    acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
-    F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)
-    op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
-    live = live_state(cfg, hs, units, F); write_handoff(cfg, live)
-    if cycle: cfg.touch("last_cycle")
+    with cfg.writer() if not cfg.run.ro else contextlib.nullcontext():   # one writer at a time (panel problem 2); readers lock nothing
+        hs = probe_all(cfg); bd_err = None; units = []
+        try: units = Beads(cfg).units()
+        except Err as e: bd_err = str(e)
+        ag = herdr_agents(cfg)
+        F = collect_findings(cfg, hs, units, ag, bd_err)
+        if not cfg.run.ro: tune_pueue(cfg, hs, units)
+        acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
+        F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)
+        op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
+        live = live_state(cfg, hs, units, F); write_handoff(cfg, live)
+        if cycle: cfg.touch("last_cycle")
     return F, live, hs, units
 
 def cmd_check(cfg, a):
@@ -134,7 +136,8 @@ def cmd_status(cfg, a):
 def cmd_ack(cfg, a):
     k, d = a.problem, a.decision
     if not ackable(k): raise Err(f"{k} cannot be acked: it costs money every hour; act on it (janus park {k.split(':', 1)[1]})")
-    acks = live_acks(cfg); acks[k] = {"t": now()}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
+    acks = live_acks(cfg); acks[k] = {"t": now(), "d": d}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
+    if getattr(a, "decision_class", False) or k.split(":", 1)[0] in DECISION_ACKS: note_event(cfg, "decision")   # routine acks leave the notes fresh
     try:
         bd = Beads(cfg); m = re.match(r"unit:([^:]+)", k)
         u = next((u for u in bd.units() if m and u["name"] == m.group(1)), None)

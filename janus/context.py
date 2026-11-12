@@ -4,7 +4,7 @@ Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X, the registered session's pro
 small helpers (pq/qp/secs/findkey/slug), Locked and atomic_write, the HANDOFF.md notes state (handoff_path/notes_state/
 handoff_stale) and refuse_agent (what only the orchestrator may do). No module imports janus or a higher layer. Run is what one
 invocation is (dry, read-only, what it read once), carried as cfg.run (section 7, seam 2)."""
-import hashlib, json, os, re, shlex, time, tomllib
+import contextlib, hashlib, json, os, re, shlex, time, tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from janus.platform import herdr, ps_table, run, secs   # re-exported: the OS/tool adapter (owner direction 2026-11-11)
@@ -58,7 +58,7 @@ class Cfg:
         self.beads = root / pr.get("beads", ".")
         self.cycle = pr.get("cycle_min", 15) * 60; self.deadline = pr.get("deadline_min", 30) * 60
         self.silent = pr.get("silent_min", 30) * 60
-        self.reset_tokens = pr.get("reset_tokens", 150000)
+        self.reset_tokens = pr.get("reset_tokens", 120000)   # below the runtime's own (lossy) auto-compaction point
         self.hosts = self.c.get("hosts", {}); self.prov = self.c.get("providers", {})
         self.models = self.c.get("models", {}); self.route = self.c.get("routing", {})
         self.paths = self.c.get("paths", {}); self.caps = self.c.get("caps", {})
@@ -70,8 +70,13 @@ class Cfg:
     def jget(self, n, d=None):
         try: return json.loads(self.f(n).read_text())
         except Exception: return {} if d is None else d
-    def jput(self, n, v):   # a read-only run changes nothing (audit M15)
-        if not self.run.ro: self.f(n).write_text(json.dumps(v))
+    def jput(self, n, v):   # a read-only run changes nothing (audit M15); temp file + rename: a kill mid-write keeps the old value
+        if not self.run.ro: atomic_write(self.f(n), json.dumps(v))
+    def writer(self, wait=300):
+        """The state folder's one writer lock (.janus/write.lock; panel problem 2): the watcher's pass, a writer check and the
+        orchestrator's state-changing commands hold it, so two never interleave read-modify-write of acks, open problems or
+        unit records. Readers do not take it. Re-entrant within a process (the watcher's pass runs the check)."""
+        return writer_lock(self.f("write.lock"), wait)
     def touch(self, n):
         if not self.run.ro: self.f(n).touch()
     def mtime(self, n):
@@ -138,7 +143,7 @@ def session_proc(t=None):
 
 def record_session_proc(cfg, t=None):
     p, st = session_proc(t)
-    if p: cfg.f("session_pid").write_text(f"{p}\t{st}\n")
+    if p: atomic_write(cfg.f("session_pid"), f"{p}\t{st}\n")
 
 def session_alive(cfg, t=None):
     """True while the registered session's process still runs (same pid and start time). None when nothing is recorded."""
@@ -199,7 +204,31 @@ def qp(p):
 
 def atomic_write(p, text, mode=0o644):
     p = Path(p); p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp"); tmp.write_text(text); tmp.chmod(mode); os.replace(tmp, p)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    try: tmp.write_text(text); tmp.chmod(mode); os.replace(tmp, p)
+    except BaseException:
+        tmp.unlink(missing_ok=True); raise
+
+_HELD = {}   # lock path -> [open file, depth]: the writer lock is re-entrant within one process
+
+@contextlib.contextmanager
+def writer_lock(path, wait=300):
+    """An exclusive flock on path, waiting up to wait seconds (then Err), re-entrant within the process."""
+    import fcntl
+    k = str(path); held = _HELD.get(k)
+    if held: held[1] += 1
+    else:
+        Path(k).parent.mkdir(parents=True, exist_ok=True); f = open(k, "a"); t0 = time.time()
+        while True:
+            try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+            except BlockingIOError:
+                if time.time() - t0 >= wait: f.close(); raise Err(f"another janus writer (the watcher or a command) holds {Path(k).name} for over {wait:g} s: try again")
+                time.sleep(0.2)
+        held = _HELD[k] = [f, 1]
+    try: yield
+    finally:
+        held[1] -= 1
+        if not held[1]: _HELD.pop(k, None); held[0].close()
 
 JANUS_SELF = Path(__file__).resolve().parent.parent / "janus.py"   # the installed release when run as `janus`: a queued task runs the version that queued it (this package sits next to it)
 
@@ -215,9 +244,23 @@ def notes_state(cfg):
     if s.get("hash") != h: s = {"hash": h, "ts": now() if not cfg.run.ro else s.get("ts", now())}; cfg.jput("notes.json", s)
     return s["ts"], notes.count("\n")
 
-def handoff_stale(cfg, running):
+# Real events (fixes10 item 8): only these make the notes stale; routine acks, collects, parks, resumes, board upkeep and the
+# clock do not (the Stop hook re-fired after every routine ack). A decision-class ack: --decision-class, or one of these families.
+EVENTS = ("launch", "close", "landing", "instruction", "decision")
+DECISION_ACKS = ("unit", "landing", "question", "instructions", "ledger", "parked", "provider", "cap", "learned", "overlap")
+
+def note_event(cfg, kind):
+    """Record a real event (one of EVENTS): the notes are stale until the orchestrator updates them."""
+    if cfg.run.ro or cfg.run.dry: return
+    cfg.touch("changed"); e = cfg.jget("events.json"); e[kind] = now(); cfg.jput("events.json", e)
+
+def handoff_stale(cfg, running=False):
+    """Stale only after a real event newer than the notes (never by the clock alone); too long over 150 lines. running is
+    accepted for the callers' sake and no longer used."""
     t, lines = notes_state(cfg); r = []
-    if t < cfg.mtime("changed") or (running and now() - t > cfg.cycle): r.append("handoff stale: update the Orchestrator notes in .janus/HANDOFF.md")
+    if t < cfg.mtime("changed"):
+        ev = cfg.jget("events.json"); last = max(ev, key=ev.get) if ev else "event"
+        r.append(f"handoff stale (after a {last}): update the Orchestrator notes in .janus/HANDOFF.md")
     if lines > 150: r.append(f"handoff notes are {lines} lines; move old ones to .janus/history.md")
     return r
 
@@ -228,4 +271,4 @@ def slug(t): return re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:40]
 def refuse_agent(what):
     if os.environ.get("JANUS_ROLE") == "agent": raise Err(f"refused: {what} is the orchestrator's (an agent proposes with board.sh post <you> learned <text>)")
 
-__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "JANUS_SELF", "JANUS_MARK", "handoff_path", "notes_state", "handoff_stale", "DIFF_X", "slug", "refuse_agent"]
+__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "writer_lock", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "JANUS_SELF", "JANUS_MARK", "handoff_path", "notes_state", "handoff_stale", "EVENTS", "DECISION_ACKS", "note_event", "DIFF_X", "slug", "refuse_agent"]

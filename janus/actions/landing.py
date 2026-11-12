@@ -5,7 +5,7 @@ from janus.actions.jobs import cmd_run, ensure_lanes, tree_guard
 from janus.actions.launch import cmd_launch
 from janus.actions.swarm import write_index
 from janus.beads import Beads
-from janus.context import Err, JANUS_SELF, X, atomic_write, now, pq, say, sh, ts
+from janus.context import Err, JANUS_SELF, X, atomic_write, note_event, now, pq, say, sh, ts
 from janus.gates import GATE_DEFAULT, GATE_LINE, judge_gate, landed
 from janus.probe import pueue
 from janus.quality import land_review
@@ -226,7 +226,7 @@ def cmd_land(cfg, a):
         if rc: raise Err(f"update-ref {br} failed: {e.strip()[:120]}")
     say(f"landed {a.unit}: {br} {base[:9]} -> {new[:9]} ({len(subj)} commit(s) squashed); push and close are separate (janus close {a.unit})")
     if u.get("id"): Beads(cfg).comment(u["id"], f"{ts()} landed on {br} as {new[:9]}")
-    cfg.touch("changed")
+    note_event(cfg, "landing")
     return 0
 
 SECRETS = [re.compile(x.encode()) for x in ("sk" + "-ant-[A-Za-z0-9_-]{20,}", "sk" + "-or-[A-Za-z0-9_-]{20,}", "sk" + "-proj-[A-Za-z0-9_-]{20,}",

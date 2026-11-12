@@ -28,6 +28,7 @@ FAMILIES = {
     "cap": Family("more agents than the owner's total or per-host cap"),
     "decision-missing": Family("an owner instruction classified as a decision has no decision record", urgent=True),
     "direct": Family("an agent runs a build or test directly on a remote host, outside its lane", urgent=True),
+    "context": Family("the orchestrator's context is over [project] reset_tokens and no reset was asked"),
     "disk": Family("a host is over its disk budget (tidy's last pass)"),
     "gate": Family("a gate failed in the last 12 h (its latest result)"),
     "gate-common": Family("the same failure in two or more gates: suspect the test or fixture"),

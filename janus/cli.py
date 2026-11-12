@@ -1,6 +1,6 @@
 """The janus command line: argparse, and the dispatch table from subcommand to command function (the only file with
 subcommand wiring)."""
-import argparse, os, sys, tomllib
+import argparse, contextlib, os, sys, tomllib
 from pathlib import Path
 from janus.actions.jobs import LANES
 from janus.context import Cfg, Err, Run, find_root, say
@@ -21,6 +21,9 @@ from janus.setup import cmd_doctor, cmd_init, cmd_queue, cmd_register, migrate
 from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
+WRITERS = {"ack", "launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
+           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report"}
+
 def main():
     ap = argparse.ArgumentParser(prog="janus"); sp = ap.add_subparsers(dest="cmd", required=True)
     def add(n, fn, *args, dry=False):   # the subcommand, the function it runs, its arguments
@@ -30,7 +33,8 @@ def main():
         return p
     A = lambda *n, **k: (n, k)
     add("check", cmd_check, A("--brief", action="store_true"), A("--escalate", action="store_true"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent, ackable, open_since)"))
-    add("capacity", cmd_capacity); add("status", cmd_status); add("watch", cmd_watch, A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"))
+    add("capacity", cmd_capacity); add("status", cmd_status); add("watch", cmd_watch, A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"),
+        A("--reset", action="store_true", help="the Stop hook's context reset: /clear once the turn ended, then the wake prompt"))
     add("learned", cmd_learned, A("--reject", help="reject learned post <agent>:<n> (check stops listing it)"), A("--why", help="why it is rejected"))
     add("launch", cmd_launch, A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
         A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
@@ -70,7 +74,7 @@ def main():
         A("--no-dispatch", action="store_true", help="on a conflict, only say what merge unit to dispatch"), dry=True)
     add("close", cmd_close, A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
     add("commit-state", cmd_commit_state, A("-m", "--message", default="janus: state"), dry=True)
-    add("ack", cmd_ack, A("problem"), A("decision"))
+    add("ack", cmd_ack, A("problem"), A("decision"), A("--decision-class", action="store_true", help="a decision the notes must record (routine keys do not make them stale)"))
     m = add("remember", cmd_remember, A("text"), A("--source", help="where it can be checked: a path, a commit sha or a job (a fact needs one)"),
             A("--key", help="its subject: a newer entry on the same subject replaces the older one"), A("--learned", help="the learned post it accepts (<agent>:<n>)"), dry=True)
     g = m.add_mutually_exclusive_group(required=True)
@@ -111,7 +115,11 @@ def main():
     if not root: print("janus: no janus.toml here or in a parent (janus init writes a starter one)", file=sys.stderr); return 2
     try: cfg = Cfg(root, Run(dry=getattr(a, "dry_run", False)))
     except (tomllib.TOMLDecodeError, OSError) as e: print(f"janus: {root / 'janus.toml'}: {e}", file=sys.stderr); return 2
-    try: r = a.fn(cfg, a)
+    # the orchestrator's state-changing commands hold the writer lock (context.Cfg.writer); long ones (land, run, gate, api-run)
+    # and agents' calls do not, so a gate never blocks the watcher; check takes it itself when it is a writer
+    lock = a.cmd in WRITERS and not cfg.run.dry and os.environ.get("JANUS_ROLE") != "agent"
+    try:
+        with cfg.writer() if lock else contextlib.nullcontext(): r = a.fn(cfg, a)
     except Err as e: print(f"janus: {e}", file=sys.stderr); return 1
     rc, lines = r if isinstance(r, tuple) else (r if isinstance(r, int) else 0, [])   # a read-only command returns its lines
     for l in lines: say(l)

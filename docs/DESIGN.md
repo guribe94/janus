@@ -126,7 +126,7 @@ ids and stay open until answered; a new question or block wakes the orchestrator
 `direct all` broadcasts. `learned` posts become memory entries once the orchestrator accepts them. `summary` groups cards by
 what needs attention; `digest` tells a human what happened.
 
-## Keeping work moving: the ending policy (spec for the autopilot round)
+## Keeping work moving: the ending policy (the autopilot, `janus/autopilot.py`)
 
 Owner rule (core): the orchestrator never leaves a unit, job, gate or host broken, held or idle without action; on any error it
 fixes, restarts, re-queues or routes around it, and records what it did. Every `janus check` finding names the action that
@@ -146,6 +146,11 @@ and within capacity, budget and caps exactly like `janus launch`.
 | Lane idle beside a backlog (`idle:<n>:<lane>:vs`) | move waiting jobs to the free host | same lane kind, local vs remote as today |
 | Reclaimable (`tidy:<n>`, `disk:<host>`) | `janus tidy` (its safe rules only) on a schedule | branch and remote deletions only with `[tidy] branches` set |
 | Thrash on a shared host (`thrash:`) | already automatic (fixes10 item 3) | |
+
+Built (imp-autopilot): the capped, crashed/gone, question, stuck-job and host-down rows, collect and card archiving, behind
+`[autopilot] enabled`. Not built: moving waiting jobs to an idle lane (`idle:...:vs`) and tidy on a schedule (the watcher only
+refreshes tidy's list). A gone herdr agent counts as crashed when its unit has no verdict; an orphan job is cancelled, not
+re-queued (its owner is gone).
 
 Out of scope for the autopilot (stays with the orchestrator): landing decisions, owner instructions, rules, briefs, any
 destructive action outside the rules above.
