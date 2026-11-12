@@ -10,7 +10,7 @@ from janus.board import board, board_dir, board_script
 from janus.budgets import bset, budget_note, finish_refusal, reload_usd, run_spend, session_usage
 from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
     sh, ts)
-from janus.ledger import keep_run_json, ledger_done, reserve_budget, run_cost, settle_run
+from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, run_cost, settle_run
 from janus.project import project_id, tag, unit_tmux
 from janus.probe import probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
@@ -259,10 +259,28 @@ def job_result(cfg, hs, ref, agent_host):
         return rc, str(loc / f"{jid}.log")
     return rc, f"{hn}:{rd}/{jid}.log"
 
+def unit_used(cfg, u):
+    """(dollars the unit's runs have used, whether all of it is known). Review F10: a run that ended but is still open in the
+    ledger (it is closed inside resume_unit, a remote one when its output arrives) counts at the cost its own json reports,
+    and is said to be unknown without one: never at its budget, which is what the unit then read as money it had spent."""
+    pv = cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {})
+    if "ledger" not in pv: return 0.0, True
+    runs = ledger_read(cfg, pv)[0]; tot, known = 0.0, True
+    for k in unit_runs(u):
+        r = runs.get(k)
+        if not r or k == u.get("wrapup"): continue
+        if r["done"]: tot += r["cost"] or 0.0; continue
+        c, rep = run_cost(cfg.p("out", "out") / u["name"] / "api.json", None, k) if k == u.get("run") else (0.0, False)
+        if rep: tot += c
+        else: known = False
+    return round(tot, 2), known
+
 def resume_message(cfg, hs, u, jobs):
-    s, b = unit_spent(cfg, u), u.get("budget") or 0
+    b = u.get("budget") or 0; s, known = unit_used(cfg, u) if b else (0.0, True)
     report = str(report_path(cfg, u)) if cfg.hosts[u["host"]].get("local") else f"{cfg.hosts[u['host']]['root']}/out/{u['name']}/REPORT.md"
-    L = [f"Your jobs finished (spent ${s:.2f} of ${b:g}):"]
+    used = "" if not b else f" (your unit has used ${s:.2f} of its ${b:g} budget)" if known else \
+        f" (your unit has used ${s:.2f} of its ${b:g} budget in its finished runs; what the run that just ended cost is not known yet)"
+    L = [f"Your jobs finished{used}:"]
     for j in jobs:
         rc, log = job_result(cfg, hs, j, u.get("host"))
         note = ""
