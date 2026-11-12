@@ -1593,4 +1593,16 @@ class Item6Adoption(unittest.TestCase):
         self.assertEqual([u.get("tmux") for u in saved_units], ["janus-u1@proj"])
 
 
+class Item30BriefPath(unittest.TestCase):
+    def test_a_key_list_is_not_read_as_a_path(self):
+        """Catches (item 30): the brief's path reader took the `/` between two KEY= items (`FMT=/CLIPPY=`) for the absolute
+        path `/CLIPPY`, so a remote launch was refused for a path the brief never named."""
+        self.assertEqual(janus.brief_paths("prints FMT=/CLIPPY= (a KEY= list in prose)"), [])
+        self.assertEqual(janus.brief_paths("A=/x=/y= and B=/z"), ["/z"])   # `/x` `/y` are KEY= separators; `/z` is a value
+
+    def test_a_real_path_is_still_read(self):
+        """Catches the other direction: the fix must not drop the paths a brief does name (quoted, after `=`, trailing dot)."""
+        self.assertEqual(janus.brief_paths("B=`/root/x` and P=/tmp/y and see /a/b.md."), ["/root/x", "/tmp/y", "/a/b.md"])
+
+
 if __name__ == "__main__": unittest.main()
