@@ -128,12 +128,21 @@ class Resume(unittest.TestCase):
         d, cfg = project(); (d / "out/orig").mkdir(); rep = d / "out/orig/REPORT.md"; rep.write_text("VERDICT: BLOCKED\nold\nVERDICT: BLOCKED\n")
         b = d / "briefs/r.md"; b.write_text(f"Continue the same report {rep} (line 1 PENDING).\n")
         a = type("A", (), {"report": None, "resume_of": None, "unit": "r"})()
-        self.assertEqual(orch.resume_report(cfg, a, b), rep.resolve())
+        self.assertIsNone(orch.resume_report(cfg, a, b))   # never parsed from the brief's prose (a launch died on such a path)
         a.resume_of = "orig"; b.write_text("x\n"); self.assertEqual(orch.resume_report(cfg, a, b), rep.resolve())
+        a.resume_of = None; a.report = str(rep); self.assertEqual(orch.resume_report(cfg, a, b), rep.resolve())
         u = {"name": "r", "report": str(rep), "resume": True, "started": time.time() + 5}
         self.assertIsNone(orch.verdict(cfg, u))   # the old verdict does not count
         u["started"] = time.time() - 5; rep.write_text("VERDICT: DONE\nnew\nVERDICT: DONE\n")
         self.assertEqual(orch.verdict(cfg, u), "VERDICT: DONE")
+
+    def test_pueue_command_quoting(self):
+        """pueue joins `add -- <args>` with spaces and runs sh -c on it: a value reaches the task intact only when quoted twice."""
+        odd = "/x/(`B/out it's/REPORT.md"
+        words = [sys.executable, "-c", "import sys; print(sys.argv[1])", odd]
+        stored = subprocess.run(["sh", "-c", f"{sys.executable} -c 'import sys; print(\" \".join(sys.argv[1:]))' {orch.pq(words)}"],
+                                capture_output=True, text=True).stdout.rstrip("\n")      # what pueue stores as the command
+        self.assertEqual(subprocess.run(["sh", "-c", stored], capture_output=True, text=True).stdout.rstrip("\n"), odd)
 
 class SelfSafety(unittest.TestCase):
     def test_in_place_edit_flagged_rename_not(self):
