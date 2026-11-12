@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """orch: thin glue over beads (bd), pueue, tmux, herdr, ssh, rsync and git. Python 3.11+, standard library only.
 Reads orch.toml from the current directory or a parent. See docs/DESIGN.md and skill/SKILL.md."""
-import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, time, tomllib
+import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -1123,7 +1123,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     for n, c in cfg.caps.get("host", {}).items():
         k = sum(1 for u in units if u.get("host") == n)
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
-    F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg)
+    F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg) + tidy_findings(cfg)
     F += lane_findings(cfg, hs, units)
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg) + script_findings()
     for n, pv in cfg.prov.items():
@@ -2076,18 +2076,174 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
         if r.get("gone") and card not in names: P.append(("card", card, "its process is gone and it belongs to no open unit"))
     return P
 
+# The whole mess orchestration makes (owner core rule, orch-fixes10 item 5b), each by a safe rule. [tidy] in orch.toml:
+#   branches = ["wk/*"]   branch name patterns tidy may delete (default none): merged or squash-landed (contained in the landing
+#                         branch), not checked out anywhere; on the remote too (remote = "origin") when its tip is the same commit
+#   keep_days = 14        job run files (runs/<jid>.*) and test roots older than this go
+#   every_min = 60        the watcher refreshes the reclaimable list this often (check: tidy:<n>, disk:<host>)
+# [hosts.X] disk_budget_gb: the host's orch root plus its cache_dirs; over it, check raises disk:<host> and tidy removes the
+# oldest top-level entries of cache_dirs (build targets, compiler caches) until under budget. Containers: our own stopped ones
+# (name prefix orch-run-) only. Remote copies of closed units: only when nothing is uncollected.
+TIDY_DEFAULTS = {"branches": [], "remote": "origin", "keep_days": 14, "every_min": 60}
+def tset(cfg, k): return cfg.c.get("tidy", {}).get(k, TIDY_DEFAULTS[k])
+
+TIDY_HOST = r'''root=%(root)s; rd=%(rd)s; kd=%(kd)d
+[ -n "$root" ] && [ -d "$root/worktrees" ] && for d in "$root"/worktrees/*/; do [ -d "$d" ] && n=${d%%/}; [ -d "$d" ] && echo "copy ${n##*/} $(du -sm "$d" 2>/dev/null | cut -f1)"; done
+[ -d "$rd" ] && echo "runfiles $(find "$rd" -maxdepth 1 -type f -mtime +$kd \( -name '*.log' -o -name '*.sh' -o -name '*.rc' -o -name '*.cmd' -o -name '*.out' -o -name '*.err' -o -name '*.done' \) 2>/dev/null | wc -l | tr -d ' ')"
+command -v podman >/dev/null 2>&1 && podman ps -a --filter name=^orch-run- --filter status=exited --format '{{.Names}}' 2>/dev/null | sed 's/^/container /'
+for c in %(caches)s; do [ -d "$c" ] || continue; for e in "$c"/*; do [ -e "$e" ] && echo "cache $(du -sm "$e" 2>/dev/null | cut -f1) $(stat -c %%Y "$e" 2>/dev/null || stat -f %%m "$e") $e"; done; done
+[ -n "$root" ] && [ -d "$root" ] && echo "rootmb $(du -sm "$root" 2>/dev/null | cut -f1)"; true'''
+
+def tidy_host(cfg, n, h, units, au):
+    """[(kind, target, why, mb)] on host n (one shell call): synced copies of closed units, old run files, our stopped containers,
+    cache entries over the disk budget; plus ("disk", n, why, over_mb) when over budget."""
+    caches = [c for c in h.get("cache_dirs", [])]
+    root = h.get("root", "") if not h.get("local") else ""
+    rc, o, e = hrun(h, TIDY_HOST % {"root": qp(root) if root else "''", "rd": qp(h["_rd"]), "kd": int(tset(cfg, "keep_days")),
+                                    "caches": " ".join(qp(c) for c in caches) or "''"}, timeout=180)
+    if rc: return []
+    P, open_ = [], {u["name"] for u in units}; cache, total = [], 0
+    for l in o.splitlines():
+        f = l.split(None, 3)
+        if not f: continue
+        if f[0] == "copy" and len(f) >= 2 and f[1] not in open_:
+            u = au.get(f[1])
+            if u and u.get("status") == "closed" and u.get("host") == n:
+                global DRY
+                d0, DRY = DRY, False
+                try: why = uncollected(cfg, {**u, "via": u.get("via") if u.get("via") not in ("failed", "starting") else "x"})
+                finally: DRY = d0
+                if why: continue
+                P.append(("remote-copy", f"{n}:{f[1]}", "its unit is closed and its copy holds nothing uncollected", int(fl(f[2]) if len(f) > 2 else 0)))
+        elif f[0] == "runfiles" and len(f) > 1 and int(f[1] or 0): P.append(("run-files", n, f"{f[1]} job run file(s) older than {tset(cfg, 'keep_days')} days", 0))
+        elif f[0] == "container" and len(f) > 1 and f[1].startswith("orch-run-"): P.append(("container", f"{n}:{f[1]}", "our own stopped container", 0))
+        elif f[0] == "cache" and len(f) > 3: cache.append((int(fl(f[1])), int(fl(f[2])), f[3]))
+        elif f[0] == "rootmb" and len(f) > 1: total += int(fl(f[1]))
+    total += sum(c[0] for c in cache); bud = h.get("disk_budget_gb")
+    if bud and total > bud * 1024:
+        over = total - bud * 1024; P.append(("disk", n, f"{total / 1024:.1f} GB used by orch root and caches, budget {bud} GB", over))
+        for mb, mt, path in sorted(cache, key=lambda c: c[1]):   # oldest first, until under budget
+            if over <= 0: break
+            P.append(("cache", f"{n}:{path}", f"cache entry, {mb} MB, last changed {ts(mt)}: over the disk budget", mb)); over -= mb
+    return P
+
+def tidy_branches(cfg, units):
+    """[(kind, target, why, 0)]: branches matching [tidy] branches, not checked out in any worktree, contained in the landing
+    branch (ancestor, or every file they changed has the tip's content); and the remote branch when its tip is the same commit."""
+    pats = tset(cfg, "branches")
+    if not pats: return []
+    import fnmatch
+    repos = set(); wd = cfg.p("worktrees", "worktrees")
+    for d in list(wd.iterdir()) if wd.is_dir() else []:
+        if (d / ".git").is_file():
+            c = sh(["git", "-C", str(d), "rev-parse", "--path-format=absolute", "--git-common-dir"])[1].strip()
+            if c: repos.add(str(Path(c).parent))
+    repos |= {str(cfg.root / r) for r in cfg.c.get("tidy", {}).get("repos", [])}
+    P, rem = [], tset(cfg, "remote")
+    for r in sorted(repos):
+        out_ = {l.split()[1][11:] for l in sh(["git", "-C", r, "worktree", "list", "--porcelain"])[1].splitlines() if l.startswith("branch refs/heads/")}
+        refs = sh(["git", "-C", r, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"])[1].splitlines()
+        rrefs = dict(l.split() for l in sh(["git", "-C", r, "for-each-ref", "--format=%(refname:short) %(objectname)", f"refs/remotes/{rem}"])[1].splitlines() if len(l.split()) == 2)
+        br_ = landing_branch(cfg, Path(r))
+        for l in refs:
+            b, sha = l.split()
+            if b in out_ or not any(fnmatch.fnmatch(b, p) for p in pats) or b == br_: continue
+            if sh(["git", "-C", r, "merge-base", "--is-ancestor", sha, br_])[0] != 0 and not branch_contained(r, sha, br_): continue
+            P.append(("branch", f"{r}:{b}", f"contained in {br_}, not checked out", 0))
+            if rrefs.get(f"{rem}/{b}") == sha: P.append(("remote-branch", f"{r}:{rem}/{b}", f"same commit as the local branch, contained in {br_}", 0))
+    return P
+
+def branch_contained(repo, sha, br):
+    mb = sh(["git", "-C", repo, "merge-base", sha, br])[1].strip()
+    if not mb: return False
+    fs = [f for f in sh(["git", "-C", repo, "diff", "--name-only", mb, sha])[1].splitlines() if f]
+    return not fs or sh(["git", "-C", repo, "diff", "--quiet", br, sha, "--", *fs])[0] == 0
+
+def tidy_roots(cfg):
+    """Test and demo roots orch or its tests created, older than keep_days... or a day for fixtures (their suite is gone)."""
+    P, cut = [], now() - 86400
+    for base in {Path("/tmp"), Path(tempfile.gettempdir())}:
+        for d in base.glob(f"{FIXTURE_MARK}-*") if base.is_dir() else []:
+            try:
+                if d.is_dir() and d.stat().st_mtime < cut: P.append(("test-root", str(d), "a test suite's fixture root, over a day old", 0))
+            except OSError: pass
+        for pat in ("orch-test-*", "orch-rem-*"):   # roots of suites from before the fixture root
+            for d in base.glob(pat) if base.is_dir() else []:
+                try:
+                    if d.is_dir() and not d.name.startswith(FIXTURE_MARK) and d.stat().st_mtime < cut: P.append(("test-root", str(d), "an old test root, over a day old", 0))
+                except OSError: pass
+    return P
+
+def tidy_all(cfg, units, hs=None):
+    """Everything tidy would do: tidy_plan (worktrees, panes, cards) + branches + per-host items + test roots."""
+    au = all_units(cfg); P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units)] + tidy_branches(cfg, units) + tidy_roots(cfg)
+    for n, h in cfg.hosts.items():
+        if hs is not None and not (hs.get(n) or {}).get("ok"): continue
+        P += tidy_host(cfg, n, h, units, au)
+    return P
+
+def tidy_findings(cfg):
+    """disk:<host> (over its disk budget) and tidy:<n> (what tidy can reclaim), from the watcher's last tidy pass."""
+    t = cfg.jget("tidy.json"); P = t.get("plan", [])
+    F = [(f"disk:{x[1]}", f"host {x[1]} over its disk budget: {x[2]}; orch tidy --dry-run, then orch tidy") for x in P if x[0] == "disk"]
+    rest = [x for x in P if x[0] != "disk"]
+    if rest:
+        kinds = {}
+        for x in rest: kinds[x[0]] = kinds.get(x[0], 0) + 1
+        mb = sum(x[3] for x in rest)
+        F.append((f"tidy:{len(rest)}", f"tidy can reclaim {len(rest)} item(s) ({', '.join(f'{v} {k}' for k, v in sorted(kinds.items()))}"
+                  + (f", {mb / 1024:.1f} GB" if mb else "") + f", as of {ts(t.get('at', 0))}): orch tidy --dry-run, then orch tidy"))
+    return F
+
+def tend_tidy(cfg, hs, units, log):
+    """The watcher refreshes the reclaimable list every [tidy] every_min (the autopilot of a later round may act on it)."""
+    if now() - cfg.jget("tidy.json").get("at", 0) < tset(cfg, "every_min") * 60: return
+    try: P = tidy_all(cfg, units, hs)
+    except Exception as e: log(f"tidy pass failed: {e}"); return
+    cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P]})
+
+def tidy_do(cfg, kind, t):
+    """Carry out one tidy item; (rc, detail)."""
+    if kind == "worktree":
+        top = sh(["git", "-C", t, "rev-parse", "--path-format=absolute", "--git-common-dir"])[1].strip()
+        rc, o, e = sh(["git", "-C", str(Path(top).parent) if top else t, "worktree", "remove", t]); return rc, e   # never --force: clean only
+    if kind == "pane": return (0, "") if herdr("pane", "close", t) is not None else (1, "herdr pane close failed")
+    if kind == "card": rc, o, e = board(cfg, "close", t); return rc, e
+    if kind in ("branch", "remote-branch"):
+        r, _, b = t.rpartition(":")
+        if kind == "branch": rc, o, e = sh(["git", "-C", r, "branch", "-D", b]); return rc, e   # -D: squash-landed is not 'merged'; checked above
+        rem, _, rb = b.partition("/"); rc, o, e = sh(["git", "-C", r, "push", rem, "--delete", rb], timeout=60); return rc, e
+    if kind == "test-root":
+        q = Path(t)   # only a test root itself: named so, directly in a temp base folder
+        if not re.fullmatch(rf"({re.escape(FIXTURE_MARK)}|orch-test|orch-rem)-[^/]+", q.name) or \
+                str(q.parent.resolve()) not in {str(Path("/tmp").resolve()), str(Path(tempfile.gettempdir()).resolve())}: return 1, "not a test root"
+        if not q.is_dir() or now() - q.stat().st_mtime < 86400: return 1, "under a day old (its suite may still run)"
+        import shutil; shutil.rmtree(t, ignore_errors=True); return 0, ""
+    hn, _, x = t.partition(":"); h = cfg.hosts.get(hn if kind != "run-files" else t, {})
+    if kind == "remote-copy":
+        root = h["root"]; return hrun(h, f"cd {qp(root)} && rm -rf worktrees/{shlex.quote(x)} base/{shlex.quote(x)} briefs/{shlex.quote(x)}.md run/{shlex.quote(x)}.* ctx/{shlex.quote(x)}; true", timeout=300)[0], ""
+    if kind == "run-files":
+        return hrun(h, f"find {qp(h['_rd'])} -maxdepth 1 -type f -mtime +{int(tset(cfg, 'keep_days'))} \\( -name '*.log' -o -name '*.sh' -o -name '*.rc' -o -name '*.cmd' -o -name '*.out' -o -name '*.err' -o -name '*.done' \\) -exec rm -f {{}} +", timeout=300)[0], ""
+    if kind == "container":
+        if not x.startswith("orch-run-"): return 1, "not ours"
+        return hrun(h, f"podman rm {shlex.quote(x)} >/dev/null", timeout=60)[0], ""
+    if kind == "cache":
+        if not any(x.startswith(c.rstrip("/") + "/") for c in h.get("cache_dirs", [])): return 1, "not under a cache_dirs entry"
+        return hrun(h, f"rm -rf {qp(x)}", timeout=600)[0], ""
+    return 1, f"unknown kind {kind}"
+
 def cmd_tidy(cfg, a):
     if not DRY: refuse_agent("orch tidy")   # --dry-run only reads
-    units = Beads(cfg).units(); kept = []; P = tidy_plan(cfg, units, kept=kept)
+    units = Beads(cfg).units(); kept = []; au = all_units(cfg)
+    P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg)
+    for n, h in cfg.hosts.items(): P += tidy_host(cfg, n, h, units, au)
     for d, why in kept: say(f"kept worktree {d}: {why}")
-    if not P: say("nothing to tidy"); return
-    for kind, t, why in P:
-        if DRY: say(f"would remove {kind} {t}: {why}"); continue
-        if kind == "worktree":
-            top = sh(["git", "-C", t, "rev-parse", "--path-format=absolute", "--git-common-dir"])[1].strip()
-            rc, o, e = sh(["git", "-C", str(Path(top).parent) if top else t, "worktree", "remove", t])   # never --force: clean only
-        elif kind == "pane": rc, e = (0, "") if herdr("pane", "close", t) is not None else (1, "herdr pane close failed")
-        else: rc, o, e = board(cfg, "close", t)
+    if not DRY and not cfg.ro: cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P if x[0] == "disk"]})
+    if not [x for x in P if x[0] != "disk"]: say("nothing to tidy" + "".join(f"; {x[1]}: {x[2]}" for x in P if x[0] == "disk")); return
+    for kind, t, why, mb in P:
+        if kind == "disk": say(f"disk {t}: {why}"); continue
+        if DRY: say(f"would remove {kind} {t}: {why}" + (f" ({mb} MB)" if mb else "")); continue
+        rc, e = tidy_do(cfg, kind, t)
         say(f"{'removed' if rc == 0 else 'NOT removed'} {kind} {t}: {why}" + (f" ({(e or '').strip()[:120]})" if rc else ""))
 
 # ---------------------------------------------------------------- park and resume (orch-fixes9 items 1, 2)
@@ -4600,6 +4756,7 @@ def cmd_watch(cfg, a):
     board_alerts(cfg, log)
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (orch-fixes9)
     tend_thrash(cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job (fixes10 item 3)
+    tend_tidy(cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)
     sync()   # push what this pass wrote (peers.md, directions) to every host
     for r, why in orphan_jobs(cfg, hs, units):   # nothing whose owner is gone keeps running or waiting (item 3)
         try: log(f"orphan {r} ({why}): " + "; ".join(cancel_job(cfg, r)))

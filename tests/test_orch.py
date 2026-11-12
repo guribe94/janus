@@ -911,6 +911,50 @@ class Fixtures(unittest.TestCase):
             finally: p.kill(); p.wait()
         finally: os.environ["ORCH_IN_TESTS"] = "1"
 
+class TidyAll(unittest.TestCase):
+    """fixes10 item 5b (owner core rule): tidy covers branches (local and remote), run files, caches over a disk budget, test
+    roots, our stopped containers, remote copies of closed units; check raises disk:<host> and tidy:<n>."""
+    def test_branches_local_and_remote(self):
+        d, cfg = project('\n[landing]\nbranch = "main"\n[paths]\nworktrees = "wts"\n[tidy]\nbranches = ["wk/*"]\n'); r = d / "repo"; r.mkdir()
+        g = lambda *a, cwd=r: subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *a], capture_output=True, text=True)
+        g("init", "-q", "-b", "main"); (r / "a").write_text("1\n"); g("add", "a"); g("commit", "-qm", "base")
+        rem = d / "rem.git"; subprocess.run(["git", "init", "-q", "--bare", str(rem)]); g("remote", "add", "origin", str(rem))
+        for b in ("wk/merged", "wk/squashed", "wk/open", "wk/live", "other/x"): g("branch", b)
+        g("checkout", "-q", "wk/squashed"); (r / "s").write_text("s\n"); g("add", "s"); g("commit", "-qm", "s")
+        g("checkout", "-q", "wk/open"); (r / "o").write_text("o\n"); g("add", "o"); g("commit", "-qm", "o")
+        g("checkout", "-q", "main"); (r / "s").write_text("s\n"); g("add", "s"); g("commit", "-qm", "squash-land s")
+        g("push", "-q", "origin", "wk/merged", "wk/squashed"); g("branch", "-f", "wk/squashed", "wk/squashed")
+        (d / "wts").mkdir(); g("worktree", "add", "-q", str(d / "wts/live"), "wk/live")
+        P = orch.tidy_branches(cfg, [])
+        got = sorted((k, t.rpartition(":")[2]) for k, t, *_ in P)
+        self.assertEqual(got, [("branch", "wk/merged"), ("branch", "wk/squashed"), ("remote-branch", "origin/wk/merged"), ("remote-branch", "origin/wk/squashed")])
+        for k, t, *_ in P: self.assertEqual(orch.tidy_do(cfg, k, t)[0], 0, t)
+        self.assertEqual(g("branch", "--list", "wk/*").stdout.split(), ["+", "wk/live", "wk/open"])
+        self.assertEqual(subprocess.run(["git", "-C", str(rem), "branch"], capture_output=True, text=True).stdout.strip(), "")
+
+    def test_host_items_budget_roots_and_findings(self):
+        d, cfg = project(); cfg.ro = False; h = cfg.hosts["here"]; c = d / "cache"; c.mkdir()
+        for n, age in (("old", 9e5), ("new", 0)):
+            (c / n).mkdir(); (c / n / "blob").write_bytes(b"x" * 1500000); os.utime(c / n, (time.time() - age,) * 2)
+        rd = Path(h["_rd"]); rd.mkdir(parents=True); (rd / "j1.log").write_text("x"); os.utime(rd / "j1.log", (time.time() - 30 * 86400,) * 2)
+        (rd / "j2.log").write_text("x")
+        h.update(cache_dirs=[str(c)], disk_budget_gb=0.002)   # 2 MB budget, 3 MB of cache: the oldest entry goes
+        P = orch.tidy_host(cfg, "here", h, [], {})
+        kinds = [(k, Path(t.split(":", 1)[-1]).name if k == "cache" else t) for k, t, *_ in P]
+        self.assertIn(("disk", "here"), kinds); self.assertIn(("cache", "old"), kinds); self.assertNotIn(("cache", "new"), kinds)
+        self.assertIn(("run-files", "here"), kinds)
+        for k, t, *_ in P:
+            if k != "disk": self.assertEqual(orch.tidy_do(cfg, k, t)[0], 0)
+        self.assertFalse((c / "old").exists()); self.assertTrue((c / "new").exists())
+        self.assertFalse((rd / "j1.log").exists()); self.assertTrue((rd / "j2.log").exists())
+        self.assertEqual(orch.tidy_do(cfg, "cache", f"here:{d}/elsewhere")[0], 1)          # never outside cache_dirs
+        self.assertEqual(orch.tidy_do(cfg, "test-root", str(d.parent))[0], 1)             # never a root that is not a test root
+        self.assertEqual(orch.tidy_do(cfg, "test-root", str(d))[0], 1); self.assertTrue(d.is_dir())   # (nor one nested elsewhere)
+        old = Path(tempfile.mkdtemp(prefix=orch.FIXTURE_MARK + "-old-", dir="/tmp")); os.utime(old, (time.time() - 2 * 86400,) * 2)
+        self.assertIn(str(old), [t for k, t, *_ in orch.tidy_roots(cfg)]); orch.tidy_do(cfg, "test-root", str(old)); self.assertFalse(old.exists())
+        cfg.jput("tidy.json", {"at": int(time.time()), "plan": [list(x) for x in P]})
+        self.assertEqual(sorted(k.split(":")[0] for k, _ in orch.tidy_findings(cfg)), ["disk", "tidy"])
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project).

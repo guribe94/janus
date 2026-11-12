@@ -509,6 +509,17 @@ idempotent. `orch backlog list` shows what it reads. `orch check` then reports:
 and used by no open unit (`git worktree remove`, never `--force`; the branch is kept), closes the herdr panes of closed
 units, and archives board cards whose process is gone and that belong to no open unit. Each worktree it keeps is listed with
 the reason (uncommitted changes, stash, changed files not on the landing branch). `--dry-run` only reads (an agent may run it).
+It also covers the rest of the mess orchestration makes, each by a safe rule:
+- branches matching `[tidy] branches` (e.g. `["wk/*"]`; none by default) that no worktree has checked out and that are merged
+  or squash-landed (contained in the landing branch) are deleted, and their `[tidy] remote` (origin) branch too when its tip is
+  the same commit;
+- job run files (`runs/<jid>.*`) older than `[tidy] keep_days` (14) on every host; this project's stopped containers (name
+  prefix `orch-run-` only); remote synced copies of closed units, only when nothing in them is uncollected;
+- test roots (`/tmp/orch-test-fixture-*`, and older `orch-test-*` / `orch-rem-*`) over a day old;
+- `[hosts.X] disk_budget_gb`: the host's orch root plus its `cache_dirs` (build targets, compiler caches); over budget, the
+  oldest top-level entries of the cache dirs go until it fits.
+The watcher refreshes the list every `[tidy] every_min` (60); `orch check` raises `disk:<host>` over a budget and `tidy:<n>`
+with what is reclaimable.
 
 **Gate policy (targeted gates, known failures, time limits).**
 - `orch gate-scope <unit> [--name land-<unit>] [--dry-run]` runs the project's affected-scope hook (`[landing] scope_cmd`,

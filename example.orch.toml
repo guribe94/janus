@@ -59,6 +59,13 @@ args = []
 # gate_timeout_min = 120  # a gate's process group is stopped after this long (RESULT: FAIL, EXIT_timeout=124)
 # quick_gate_min = 15     # gates expected under this many minutes use the one-slot gates-quick group
 
+# [tidy]                 # orch tidy [--dry-run]: what orchestration leaves behind, each by a safe rule
+# branches = ["wk/*"]    # branch patterns it may delete when contained in the landing branch (and the remote one at the same commit)
+# remote = "origin"
+# keep_days = 14         # job run files and test roots older than this
+# every_min = 60         # the watcher refreshes the reclaimable list (check: tidy:<n>, disk:<host>)
+# per host: disk_budget_gb = 200; cache_dirs = ["/home/me/build/target"]   # over budget: oldest cache entries go
+
 # Caps exist only when the owner sets them.
 # [caps]
 # total = 6
