@@ -157,4 +157,22 @@ class Item9ResumeCard(unittest.TestCase):
         self.assertTrue(any(a[0] == "post" and a[2] == "waiting" and (e or {}).get("BOARD_CHECK") == "pueue here:7" for a, e in posts), posts)
 
 
+class Item10UnitChanges(unittest.TestCase):
+    def test_a_staged_landing_merge_does_not_count_the_branchs_files(self):
+        """Catches: a unit holding a staged merge of the landing branch counted all of the branch's files as its changes, so it
+        overlapped every other such unit (merge-u15 vs merge-pico2: +73 files)."""
+        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u10-")); R = base / "repo"; R.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(R), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
+        g("init", "-q", "-b", "main"); (R / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a")
+        g("checkout", "-q", "-b", "unit"); (R / "a").write_text("1x\n"); g("commit", "-qam", "unit change")
+        g("checkout", "-q", "main"); (R / "c").write_text("2\n"); g("add", "."); g("commit", "-qm", "main adds c")
+        g("checkout", "-q", "unit"); (R / "a").write_text("1y\n")   # the unit's staged work
+        g("merge", "--no-commit", "--no-ff", "main")                 # the landing branch merged and staged
+        d, cfg = project()
+        u = {"id": "t-1", "name": "u1", "host": "here", "cwd": str(R)}
+        hs = {"here": probe_of()}
+        br, fs = janus.unit_changes(cfg, u, [u])
+        self.assertIn("a", fs); self.assertNotIn("c", fs, "the landing branch's own file counted as the unit's change")
+
+
 if __name__ == "__main__": unittest.main()
