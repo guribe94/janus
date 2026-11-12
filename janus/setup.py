@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from janus.actions.jobs import remote_wt
 from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, wait_shell
+from janus.beads import Beads
 from janus.board import board_dir, board_script
 from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, Run, atomic_write, clean_env, herdr, hrun, now, pending_age, projects, qp,
     record_session_proc, say, session_alive, sh, slug, ts)
@@ -230,64 +231,89 @@ def cmd_init(cfg, a):
 OLD_CFG, NEW_CFG = "orch.toml", "janus.toml"   # the old names are quoted here on purpose: this is the one-time migration off them
 OLD_STATE, NEW_STATE = ".orch", ".janus"
 
-# Item 1: the old names a config value can carry. The specific ones first (so bin/orch.py and .orch/HANDOFF.md win over a bare
-# orch); the bare name is rewritten only as a whole path token (a folder, $HOME/orch, a command word), never inside a word.
+# Item 1 (finding 1): the old names a config value can carry. Only the old state folder `.orch` and the old file/folder names
+# (`orch.py`, `orch.toml`, `orchkit`) are rewritten, and only as a whole path component (or the whole value) -- never a bare
+# `orch` token inside a path, host, keychain name or word (`root = "/home/x/orch"`, `research.orchard`, `torch.py`, `me@orch`,
+# the keychain name `orch` and `ORCH_API` all stay). `com.orch.watch` is a specific label, replaced as it is.
 OLD_VALUE = [(".orch", ".janus"), ("orch.py", "janus.py"), ("orchkit", "janus"), ("orch.toml", "janus.toml"),
-             ("ORCH_", "JANUS_"), ("com.orch.watch", "com.janus.watch"), ("orchestrating", "janus")]
+             ("com.orch.watch", "com.janus.watch")]
 
 def old_value(v):
-    """One config value with the old names replaced (item 1). Only a value reaches here: comments are never rewritten."""
-    for a, b in OLD_VALUE: v = v.replace(a, b)
-    return re.sub(r"(?<![\w.-])orch(?![\w.-])", "janus", v)
+    """One config value with the old names replaced (item 1, finding 1): each only as a whole path component (a `.orch` path,
+    `orch.py`), so a bare `orch` token, `research.orchard` and `scripts/torch.py` stay. Only a value reaches here: comments are
+    never rewritten."""
+    for a, b in OLD_VALUE:
+        if a == "com.orch.watch": v = v.replace(a, b); continue   # a specific launchd label, not a bare token
+        v = re.sub(r"(?<![\w.-])" + re.escape(a) + r"(?![\w.-])", b, v)
+    return v
 
 ASSIGN = re.compile(r"^(\s*[A-Za-z0-9_.-]+\s*=\s*)(.*)$")
 
-def value_comment(rest):
-    """(value, trailing comment) of a line's right-hand side, split at the first # outside a quoted string."""
-    q = ""; esc = False
+def value_comment(rest, q0=""):
+    """(value, trailing comment, quote state, bracket depth) of a line's right-hand side: the comment starts at the first #
+    outside a quoted string, and the quote state and the [/{ depth carry across the lines of a multi-line value (finding 1)."""
+    q, esc, depth = q0, False, 0
     for i, ch in enumerate(rest):
         if esc: esc = False; continue
         if ch == "\\" and q == '"': esc = True; continue
         if q:
             if ch == q: q = ""
         elif ch in "\"'": q = ch
-        elif ch == "#": return rest[:i], rest[i:]
-    return rest, ""
+        elif ch == "#": return rest[:i], rest[i:], q, depth
+        elif ch in "[{": depth += 1
+        elif ch in "]}": depth -= 1
+    return rest, "", q, depth
 
 def rewrite_config(path, dry=False):
-    """Rewrite every value in a migrated janus.toml that names the old state folder or an old name (item 1); comments and
-    anything that is not a value are left as written. Returns one line per change; writes nothing in dry mode."""
-    lines, changes = path.read_text().split("\n"), []
+    """Rewrite every value in a migrated janus.toml that names the old state folder or an old name (item 1, finding 1); a
+    multi-line value (a list or table spanning lines) is rewritten on its continuation lines too, and comments and anything that
+    is not a value are left as written. Returns one line per change; writes nothing in dry mode."""
+    lines, changes, q, depth, key = path.read_text().split("\n"), [], "", 0, ""
     for i, line in enumerate(lines):
-        if line.lstrip().startswith("#"): continue   # a comment is not a value (the one place old names may stay on purpose)
-        m = ASSIGN.match(line)
-        if not m: continue
-        val, com = value_comment(m.group(2))
+        if q == "" and depth == 0:
+            if line.lstrip().startswith("#"): continue   # a comment is not a value (the one place old names may stay on purpose)
+            m = ASSIGN.match(line)
+            if not m: continue
+            head, rest = m.group(1), m.group(2); key = head.split("=", 1)[0].strip()
+        else: head, rest = "", line   # a continuation line of a value that started on an earlier line
+        val, com, q, d = value_comment(rest, q); depth += d
         new = old_value(val)
         if new == val: continue
-        key = m.group(1).split("=", 1)[0].strip()
         changes.append(f"{path}: {key}: {val.strip()} -> {new.strip()}")
-        lines[i] = m.group(1) + new + com
+        lines[i] = head + new + com
     if changes and not dry: atomic_write(path, "\n".join(lines))
     return changes
 
-OLD_ORCH_RX = re.compile(r"(^|[/\s])orch(\.py)?(\s|$)")   # a command naming the old toolkit: orch.py, `orch <cmd>` (item 14)
+# Item 14 (finding 4): the old orch's standing loops only -- its bin scripts and its watcher -- whose command names this
+# project (root), never a job waiter (`orch run ... --lane`, `pueue wait`), an ssh/rsync, an editor, or another project's
+# process. The command word (not the whole line) decides, so a path holding `code` or `less` is not an editor.
+OLD_ORCH_LOOP_RX = re.compile(r"(^|[/\s])(fleet-loops|handoff-queue|orch-backup|wip-snapshot|watch-stream)\.sh(\s|$)")
+OLD_ORCH_WATCH_RX = re.compile(r"(^|[/\s])orch(\.py)?\s+watch(\s|$)")
+OLD_ORCH_NOT = {"ssh", "mosh", "rsync", "scp", "sftp", "vim", "vi", "nvim", "nano", "emacs", "less", "more", "ed", "make"}
 
-def old_orch_procs(ps_text=None):
-    """[(pid, command)] of this machine's running old-orch processes (item 14): a command that names the old toolkit (orch.py /
-    `orch <cmd>`) and is not a janus process. migrate lists them; janus migrate --retire stops them (the owner's yes)."""
+def old_orch_procs(ps_text=None, root=None):
+    """[(pid, command)] of this machine's running old-orch standing processes (item 14, finding 4): one of the old toolkit's
+    loop scripts (fleet-loops.sh, handoff-queue.sh, orch-backup.sh, wip-snapshot.sh, watch-stream.sh) or its watcher, whose
+    command names this project (root); never a job waiter, an ssh/rsync, an editor or another project's process. migrate lists
+    them; janus migrate --retire stops them (the owner's yes)."""
     o = ps_text if ps_text is not None else sh(["ps", "-Aww", "-o", "pid=,command="], timeout=10)[1]
     out = []
     for l in o.splitlines():
         f = l.split(None, 1)
-        if len(f) == 2 and f[0].isdigit() and OLD_ORCH_RX.search(f[1]) and "janus" not in f[1]: out.append((int(f[0]), f[1]))
+        if len(f) != 2 or not f[0].isdigit(): continue
+        cmd = f[1]
+        if not (OLD_ORCH_LOOP_RX.search(cmd) or OLD_ORCH_WATCH_RX.search(cmd)): continue
+        if os.path.basename(cmd.split(None, 1)[0]) in OLD_ORCH_NOT: continue
+        if root is not None and str(root) not in cmd: continue
+        out.append((int(f[0]), cmd))
     return out
 
-def retire_old_orch(dry=False, retire=False, ps_text=None):
-    """Item 14: list the old orch's standing processes and, only with the owner's explicit yes (--retire), stop them (TERM)."""
-    procs = old_orch_procs(ps_text)
+def retire_old_orch(dry=False, retire=False, ps_text=None, root=None):
+    """Item 14: list the old orch's standing processes (the full command line, so the owner can tell a loop from a waiter) and,
+    only with the owner's explicit yes (--retire), stop them (TERM)."""
+    procs = old_orch_procs(ps_text, root)
     if not procs: return []
-    out = [f"old orch process {p} still running: {c[:100]}" for p, c in procs]
+    out = [f"old orch process {p} still running: {c}" for p, c in procs]
     if retire and not dry:
         for p, _ in procs: run(["kill", "-TERM", str(p)])
         out.append(f"-> sent TERM to {len(procs)} old orch process(es) (--retire)")
@@ -320,7 +346,7 @@ def migrate(project=None, dry=False, retire=False):
     if src.is_file(): did += rewrite_config(src, dry=dry)   # item 1
     did += migrate_hooks(dry=dry) + migrate_watcher(dry=dry)
     if new_cfg.is_file() or (dry and old_cfg.is_file()): did += adopt_items(root, dry=dry, config=src)   # item 6
-    did += retire_old_orch(dry=dry, retire=retire)   # item 14: the old orch's standing processes
+    did += retire_old_orch(dry=dry, retire=retire, root=root)   # item 14: the old orch's standing processes (finding 4)
     for x in did: say(x)
     say("janus migrate: " + ("done" if did else "nothing to do (already migrated)") + (" [dry-run: nothing changed]" if dry else ""))
     return 0
@@ -403,13 +429,56 @@ def pueue_editor(path, new):
                     "    f.write_text(t)\n")
     return f"python3 {shlex.quote(str(path))}"
 
+def _local_pueue(cfg):
+    """The real pueue command (a list) for this machine (finding 6): the janus pueue shim (`.janus/bin/pueue`) drops EDITOR, so
+    migrate calls the real binary, with this host's pueue_config when it has one."""
+    import shutil
+    real = shutil.which("pueue", path=clean_env()["PATH"]) or "pueue"
+    h = next((x for x in cfg.hosts.values() if x.get("local")), {})
+    return [real, *(["-c", str(h["pueue_config"])] if h.get("pueue_config") else [])]
+
+def _under(root, path):
+    """True when a pueue task's working directory is the project root or under it (finding 6: a job is this project's only when
+    both its unit and its path are)."""
+    if not path: return False
+    try: p = Path(path).resolve()
+    except OSError: return False
+    r = Path(root).resolve()
+    return p == r or r in p.parents
+
+def _gate_unit(name, units):
+    """The unit a gate job's name belongs to (finding 6): `land-<unit>`/`<unit>-...`, or a unit named as a whole token of the
+    gate name (`gate:land-u1-linux` -> u1); None when it names no unit."""
+    for s in (name, name[5:] if name.startswith("land-") else name):
+        if s in units: return s
+    for u in sorted(units, key=len, reverse=True):
+        if re.search(rf"(?<!\w){re.escape(u)}(?!\w)", name): return u
+    return None
+
+def _task_label(pq_cmd, tid):
+    """The label of task tid now, or None when it cannot be read (finding 6: verify a pueue edit took effect)."""
+    rc, o, e = sh([*pq_cmd, "status", "--json"])
+    if rc: return None
+    try: return (json.loads(o).get("tasks", {}).get(str(tid)) or {}).get("label")
+    except Exception: return None
+
+def _follow_tmux_rename(view, name, new):
+    """The open unit record follows its renamed tmux session (finding 6), so unit_tmux(u) names the new session."""
+    try:
+        bd = Beads(view); u = next((x for x in bd.units() if x["name"] == name), None)
+        if u: u["tmux"] = new; bd.save(u)
+    except Err: pass
+
 def adopt_items(root, dry=False, config=None):
-    """Item 6: give this project's own pre-existing items their project id, and list what it cannot attribute. A pueue job whose
-    label matches one of the project's units is relabelled (…@<id>) through pueue's editor when it is queued or stashed, else
-    listed; a tmux session named janus-<unit> or orch-<unit> is renamed (…@<id>); a card of such a unit gets its project field.
-    Returns one line per adoption and one per item left alone; changes nothing in dry mode."""
+    """Item 6 (finding 6): give this project's own pre-existing items their project id, and list what it cannot attribute. A
+    pueue job is this project's only when its label matches one of the project's units (or a gate of one) AND its working
+    directory is under this project's root; it is relabelled (…@<id>) through pueue's editor when it is queued or stashed, and
+    the relabel is verified (a pueue edit that did not take is reported, never claimed). A tmux session named janus-<unit> or
+    orch-<unit> is renamed (…@<id>) and the unit record follows it; a card of such a unit gets its project field. Returns one
+    line per adoption and one per item left alone; changes nothing in dry mode."""
     view = _adopt_view(root, config); pid = project_id(view); units = set(all_units(view)); out = []
-    rc, o, e = sh(["pueue", "status", "--json"])
+    pq_cmd = _local_pueue(view)
+    rc, o, e = sh([*pq_cmd, "status", "--json"])
     if rc == 0 and o.strip():
         try: tasks = json.loads(o).get("tasks", {})
         except Exception: tasks = {}
@@ -417,18 +486,26 @@ def adopt_items(root, dry=False, config=None):
             lab = t.get("label") or ""
             if label_owner(lab)[1] is not None: continue
             base = lab.split(":", 1)[1] if lab.startswith(("unit:", "run:", "gate:")) else lab
-            if base not in units:
-                out.append(f"job {tid} ({lab or (t.get('command') or '')[:40]}): not one of this project's units; left alone")
-                continue
+            name = _gate_unit(base, units) if lab.startswith("gate:") else base
+            if name not in units:
+                out.append(f"job {tid} ({lab or (t.get('command') or '')[:40]}): not one of this project's units; left alone"); continue
+            if not _under(view.root, t.get("path")):
+                out.append(f"job {tid} ({lab}): its path {t.get('path')} is not under {view.root}; another project's, left alone"); continue
             new = f"{lab}@{pid}"; st = t.get("status"); st = st if isinstance(st, str) else next(iter(st), "")
             if st not in ("Queued", "Stashed", "Locked"):
-                out.append(f"job {tid} ({lab} -> {new}): {st.lower() or 'running'}, pueue relabels only a queued or stashed task; adopt it by hand (pueue edit {tid})")
-                continue
+                out.append(f"job {tid} ({lab} -> {new}): {st.lower() or 'running'}, pueue relabels only a queued or stashed task; adopt it by hand (pueue edit {tid})"); continue
+            if dry:
+                out.append(f"job {tid}: {lab} -> {new}"); continue
+            ed = view.state / f".pueue-label-{tid}.py"; ed.parent.mkdir(parents=True, exist_ok=True); got = None
+            try:
+                sh([*pq_cmd, "edit", str(tid)], env={"EDITOR": pueue_editor(ed, new)}, timeout=30)
+                got = _task_label(pq_cmd, tid)
+            finally:
+                ed.unlink(missing_ok=True)
+            if got != new:
+                out.append(f"job {tid} ({lab}): pueue edit did not change the label (still {got!r}); adopt it by hand (pueue edit {tid})"); continue
             out.append(f"job {tid}: {lab} -> {new}")
-            if not dry:
-                ed = view.state / f".pueue-label-{tid}.py"; ed.parent.mkdir(parents=True, exist_ok=True)
-                sh(["pueue", "edit", str(tid)], env={"EDITOR": pueue_editor(ed, new)}, timeout=30)
-    elif rc: out.append(f"pueue: no queue on this machine ({e.strip()[:60] or 'rc %s' % rc}); no jobs adopted")
+    elif rc: out.append(f"pueue: no queue on this machine ({(e or o).strip()[:60] or 'rc %s' % rc}); no jobs adopted")
     rc, o, e = sh(["tmux", "list-sessions", "-F", "#{session_name}"])
     if rc == 0:
         for s in o.split():
@@ -438,8 +515,9 @@ def adopt_items(root, dry=False, config=None):
             name = s[len(pref):]
             if name not in units: out.append(f"session {s}: not one of this project's units; left alone"); continue
             new = tmux_name(view, name); out.append(f"session {s} -> {new}")
-            if not dry: sh(["tmux", "rename-session", "-t", s, new])
-    elif rc: out.append(f"tmux: no server on this machine ({e.strip()[:60] or 'rc %s' % rc}); no sessions adopted")
+            if not dry:
+                sh(["tmux", "rename-session", "-t", s, new]); _follow_tmux_rename(view, name, new)
+    elif rc: out.append(f"tmux: no server on this machine ({(e or o).strip()[:60] or 'rc %s' % rc}); no sessions adopted")
     for c in (sorted((board_dir(view) / "agents").glob("*.md")) if (board_dir(view) / "agents").is_dir() else []):
         name, txt = c.stem, c.read_text(errors="replace")
         if re.search(r"^- project: *\S", txt, re.M): continue   # already adopted

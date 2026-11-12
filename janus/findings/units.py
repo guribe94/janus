@@ -87,10 +87,13 @@ def unit_changes(cfg, u, units=()):
     if not cwd or not Path(cwd).is_dir() or not own_tree(cfg, u, units or [u]): return "?", []
     br = sh(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])[1].strip() or "?"
     lb = cfg.c.get("landing", {}).get("branch") or "main"
-    # item 10: a tree that has the landing branch merged (or its merge staged) counts the branch's own files as the unit's, so
-    # every such unit overlapped every other. Diff against the landing branch's side of the merge, not the merge base, and drop
-    # the branch's files from the status part too.
-    merged = sh(["git", "-C", cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD"])[0] == 0 or sh(["git", "-C", cwd, "merge-base", "--is-ancestor", lb, "HEAD"])[0] == 0
+    # item 10 / finding 14: a tree with the landing branch's merge staged (MERGE_HEAD is the landing branch tip) counts the
+    # branch's own files as the unit's, so every such unit overlapped every other. Diff against the landing branch's side of
+    # the merge, not the merge base, and drop the branch's files from the status part too. A staged merge of any OTHER branch
+    # (or a committed merge) is not the landing branch's: its base stays the merge base.
+    mh = sh(["git", "-C", cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD"])[1].strip()
+    lbt = sh(["git", "-C", cwd, "rev-parse", "-q", "--verify", lb])[1].strip()
+    merged = bool(mh and lbt and mh == lbt)
     base = lb if merged else sh(["git", "-C", cwd, "merge-base", "HEAD", lb])[1].strip()
     fs = set(sh(["git", "-C", cwd, "diff", "--relative", "--name-only", base, "--", "."])[1].split("\n")) if base else set()
     top = sh(["git", "-C", cwd, "rev-parse", "--show-toplevel"])[1].strip()

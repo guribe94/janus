@@ -32,12 +32,15 @@ def module_of(rel):
 
 
 def repo_of(cwd):
-    """The repository a unit's tree belongs to (its git common dir), or '' when it cannot be told. Item 16a: two units in
-    different repositories are never 'related' by a shared module or file name (two projects that both change a `docs` module). The
-    common dir, not the worktree toplevel, so two worktrees of one repository still count as one."""
+    """A stable key for the repository a unit's tree belongs to, or '' when it cannot be told. Item 16a: two units in different
+    repositories are never 'related' by a shared module or file name. Finding 10: two clones of one repository must compare
+    equal, so the key is the root commit (content-addressed, shared by every clone), else the remote URL, else the tree path --
+    never the git common dir (each clone has its own)."""
     if not cwd or not Path(cwd).is_dir(): return ""
-    o = sh(["git", "-C", str(cwd), "rev-parse", "--git-common-dir"])[1].strip()
-    return str(Path(cwd, o).resolve()) if o else ""
+    roots = sorted(set(sh(["git", "-C", str(cwd), "rev-list", "--max-parents=0", "HEAD"])[1].split()))
+    if roots: return "root:" + " ".join(roots)
+    url = sh(["git", "-C", str(cwd), "config", "--get", "remote.origin.url"])[1].strip()
+    return "url:" + url if url else str(Path(cwd).resolve())
 
 
 def unit_of_gate(name, names):

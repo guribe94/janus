@@ -12,16 +12,18 @@ from janus.context import Err, slug
 # has room while backlog items have no open unit, and "finished, not landing" when a finished unit has no gate, or its gates
 # passed and it is not on the landing branch.
 
-LOG_RX = re.compile(r"^[\w.-]+: (decisions?|log)\b", re.I)   # a decision/log record bead, not work (item 15)
+LOG_RX = re.compile(r"^(?:janus|orch):\s*(?:decisions?|log)\b", re.I)   # the toolkit's own decision/log bead, not work (item 15)
+LOG_LABELS = {"janus-log", "orch-log"}   # finding 8: only the toolkit's own log label, not any bead whose label merely ends -log
 
 def ready_work(cfg):
-    """Ready work items in beads: not units (launched work), not janus's decision log (a `<tool>-log` label, or a `<tool>:
-    decisions`/`<tool>: log` bead -- the old orch's too, item 15), not owner instructions (audit H7)."""
+    """Ready work items in beads: not units (launched work), not janus's decision log (the `janus-log`/`orch-log` label, or a
+    `janus:`/`orch: decisions`/`log` title -- only those; a bead whose title or label merely contains log is real work,
+    finding 8), not owner instructions (audit H7)."""
     skip = {"unit", "instruction", "backlog"}   # backlog items have their own finding (idle with backlog)
     out = []
     for i in Beads(cfg).run("ready"):
         labels = set(i.get("labels") or []); title = str(i.get("title", ""))
-        if skip & labels or any(l.endswith("-log") for l in labels): continue
+        if skip & labels or labels & LOG_LABELS: continue
         if title.startswith(("unit:", "janus:", "instr:")) or LOG_RX.match(title): continue
         out.append(i)
     return out

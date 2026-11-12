@@ -66,20 +66,24 @@ class BriefLint(unittest.TestCase):
 
 
 class ReportJson(unittest.TestCase):
-    """item 4: report.json wins over the report's prose and the prose is the fallback. The failure caught: a verdict read from
-    stale prose when the unit wrote a structured report (or read from a report that is only PENDING)."""
+    """item 4: report.json wins over the report's prose (when the prose states no verdict) and the prose is the fallback. The
+    failure caught: a verdict read from stale prose when the unit wrote a structured report. Finding 2 narrows it: a report
+    whose LAST VERDICT line is WAITING/PENDING is not finished, whatever a stale report.json says."""
 
     def test_verdict_prefers_report_json_and_falls_back(self):
         d, cfg = project(); o = d / "out/u"; o.mkdir(parents=True)
-        (o / "REPORT.md").write_text("VERDICT: PENDING\nstep\nVERDICT: PENDING\n")
+        (o / "REPORT.md").write_text("body\n")                                   # no VERDICT line: the json is read
         (o / "report.json").write_text(json.dumps({"verdict": "DONE"}))
         self.assertEqual(janus.verdict(cfg, {"name": "u"}), "VERDICT: DONE")
         (o / "report.json").write_text("{ broken json")
-        self.assertIsNone(janus.verdict(cfg, {"name": "u"}))                     # prose holds only PENDING: no verdict
+        self.assertIsNone(janus.verdict(cfg, {"name": "u"}))                     # no json, no verdict line: no verdict
         (o / "REPORT.md").write_text("body\nVERDICT: BLOCKED\n")
         self.assertEqual(janus.verdict(cfg, {"name": "u"}), "VERDICT: BLOCKED")  # clean fallback to the prose
         (o / "report.json").write_text(json.dumps({"verdict": "PENDING"}))
         self.assertIsNone(janus.verdict(cfg, {"name": "u"}))                     # a stated PENDING is not a verdict
+        (o / "report.json").write_text(json.dumps({"verdict": "DONE"}))
+        (o / "REPORT.md").write_text("VERDICT: DONE\nmore work\nVERDICT: WAITING\n")
+        self.assertIsNone(janus.verdict(cfg, {"name": "u"}))                     # finding 2: ends parked, not finished
 
     def test_report_summary_prefers_json_then_prose(self):
         self.assertEqual(janus.report_summary("VERDICT: PENDING\n", {"verdict": "DONE", "left": "all green"}), ("DONE", "all green"))

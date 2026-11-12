@@ -376,11 +376,10 @@ def cmd_launch(cfg, a):
     for x in units: x.setdefault("state", unit_state(x, hs, ag))   # finished units hold no build position
     hn, build, why_place = choose(cfg, a, brief, mc, units, hs)
     h = cfg.hosts[hn]; local = h.get("local", False)
+    if getattr(a, "new_worktree", None) and a.cwd:   # finding 12: --new-worktree makes its own tree
+        raise Err("--cwd with --new-worktree: --new-worktree makes its own worktree (drop --cwd)")
     cwd = cfg.p("worktrees", "worktrees") / name
-    if getattr(a, "new_worktree", None):   # item 16b: a fresh worktree of <repo> on a new branch, from <ref>
-        ref = getattr(a, "from_ref", None) or "main"
-        if cfg.run.dry: say(f"+ git -C {a.new_worktree} worktree add -b {name} {cwd} {ref}"); cwd = cwd.resolve()
-        else: cwd = new_worktree(Path(a.new_worktree).resolve(), cwd, name, ref)
+    if getattr(a, "new_worktree", None): cwd = cwd.resolve()   # the fresh worktree is made after every refusal check (finding 12)
     elif a.cwd: cwd = Path(a.cwd).resolve()
     elif cwd.is_dir(): cwd = cwd.resolve()
     else: cwd = cfg.root.resolve()
@@ -413,6 +412,11 @@ def cmd_launch(cfg, a):
     if report and report.exists():
         t = report.read_text().split("\n", 1)
         if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not cfg.run.dry: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
+    if getattr(a, "new_worktree", None):   # item 16b (finding 12): make the tree only now, after every refusal check
+        ref = getattr(a, "from_ref", None) or cfg.c.get("landing", {}).get("branch") or "main"
+        if cfg.run.dry: say(f"+ git -C {a.new_worktree} worktree add -b {name} {cwd} {ref}")
+        else: cwd = new_worktree(Path(a.new_worktree).resolve(), cwd, name, ref)
+        rcwd = str(cwd)
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
     pred = predecessor_name(cfg, name, a.resume_of)   # RELATED: names and the predecessor reach the brief (imp-awareness)
     u = {"v": UNIT_V, "host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
