@@ -672,6 +672,12 @@ class Board(unittest.TestCase):
         orch.learned_mark(cfg, "learned:a2:1", "rejected"); self.assertEqual(orch.board_findings(cfg, set()), [])
         self.assertIn("asked: 1", B("digest", "--since", "1h")[1])
 
+    def test_remote_rule_on_a_fresh_board(self):
+        """A remote unit launched before any check got this machine's board path in its rule (exit 127 there)."""
+        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\n')
+        p = orch.agent_prompt(cfg, "u", "/b.md", "far")
+        self.assertIn("/r/bin/board.sh post u status", p); self.assertNotIn(str(orch.ORCH_SELF.parent), p)
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project)."""

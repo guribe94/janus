@@ -763,10 +763,9 @@ def board_script(cfg):
 def board_dir(cfg): return cfg.root / cfg.paths.get("board_dir", "board")
 def board(cfg, *args, env=None, timeout=25):
     """Run the board script with BOARD_DIR set (the shipped board keeps its files there; a project's own script may ignore it).
-    The shipped board's folder is the coordinating board (.master) from the first call, so posts never land in an outbox here."""
-    if not cfg.paths.get("board") and not DRY and not (board_dir(cfg) / ".master").exists():
-        board_dir(cfg).mkdir(parents=True, exist_ok=True)
-        (board_dir(cfg) / ".master").write_text(next((n for n, h in cfg.hosts.items() if h.get("local")), "local") + "\n")
+    The shipped board's files (.master, .hosts, .notify) exist from the first call: posts never land in an outbox here, and a
+    remote unit's rule names <root>/bin/board.sh (not this machine's path)."""
+    if not cfg.paths.get("board") and not DRY: board_files(cfg)   # .master, and .hosts before a remote unit's rule is written
     return sh([str(board_script(cfg)), *args], env={"BOARD_DIR": str(board_dir(cfg)), **(env or {})}, timeout=timeout)
 
 def board_rows(cfg):
