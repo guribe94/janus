@@ -41,5 +41,20 @@ class GateBaseline(unittest.TestCase):
         self.assertIn("no recorded gate", str(e.exception))
 
 
+class GateLog(unittest.TestCase):
+    def test_shows_steps_and_first_error(self):
+        d, cfg = project()
+        (d / "out/g").mkdir()
+        (d / "out/g/failed.txt").write_text("a\nb\n")
+        (d / "out/g/passed.txt").write_text("c\n")
+        (d / "out/g/log").write_text("EXIT_build=0\nEXIT_tests=1\nsome ok line\nerror: assertion failed in x\n")
+        (d / "out/gates.log").write_text("2026-01-01 00:00:00 g EXIT_tests=1 RESULT: FAIL\n")
+        rc, L = janus.cmd_gate_log(cfg, type("A", (), {"name": "g", "task": None})())
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("steps:" in x and "tests=rc1" in x for x in L), L)          # per-step summary from the output
+        self.assertTrue(any("a, b" in x for x in L), L)                                  # the failing test ids
+        self.assertTrue(any("error: assertion failed" in x for x in L), L)               # the first error line
+
+
 if __name__ == "__main__":
     unittest.main()
