@@ -123,7 +123,10 @@ class CpuScheduling(unittest.TestCase):
         try: js = janus.job_script(self.cfg, "b", self.h, a, "t", cmd, "t-1")
         finally: del os.environ["JANUS_TQ"]
         (self.rd / "t-1.sh").write_text(js)
-        r = subprocess.run(["bash", str(self.rd / "t-1.sh")], env={**os.environ, "JANUS_POLL_S": "1"}, capture_output=True, text=True, timeout=60)
+        env = {**os.environ, "JANUS_POLL_S": "1"}
+        for k in ("JANUS_CORES", "MAKEFLAGS", "CARGO_BUILD_JOBS", "RUST_TEST_THREADS", "NEXTEST_TEST_THREADS", "PYTEST_XDIST_AUTO_NUM_WORKERS", "OMP_NUM_THREADS"):
+            env.pop(k, None)   # the suite itself may run inside a janus lane, which exports the cap: the test is about the default
+        r = subprocess.run(["bash", str(self.rd / "t-1.sh")], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr); self.assertIn("\n2\n", r.stdout)       # capped at its 2 cores
         f = (self.rd / "history.tsv").read_text().split("\t")
         self.assertGreaterEqual(int(f[5]), 2); self.assertGreaterEqual(int(f[6]), 29)                 # CPU seconds, queue wait
