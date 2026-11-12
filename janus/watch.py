@@ -10,7 +10,7 @@ from janus.board import board, board_alerts, board_dir, board_files
 from janus.autopilot import record, tend_autopilot
 from janus.check import run_check
 from janus.reset import orch_tokens, reset_now
-from janus.context import Err, JANUS_MARK, atomic_write, WAKE, handoff_stale, herdr, now, session_alive, sh, ts
+from janus.context import Err, JANUS_MARK, WAKE, WAKE_CLEAR, atomic_write, handoff_stale, herdr, now, session_alive, sh, ts
 from janus.setup import heartbeat_beat
 
 def cmd_watch(cfg, a):
@@ -76,10 +76,10 @@ def watch_pass(cfg, log):
         kind = (cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else "") or cfg.c.get("orchestrator", {}).get("kind", "claude")
         oc = cfg.c.get("orchestrator", {}); args = oc.get("args", []) if oc.get("kind", "claude") == kind else []
         cfg.touch("last_wake"); log(f"orchestrator gone (pane absent, process ended, transcript quiet): starting a new {kind} one")
-        atomic_write(cfg.f("session"), f"pending:{int(now())}")   # its first hook event claims the registration
         pane, _ = new_tab(cfg, "orchestrator", cfg.root); wait_shell(pane, "orchestrator")
+        atomic_write(cfg.f("session"), f"pending:{int(now())}:{pane}")   # only a hook in this pane claims it (panel-eng F5)
         sh(["herdr", "agent", "start", "orchestrator", "--kind", kind, "--pane", pane, "--timeout", "90000", "--", *args], timeout=100)
-        atomic_write(cfg.f("pane"), pane); herdr("agent", "prompt", "orchestrator", JANUS_MARK + "You are the orchestrator. Run janus register, then " + WAKE); return
+        atomic_write(cfg.f("pane"), pane); herdr("agent", "prompt", "orchestrator", JANUS_MARK + "You are the orchestrator. Run janus register, then " + WAKE_CLEAR.format(reason="a new session")); return
     st = ag["agent"].get("agent_status")
     if st == "working": return
     tok = orch_tokens(cfg)
@@ -91,4 +91,5 @@ def watch_pass(cfg, log):
             cfg.touch("reset_prompted"); log(f"context large ({tok} tokens): asked for final notes")
             herdr("agent", "prompt", pane, JANUS_MARK + "Context is large: finish the Orchestrator notes in .janus/HANDOFF.md, then end the turn (janus resets the context then)."); return
     if (overdue or late) and now() - cfg.mtime("last_wake") > 600:
-        cfg.touch("last_wake"); log(f"wake: overdue={bool(overdue)} late={late[:3]}"); herdr("agent", "prompt", pane, JANUS_MARK + WAKE)
+        cfg.touch("last_wake"); log(f"wake: overdue={bool(overdue)} late={late[:3]}")
+        herdr("agent", "prompt", pane, JANUS_MARK + WAKE.format(reason="cycle overdue" if overdue else "late: " + ", ".join(late[:3])))

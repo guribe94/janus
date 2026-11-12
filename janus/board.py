@@ -59,7 +59,8 @@ def board_findings(cfg, names):
     for q, ag, at, tx in board_questions(cfg) or []:
         try: age = int((now() - time.mktime(time.strptime(at, "%Y-%m-%d %H:%M"))) / 60)
         except ValueError: age = 0
-        F.append((f"question:{q}", f"{ag}{'' if ag in names else ' (not a unit)'} asks [{q}] ({age} min): {tx[:160]}; check MEMORY.md (janus memory), then board.sh answer {q} <text>"))
+        F.append((f"question:{q}", f"{ag}{'' if ag in names else ' (not a unit)'} asks [{q}] ({age} min): {tx[:160]}; check janus "
+                  f"memory, janus decisions --grep <topic>, bd memories <word>; then board.sh answer {q} <text>"))
     done = cfg.jget("learned.json")
     F += [(f"learned:{i}", f"{i.split(':')[0]} proposes for the session memory: {t[:160]}; janus remember --fact|--decision|--pitfall <text> --learned {i}, or janus learned --reject {i}")
           for i, t in learned_posts(cfg) if i not in done]
@@ -85,8 +86,9 @@ def board_alerts(cfg, log):
     seen = cfg.jget("alerted.json"); new = [(k, t) for k, t in items if k not in seen]
     if not new: return None
     pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
-    msg = (JANUS_MARK + "Board needs you now: " + " | ".join(t for _, t in new) + ". Check MEMORY.md (janus memory) first; answer with "
-           "board.sh answer <id> <text> (a block: board.sh direct <agent> <text>); janus remember what every agent should know.")
+    msg = (JANUS_MARK + "Board needs you now: " + " | ".join(t for _, t in new) + ". Check janus memory, janus decisions --grep <topic>, "
+           "bd memories <word>; answer with board.sh answer <id> <text> (a block: board.sh direct <agent> <text>); janus remember what "
+           "every agent should know.")
     if not pane or herdr("agent", "prompt", pane, msg) is None: log(f"board alert not delivered (no orchestrator pane): {msg[:300]}"); return None
     log(f"board alert: {msg[:600]}"); cfg.jput("alerted.json", {**{k: v for k, v in seen.items() if now() - v < 7 * 86400}, **{k: now() for k, _ in new}})
     return msg

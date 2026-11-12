@@ -126,6 +126,187 @@ class Hooks(unittest.TestCase):
         self.assertIsNone(w(str(Path.home() / ".claude/plans/next-steps.md")))
         self.assertIsNotNone(w(str(Path.home() / ".claude/settings.json"))); self.assertIsNotNone(w(str(self.d / "src.py")))
 
+class AgentStop(unittest.TestCase):
+    """F1/F6: an agent that obeys the park rule is not told it is unfinished, and a block can never loop forever. The failure
+    caught: an agent that wrote 'WAITING <job ids>' and ended its turn (per PARK_RULE) was blocked with 'Not finished' and its
+    only exit was to poll (or to write a false DONE)."""
+    def setUp(self):
+        self.d, self.cfg = project()
+        self.rp = self.d / "out/u/REPORT.md"; self.rp.parent.mkdir(parents=True, exist_ok=True)
+    def stop(self, text, active=False):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        self.rp.write_text(text); buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"JANUS_ROLE": "agent", "JANUS_REPORT": str(self.rp)}), \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({"stop_hook_active": active}))):
+            with redirect_stdout(buf): janus.cmd_hook("Stop")
+        return buf.getvalue()
+    def test_parked_report_is_not_blocked(self):
+        self.assertNotIn("Not finished", self.stop("VERDICT: PENDING\ndoing x\nWAITING here:7\n"))
+        self.assertNotIn("Not finished", self.stop("VERDICT: PENDING\ndoing x\nWAITING here:7\nmoved on\nVERDICT: PENDING\nWAITING here:8\n"))
+    def test_a_block_does_not_loop(self):
+        t = "VERDICT: PENDING\nnothing done yet\n"
+        self.assertIn("Not finished", self.stop(t))                     # first stop: blocked
+        msg = self.stop(t, active=True)
+        self.assertIn("Not finished", msg)                              # the block re-fires (repeat one)
+        for w in ("'VERDICT: DONE'", "'VERDICT: BLOCKED'", "'VERDICT: FAILED'"): self.assertIn(w, msg)   # names all three
+        self.assertNotIn("Not finished", self.stop(t, active=True))     # repeat two: give up, the block never loops
+    def test_finished_report_stops(self):
+        self.assertNotIn("Not finished", self.stop("VERDICT: DONE\nran the suite: exit code 0\n"))
+        # a final verdict after a line-1 PENDING (janus reads the last VERDICT line) is finished too
+        self.assertNotIn("Not finished", self.stop("VERDICT: PENDING\nwork\nVERDICT: BLOCKED\nno commands run: exit codes none\n"))
+
+
+class UserPrompt(unittest.TestCase):
+    """F3: an owner instruction is filed to one store per audience — beads memories for the orchestrator's own rules, MEMORY.md
+    for what agents must follow. The failure caught: the old text told the orchestrator to copy the same fact into both stores,
+    and a rule filed with `bd remember` never reached an agent."""
+    def setUp(self):
+        self.d, self.cfg = project()
+        self.cfg.f("session").write_text(f"pending:{int(time.time())}")
+    def prompt(self, text):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        created = []
+        class FakeBeads:
+            def __init__(self, cfg): pass
+            def create(self, title, kind, body): created.append((title, kind)); return "i-7"
+        saved = (janus.Beads, janus.session_root); janus.Beads = FakeBeads; janus.session_root = lambda sid: None
+        try:
+            with mock.patch.dict(os.environ, {"JANUS_ROLE": ""}), \
+                 mock.patch("sys.stdin", io.StringIO(json.dumps({"session_id": "sid", "cwd": str(self.d), "prompt": text}))):
+                buf = io.StringIO()
+                with redirect_stdout(buf): janus.cmd_hook("UserPromptSubmit")
+        finally: janus.Beads, janus.session_root = saved
+        return created, buf.getvalue()
+    def test_the_two_stores_are_named_and_not_copied(self):
+        created, out = self.prompt("Make the gate use the new runner")
+        self.assertEqual(created, [("instr: Make the gate use the new runner", "instruction")])
+        text = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("bd remember", text)              # the orchestrator's own rules (beads)
+        self.assertIn("janus remember", text)           # what agents must follow (MEMORY.md)
+        self.assertNotIn("also janus remember", text)   # the old copy-the-same-fact-into-both instruction
+    def test_the_broadcast_reply_names_the_stores(self):
+        d, cfg = project(); bd = d / "board"; bd.mkdir(); (bd / ".master").write_text("here\n")
+        B = lambda *a: janus.board(cfg, *a)
+        B("post", "a1", "status", "start")
+        self.assertIn("bd remember", B("direct", "all", "freeze main")[1])
+        self.assertIn("janus remember", B("direct", "all", "freeze main")[1])
+
+
+class SkillDoc(unittest.TestCase):
+    """F4/F5: the skill's description triggers for the orchestrator only (never an agent working a unit), and the launch recipe
+    names the markers lint_brief checks. The failure caught: a unit agent loading the skill and reading 'never do the work'."""
+    P = Path(JANUS_PY).parent / "skill/SKILL.md"
+    def test_description_triggers_for_the_orchestrator_only(self):
+        desc = self.P.read_text().split("---")[1]
+        self.assertIn("Orchestrator role for a janus project", desc)
+        self.assertIn("[janus]", desc)
+        self.assertIn("Not for an agent working a unit", desc)
+        self.assertNotIn("never do the work", desc)   # that is a rule, not a trigger
+    def test_launch_recipe_names_the_lint_markers(self):
+        txt = self.P.read_text()
+        for m in ("TIER:", "SCOPE:", "REPORT.md", "DONE-WHEN:", "PROOF:"): self.assertIn(m, txt)
+        self.assertNotIn("every few minutes", txt)   # a session cannot schedule itself; the watcher wakes it
+
+
+class PromptFixes(unittest.TestCase):
+    """F7/F8/F9/F13/F15 and the board direction: the wrap-up and resume texts, the refusal's named alternative, the wake's
+    reason, read only showing new directions, and the header's absolute report path (for the opencode launch path, too)."""
+    def setUp(self): self.d, self.cfg = project()
+    def test_wrapup_forbids_work_and_names_the_structured_report(self):
+        w = janus.WRAPUP.format(report="/o/u/REPORT.md")
+        self.assertIn("Do not run, submit or wait", w)
+        self.assertIn("/o/u/REPORT.md", w); self.assertIn("report.json", w)
+    def test_resume_message_names_the_report_path(self):
+        u = {"name": "u", "host": "here", "budget": 2.0}
+        m = janus.resume_message(self.cfg, {}, u, [])
+        self.assertIn(str(self.cfg.p("out", "out") / "u/REPORT.md"), m)
+        self.assertIn("Read only the logs you need", m); self.assertIn("WAITING <job ids>", m)
+    def test_a_refusal_names_the_command_that_does_the_job(self):
+        w = lambda c: janus.pretool_why(self.cfg, {"tool_name": "Bash", "tool_input": {"command": c}, "cwd": str(self.d)})
+        self.assertEqual(janus.deny_alt(w("pueue kill 3")), "janus cancel <host>:<task> (see them with janus queue)")
+        self.assertEqual(janus.deny_alt(w("kill 5")), "janus stop <unit>")
+        self.assertEqual(janus.deny_alt(w("git branch -D x")), "janus tidy --dry-run, then janus tidy")
+        self.assertEqual(janus.deny_alt(w("rm -rf build")), "janus tidy --dry-run, then janus tidy")
+        self.assertEqual(janus.deny_alt(w("janus api-run u --run x")), "janus launch")
+    def test_the_wake_says_why_and_reads_handoff_only_after_clear(self):
+        w = janus.WAKE.format(reason="late: here:3, here:4")
+        self.assertIn("late: here:3, here:4", w); self.assertNotIn("HANDOFF.md", w)   # no full read on every wake
+        self.assertIn("cycle overdue", janus.WAKE.format(reason="cycle overdue"))
+        self.assertIn("HANDOFF.md", janus.WAKE_CLEAR.format(reason="the context was cleared"))
+    def test_read_shows_only_new_directions(self):
+        bd = self.d / "board"; bd.mkdir(); (bd / ".master").write_text("here\n")
+        B = lambda *a: janus.board(self.cfg, *a)
+        B("post", "a1", "status", "start")
+        B("direct", "a1", "first"); B("direct", "a1", "second")
+        o1 = B("read", "a1")[1]; self.assertIn("second", o1); self.assertIn("first", o1)
+        o2 = B("read", "a1")[1]; self.assertNotIn("second", o2); self.assertNotIn("first", o2)
+        B("direct", "a1", "third")
+        o3 = B("read", "a1")[1]; self.assertIn("third", o3); self.assertNotIn("second", o3)
+    def test_the_question_finding_names_every_knowledge_source(self):
+        """F16: a question's finding names every place the answer may be, not only MEMORY.md."""
+        bd = self.d / "board"; bd.mkdir(); (bd / ".master").write_text("here\n")
+        janus.board(self.cfg, "post", "a1", "question", "which port?")
+        txt = dict(janus.board_findings(self.cfg, {"a1"}))["question:q1"]
+        for w in ("janus memory", "janus decisions", "bd memories"): self.assertIn(w, txt)
+    def test_the_opencode_launch_writes_the_absolute_report_path_in_the_header(self):
+        d, cfg = project('\n[providers.oc]\nenabled = true\n[models.oc]\nprovider = "oc"\nkind = "opencode"\nmodel = "z"\n')
+        (d / "briefs/u.md").write_text("TIER: NORMAL\nSCOPE: all\nWrite REPORT.md.\nPROOF: x\n")
+        hs = {"here": {"name": "here", "ok": True, "avail_mb": "64000", "disk_gb": "100", "load": "0"}}
+        class FakeBeads:
+            def __init__(self, cfg): pass
+            def units(self): return []
+            def create(self, *a): return "u-1"
+            def run(self, *a): return {"issues": []}
+            def save(self, u): pass
+            def comment(self, *a): pass
+        saved = (janus.Beads, janus.herdr)
+        janus.Beads = FakeBeads; janus.herdr = lambda *a, **k: None   # new_tab finds no tab and raises, after the header is written
+        try:
+            a = type("A", (), {"unit": "u", "kind": "implement", "tier": "normal", "host": "here", "model": "oc", "brief": None,
+                               "cwd": str(d), "budget": None, "test_host": None, "allow_main": True, "of": None, "report": None,
+                               "resume_of": None, "item": None, "probes": hs, "share_with": None, "dry_run": False})()
+            with self.assertRaises(janus.Err): janus.cmd_launch(cfg, a)
+        finally: janus.Beads, janus.herdr = saved
+        f = d / "out/u/u.md"
+        self.assertTrue(f.exists(), "the brief with the header was not written")
+        hd = f.read_text(); rep = str(d / "out/u/REPORT.md")
+        self.assertIn(f"Write your report to `{rep}`", hd)     # the absolute path, once, prominently (the opencode path)
+        self.assertIn(rep, hd)                                 # and the same path in the park rule and the quality block
+
+
+class Registration(unittest.TestCase):
+    """panel-eng F5: the watcher records the pane it started the new orchestrator in (pending:<ts>:<pane>); only a hook in that
+    pane claims the registration. The failure caught: any session in the project tree claiming the pending registration."""
+    def setUp(self):
+        self.d, self.cfg = project()
+        self.saved = (janus.session_root, janus.sh)
+        janus.session_root = lambda sid: None; janus.sh = lambda *a, **k: (0, "(prime)", "")
+    def tearDown(self): janus.session_root, janus.sh = self.saved
+    def hook(self, pane=""):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"JANUS_ROLE": "", "HERDR_PANE_ID": pane}):
+            if not pane: os.environ.pop("HERDR_PANE_ID", None)
+            with mock.patch("sys.stdin", io.StringIO(json.dumps({"session_id": "sid", "cwd": str(self.d)}))):
+                with redirect_stdout(io.StringIO()): janus.cmd_hook("SessionStart")
+        return self.cfg.f("session").read_text().strip()
+    def test_claimed_from_its_own_pane(self):
+        self.cfg.f("session").write_text(f"pending:{int(time.time())}:pane-A")
+        self.assertEqual(self.hook("pane-A"), "sid")
+    def test_not_claimed_from_another_pane(self):
+        self.cfg.f("session").write_text(f"pending:{int(time.time())}:pane-A")
+        self.assertTrue(self.hook("pane-B").startswith("pending:"))
+    def test_a_pending_without_a_pane_is_still_claimed(self):
+        """janus register without a session id writes pending:<ts> (no pane): the fallback still claims it."""
+        self.cfg.f("session").write_text(f"pending:{int(time.time())}")
+        self.assertEqual(self.hook("pane-B"), "sid")
+
+
 class Backlog(unittest.TestCase):
     def test_table_and_checkboxes(self):
         d, cfg = project('\n[backlog]\nfile = "S.md"\nready = ["READY", "FIX"]\n')
@@ -685,7 +866,8 @@ class Board(unittest.TestCase):
         """A remote unit launched before any check got this machine's board path in its rule (exit 127 there)."""
         d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\n')
         p = janus.agent_prompt(cfg, "u", "/b.md", "far")
-        self.assertIn("/r/bin/board.sh post u status", p); self.assertNotIn(str(janus.JANUS_SELF.parent), p)
+        self.assertIn("B=/r/bin/board.sh", p); self.assertIn("$B post u <kind> <text>", p)
+        self.assertNotIn(str(janus.JANUS_SELF.parent), p)
 
     def test_board_contract_is_python_with_one_validator(self):
         """Step 3b: board.sh is a thin shim over the Python module; one name validator refuses path names and '..'."""

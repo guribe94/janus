@@ -31,14 +31,15 @@ def pick_model(cfg, tier, kind, of_vendor, host=None):
 
 def agent_prompt(cfg, unit, brief, hn, report=None):
     """The first prompt of a unit. It names the report path the unit must keep (row 26: a resumed unit continues its original
-    report, which janus reads; the agent must not guess it from the brief)."""
+    report, which janus reads; the agent must not guess it from the brief) and the one instruction that matters (keep it
+    current; the VERDICT line). The report.json contract lives in the brief header (quality_block) and is not repeated here
+    (F11: the prompt keeps the report-current rule, the header keeps report.json)."""
     rc, o, e = board(cfg, "rule", unit, *([] if cfg.hosts[hn].get("local") else [hn]))
-    rp = f"your report {report}" if report else "REPORT.md (path in the brief)"
-    return (f"Read {brief} and carry out every instruction exactly. Keep {rp} current after every step (a run "
-            f"stopped by its budget must leave its state written): line 1 'VERDICT: PENDING' "
-            f"until done, then end with 'VERDICT: DONE' (or BLOCKED) and the real exit codes. Also write report.json "
-            f"beside it (verdict, files_changed, jobs with their exit codes, tests_added with the failure each catches, "
-            f"left); janus reads it before the prose. {o.strip()}")
+    rp = report or "REPORT.md (the path in the brief)"
+    board_rule = f" {o.strip()}" if o.strip() else ""
+    return (f"Read {brief} (absolute path) and carry out every instruction exactly. Keep {rp} current after every step so a run "
+            f"stopped by its budget leaves its state: line 1 'VERDICT: PENDING' until done, then end with 'VERDICT: DONE' or "
+            f"'VERDICT: BLOCKED' and the real exit codes.{board_rule}")
 
 def wait_shell(pane, unit):
     for _ in range(30):
@@ -204,10 +205,6 @@ PARK_RULE = ("**Never wait for a build or test (janus rule).** Submit it with `{
              "janus resumes this same session with each job's exit code and log path when all of them have finished. A turn spent "
              "waiting costs money and can end the run at its budget cap with nothing written.\n\n")
 
-BOARD_RULE = ("**Board:** post only state changes (status when you start, `waiting <job ids>` when you park, `blocked` or `question` when "
-              "stuck, `learned <fact, with its source>` when you found something every agent should know, `done <VERDICT line>` at the end); "
-              "your steps go in your report, not on the board.")
-
 def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
     """What every agent gets at start besides its brief (janus-swarm item 2): the session memory, then pointers (never content)
     to the project's agent instructions, the reports index, the peers file and how to read another agent's transcript; then the
@@ -230,8 +227,7 @@ def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
            "- Another agent's transcript: peers.md names where it is; when it is on this host, grep or tail it (never read it whole); "
            "otherwise ask with a board question and the orchestrator reads it for you."),
           "- Rule: read peers.md and the index when your task touches another unit's area; read a transcript only to solve a problem "
-          "another unit met, by grep or tail, never whole.",
-          "- " + BOARD_RULE, "", ""]
+          "another unit met, by grep or tail, never whole.", "", ""]
     rel = related_pointers(cfg, name, brief_text, pred)
     if rel: L += [rel, ""]
     return "\n".join(L)
@@ -247,19 +243,25 @@ def quality_block(cfg, report=None):
     return "\n".join(L) + "\n"
 
 def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None):
-    """The header every unit's brief gets: where it runs, how it submits builds and tests (detached, then WAITING), its report and
-    the quality rules, then the session memory and the swarm pointers (swarm_header; imp-awareness adds the RELATED: names and the
-    predecessor there)."""
+    """The header every unit's brief gets: the absolute report path once, prominently (the one thing janus reads; a runtime that
+    wrote it elsewhere lost its report), where it runs and how it submits builds and tests (detached, then WAITING), its report,
+    the quality rules, then the session memory and the swarm pointers (swarm_header; imp-awareness adds the RELATED: names and
+    the predecessor there)."""
+    rep = report or "REPORT.md"
+    head = (f"<!-- janus: unit {name} runs on {hn} -->\n"
+            f"**Write your report to `{rep}`.** That absolute path is the only report janus reads: keep it current after every "
+            f"step (line 1 'VERDICT: PENDING' until done, then end with 'VERDICT: DONE' or 'VERDICT: BLOCKED' and the real exit "
+            f"codes). Do not write the report anywhere else.\n")
     if local:
         b = build or hn
-        return (f"<!-- janus: unit {name} runs on {hn} -->\n" + PARK_RULE.format(
-            submit=f"janus run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=report or "REPORT.md")
+        return (head + PARK_RULE.format(
+            submit=f"janus run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=rep)
             + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
-    return (f"<!-- janus: unit {name} runs on {hn} -->\n**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
+    return (head + f"**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
             f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
-            f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=report or "REPORT.md")
+            f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=rep)
             + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
 
 def place(cfg, a, brief, mc, units, hs):
