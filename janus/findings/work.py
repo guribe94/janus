@@ -48,7 +48,7 @@ def git_findings(cfg):
         sd = cfg.state.resolve().relative_to(cfg.root.resolve()).as_posix() + "/" if cfg.state.resolve().is_relative_to(cfg.root.resolve()) else None
         if sd: dirty = [l for l in dirty if not (l[3:].strip().strip('"').startswith(sd) and not l[3:].strip().strip('"').endswith(".md"))]
         hp = handoff_path(cfg).relative_to(cfg.root) if handoff_path(cfg).is_relative_to(cfg.root) else None
-        if hp and any(l[3:].strip() == str(hp) for l in dirty):   # check's own rewrite of the Live block is not a change (row 50)
+        if hp and handoff_path(cfg).exists() and any(l[3:].strip() == str(hp) for l in dirty):   # check's own rewrite of the Live block is not a change (row 50)
             rc2, old, _ = sh(["git", "show", f"HEAD:{hp}"], cwd=cfg.root)
             if rc2 == 0 and old.split(LE, 1)[-1] == handoff_path(cfg).read_text().split(LE, 1)[-1]: dirty = [l for l in dirty if l[3:].strip() != str(hp)]
         if dirty: F.append(("git:dirty", f"{len(dirty)} uncommitted path(s) in {cfg.root.name}: janus commit-state"))
@@ -149,12 +149,17 @@ def orchestrator_findings(cfg):
     return F
 
 def session_findings(cfg, running):
-    """instructions (owner instructions to classify), handoff (stale notes), watcher (not loaded)."""
+    """instructions (owner instructions to classify), handoff (stale notes, or a missing state file), watcher (not loaded)."""
     F = []
     try:
         ins = Beads(cfg).issues("instruction")
         if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done, or bd remember --key <subject>: same subject replaces): " + "; ".join(i['title'][:50] for i in ins[:3])))
     except Err: pass
+    hp = handoff_path(cfg)
+    if not hp.exists():   # item 2: a missing state file is a finding with its fix, never a traceback
+        st = cfg.c.get("project", {}).get("state")
+        F.append(("handoff:missing", f"{hp} is missing (janus.toml [project] state = {st}): run janus check as the orchestrator (it writes the Live state and "
+                  f"the notes skeleton); if the state folder is really {cfg.state.name}, janus migrate rewrites [project] state, or set it by hand"))
     for s in handoff_stale(cfg, running): F.append(("handoff", s))
     if not watcher_loaded(): F.append(("watcher", f"watcher {watcher_service()[1]} ({watcher_service()[0]}) is not running: run install"))
     return F

@@ -1,6 +1,6 @@
 """Checks for janus.py, run before every release (./check, and install runs them against the copy it installs).
 JANUS_PY names the janus.py under test (default: the one next to tests/). Standard library only; no network, no API spend."""
-import json, os, stat, subprocess, sys, tempfile, textwrap, time, unittest
+import contextlib, io, json, os, re, stat, subprocess, sys, tempfile, textwrap, time, unittest
 from pathlib import Path
 
 from janusload import JANUS_PY, load
@@ -1217,5 +1217,169 @@ class Migrate(unittest.TestCase):
             janus.run = real_run
             if old_home is None: os.environ.pop("HOME", None)
             else: os.environ["HOME"] = old_home
+
+    def test_config_values_naming_the_old_state_are_rewritten(self):
+        """Catches (item 1): migrate renamed .orch/ to .janus/ but left [project] state = ".orch", so the next janus check read
+        .orch/HANDOFF.md and crashed."""
+        d = Path(tempfile.mkdtemp(prefix="janus-mig-"))
+        (d / "orch.toml").write_text('[project]\nname = "t"\nstate = ".orch"   # where the state lives\n'
+                                     '[paths]\ngate_log = ".orch/gates.log"\n')
+        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("old notes\n")
+        home = Path(tempfile.mkdtemp(prefix="janus-home-"))
+        old_home = os.environ.get("HOME"); os.environ["HOME"] = str(home)
+        real_run, real_sh = janus.run, janus.sh
+        janus.run = lambda *a, **k: (0, "", ""); janus.sh = lambda *a, **k: (1, "", "")
+        try: self.assertEqual(janus.migrate(str(d)), 0)
+        finally:
+            janus.run, janus.sh = real_run, real_sh
+            if old_home is None: os.environ.pop("HOME", None)
+            else: os.environ["HOME"] = old_home
+        t = (d / "janus.toml").read_text()
+        self.assertIn('state = ".janus"', t); self.assertIn('gate_log = ".janus/gates.log"', t)
+        self.assertIn("# where the state lives", t, "the comment was rewritten")   # comments are left as written
+        self.assertNotIn(".orch", t)
+
+    def test_dry_run_changes_nothing(self):
+        """Catches (item 3): migrate had no --dry-run, so a project could not see what the state-changing command would do."""
+        d = Path(tempfile.mkdtemp(prefix="janus-mig-"))
+        (d / "orch.toml").write_text('[project]\nname = "t"\nstate = ".orch"\n')
+        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("old notes\n")
+        home = Path(tempfile.mkdtemp(prefix="janus-home-")); (home / ".claude").mkdir()
+        (home / ".claude/settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/u/.local/bin/orch hook Stop"}]}]}}))
+        old_home = os.environ.get("HOME"); os.environ["HOME"] = str(home)
+        calls = []; real_run, real_sh = janus.run, janus.sh
+        janus.run = lambda *a, **k: (calls.append(a[0][0]), 0, "", "")[1:]; janus.sh = lambda *a, **k: (1, "", "")
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out): self.assertEqual(janus.migrate(str(d), dry=True), 0)
+        finally:
+            janus.run, janus.sh = real_run, real_sh
+            if old_home is None: os.environ.pop("HOME", None)
+            else: os.environ["HOME"] = old_home
+        self.assertTrue((d / "orch.toml").is_file()); self.assertTrue((d / ".orch/HANDOFF.md").is_file())
+        self.assertFalse((d / "janus.toml").exists())
+        cmd = json.loads((home / ".claude/settings.json").read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]
+        self.assertIn("/orch hook", cmd, "dry-run rewrote the hooks file"); self.assertNotIn("launchctl", calls, "dry-run touched the watcher")
+        s = out.getvalue()
+        self.assertIn("orch.toml -> janus.toml", s); self.assertIn(".orch/ -> .janus/", s); self.assertIn("hook command(s) -> janus", s)
+
+    def test_adopts_pre_existing_items(self):
+        """Catches (item 6): jobs, sessions and cards made before the project id existed were left as machine state and never
+        collected, cancelled or tracked."""
+        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "janus.toml").write_text('[project]\nname = "t"\nid = "proj"\n')
+        (d / "board/agents").mkdir(parents=True)
+        (d / "board/agents/u1.md").write_text("# u1\n- task: t\n- state: working\n- project: \n")
+        (d / "board/agents/zzz.md").write_text("# zzz\n- task: t\n- state: working\n- project: \n")
+        tasks = {"7": {"label": "unit:u1", "status": "Queued"}, "8": {"label": "unit:u9", "status": "Running"},
+                 "9": {"label": "gate:g@proj", "status": "Running"}}
+        calls = []
+        def fake_sh(cmd, **k):
+            calls.append(list(cmd))
+            if cmd[:2] == ["pueue", "status"]: return 0, json.dumps({"tasks": tasks}), ""
+            if cmd[:2] == ["tmux", "list-sessions"]: return 0, "janus-u2\norch-u1\njanus-zzz\n", ""
+            return 0, "", ""
+        real_sh, real_units = janus.sh, janus.all_units
+        janus.sh = fake_sh; janus.all_units = lambda cfg: {"u1": {}, "u2": {}, "u3": {}}
+        try:
+            out = janus.adopt_items(d, dry=False, config=d / "janus.toml")
+        finally:
+            janus.sh, janus.all_units = real_sh, real_units
+        s = "\n".join(out)
+        self.assertIn("adopt: job 7: unit:u1 -> unit:u1@proj", s)
+        self.assertIn("adopt: job 8 (unit:u9): not one of this project's units", s)
+        self.assertIn("adopt: session janus-u2 -> janus-u2@proj", s)
+        self.assertIn("adopt: session orch-u1 -> janus-u1@proj", s)
+        self.assertIn("adopt: session janus-zzz: not one of this project's units", s)
+        self.assertIn("adopt: card u1: project proj", s); self.assertIn("adopt: card zzz: not one", s)
+        self.assertIn("- project: proj", (d / "board/agents/u1.md").read_text())
+        self.assertEqual(sorted(tuple(c) for c in calls if c[:2] == ["tmux", "rename-session"]),
+                         [("tmux", "rename-session", "-t", "janus-u2", "janus-u2@proj"),
+                          ("tmux", "rename-session", "-t", "orch-u1", "janus-u1@proj")])
+        self.assertEqual([c for c in calls if c[:2] == ["pueue", "edit"]], [["pueue", "edit", "7"]], "another project's job was touched")
+
+    def test_adopt_dry_run_changes_nothing(self):
+        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "janus.toml").write_text('[project]\nname = "t"\nid = "proj"\n')
+        (d / "board/agents").mkdir(parents=True); (d / "board/agents/u1.md").write_text("# u1\n- state: working\n- project: \n")
+        calls = []
+        def fake_sh(cmd, **k):
+            calls.append(list(cmd))
+            if cmd[:2] == ["pueue", "status"]: return 0, json.dumps({"tasks": {"7": {"label": "unit:u1", "status": "Queued"}}}), ""
+            if cmd[:2] == ["tmux", "list-sessions"]: return 0, "janus-u1\n", ""
+            return 0, "", ""
+        real_sh, real_units = janus.sh, janus.all_units
+        janus.sh = fake_sh; janus.all_units = lambda cfg: {"u1": {}}
+        try: s = "\n".join(janus.adopt_items(d, dry=True, config=d / "janus.toml"))
+        finally: janus.sh, janus.all_units = real_sh, real_units
+        self.assertIn("job 7: unit:u1 -> unit:u1@proj", s); self.assertIn("session janus-u1 -> janus-u1@proj", s)
+        self.assertFalse(any(c[:2] == ["pueue", "edit"] for c in calls), "dry-run relabelled a job")
+        self.assertFalse(any(c[:2] == ["tmux", "rename-session"] for c in calls), "dry-run renamed a session")
+        self.assertNotIn("project: proj", (d / "board/agents/u1.md").read_text(), "dry-run wrote the card")
+
+
+class CheckMissingState(unittest.TestCase):
+    def test_missing_handoff_is_a_finding_not_a_crash(self):
+        """Catches (item 2): check crashed with FileNotFoundError .orch/HANDOFF.md when git records a state file the disk lost."""
+        d = Path(tempfile.mkdtemp(prefix="janus-handoff-"))
+        (d / "janus.toml").write_text('[project]\nname = "t"\nstate = ".orch"\n[hosts.here]\nlocal = true\n')
+        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("notes\n")
+        g = lambda *x: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *x], capture_output=True, check=True)
+        g("init", "-q"); g("add", "."); g("commit", "-qm", "a")
+        (d / ".orch/HANDOFF.md").unlink()   # on disk gone, still a tracked file in git (the live crash)
+        cfg = janus.Cfg(d)
+        keys = {k for k, _ in janus.git_findings(cfg)}   # no crash; the deleted state file is just reported
+        self.assertIn("git:dirty", keys)
+        real = janus.watcher_loaded; janus.watcher_loaded = lambda *a: True
+        try: keys = {k for k, _ in janus.session_findings(cfg, 0)}
+        finally: janus.watcher_loaded = real
+        self.assertIn("handoff:missing", keys)
+
+
+class DoctorProjectListed(unittest.TestCase):
+    """item 4: doctor said 'ok project not listed in ~/.config/janus/projects' while the project IS listed."""
+    def _doctor(self, d, listed):
+        home = Path(tempfile.mkdtemp(prefix="janus-home-"))
+        (home / ".config/janus").mkdir(parents=True); (home / ".config/janus/projects").write_text(str(d) + "\n" if listed else "")
+        old = os.environ.get("HOME"); os.environ["HOME"] = str(home)
+        real = {k: getattr(janus, k) for k in ("sh", "watcher_loaded", "watcher_service")}
+        janus.sh = lambda *a, **k: (0, "", ""); janus.watcher_loaded = lambda *a: True; janus.watcher_service = lambda: ("launchd", "com.janus.watch")
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out): janus.doctor(janus.Cfg(d), type("A", (), {"no_hosts": True})())
+        finally:
+            for k, v in real.items(): setattr(janus, k, v)
+            if old is None: os.environ.pop("HOME", None)
+            else: os.environ["HOME"] = old
+        return next(l for l in out.getvalue().splitlines() if "listed" in l)
+
+    def _project(self):
+        d = Path(tempfile.mkdtemp(prefix="janus-doc-")); (d / "janus.toml").write_text('[project]\nname = "t"\n[hosts.here]\nlocal = true\n'); return d
+
+    def test_listed_project_says_ok(self):
+        line = self._doctor(self._project(), True)
+        self.assertTrue(line.startswith("ok "), line); self.assertIn("project listed in", line); self.assertNotIn("not listed", line)
+
+    def test_unlisted_project_is_warned(self):
+        line = self._doctor(self._project(), False)
+        self.assertTrue(line.startswith("WARN "), line); self.assertIn("not listed in", line); self.assertIn("will not visit", line)
+
+
+class SkillPointers(unittest.TestCase):
+    def test_every_path_skill_names_is_in_the_shipped_set(self):
+        """Catches (item 5): install shipped no docs/, so the path SKILL.md sends the orchestrator to (docs/REFERENCE.md) was
+        absent from the release (the shipped set is install's PARTS; in a release copy, the copy itself)."""
+        import ast
+        root = JANUS_PY.parent; skill = root / "skill/SKILL.md"
+        self.assertTrue(skill.is_file(), skill)
+        inst = root / "install"; parts = None
+        if inst.is_file():
+            parts = next(ast.literal_eval(n.value) for n in ast.parse(inst.read_text()).body
+                         if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "PARTS")
+        missing = set()
+        for m in re.finditer(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*[A-Za-z0-9]", skill.read_text()):
+            r = m.group(0).rstrip(".,;:)")
+            if not (root / r).exists(): continue            # a project's own state path (.janus/...), not a shipped file
+            if parts is not None and not any(r == p or r.startswith(p + "/") for p in parts): missing.add(r)
+        self.assertEqual(sorted(missing), [], "SKILL.md names paths install does not ship")
+
 
 if __name__ == "__main__": unittest.main()
