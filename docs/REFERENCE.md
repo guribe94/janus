@@ -115,6 +115,10 @@ a done row. `janus ledger reconcile [--dry-run]` closes the rest: every run whos
 superseded by a later run of its unit, its agent ended, or over a day old with no unit) and that has no done row gets one,
 `done unknown`, with its budget as the cost (the upper bound, so the cap never undercounts); `janus report` lists them as
 reconciled, and `janus check` raises `ledger:<provider>:unreconciled` until it is run. Remote API agents get the key over ssh into a fifo only their task reads; `janus collect` records their cost.
+Each run pays its own cost: the agent CLI reports the cost of the whole session in every run's json, so a resumed run is charged
+its total minus what the session had reported before it. `janus ledger recost [--dry-run]` corrects done rows written before
+that rule (backup first; `ledger:<provider>:recost` until it is run). A remote unit's run is closed at its reported cost as soon
+as the watcher or `check` has brought its ended output here, not only at `janus collect`.
 Project launchers (an older `launcher` key) are no longer used; doctor says so.
 
 **`[models.<name>]`**: `provider`, `vendor`, `kind`. `kind = "api"` is an API agent run by janus (`api_id` is the model id
@@ -280,8 +284,10 @@ session start, so the record chain is in front of the orchestrator before it dec
 **Notes.** After each decision, update the *Orchestrator notes* part of `.janus/HANDOFF.md` (see section 5).
 
 **A unit failed — what now.** The command depends on how it ended:
-- *Crashed or capped with no verdict* (`unit:<u>:finished`): relaunch from its report with `janus launch <u> --resume-of <u>`;
-  with `[autopilot] enabled` the watcher does this for a local unit.
+- *Crashed with no verdict* (`unit:<u>:finished`): relaunch from its report with `janus launch <u> --resume-of <u>`; the
+  autopilot does this for a local unit.
+- *Stopped by its budget* (`unit:<u>:resumable`): it continues in its own session once the provider has room (section 4a,
+  Budget); `janus resume <u> --budget <usd>` by hand.
 - *Finished with a verdict*: `janus collect <u>` for a remote unit, then `janus close <u>`.
 - *Done but not landed* (`landing:<u>:unlanded`): `janus gate <name>`, then `janus land <u>`.
 - *Parked, not failed* (a `WAITING <jobs>` line, no final verdict): its jobs are still running; the watcher resumes it when they
@@ -367,8 +373,34 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
   agents also write `report.json` beside REPORT.md. On a project with `[quality] review_model`, run `janus quality review
   <unit>` before `janus land` (its findings block the landing until fixed, or `--override '<reason>'`); on `test-signal:<gate>`
   scope or trim the slow gate. `janus soak` (read-only) checks the read paths on a live project.
+- **Budget: open units finish first.** A provider's cap must pay for the units already open before anything new. janus keeps
+  the rest of every open API unit's budget (the finish reserve; `[budget] finish_reserve = false` turns it off): `janus launch`,
+  `janus fill` and `janus resume <u> --budget <usd>` are refused when committed spend + that reserve + the new run would pass
+  `cap_usd`, and the refusal names the units. Act before the cap is reached:
+  - `spend:<p>:reserve`: the open units fit, a new one does not. Ask the owner now (`janus ask`, with a recommendation) whether
+    to raise `cap_usd`; launch nothing new until then.
+  - `spend:<p>:short`: the open units no longer fit. Ask the owner now for at least the amount named, or `janus close` the unit
+    that matters least.
+  - `unit:<u>:resumable`: the unit was stopped by its budget and can go on in its own session and tree; the money it needs is
+    kept. The watcher resumes such units first, oldest first, before any new unit, as soon as the provider has room (at most
+    `[autopilot] relaunch_max` new budgets per unit). Give it room (a higher cap, a closed unit) or `janus close <u>`; with the
+    unattended loop off, `janus resume <u> --budget <usd>` does it by hand. Never relaunch it as a new unit: that loses its context.
+  - `unit:<u>:resume-limit`: it was stopped at every new budget. Read its report, then split the work, resume it by hand with a
+    larger budget, or close it.
+  - `budget80:<u>`, `waste:<u>`: as before (a stale report near the budget; a run that ended at its cap with no verdict).
+  A unit's default budget is the median of what past units of its kind and tier cost in all, their resumes included. Every API
+  agent is told its run's budget in its prompt and in each resume message, and at `[budget] warn_pct` (80) % of it the watcher
+  posts a budget checkpoint direction on the board: commit, write state, park or finish. A resume is refused when its budget
+  cannot pay for loading the session's context again plus `[budget] resume_min_usd`; the unit then becomes resumable.
+- **Unattended loop.** With a cap (`cap_usd` and a ledger) the watcher keeps work moving while no orchestrator is at work:
+  the autopilot and the fill (section 6) are on unless janus.toml sets `[autopilot] enabled = false` or `[fill] watcher = false`.
+  On `unattended:off` a part of it is off while there is work it would move: turn it on, or ack with the owner's reason (the
+  ack holds 7 days). On `watcher:step:<name>` one step of the watcher's pass failed three passes in a row (the other steps
+  still ran): the error is in the finding and in `.janus/watch.log`; fix its cause (often one unit's record or one host), and
+  the finding clears when the step works again.
 - **Ledger:** on `ledger:` findings run `janus ledger check`, then `janus ledger repair` (on `ledger:<p>:unreconciled`,
-  `janus ledger reconcile`); launches are refused until the ledger is valid. On `script:<pid>`, stop that process and relaunch
+  `janus ledger reconcile`; on `ledger:<p>:recost`, `janus ledger recost --dry-run`, then `janus ledger recost`); launches are
+  refused until the ledger is valid. On `script:<pid>`, stop that process and relaunch
   it.
 - **Token rules.** Read `janus` output, never panes, logs or board files directly (`janus status` for the whole picture).
   Briefs are short: goal, scope, tier line, report path, done-criteria. Spend sparingly; critical work goes to the top models
@@ -487,19 +519,21 @@ pane left without an agent for 20 minutes is closed first (section 2). A live se
 - **One scheduler per host.** `check` raises `scheduler:<host>` for another job runner or a job that holds no reservation.
 - **Agents count against build capacity.** A unit records its build host; `janus launch` refuses, saying when, unless a build
   reservation or a queue position (one queued job per running job) is free there.
-- **Fill.** `janus fill --dry-run` lists what fits now and why it stops; `janus fill` launches it; `[fill] watcher = true` lets the
-  watcher do it. `check` reports `idle-with-backlog`.
-- **Autopilot (opt-in: `[autopilot] enabled = true`; off by default).** The watcher applies the ending policy's fixed rules
-  itself (docs/DESIGN.md, "Keeping work moving"): collect finished remote units; relaunch a crashed unit, or a capped one after
-  its wrap-up run, from its report as `<unit>-r<k>` (same brief, tree and report, through `janus launch`: capacity, budget and
+- **Fill.** `janus fill --dry-run` lists what fits now and why it stops; `janus fill` launches it, and so does the
+  watcher (`[fill] watcher`: on by default when a provider has a cap, else off). `check` reports `idle-with-backlog`.
+- **Autopilot (`[autopilot] enabled`: on by default when a provider has a `cap_usd` and a ledger, the cap being what bounds
+  it; `enabled = false` turns it off, `check` then says `unattended:off`).** The watcher applies the ending policy's fixed rules
+  itself (docs/DESIGN.md, "Keeping work moving"): collect finished remote units; resume a unit stopped by its budget in its own
+  session when the cap has room (before any new unit); relaunch a crashed unit from its report as `<unit>-r<k>` (same brief, tree and report, through `janus launch`: capacity, budget and
   the waste pause apply; at most `relaunch_max`, default 2); answer a board question that names a MEMORY.md subject exactly;
   cancel a job past its age limit and re-queue it once on a host with room; re-queue the unstarted jobs of a host down over
   `host_down_min` (20) elsewhere (the old copies are cancelled when it is back); archive finished cards. Always on: resume
-  parked units, the wrap-up resume, cancel orphan jobs. Each action is recorded once per cause in `.janus/autopilot.log` and
+  parked units, the wrap-up resume, the budget checkpoint, cancel orphan jobs. Each step of the watcher's pass is guarded: one
+  that fails is logged and tried again next pass while the others run (`watcher:step:<name>` after three in a row). Each action is recorded once per cause in `.janus/autopilot.log` and
   `autopilot.json`, as an ack of its finding with the reason, and on the unit in beads. `janus ack <key naming the unit> hold`
   keeps the autopilot off that unit. Everything else stays with the orchestrator.
-- **Budgets from history.** A unit's default budget is the median cost of its kind and tier + `[budget] margin_pct`; `budget80:<unit>`
-  warns at 80 % with a stale report.
+- **Budgets from history.** A unit's default budget is the median of what past units of its kind and tier cost in all (every
+  run of the unit, its resumes included) + `[budget] margin_pct`; `budget80:<unit>` warns at 80 % with a stale report.
 - **Landing.** `janus land <unit>` merges the landing branch (stops and dispatches `merge-<unit>` on a conflict), gates the merged
   tree on `[landing] final_gate_host`, then squash-lands. `final_gate` may name `{unit}`, `{wt}` and `{branch}`, substituted per
   land, so a project that gates per unit (`out/land-{unit}-linux/...`) gets the unit it is landing (item 12).
@@ -678,10 +712,13 @@ writes `WAITING <job ids>` in its report and ends its turn. The unit is then par
 finished, the watcher resumes the same session with each job's exit code and log path: an API unit gets a new run of the
 same session (`claude -p --resume <session id>`, or the provider's `resume_cmd`) with its own ledger rows and the rest of the
 unit's budget; an interactive agent gets a prompt. A run that ends at its budget cap without a final verdict is resumed once
-with `[budget] wrapup_usd` (default 0.5) to write its report.
+with `[budget] wrapup_usd` (default 0.5) to write its report. A resumed run's cap counts that run's own spend, and its first
+request loads the whole context again: the wrap-up gets that reload cost on top, and any other resume whose budget cannot pay
+for the reload plus `[budget] resume_min_usd` (0.1) is refused and the unit recorded resumable (section 4a, Budget).
 
 - `janus park <unit>` parks a live agent: its turn is stopped, its jobs keep running. Refused when it has no job of its own.
-- `janus resume <unit> [--message <text>] [--force]` resumes by hand (`--force` before its jobs finish).
+- `janus resume <unit> [--message <text>] [--force] [--budget <usd>]` resumes by hand (`--force` before its jobs finish;
+  `--budget` gives this run a new budget, checked against the cap and the finish reserve).
 - `check` raises `parked:<unit>:resume` when a resume failed, `parked:<unit>:finished` when its jobs all finished and it is
   still parked (the watcher resumes it on its next pass; `janus resume <unit>` wakes it now), and `parked:<unit>` when a job
   it waits on can never finish.
