@@ -230,9 +230,11 @@ launched parser on laptop via herdr
 A `cleanup` unit frees disk and load, so neither `min_disk_gb` nor the load limit refuses it; memory and caps still apply.
 - **Model:** from `[routing]`, or `--model`, which passes the same checks (provider enabled, budget left). Every API launch
   checks `committed + budget <= cap_usd` and reserves the run's "running" row under the ledger's lock before anything is
-  queued. A resumed unit continues its original report: `--resume-of <unit>`, `--report <path>`, or a `REPORT: <path>` /
-  "Continue the same report <path>" line in the brief; check, close, collect and the Stop hook read that report, and a verdict
-  written before the resume started does not count. `--item <id>` (or an `ITEM: <id>` line) ties the unit to a backlog item.
+  queued. A resumed unit continues its original report: `--resume-of <unit>` (its `out/<unit>/REPORT.md`) or `--report
+  <path>`, never a path read from the brief's prose; check, close, collect and the Stop hook read that report, and a verdict
+  written before the resume started does not count. Every value orch puts in a shell command is quoted, and launch waits a few
+  seconds to confirm the run started (or is queued for a slot): a run that dies at once fails the launch with its exit code
+  and log, and nothing is reported as launched. `--item <id>` (or an `ITEM: <id>` line) ties the unit to a backlog item.
 - **Host:** `--host`; else where the unit's builds and tests run (`--test-host`, a `TEST-HOST: <h>` line in the brief, the
   first matching `[placement]` regex in orch.toml, or the sticky host in `out/linux-host/<unit>`) when the model may run
   there; else the allowed host with the most room.
