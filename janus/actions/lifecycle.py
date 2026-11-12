@@ -315,21 +315,32 @@ def cmd_park(cfg, a):
 def cmd_resume(cfg, a):
     """Resume a unit's own session now: parked (its jobs' results, when they finished), or with --message.
 
-    Finding 2: never a second agent beside a running one, and never a job marked handled while it still runs, so the unit's
-    next park line still names it (the guard covers --message too, and --force overrides only the 'not finished' refusal)."""
+    Finding 2: never a second agent beside a running one -- a pueue API run's resume queues a NEW task, so a still-running agent
+    task is refused even with --force; tmux/herdr only type into the agent's own pane, so they are never refused on state (a
+    blocked herdr unit can be answered), and a review/audit unit may resume in the tree it reviews (the launch H9 exception).
+    A still-running job is never marked handled, so the next park line still names it; --force overrides only the 'not finished'
+    refusal."""
     bd, u = get_unit(cfg, a.unit); hs = probe_all(cfg)
     jobs = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
     if a.message: msg = a.message
     elif jobs: msg = resume_message(cfg, hs, u, jobs)
     else: raise Err(f"{u['name']} is not parked: give --message")
-    # finding 2: the tree is another open unit's cwd: never put a unit back into the tree its successor now works in (H9).
+    # finding 2: the tree is another open unit's cwd: never put a unit back into the tree its successor now works in (H9). A
+    # review/audit unit may share a tree with the unit it reviews, exactly as launch allows (launch.py H9 exception).
     cwd = Path(u["cwd"]).resolve() if u.get("cwd") else None
     shared, _ = cwd_taken(cfg, bd.units(), cwd, u["name"]) if cwd else ([], None)
-    if shared: raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}: resume {u['name']} in a tree of its own (H9)")
-    if not a.force:
+    local = cfg.hosts.get(u.get("host"), {}).get("local")
+    if shared and not (local and u.get("kind") in ("review", "audit")):
+        raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}: resume {u['name']} in a tree of its own (H9)")
+    # finding 2: never a second agent beside a running one. A pueue API run's resume queues a NEW task, so a still-running agent
+    # task is refused even with --force (the old guard sat inside `not --force`, and --force then started the second agent). A
+    # tmux/herdr resume only types into the agent's own pane (it cannot double-start), and a herdr unit blocked on a question is
+    # answerable, so those are never refused on their state.
+    if u.get("via") == "pueue":
         st = unit_state(u, hs, herdr_agents(cfg))
-        if st in ("working", "queued", "blocked"):
-            raise Err(f"{u['name']}'s agent is still {st}: stop it first (janus stop {u['name']}), or --force to resume now")
+        if st in ("working", "queued"):
+            raise Err(f"{u['name']}'s agent is still {st}: a resume would start a second agent beside it (janus stop {u['name']} first)")
+    if not a.force:
         left = [j for j in jobs if job_state(hs, j)[0] not in ("done", "gone")]
         if left: raise Err(f"{u['name']} waits on {', '.join(left)}, not finished (--force to resume now)")
     say(resume_unit(cfg, u, msg, budget=getattr(a, "budget", None)))

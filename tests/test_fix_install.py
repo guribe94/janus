@@ -588,11 +588,14 @@ class Item2ResumeGuard(unittest.TestCase):
         return u
 
     def test_message_refuses_while_the_agent_runs(self):
-        """Catches: `resume --message` with a Running agent task started a second agent on the same session in the same tree."""
+        """Catches (finding 2): `resume --message` with a Running agent task started a second agent on the same session in the
+        same tree; and the old refusal offered --force -- the one path that still started the second agent beside it."""
         u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0, "cwd": str(self.d / "wt")}
         with self.assertRaises(janus.Err) as e: self._run(u, state="working", job="running", message="go")
-        self.assertIn("still working", str(e.exception)); self.assertIn("--force", str(e.exception))
+        self.assertIn("still working", str(e.exception)); self.assertNotIn("--force", str(e.exception))
         self.assertEqual(self.calls, [], "a second agent was started beside the running one")
+        with self.assertRaises(janus.Err): self._run(u, state="working", job="running", message="go", force=True)
+        self.assertEqual(self.calls, [], "--force started a second agent beside the running one")
 
     def test_message_refuses_while_its_jobs_are_unfinished(self):
         """Catches: the jobs guard was skipped entirely with --message, so a unit whose job still ran was resumed."""
@@ -616,6 +619,22 @@ class Item2ResumeGuard(unittest.TestCase):
         u2 = {"id": "t-2", "name": "u2", "host": "here", "cwd": str(W)}
         with self.assertRaises(janus.Err) as e: self._run(u, units=[u, u2], state="gone", job="done", message="go")
         self.assertIn("u2", str(e.exception)); self.assertEqual(self.calls, [])
+
+    def test_hand_resume_works_for_tmux_a_blocked_herdr_unit_and_a_review_unit(self):
+        """Catches (finding 2): a tmux unit read as 'working' for as long as its session existed, a herdr unit blocked on a
+        question could not be answered, and a review unit that shares the tree it reviews was refused -- so the routine answer
+        became --force, the one path that double-starts an agent."""
+        W = self.d / "wt"; W.mkdir()
+        tm = {"id": "t-1", "name": "u1", "host": "here", "via": "tmux", "model": "m", "started": 0, "cwd": str(W)}
+        self._run(tm, state="working", job="done", message="continue")
+        self.assertEqual(len(self.calls), 1, "a tmux unit's hand resume was refused"); self.calls.clear()
+        hd = {"id": "t-2", "name": "u2", "host": "here", "via": "herdr", "pane": "p", "model": "m", "started": 0, "cwd": str(W)}
+        self._run(hd, state="blocked", job="done", message="answer")
+        self.assertEqual(len(self.calls), 1, "a blocked herdr unit's answer was refused"); self.calls.clear()
+        rv = {"id": "t-3", "name": "u3", "host": "here", "via": "pueue", "task": 7, "model": "m", "started": 0, "cwd": str(W), "kind": "review"}
+        other = {"id": "t-4", "name": "u4", "host": "here", "cwd": str(W)}
+        self._run(rv, units=[rv, other], state="gone", job="done", message="go")
+        self.assertEqual(len(self.calls), 1, "a review unit could not resume in the tree it reviews")
 
 
 class Item3Handover(unittest.TestCase):
