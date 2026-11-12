@@ -251,11 +251,12 @@ def lane_findings(cfg, hs, units=()):
             st = lambda x: x["status"] if isinstance(x["status"], str) else next(iter(x["status"]))
             q = [x for x in mine if st(x) == "Queued"]; r = [x for x in mine if st(x) == "Running"]; par = g.get("parallel_tasks", 1)
             wt = int(p.get(f"wait_{lane}", 0) or 0)   # running tasks still waiting in janus's own admission
-            if wt:   # item 21: name why a job is held in admission (disk/mem/psi with numbers), not just that it waits
-                why = (p.get("cap_pause") or "").strip()
-                if not why and p.get("cap_admit", "").strip() == "disk":
+            adm = (p.get("cap_admit") or "").strip(); paused = (p.get("cap_pause") or "").strip()
+            if wt and (paused or (adm and adm != "yes")):   # finding 7: only a job that IS blocked (admission says no, or paused)
+                why = paused   # item 21: name why a job is held in admission (disk/mem/psi with numbers), not just that it waits
+                if not why and adm == "disk":
                     why = f"disk {p.get('disk_gb')}G free, floor {capv(cfg, h, 'min_disk_gb')}G"
-                why = why or (p.get("cap_admit") or "admission blocked").strip()
+                why = why or adm or "admission blocked"
                 F.append((f"blocked:{n}:{lane}", f"{n} {lane}: {wt} job(s) waiting in admission ({why}; jobs hold {p.get('cap_rc', '?')} cores "
                           f"and {p.get('cap_rm', '?')} MB, agents {p.get('cap_ram', '?')} MB, PSI {p.get('cap_psi', '?')}): free the cause "
                           f"(janus tidy for disk, or wait for the load/PSI to fall), or cancel and re-queue elsewhere"))

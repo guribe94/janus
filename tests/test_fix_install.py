@@ -185,6 +185,43 @@ class Item10UnitChanges(unittest.TestCase):
         self.assertIn("a", fs); self.assertNotIn("c", fs, "the landing branch's own file counted as the unit's change")
 
 
+class Item7BlockedLane(unittest.TestCase):
+    def test_a_normally_queued_job_is_not_a_blocked_lane(self):
+        """Catches (finding 7): `blocked:<host>:<lane>` fired whenever a job waited in admission, even when admission said yes
+        (a job merely queued behind an older one), with the advice to cancel and re-queue it."""
+        d, cfg = project()
+        hs = {"here": {"ok": True, "pueue": {"groups": {"jobs": {"parallel_tasks": 1, "status": "Running"}},
+                                            "tasks": {"1": {"status": {"Running": {}}, "label": "unit:x@t"}}},
+                       "wait_jobs": "1", "cap_admit": "yes", "cap_pause": "", "cap_rc": "8", "cap_rm": "2048", "cap_ram": "0",
+                       "cap_psi": "0", "res": [], "hist": [], "sched": [], "direct": [], "tmux": []}}
+        F = dict(janus.lane_findings(cfg, hs))
+        self.assertNotIn("blocked:here:jobs", F, f"a normally queued job read as a blocked lane: {F}")
+        hs["here"]["cap_pause"] = "memory PSI avg10 12 over 10"   # a paused host IS a blocked lane
+        self.assertIn("blocked:here:jobs", dict(janus.lane_findings(cfg, hs)))
+
+
+class Item7CallerWait(unittest.TestCase):
+    def test_a_running_task_is_not_reported_as_waiting_in_admission(self):
+        """Catches (finding 7): the caller's bounded wait reported a task that had STARTED as 'still waiting' in admission (and
+        probed its host) after each 300 s, which is a false alarm that leaves work behind on a remote host."""
+        d, cfg = project(); h = cfg.hosts["here"]
+        calls = []
+        def fake_run(cmd, **k): raise subprocess.TimeoutExpired(cmd, k.get("timeout", 0))
+        states = [{"status": {"Running": {}}}, {"status": {"Done": {"result": "Success"}}}]
+        saved_run, saved_status, saved_probe = subprocess.run, janus.task_status, janus.probe
+        subprocess.run = fake_run
+        janus.task_status = lambda h_, tid: states.pop(0) if states else {"status": {"Done": {"result": "Success"}}}
+        janus.probe = lambda n, h_, **k: (calls.append(n), {"cap_admit": "disk", "cap_pause": "", "disk_gb": "9"})[1]
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(out): rc = janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
+        finally:
+            subprocess.run, janus.task_status, janus.probe = saved_run, saved_status, saved_probe
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [], "the host was probed for a task that had already started")
+        self.assertNotIn("still waiting", out.getvalue(), out.getvalue())
+
+
 class Item8ResumeDryRun(unittest.TestCase):
     def test_dry_run_says_would_prompt(self):
         """Catches: janus resume --dry-run <herdr unit> printed '<unit>: prompted in its herdr pane' although nothing was prompted."""
