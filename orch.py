@@ -2039,6 +2039,51 @@ def cmd_close(cfg, a):
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
     say("closed")
 
+# ---------------------------------------------------------------- tidy: bookkeeping without hand operations (orch-fixes10 item 5)
+def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
+    """[(kind, target, why)] of what orch tidy removes: worktrees under paths.worktrees that are clean (no change, no untracked
+    file, no stash of their branch), whose tree is contained in the landing branch and that no open unit uses; herdr panes
+    of closed units; board cards whose process is gone and that belong to no open unit."""
+    P = []; names = {u["name"] for u in units}
+    used = {Path(u["cwd"]).resolve() for u in units if u.get("cwd")}
+    wd = cfg.p("worktrees", "worktrees")
+    for d in sorted(wd.iterdir()) if wd.is_dir() else []:
+        if not (d / ".git").is_file() or d.resolve() in used or d.resolve() == cfg.root.resolve(): continue
+        keep = (lambda why: kept.append((str(d), why))) if kept is not None else (lambda why: None)
+        rc, o, e = sh(["git", "-C", str(d), "status", "--porcelain", "--ignore-submodules=none"])
+        if rc or o.strip(): keep(f"{len(o.splitlines())} uncommitted change(s)" if not rc else "git status failed"); continue
+        br = sh(["git", "-C", str(d), "symbolic-ref", "-q", "--short", "HEAD"])[1].strip()
+        if br and any(l.startswith((f"WIP on {br}:", f"On {br}:")) for l in sh(["git", "-C", str(d), "stash", "list", "--format=%gs"])[1].splitlines()):
+            keep(f"stashed changes on {br}"); continue
+        lt = landed(cfg, {"cwd": str(d)})
+        if lt is not True:
+            mb = sh(["git", "-C", str(d), "merge-base", "HEAD", landing_branch(cfg, d)])[1].strip()
+            n = len(sh(["git", "-C", str(d), "diff", "--name-only", mb, "HEAD"])[1].split()) if mb else 0
+            keep(f"no open unit, but its {n} changed file(s) are not all on the landing branch: land them, or decide" if lt is False else "landing state unknown"); continue
+        P.append(("worktree", str(d), f"clean, contained in the landing branch{', branch ' + br + ' kept' if br else ''}, no open unit"))
+    au = all_units(cfg); ws = ws_id(cfg)
+    for k, a in (ag if ag is not None else herdr_agents(cfg)).items():
+        if ws and a.get("workspace_id") != ws: continue
+        if k in names or k == "orchestrator" or au.get(k, {}).get("status") != "closed": continue
+        P.append(("pane", a["pane_id"], f"herdr agent {k}: its unit is closed ({a.get('agent_status')})"))
+    for card, r in (rows if rows is not None else board_rows(cfg)).items():
+        if r.get("gone") and card not in names: P.append(("card", card, "its process is gone and it belongs to no open unit"))
+    return P
+
+def cmd_tidy(cfg, a):
+    if not DRY: refuse_agent("orch tidy")   # --dry-run only reads
+    units = Beads(cfg).units(); kept = []; P = tidy_plan(cfg, units, kept=kept)
+    for d, why in kept: say(f"kept worktree {d}: {why}")
+    if not P: say("nothing to tidy"); return
+    for kind, t, why in P:
+        if DRY: say(f"would remove {kind} {t}: {why}"); continue
+        if kind == "worktree":
+            top = sh(["git", "-C", t, "rev-parse", "--path-format=absolute", "--git-common-dir"])[1].strip()
+            rc, o, e = sh(["git", "-C", str(Path(top).parent) if top else t, "worktree", "remove", t])   # never --force: clean only
+        elif kind == "pane": rc, e = (0, "") if herdr("pane", "close", t) is not None else (1, "herdr pane close failed")
+        else: rc, o, e = board(cfg, "close", t)
+        say(f"{'removed' if rc == 0 else 'NOT removed'} {kind} {t}: {why}" + (f" ({(e or '').strip()[:120]})" if rc else ""))
+
 # ---------------------------------------------------------------- park and resume (orch-fixes9 items 1, 2)
 # Agents never pay to wait. An agent submits its builds and tests detached (`orch run --detach`, or its lane runner's
 # `--detach`), which prints each job id (<host>:<task>) at once, writes `WAITING <job ids>` in its report and ends its turn.
@@ -2463,13 +2508,16 @@ def landed(cfg, u):
     it cannot be told (no worktree of its own)."""
     c = Path(u.get("cwd", "/"))
     if c.resolve() == cfg.root.resolve() or not c.is_dir(): return None
-    br = cfg.c.get("landing", {}).get("branch")
-    if not br:
-        rc, o, e = sh(["git", "-C", str(c), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        br = o.strip() if rc == 0 and o.strip() else "main"
+    br = landing_branch(cfg, c)
     rc, o, e = sh(["git", "-C", str(c), "merge-base", "--is-ancestor", "HEAD", br])
     if rc != 1: return True if rc == 0 else None
     return contained(c, br)
+
+def landing_branch(cfg, c):
+    br = cfg.c.get("landing", {}).get("branch")
+    if br: return br
+    rc, o, e = sh(["git", "-C", str(c), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    return o.strip() if rc == 0 and o.strip() else "main"
 
 def contained(c, br):
     """True when every file the tree at c changed since it left br has br's tip content (squash-landed, or the same change is
@@ -4344,7 +4392,7 @@ def judge_words(cfg, w, cwd, ok_dirs, remote, depth):
         a2 = [x for x in args if not x.startswith("-")][:2]
         if tuple(a2) in HERDR_NO: return f"herdr {' '.join(a2)} by hand: orch launch/stop/close manage panes"
     if b == "board.sh" and args[:1] == ["close"]: return "board.sh close by hand: orch close does it"
-    if b == "orch" and args[:1] == ["close"] and "--force" in args: return "orch close --force (owner: never on shared repos)"
+    if b == "orch" and args[:1] == ["close"] and "--force" in args and not force_close_ok(cfg, args): return "orch close --force (owner: never on shared repos; allowed on a unit's own non-shared worktree)"
     if b == "orch" and args[:1] == ["api-run"]: return "orch api-run by hand: orch launch queues it (budget, ledger, lanes)"
     if b == "launchctl" and args[:1] and args[0] in ("bootout", "remove", "unload", "kill", "disable"): return f"launchctl {args[0]}"
     if b == "systemctl" and any(x in ("stop", "restart", "kill", "disable", "mask", "reboot", "poweroff") for x in args): return "systemctl stop/restart"
@@ -4360,6 +4408,20 @@ def git_sub(args):
     return args[i] if i < len(args) else ""
 
 MUTATORS = {"rm", "mv", "cp", "ln", "rsync", "touch", "chmod", "chown", "install", "rmdir", "unlink", "tee"}
+
+def force_close_ok(cfg, args):
+    """orch close <unit> --force on the unit's own worktree (not the project root, no other open unit's cwd, not a main checkout
+    with linked worktrees) is the orchestrator's to run (orch-fixes10 item 5)."""
+    names = [x for x in args[1:] if not x.startswith("-")]
+    if "--reason" in args:
+        i = args.index("--reason"); names = [x for x in names if x != (args[i + 1] if i + 1 < len(args) else None)]
+    if len(names) != 1: return False
+    try:
+        units = Beads(cfg).units(); u = next((x for x in units if x["name"] == names[0]), None)
+        return bool(u and u.get("cwd") and own_tree(cfg, u, units) and not main_checkout(Path(u["cwd"])))
+    except Exception: return False
+
+ORCH_READ = {"ack", "check", "status", "queue", "peers", "transcript", "memory", "report", "capacity", "busy", "doctor", "learned", "thrash"}
 
 def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
     """Why the shell command c is refused, or None."""
@@ -4380,9 +4442,17 @@ def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
         if why: return why
     # A loop is judged from command words only (orch-fixes7): `for`/`while`/`until`/`select` or xargs/parallel in command
     # position, over worktrees named outside quoted text; a commit message or an echo that says "while" or "worktrees" is data.
+    # Only the commands inside the loop count (orch-fixes10 item 5): a `git merge` before or after a loop is not in it; a loop
+    # of `orch ack` / orch read commands is allowed; file and git changes, and other orch commands, in it are refused.
     segs = segments(text)
-    loop = any(w and (w[0] in ("for", "while", "until", "select") or os.path.basename(w[0]) in ("xargs", "parallel")) for w, _ in segs) and re.search(r"\bworktrees?\b", unquoted(text))
-    for w, redir in segs:
+    wt = re.search(r"\bworktrees?\b", unquoted(text)); depth_ = 0; inloop = []
+    for w, _ in segs:
+        sw = strip_wrappers(list(w))
+        if w and w[0] in ("for", "while", "until", "select"): depth_ += 1; inloop.append(False); continue   # header (the list or condition)
+        if w and w[0] == "done": depth_ = max(0, depth_ - 1); inloop.append(False); continue
+        xa = any(os.path.basename(x) in ("xargs", "parallel") for x in w[:3])   # strip_wrappers drops xargs itself
+        inloop.append(depth_ > 0 or xa)
+    for k, (w, redir) in enumerate(segs):
         if w and w[0] == "cd" and len(w) > 1 and not remote: cwd = str((Path(cwd) / os.path.expanduser(w[1])).resolve())
         if w and w[0] in ("for", "case", "select", "function", "in"): continue
         why = judge_words(cfg, w, cwd, ok_dirs, remote, depth)
@@ -4391,7 +4461,12 @@ def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
             for t in redir:
                 if not write_ok(cfg, cwd, t, ok_dirs): return f"writing {t} by hand"
         sw = strip_wrappers(w)
-        if loop and sw and (os.path.basename(sw[0]) in MUTATORS or (sw[0] == "git" and git_sub(sw[1:]) in GIT_MUT)):
+        if sw and os.path.basename(sw[0]) in ("xargs", "parallel"):   # the command it runs per item
+            r_, i = sw[1:], 0
+            while i < len(r_) and r_[i].startswith("-"): i += 2 if r_[i] in ("-I", "-n", "-P", "-L", "-d", "-E", "-s", "-j") else 1
+            sw = strip_wrappers(r_[i:])
+        if wt and inloop[k] and sw and (os.path.basename(sw[0]) in MUTATORS or (sw[0] == "git" and git_sub(sw[1:]) in GIT_MUT)
+                                         or (os.path.basename(sw[0]) == "orch" and len(sw) > 1 and sw[1] not in ORCH_READ)):
             return "loop that changes worktrees"
     return None
 
@@ -4620,6 +4695,7 @@ def main():
     add("gate-exec", A("name"), A("--timeout-min", type=float, default=0), A("command", nargs=argparse.REMAINDER))
     add("gate-scope", A("unit"), A("--name", help="the gate's name (default land-<unit>)"), dry=True)
     add("thrash", dry=True)
+    add("tidy", dry=True)
     add("busy", A("wt", help="a worktree: exit 0 while an orch job, a unit's job or a mutation run uses it, else 1"))
     add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", A("--max", type=int, help="launch at most this many"), dry=True)
