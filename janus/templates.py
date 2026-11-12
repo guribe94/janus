@@ -85,6 +85,11 @@ cap_secs() {  # $1 class: its expected run time (s), the median of its recorded 
   awk -F'\t' -v c="$1" '$2 == c && $4 ~ /^[0-9]+$/ {v_[++j] = $4 + 0}
     END {if (!j) exit; for (a = 2; a <= j; a++) {x = v_[a]; b = a - 1; while (b > 0 && v_[b] > x) {v_[b + 1] = v_[b]; b--}; v_[b + 1] = x}; print v_[int(j / 2) + 1]}' "$RD/history.tsv"
 }
+cap_shape() {  # $1 a command: a short signature of its normalized text. Two jobs with the same class but different commands
+  # (a 1-minute `cargo test` and a 20-minute one) are not comparable, so overrun judges a job against jobs of ITS command
+  # (item 32: the class median flagged a 3-crate cargo test with a 20-minute test binary as stuck 121x).
+  printf '%%s' "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//' | cksum | awk '{print $1}'
+}
 ahead() {  # $1 this job's wait file ("pid expected-s since MB cores"): NB jobs waiting here that go first, holding BCC cores, BMB MB.
   # First: the lower expected run time minus AGEW x seconds waited (short jobs first, a waiting job ages), among the same wait
   # kind (.wait or .gwait). A job is admitted only when it fits together with every job ahead of it, so it never takes their room.
@@ -120,8 +125,9 @@ res_sum() {  # live reservations: RJ jobs holding RC cores and RM MB, RA agents 
     case "$p$c$m" in *[!0-9]*|"") continue;; esac
     if ! kill -0 "$p" 2>/dev/null; then [ -n "$CAP_RO" ] || rm -f "$f"; continue; fi
     case $k in agent*) RA=$((RA + 1)); RAM=$((RAM + m));; *) RJ=$((RJ + 1)); RC=$((RC + c)); RM=$((RM + m));; esac
+    sc=-; [ -e "${f%%.res}.cmd" ] && sc=$(cap_shape "$(cat "${f%%.res}.cmd" 2>/dev/null)")   # shape: what this job is compared against (item 32)
     RL="$RL
-res=$p $c $m $t $k ${f##*/}"
+res=$p $c $m $t $k ${f##*/} $sc"
   done
   for j in $( { %(jobids)s; } 2>/dev/null); do
     [ -e "$RD/$j.res" ] && continue
@@ -169,9 +175,10 @@ job_mb() {  # $1 pid, $2 job id: the job's resident memory now, in MB (empty whe
 tree_mb() {  # resident memory of process $1 and all its descendants, MB
   ps -A -o pid=,ppid=,rss= | awk -v r="$1" '{pp[$1] = $2; rs[$1] = $3} END {q[r] = 1; do {ch = 0; for (x in pp) if (!(x in q) && (pp[x] in q)) {q[x] = 1; ch = 1}} while (ch); for (x in q) s += rs[x]; print int(s / 1024)}'
 }
-cap_record() {  # $1 class $2 peak MB $3 seconds $4 exit code $5 CPU seconds $6 queue wait (s): one line of RD/history.tsv (last 2000 kept)
+cap_record() {  # $1 class $2 peak MB $3 seconds $4 exit code $5 CPU seconds $6 queue wait (s) $7 shape (the command signature,
+  # column 8: what overrun compares a running job against); one line of RD/history.tsv (last 2000 kept)
   { [ "${2:-0}" -gt 0 ] || [ "${5:-0}" -gt 0 ]; } 2>/dev/null || return 0   # nothing measured: no line
-  printf '%%s\t%%s\t%%s\t%%s\t%%s\t%%s\t%%s\n' "$(date +%%s)" "$1" "$2" "$3" "$4" "${5:-0}" "${6:-0}" >> "$RD/history.tsv"
+  printf '%%s\t%%s\t%%s\t%%s\t%%s\t%%s\t%%s\t%%s\n' "$(date +%%s)" "$1" "$2" "$3" "$4" "${5:-0}" "${6:-0}" "${7:-}" >> "$RD/history.tsv"
   [ "$(wc -l < "$RD/history.tsv")" -gt 2400 ] && tail -n 2000 "$RD/history.tsv" > "$RD/history.tsv.$$" && mv -f "$RD/history.tsv.$$" "$RD/history.tsv"
   return 0
 }
@@ -222,7 +229,7 @@ echo "fp=$d|$o"; echo "n=$n"; echo "p=${p:-0}"'''
 ADMIT = r'''# Admission (janus-fixes8): by reservations, rule in $RD/cap.sh (re-read each poll). One job is judged at a time under the lock;
 # an admitted job writes its reservation ($R.res) before the lock is released. A jobs-lane job yields while a gates job waits.
 [ -f "$RD/cap.sh" ] || { echo "janus: no $RD/cap.sh on this host (janus run or janus launch writes it)"; exit 125; }
-lane=%(lane)s; BROAD=%(broad)s; . "$RD/cap.sh"; CLS=$(cap_class %(clsrc)s)
+lane=%(lane)s; BROAD=%(broad)s; . "$RD/cap.sh"; CLS=$(cap_class %(clsrc)s); SHAPE=$(cap_shape %(clsrc)s)   # shape: the jobs this one is comparable to (item 32)
 EXP=$(cap_secs "$CLS"); EXP=${EXP:-$EXPS}; [ -n "$BROAD" ] && EXP=$((EXP * 2))   # expected run time; a broad run counts double (goes later)
 if command -v flock >/dev/null 2>&1; then exec 7>>"$RD/admit.lock"; lk() { flock 7; }; ulk() { flock -u 7; }
 else   # no flock: a lock dir holding its owner's pid; a dead owner's dir is taken over (a SIGKILL never leaves the host stuck)
@@ -287,7 +294,7 @@ run_sampled() {  # run "$@", sample its memory (and a cgroup's CPU) every 5 s, t
   wait $pid; rc=$?; times > "$R.t1"; k=$(cat "$pf" 2>/dev/null); rm -f "$pf"; [ "${k:-0}" -gt "$peak" ] 2>/dev/null && peak=$k
   v=$(awk -v a="$(cpu_s "$R.t0")" -v b="$(cpu_s "$R.t1")" 'BEGIN {print int(b - a + 0.5)}'); rm -f "$R.t0" "$R.t1"
   [ "${v:-0}" -gt "$cpu" ] 2>/dev/null && cpu=$v
-  cap_record "$CLS" "$peak" $(( $(date +%%s) - t0 )) $rc $cpu $WAITED; return $rc
+  cap_record "$CLS" "$peak" $(( $(date +%%s) - t0 )) $rc $cpu $WAITED "$SHAPE"; return $rc
 }
 '''
 

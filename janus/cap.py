@@ -83,9 +83,13 @@ def class_mb(hist, cls, d, cap, hn=5, margin=15):
     v = max(128 if ag else 256, int((pk[(len(pk) - 1) // 2] if ag else pk[-1]) * (100 + margin) / 100))
     return min(v, cap) if cap > 0 else v
 
-def class_secs(hist, cls):
-    """Median run time (s) of a job class from history lines, None without history."""
-    s = sorted(int(f[3]) for f in (l.split("\t") for l in hist) if len(f) >= 4 and f[1] == cls and f[3].isdigit())
+def class_secs(hist, cls, shape=None):
+    """Median run time (s) of a job class from history lines, None without history. shape (a command signature, column 8 of a
+    history line) limits the runs to COMPARABLE jobs (item 32): one class lumps a 1-minute `cargo test` together with a
+    20-minute one, so the class median flagged the long job as stuck; with a shape, only jobs of the same command count."""
+    rows = [f for f in (l.split("\t") for l in hist)
+            if len(f) >= 4 and f[1] == cls and f[3].isdigit() and (shape is None or (len(f) >= 8 and f[7] == shape))]
+    s = sorted(int(f[3]) for f in rows)
     return s[len(s) // 2] if s else None
 
 def class_cores(hist, cls, cpj, hn=5):
