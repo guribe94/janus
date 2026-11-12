@@ -1647,4 +1647,36 @@ class Item33WakeRoot(unittest.TestCase):
         self.assertIn(str(cfg.root.resolve()), r.stderr, "check did not say where the root is: " + r.stderr)
 
 
+class Item29RemotePatch(unittest.TestCase):
+    def test_the_patch_git_apply_takes_includes_new_and_deleted_files(self):
+        """Catches (item 29): janus collect built a remote unit's patch with `diff -ruN | sed`, which wrote a new file as
+        `--- a/<f>` with an epoch date and no `new file mode`, so `git apply` refused it ("does not exist in index"); a host
+        without `patch` (linux1) could not take it either, and a new EMPTY file never appeared in the diff at all (the live
+        unit had to recreate its two new crate files by hand)."""
+        base = Path(tempfile.mkdtemp(prefix="janus-p29-")); b, w = base / "base/u", base / "worktrees/u"
+        for d, files in ((b, {"keep": "a\n", "del": "b\n", "target/junk": "x\n"}), (w, {"keep": "a2\n", "new": "n\n", "empty": "", "sub/deep": "d\n"})):
+            for rel, t in files.items(): (d / rel).parent.mkdir(parents=True, exist_ok=True); (d / rel).write_text(t)
+        PATCH = getattr(janus, "PATCH_PY", None)
+        if PATCH:   # the fix: the host's python3 builds the patch from the two trees
+            p = subprocess.run([sys.executable, "-c", PATCH, "u", "base/u", "worktrees/u"], cwd=base, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr); P = p.stdout
+        else:       # the base tip's janus collect: `diff -ruN <excludes> base/u worktrees/u | sed ...`
+            q = "diff -ruN -x target -x .venv -x node_modules -x __pycache__ -x .git base/u worktrees/u | sed -e 's#^--- base/u/#--- a/#' -e 's#^+++ worktrees/u/#+++ b/#'"
+            P = subprocess.run(q, shell=True, cwd=base, capture_output=True, text=True).stdout
+        chk = base / "chk"; chk.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(chk), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
+        g("init", "-q", "-b", "main")
+        for rel in ("keep", "del", "target/junk"): f = chk / rel; f.parent.mkdir(parents=True, exist_ok=True); f.write_text((b / rel).read_text())
+        g("add", "-A"); g("commit", "-qm", "base")
+        r = subprocess.run(["git", "-C", str(chk), "apply", "-"], input=P, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr + "\n--- patch ---\n" + P)
+        self.assertIn("new file mode 100644", P); self.assertIn("deleted file mode 100644", P)
+        self.assertIn("--- /dev/null", P); self.assertIn("+++ /dev/null", P)
+        self.assertNotIn("1970-01-01", P); self.assertNotIn("1969-12-31", P)
+        self.assertNotIn("a/target/junk", P, "an excluded directory (target) reached the patch")
+        self.assertEqual((chk / "keep").read_text(), "a2\n"); self.assertFalse((chk / "del").exists())
+        self.assertEqual((chk / "new").read_text(), "n\n"); self.assertTrue((chk / "sub/deep").is_file())
+        self.assertTrue((chk / "empty").is_file() and (chk / "empty").stat().st_size == 0, "a new empty file did not arrive")
+
+
 if __name__ == "__main__": unittest.main()
