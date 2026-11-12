@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """orch: thin glue over beads (bd), pueue, tmux, herdr, ssh, rsync and git. Python 3.11+, standard library only.
 Reads orch.toml from the current directory or a parent. See docs/DESIGN.md and skill/SKILL.md."""
-import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, time, tomllib
+import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, time, tomllib
 from pathlib import Path
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -861,9 +861,9 @@ def gate_findings(cfg, hs=None):
     latest = {}
     for l in lines:
         if "RESULT:" in l and len(l) > 20: latest[l[20:].split()[0]] = l
-    fails, cut = [], now() - 12 * 3600
+    fails, cut = [], now() - 12 * 3600; judged = gate_results(cfg)
     for n, l in latest.items():
-        if "RESULT: FAIL" not in l or n in busy: continue
+        if "RESULT: FAIL" not in l or n in busy or judged.get(n, ("", ""))[1] == "PASS": continue   # only known failures: passed
         try:
             if time.mktime(time.strptime(l[:19], "%Y-%m-%d %H:%M:%S")) < cut: continue
         except ValueError: continue
@@ -1117,7 +1117,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     for n, c in cfg.caps.get("host", {}).items():
         k = sum(1 for u in units if u.get("host") == n)
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
-    F += gate_findings(cfg, hs)
+    F += gate_findings(cfg, hs) + known_failure_findings(cfg, names)
     F += lane_findings(cfg, hs, units)
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg) + script_findings()
     for n, pv in cfg.prov.items():
@@ -2385,10 +2385,17 @@ def gate_results(cfg):
     """{gate name: (time, PASS|FAIL)}, the latest line of each gate in paths.gate_log."""
     try: lines = cfg.p("gate_log", "out/gates.log").read_text().splitlines()
     except OSError: return {}
-    r = {}
+    r, last = {}, {}
     for l in lines:
         m = GATE_LINE.match(l)
-        if m: r[m.group(1)] = (l[:19], m.group(2))
+        if m: r[m.group(1)] = (l[:19], m.group(2)); last[m.group(1)] = l
+    kf = known_failures(cfg)
+    for n, (t, res) in list(r.items()):   # a project runner's FAIL whose named failures are all known passes (item 2)
+        if res == "FAIL" and kf and "EXIT_timeout" not in last[n] and gate_ids(cfg, n, "failed"):
+            try:
+                if (cfg.p("out", "out") / n / "failed.txt").stat().st_mtime >= time.mktime(time.strptime(t, "%Y-%m-%d %H:%M:%S")) - 600 \
+                        and judge_gate(cfg, n, 1)[0] == "PASS": r[n] = (t, "PASS")
+            except (OSError, ValueError): pass
     return r
 
 def landed(cfg, u):
@@ -2784,8 +2791,8 @@ def cmd_fill(cfg, a):
 # ---------------------------------------------------------------- run / gate: build and test jobs in each host's own pueue
 # A job belongs to the host's pueue daemon, never to the ssh connection that queued it: if the caller dies the job keeps running,
 # and its log and exit code stay under <root>/runs/<jid>.{log,rc} on that host for `orch collect <host>:<task>`.
-LANES = ("gates", "jobs", "land")
-AGE_MIN = {"gates": 240, "jobs": 120, "land": 240}   # class age limits (minutes from enqueue); orch.toml [lanes.<lane>] age_min overrides
+LANES = ("gates", "jobs", "land", "gates-quick")   # gates-quick: one slot kept for gates under [landing] quick_gate_min
+AGE_MIN = {"gates": 240, "jobs": 120, "land": 240, "gates-quick": 60}   # class age limits (minutes from enqueue); orch.toml [lanes.<lane>] age_min overrides
 LSSH = [*SSH, "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
 
 def lane_age(cfg, lane): return cfg.c.get("lanes", {}).get(lane, {}).get("age_min", AGE_MIN.get(lane, 120))
@@ -2805,7 +2812,7 @@ def agent_res(cfg, hn, h, name, pid):
 
 def ensure_lanes(h, cfg=None):
     p = pueue(h); n = slots(h, cfg)
-    g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1} if h.get("local") else {})
+    g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1, "gates-quick": 1} if h.get("local") else {})
     return "; ".join(f"{p} group add -p {int(k)} {g_} >/dev/null 2>&1" for g_, k in g.items()) + "; true"
 
 def runs_dir(cfg, h): return h["_rd"]
@@ -3169,8 +3176,140 @@ def collect_job(cfg, ref):
 
 GATE_LINE = re.compile(r"^\S+ \S+ (\S+) .*RESULT: (\S+)")
 
-GATE_DEFAULT = ('cd "$ORCH_ROOT" && bash "$1"; rc=$?; r=PASS; [ $rc -eq 0 ] || r=FAIL; '
-                'printf "%s %s EXIT_tests=%s RESULT: %s\\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$2" $rc $r >> "$3"; exit $rc')
+# $1 tests.sh, $2 name, $3 gate log, $4 python, $5 orch.py. tests.sh may name its failing tests in $ORCH_GATE_OUT/failed.txt and
+# the tests that ran and passed in passed.txt (one id per line): gate-judge then passes a gate whose failures are all known.
+GATE_DEFAULT = ('cd "$ORCH_ROOT" && ORCH_GATE_OUT=$(dirname "$1") bash "$1"; rc=$?; '
+                'line=$("$4" "$5" gate-judge "$2" $rc); echo "$line" >> "$3"; case $line in *"RESULT: PASS"*) exit 0;; esac; exit $rc')
+
+# ---------------------------------------------------------------- gate policy (orch-fixes10 item 2): known failures, time limit,
+# a quick slot, an affected-scope hook. The known-failures file ([landing] known_failures, tab-separated): <test id columns...>
+# <cause> <unit fixing it at the root>; '#' lines are comments. The id is the columns before the last two joined by '/'.
+def known_failures(cfg):
+    """{test id: (cause, unit)} from [landing] known_failures ({} when unset or missing)."""
+    p = cfg.c.get("landing", {}).get("known_failures")
+    if not p: return {}
+    try: lines = (cfg.root / p).read_text(errors="replace").splitlines()
+    except OSError: return {}
+    r = {}
+    for l in lines:
+        if not l.strip() or l.startswith("#"): continue
+        c = [x.strip() for x in l.split("\t")]
+        if len(c) < 3: c += [""] * (3 - len(c))
+        r["/".join(c[:-2])] = (c[-2], c[-1])
+    return r
+
+def kf_active(v): return v[1] not in ("", "-")   # set aside only while a unit fixing it is named (owner rule)
+
+def gate_ids(cfg, name, which):
+    """Test ids a gate run wrote to out/<name>/<which>.txt (failed or passed); None when the file is missing."""
+    try: return [l.strip() for l in (cfg.p("out", "out") / name / f"{which}.txt").read_text(errors="replace").splitlines() if l.strip()]
+    except OSError: return None
+
+def judge_gate(cfg, name, rc):
+    """(PASS|FAIL, new failures, known failures that occurred): PASS when rc is 0, or when the gate named its failing tests and
+    every one is a known failure with a fixing unit. A non-zero gate that names no failing test is a failure (build, timeout)."""
+    if int(rc) == 0: return "PASS", [], []
+    fs = gate_ids(cfg, name, "failed")
+    if not fs: return "FAIL", [f"exit {rc}"], []
+    kf = known_failures(cfg); new = [i for i in fs if not (i in kf and kf_active(kf[i]))]
+    return ("FAIL" if new else "PASS"), new, [i for i in fs if i not in new]
+
+def cmd_gate_judge(cfg, a):
+    r, new, known = judge_gate(cfg, a.name, a.rc)
+    extra = (f" KNOWN={len(known)}" if known else "") + (f" NEW={','.join(new[:20])[:400]}" if new and new != [f"exit {a.rc}"] else "")
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {a.name} EXIT_tests={a.rc}{extra} RESULT: {r}")
+    return 0 if r == "PASS" else 1
+
+def known_failure_findings(cfg, names):
+    """known-failure:<id>: a known failure no open unit fixes (failures on main are fixed at their root cause, owner rule);
+    known-failure:<id>:passes: an entry a gate of the last 24 h ran and passed (remove it)."""
+    kf = known_failures(cfg); F = []
+    if not kf: return F
+    for i, (cause, unit) in kf.items():
+        if not kf_active((cause, unit)) or unit not in names:
+            F.append((f"known-failure:{i}", f"known failure {i} ({cause or 'no cause'}) has no open unit fixing it at the root"
+                      + (f" (unit {unit} is not open)" if kf_active((cause, unit)) else "") + ": launch one, or remove the entry"))
+    out = cfg.p("out", "out"); cut = now() - 86400; seen = set()
+    for n in gate_results(cfg):
+        f = out / n / "passed.txt"
+        try:
+            if f.stat().st_mtime < cut: continue
+        except OSError: continue
+        for i in gate_ids(cfg, n, "passed") or []:
+            if i in kf and i not in seen:
+                seen.add(i); F.append((f"known-failure:{i}:passes", f"known failure {i} passed in gate {n}: remove it from {cfg.c['landing']['known_failures']}"))
+    return F
+
+def gate_times(cfg): return cfg.jget("gate-times.json")
+
+def gate_estimate(cfg, name):
+    """Minutes a gate is expected to take: the median of its own last runs, else of the gates of the same family (the name with
+    its unit part replaced: land-<unit>-x -> land-*-x), else None."""
+    t = gate_times(cfg)
+    def fam(n): return re.sub(r"^(land-)?[^-]+", r"\1*", n)
+    xs = t.get(name) or [v for k, vs in t.items() if fam(k) == fam(name) for v in vs]
+    if not xs: return None
+    xs = sorted(xs[-10:]); return xs[len(xs) // 2]
+
+def cmd_gate_exec(cfg, a):
+    """The gate wrapper (pueue runs it): clears the run's failed/passed lists, runs the gate's command in its own process group,
+    stops the group at [landing] gate_timeout_min (then writes a RESULT: FAIL line with EXIT_timeout=124), records the duration."""
+    od = cfg.p("out", "out") / a.name
+    for w in ("failed", "passed"): (od / f"{w}.txt").unlink(missing_ok=True)
+    t0 = now(); lim = (a.timeout_min or 0) * 60 or None
+    c = a.command[1:] if a.command[:1] == ["--"] else a.command
+    p = subprocess.Popen(["sh", "-c", c[0] if len(c) == 1 else shlex.join(c)], start_new_session=True)
+    try: rc = p.wait(timeout=lim)
+    except subprocess.TimeoutExpired:
+        try: os.killpg(p.pid, signal.SIGTERM); p.wait(timeout=20)
+        except (subprocess.TimeoutExpired, ProcessLookupError):
+            try: os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        rc = 124
+        with open(cfg.p("gate_log", "out/gates.log"), "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {a.name} EXIT_timeout=124 RESULT: FAIL\n")
+        say(f"gate {a.name} stopped at its {a.timeout_min} min limit")
+    t = gate_times(cfg); t[a.name] = [*t.get(a.name, []), round((now() - t0) / 60, 1)][-10:]
+    if rc != 124: cfg.jput("gate-times.json", t)   # a stopped run says nothing about the gate's length
+    return rc
+
+STEP_RX = re.compile(r"^(?:@([A-Za-z0-9._-]+)\s+)?([A-Za-z0-9._-]+):\s*(.+)$")
+
+def scope_steps(cfg, unit, tree):
+    """[(host or None, step, command)] the project's affected-scope hook ([landing] scope_cmd, called with {unit} {tree}) prints
+    for a tree: one step per line, '[@host ]<step>: <command>'. A step with no host runs on this machine (portable steps)."""
+    sc = cfg.c.get("landing", {}).get("scope_cmd")
+    if not sc: raise Err("no [landing] scope_cmd in orch.toml (the project's hook that prints a tree's gate steps)")
+    cmd = sc.replace("{unit}", shlex.quote(unit)).replace("{tree}", shlex.quote(str(tree)))
+    rc, o, e = sh(["sh", "-c", cmd], cwd=cfg.root, env={"ORCH_UNIT": unit, "ORCH_TREE": str(tree)}, timeout=300)
+    if rc: raise Err(f"scope_cmd failed ({rc}): {(e or o).strip()[:200]}")
+    st = []
+    for l in o.splitlines():
+        if not l.strip() or l.lstrip().startswith("#"): continue
+        m = STEP_RX.match(l.strip())
+        if not m: raise Err(f"scope_cmd printed a line that is not '[@host ]<step>: <command>': {l[:120]}")
+        h = m.group(1)
+        if h and h not in cfg.hosts: raise Err(f"scope_cmd names unknown host {h}")
+        st.append((None if h and cfg.hosts[h].get("local") else h, m.group(2), m.group(3)))
+    return st
+
+def scope_script(cfg, unit, tree, steps):
+    """tests.sh for the steps: each runs (here in the tree, or orch run on its host), prints EXIT_<step>=<rc>; exit 1 on any."""
+    L = ["#!/bin/bash", f"# gate for {unit} generated by orch gate-scope from [landing] scope_cmd; tree {tree}", "fail=0"]
+    me = shlex.join([sys.executable, str(ORCH_SELF)])
+    for h, n, c in steps:
+        run = f"(cd {shlex.quote(str(tree))} && {c})" if not h else f"{me} run --host {shlex.quote(h)} --lane jobs --unit {shlex.quote(unit)} --wt {shlex.quote(str(tree))} -- {shlex.quote(c)}"
+        L.append(f"{run}; rc=$?; echo EXIT_{n}=$rc; [ $rc -eq 0 ] || fail=1")
+    L.append("exit $fail"); return "\n".join(L) + "\n"
+
+def cmd_gate_scope(cfg, a):
+    bd, u = get_unit(cfg, a.unit); name = a.name or f"land-{a.unit}"
+    steps = scope_steps(cfg, a.unit, u["cwd"]); txt = scope_script(cfg, a.unit, u["cwd"], steps)
+    if DRY: say(txt.rstrip()); say(f"(dry run: would write out/{name}/tests.sh; then orch gate {name} --unit {a.unit})"); return
+    t = cfg.p("out", "out") / name / "tests.sh"; t.parent.mkdir(parents=True, exist_ok=True); atomic_write(t, txt); t.chmod(0o755)
+    est = gate_estimate(cfg, name)
+    say(f"wrote {t}: {len(steps)} step(s) ({', '.join(n + ('@' + h if h else '') for h, n, _ in steps)})"
+        + (f"; expected {est:g} min" if est is not None else "") + f"; queue it: orch gate {name} --unit {a.unit}")
 
 def cmd_gate(cfg, a):
     """Run out/<name>/tests.sh as a gates-lane task on this machine. paths.gate_runner (a project script called with <name>)
@@ -3184,7 +3323,11 @@ def cmd_gate(cfg, a):
     pre = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     rh = cfg.paths.get("gate_runner") or cfg.paths.get("run_handoff")
     run = (shlex.quote(str(cfg.root / rh)) + " " + shlex.quote(a.name)) if rh else \
-          shlex.join(["sh", "-c", GATE_DEFAULT, "gate", str(t), a.name, str(cfg.p("gate_log", "out/gates.log"))])
+          shlex.join(["sh", "-c", GATE_DEFAULT, "gate", str(t), a.name, str(cfg.p("gate_log", "out/gates.log")), sys.executable, str(ORCH_SELF)])
+    ld = cfg.c.get("landing", {}); lim = a.timeout_min if a.timeout_min is not None else ld.get("gate_timeout_min", 0)
+    run = shlex.join([sys.executable, str(ORCH_SELF), "gate-exec", a.name, "--timeout-min", str(lim or 0), "--", run])
+    est = gate_estimate(cfg, a.name); qm = ld.get("quick_gate_min")
+    group = "gates-quick" if qm and (a.quick or (est is not None and est < qm)) else "gates"   # short gates never wait behind long ones
     unit = a.unit or os.environ.get("ORCH_UNIT")
     if unit:   # a gate refuses its unit's tree mid-merge, with conflict markers, or too far behind the landing branch (item 41)
         try:
@@ -3200,10 +3343,11 @@ def cmd_gate(cfg, a):
         except Err as e: say(f"note: gate not recorded on {unit}: {e}")
     X(h, ensure_lanes(h, cfg))
     tok = f"gate-{re.sub(r'[^A-Za-z0-9_-]', '_', a.name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"   # cancel follows the jobs it queues
-    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g gates -l {shlex.quote('gate:' + a.name)} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env ORCH_WRAP={tok} {run}')}")
+    rc, o, e = X(h, f"env {pre} {pueue(h)} add -g {group} -l {shlex.quote('gate:' + a.name)} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env ORCH_WRAP={tok} {run}')}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
     if DRY: return
-    tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid}")
+    tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid} in {group}"
+                         + (f" (expected {est:g} min)" if est is not None else "") + (f", limit {lim} min" if lim else ""))
     if not a.wait: return
     subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {tid}"])
     lines = [l for l in cfg.p("gate_log").read_text().splitlines() if (m := GATE_LINE.match(l)) and m.group(1) == a.name]
@@ -3227,7 +3371,7 @@ def lane_findings(cfg, hs, units=()):
             wt = int(p.get(f"wait_{lane}", 0) or 0)   # running tasks still waiting in orch's own admission
             if q and (g.get("status") != "Running" or len(r) < par):
                 F.append((f"stalled:{n}:{lane}", f"{n} {lane} STALLED: {len(q)} queued, {len(r)} of {par} slots running, group {g.get('status')}"))
-            elif q and not wt and lane != "land" and len(r) < (h.get("gate_slots", slots(h, cfg)) if lane == "gates" else slots(h, cfg)) and \
+            elif q and not wt and lane != "land" and len(r) < (h.get("gate_slots", slots(h, cfg)) if lane == "gates" else 1 if lane == "gates-quick" else slots(h, cfg)) and \
                     (p["cap_admit"].strip() == "yes" if "cap_admit" in p else host_cap(cfg, n, p, list(units))["free"] > 0):
                 # idle by the admission's own verdict (row 48): work queued in pueue, none held by admission, and admission would
                 # take one more now; jobs waiting inside their scripts are held by admission, never idle
@@ -4319,7 +4463,12 @@ def main():
         A("command", nargs=argparse.REMAINDER), dry=True)
     add("gate", A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $ORCH_UNIT)"), A("--priority", type=int, default=10),
         A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"),
+        A("--timeout-min", type=float, help="stop the gate after this long (default [landing] gate_timeout_min; 0: none)"),
+        A("--quick", action="store_true", help="a short gate: the gates-quick slot when [landing] quick_gate_min is set"),
         A("--allow-unmerged", action="store_true", help="gate a tree mid-merge, with conflict markers or far behind the landing branch"), dry=True)
+    add("gate-judge", A("name"), A("rc", type=int))
+    add("gate-exec", A("name"), A("--timeout-min", type=float, default=0), A("command", nargs=argparse.REMAINDER))
+    add("gate-scope", A("unit"), A("--name", help="the gate's name (default land-<unit>)"), dry=True)
     add("busy", A("wt", help="a worktree: exit 0 while an orch job, a unit's job or a mutation run uses it, else 1"))
     add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", A("--max", type=int, help="launch at most this many"), dry=True)

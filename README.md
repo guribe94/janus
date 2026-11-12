@@ -488,7 +488,25 @@ idempotent. `orch backlog list` shows what it reads. `orch check` then reports:
 - `backlog:stale` / `backlog:import`: the checklist changed since the last import, or was never imported;
 - `landing:<unit>:nogate`: a unit with VERDICT DONE for over `[landing] finished_min` (30) minutes has no gate queued or
   run (gates belong to a unit by `orch gate --unit` or `[landing] gate_names` patterns);
-- `landing:<unit>:unlanded`: its gates passed (`gates_required`, default 1) but its worktree HEAD is not on the landing branch.
+- `landing:<unit>:unlanded`: its gates passed (`gates_required`, default 1) but its worktree HEAD is not on the landing branch
+  (an ancestor of it, or every file the unit changed has the tip's content).
+
+**Gate policy (targeted gates, known failures, time limits).**
+- `orch gate-scope <unit> [--name land-<unit>] [--dry-run]` runs the project's affected-scope hook (`[landing] scope_cmd`,
+  called with `{unit} {tree}`, env `ORCH_UNIT`/`ORCH_TREE`), which prints the tree's gate steps, one per line:
+  `[@host ]<step>: <command>`. Steps without a host (portable ones) run on this machine in the tree; `@host` steps run there
+  through `orch run`. orch writes `out/<name>/tests.sh` (each step prints `EXIT_<step>=<rc>`); queue it with `orch gate`.
+- Known failures: `[landing] known_failures` names a tab-separated file: the test id columns, the cause, the unit fixing it at
+  the root (the id is the columns before the last two joined by `/`; `#` lines are comments). A gate's `tests.sh` names its
+  failing tests in `$ORCH_GATE_OUT/failed.txt` and the tests that ran and passed in `passed.txt`. The gate's RESULT is PASS when
+  every failing test is in the file with a fixing unit (`orch gate-judge <name> <rc>` prints the judged line; a project
+  runner's FAIL is re-judged the same way). A non-zero gate that names no failing test fails. `orch check` raises
+  `known-failure:<id>` for an entry whose unit is missing or not open (failures on main are fixed at their root cause) and
+  `known-failure:<id>:passes` for an entry a gate ran and passed in the last 24 h (remove it).
+- `[landing] gate_timeout_min` (or `orch gate --timeout-min`): the gate's process group is stopped at the limit and a
+  `EXIT_timeout=124 RESULT: FAIL` line is written. Every gate runs under `orch gate-exec`, which records its length.
+- `[landing] quick_gate_min`: a gate expected (median of its own last runs, else of its family `land-*-<suffix>`) under this
+  many minutes, or queued with `--quick`, goes to the one-slot `gates-quick` group, so short gates never wait behind long ones.
 
 ## 7c. Self-safety
 
