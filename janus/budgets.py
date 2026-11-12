@@ -2,12 +2,14 @@
 
 Queries only: a unit's default budget, its spend so far (ledger, else its transcript priced at learned rates), each run's
 outcome, and whether launch and fill are paused by the waste rule."""
-import calendar, json, time
+import calendar, json, re, time
 from pathlib import Path
-from janus.context import now, sh
+from janus.context import hrun, now, sh
 from janus.findings import live_acks
 from janus.ledger import RECONCILED, ledger_read
-from janus.transcripts import transcript_of
+from janus.transcripts import remote_slug_sh, transcript_of
+from janus.usage import usage_scan
+import janus.usage as usage_mod
 from janus.units import all_units, api_out, report_text, unit_runs, verdict
 
 # A unit's default budget is the median cost of the past finished runs of its kind and tier (ledger done rows joined to the
@@ -120,6 +122,39 @@ def transcript_cost(cfg, f, since=0):
         if r is None: return None, "no learned rate (no finished api.json yet)"
         tot += token_cost(us, w, r)
     return tot, "transcript"
+
+def session_file(cfg, u, sid=None):
+    """The transcript of a local unit's agent session: ~/.claude/projects/*/<session id>.jsonl, else the one its brief names."""
+    sid = sid or api_out(cfg, u).get("session_id")
+    f = next(iter(sorted((Path.home() / ".claude/projects").glob(f"*/{sid}.jsonl"))), None) if sid else None
+    return f or transcript_of(cfg, u)
+
+def session_usage(cfg, u, since=0, sid=None):
+    """usage_scan of the unit's agent session ({ctx, model, use}), or None when it cannot be read: here from its transcript; for
+    a unit on another host janus/usage.py runs there (one ssh, one JSON line back)."""
+    h = cfg.hosts.get(u.get("host"), {})
+    if h.get("local"):
+        f = session_file(cfg, u, sid)
+        try: return usage_scan(f, since) if f else None
+        except OSError: return None
+    sid = sid or api_out(cfg, u).get("session_id")
+    if not sid or not re.fullmatch(r"[A-Za-z0-9-]{3,64}", str(sid)): return None
+    rc, o, e = hrun(h, f"s={remote_slug_sh(u)}\n{h.get('agent_env', '')}\npython3 - \"$HOME/.claude/projects/$s/{sid}.jsonl\" {int(since)}",
+                    inp=Path(usage_mod.__file__).read_text(), timeout=40)
+    try: d = json.loads(o.strip().splitlines()[-1]) if rc == 0 and o.strip() else None
+    except ValueError: d = None
+    return d if isinstance(d, dict) and "ctx" in d else None
+
+def model_rate(cfg, model):
+    """$ per weighted token of a model (learned_rates; an unknown model gets the mean), None when nothing is learned yet."""
+    rates = learned_rates(cfg)
+    return rates.get(model) or (sum(rates.values()) / len(rates) if rates else None)
+
+def reload_usd(cfg, use):
+    """What a resume pays before it does anything: the session's context (use: session_usage) written to the cache again (the
+    cache is cold after a wait) at its model's learned rate. 0.0 when it is not known."""
+    r = model_rate(cfg, (use or {}).get("model"))
+    return round(use["ctx"] * bset(cfg, "token_weights")["cache_write"] * r, 4) if use and use.get("ctx") and r else 0.0
 
 OUTCOMES = (("verdict", "finished with a verdict"), ("capped-partial", "capped, partial work"), ("capped-nothing", "capped, nothing written"),
             ("open", "open unit, no verdict yet"), ("no-verdict", "ended without a verdict"), ("unknown", "unknown (no done row)"),
