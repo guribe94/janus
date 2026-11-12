@@ -76,7 +76,10 @@ def main():
         A("--quick", action="store_true", help="a short gate: the gates-quick slot when [landing] quick_gate_min is set"),
         A("--allow-unmerged", action="store_true", help="gate a tree mid-merge, with conflict markers or far behind the landing branch"), dry=True)
     add("gate-judge", cmd_gate_judge, A("name"), A("rc", type=int))
-    add("gate-exec", cmd_gate_exec, A("name"), A("--timeout-min", type=float, default=0), A("command", nargs=argparse.REMAINDER))
+    # gate-exec's command is "*", never REMAINDER: REMAINDER comes after the positional <name> and swallows the
+    # --timeout-min option into a.command, so the wrapper ran `sh -c '--timeout-min 0 -- <cmd>'` and sh refused it
+    # ('sh: --: invalid option', exit 2, item 26) with the limit never applied
+    add("gate-exec", cmd_gate_exec, A("name"), A("--timeout-min", type=float, default=0), A("command", nargs="*"))
     add("gate-scope", cmd_gate_scope, A("unit"), A("--name", help="the gate's name (default land-<unit>)"), dry=True)
     add("thrash", cmd_thrash, dry=True)
     add("tidy", cmd_tidy, dry=True)

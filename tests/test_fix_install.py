@@ -4,7 +4,7 @@ import contextlib, io, json, os, re, subprocess, sys, tempfile, textwrap, time, 
 from pathlib import Path
 from unittest import mock
 
-from janusload import load
+from janusload import JANUS_PY, load
 
 janus = load()
 
@@ -460,6 +460,32 @@ class Item25Soak(unittest.TestCase):
             self.assertTrue(janus.broad_why(cfg, "here", h, "cargo test --workspace"))
             self.assertTrue(janus.broad_why(cfg, "here", h, "cargo test --all-features"))
         finally: janus.job_class, janus.host_history = saved
+
+
+class Item26GateExec(unittest.TestCase):
+    """Item 26: the wrapper `janus gate` queues (`janus gate-exec <name> --timeout-min <lim> -- <cmd>`) must run the gate
+    command; its own argument line is parsed by the real CLI, not by a hand-made namespace."""
+    def gate_exec(self, d, *argv):
+        return subprocess.run([sys.executable, str(JANUS_PY), "gate-exec", *argv], cwd=d, capture_output=True, text=True)
+
+    def test_the_wrapper_runs_the_command_after_the_timeout_option(self):
+        """Catches (item 26): with a positional before it, argparse's REMAINDER command swallowed the `--timeout-min` option,
+        so the wrapper ran `sh -c '--timeout-min 0 -- <cmd>'`; sh refuses that string ('sh: --: invalid option', exit 2) and no
+        gate step ran at all (a real landing gate's whole log was bash's usage text)."""
+        d, _ = project()
+        r = self.gate_exec(d, "land-u1-x", "--timeout-min", "0", "--", "printf ran > out/marker")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual((d / "out/marker").read_text(), "ran")
+
+    def test_the_wrapper_honours_the_timeout_option_from_the_command_line(self):
+        """Catches (item 26, the silent half): the same REMAINDER swallowed `--timeout-min` itself, so `a.timeout_min` stayed 0
+        and a gate's limit was never applied; the CLI must hand the limit to the wrapper (a 0.6 s limit stops a 30 s step)."""
+        d, _ = project()
+        t0 = time.time()
+        r = self.gate_exec(d, "land-u2-x", "--timeout-min", "0.01", "--", "sleep 30")
+        self.assertEqual(r.returncode, 124, r.stderr + r.stdout)
+        self.assertLess(time.time() - t0, 15)
+        self.assertIn("land-u2-x EXIT_timeout=124 RESULT: FAIL", (d / "out/gates.log").read_text())
 
 
 class FakeBeads:
