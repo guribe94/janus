@@ -8,6 +8,7 @@ from janus.beads import Beads
 from janus.context import Err, JANUS_SELF, X, atomic_write, now, pq, say, sh, ts
 from janus.gates import GATE_DEFAULT, GATE_LINE, judge_gate, landed
 from janus.probe import pueue
+from janus.quality import land_review
 from janus.units import all_units, get_unit, own_tree
 
 def cmd_gate_judge(cfg, a):
@@ -167,6 +168,8 @@ def cmd_land(cfg, a):
     ahead = int(git(wt, "rev-list", "--count", f"{br}..HEAD")[1].strip() or 0); behind = int(git(wt, "rev-list", "--count", f"HEAD..{br}")[1].strip() or 0)
     if not ahead: raise Err(f"{branch} has no commits over {br}: nothing to land")
     if landed(cfg, u): raise Err(f"{a.unit} is already landed: {br} holds its tree ({branch} has no change since): janus close {a.unit}")
+    qr = land_review(cfg, u)   # [quality] review_model: its review must pass or be overridden before it lands (item 2)
+    if qr: raise Err(qr)
     say(f"land {a.unit}: {branch} in {wt}, {ahead} commit(s) ahead of {br} ({base[:9]}), {behind} behind")
     # 1. merge the current landing branch (dry run: merge-tree only)
     rc, o, e = git(wt, "merge-tree", "--write-tree", "--name-only", "HEAD", br)

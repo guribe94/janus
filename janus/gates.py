@@ -80,6 +80,25 @@ def gate_ids(cfg, name, which):
     try: return [l.strip() for l in (cfg.p("out", "out") / name / f"{which}.txt").read_text(errors="replace").splitlines() if l.strip()]
     except OSError: return None
 
+def gate_signals(cfg, runs=5, min_min=20):
+    """[(gate, minutes, runs)] of gates whose last `runs` recorded results all passed and whose median recorded length is over
+    min_min minutes: a long step that has not failed in runs, proposed for scoping or trimming (deletion stays the owner's call)."""
+    try: lines = cfg.p("gate_log", "out/gates.log").read_text().splitlines()
+    except OSError: return []
+    hist = {}
+    for l in lines:
+        m = GATE_LINE.match(l)
+        if m: hist.setdefault(m.group(1), []).append(m.group(2))
+    times = cfg.jget("gate-times.json"); out = []
+    for n, res in hist.items():
+        last = res[-runs:]
+        if len(last) < runs or any(r != "PASS" for r in last): continue   # it has failed in the window (or too few runs to say)
+        xs = sorted(times.get(n) or [])[-runs:]
+        if not xs: continue
+        med = xs[len(xs) // 2]
+        if med >= min_min: out.append((n, med, len(last)))
+    return sorted(out, key=lambda x: -x[1])
+
 def judge_gate(cfg, name, rc):
     """(PASS|FAIL, new failures, known failures that occurred): PASS when rc is 0, or when the gate named its failing tests and
     every one is a known failure with a fixing unit. A non-zero gate that names no failing test is a failure (build, timeout)."""

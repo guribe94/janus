@@ -65,6 +65,7 @@ FAMILIES = {
     "script": Family("a running script's file was changed after it started", urgent=True),
     "spend": Family("a provider's spend is at its cap", urgent=True),
     "stalled": Family("queued work with free slots, or an old queue that does not drain", urgent=True),
+    "test-signal": Family("a long gate/test step that has not failed in N runs: scope or trim it (deletion stays the owner's call)"),
     "thrash": Family("the watcher stopped and re-queued a job on a thrashing shared host"),
     "tidy": Family("what janus tidy can reclaim"),
     "unit": Family("a unit is blocked, finished, or stopped by a limit without a verdict", urgent=True),
