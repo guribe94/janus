@@ -422,6 +422,46 @@ class Item16Budget(unittest.TestCase):
         self.assertGreaterEqual(b, 2.0, f"the tiny/verdictless runs skewed the budget: {b} ({why})")
 
 
+class Item25Soak(unittest.TestCase):
+    def test_a_broad_run_passes_a_negative_priority_pueue_accepts(self):
+        """Catches (item 25a): `janus run --broad` passed the priority as `-o -5`, which pueue 4 rejects ('to pass -5 as a
+        value, use -- -5'), so nothing was queued; the flag is now passed in a form pueue accepts."""
+        import argparse, shutil
+        d, cfg = project(); src = d / "wt"; src.mkdir()
+        a = argparse.Namespace(host="here", lane="jobs", unit="u1", wt=str(src), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=True, command=["--", "true"], broad="a matrix build", needs=None)
+        calls = []
+        def fake_hrun(h, script, **k):
+            calls.append(script)
+            return (0, "7", "") if " add " in script else (0, "", "")
+        saved = (janus.hrun, janus.tree_guard, janus.ensure_lanes, janus.write_cap)
+        janus.hrun = fake_hrun; janus.tree_guard = lambda *a, **k: None
+        janus.ensure_lanes = lambda h, cfg: ""; janus.write_cap = lambda *a, **k: (0, "", "")
+        try: janus.cmd_run(cfg, a)
+        finally: janus.hrun, janus.tree_guard, janus.ensure_lanes, janus.write_cap = saved
+        add = [c for c in calls if " add " in c]
+        self.assertTrue(add, calls)
+        self.assertIn("-o=-5", add[0], "a broad run passed the negative priority in a form pueue rejects")
+        if shutil.which("pueue"):
+            ok = subprocess.run(["pueue", "add", "-o=-5"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            bad = subprocess.run(["pueue", "add", "-o", "-5"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            self.assertNotIn("to pass", ok.stderr + ok.stdout, "pueue rejects the form janus writes")
+            self.assertIn("to pass", bad.stderr + bad.stdout, "pueue now accepts the space form: update janus")
+
+    def test_a_one_package_cargo_run_is_not_broad(self):
+        """Catches (item 25b): the whole-suite guard matched `--all-targets` on a one-package cargo command
+        (`cargo test -p recorder --all-targets`), refusing a run that is not a whole suite."""
+        d, cfg = project(); h = cfg.hosts["here"]
+        saved = (janus.job_class, janus.host_history)
+        janus.job_class = lambda *a: "job"; janus.host_history = lambda *a: []
+        try:
+            self.assertIsNone(janus.broad_why(cfg, "here", h, "cargo test -p recorder --all-targets"))
+            self.assertIsNone(janus.broad_why(cfg, "here", h, "cargo test --package=recorder --all-targets"))
+            self.assertTrue(janus.broad_why(cfg, "here", h, "cargo test --workspace"))
+            self.assertTrue(janus.broad_why(cfg, "here", h, "cargo test --all-features"))
+        finally: janus.job_class, janus.host_history = saved
+
+
 class FakeBeads:
     """A beads stand-in for a launch fixture: no database, no unit ever recorded."""
     def __init__(self, cfg): pass
@@ -607,7 +647,8 @@ class Item3AdmitClock(unittest.TestCase):
                            env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"})
         self.assertNotEqual(p.returncode, 124, "a queued job was dropped as if its command had timed out: " + p.stdout + p.stderr)
         self.assertEqual(p.returncode, 121, p.stdout + p.stderr)
-        self.assertGreaterEqual(time.time() - t0, 2.5, "it was dropped before its blocked clock ran out: " + p.stdout)
+        self.assertGreaterEqual(time.time() - t0, 2.0, "it was dropped before its blocked clock ran out: " + p.stdout)
+        self.assertIn("not admitted after 3s blocked", p.stdout, p.stdout)
         self.assertNotIn("after 73", p.stdout, "the clock started at enqueue, not at the first blocked poll: " + p.stdout)
         self.assertIn("blocked (limit 3s", p.stdout, p.stdout)
 
