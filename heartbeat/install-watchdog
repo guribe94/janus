@@ -1,0 +1,113 @@
+#!/bin/sh
+# heartbeat/install-watchdog: install (or --uninstall) the systemd user timer that runs
+# heartbeat/watchdog every 5 minutes on the watchdog host.
+#
+# It writes janus-heartbeat.service and janus-heartbeat.timer under
+# ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user, writes the configuration to
+# ${XDG_CONFIG_HOME:-$HOME/.config}/janus/heartbeat.env, then runs
+# `systemctl --user enable --now janus-heartbeat.timer`. Re-running is safe.
+#
+# Configuration is read from the environment and written to the env file:
+#   HEARTBEAT_FILE HEARTBEAT_MAX_AGE HEARTBEAT_STATE HEARTBEAT_OUTBOX
+#   HEARTBEAT_AGENT HEARTBEAT_ALERT_CMD HEARTBEAT_HOST
+# A value already in the env file is kept when the variable is not set here.
+#
+# --uninstall disables and removes the units; the env file is kept.
+
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+watchdog=$here/watchdog
+unitdir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+envdir=${XDG_CONFIG_HOME:-$HOME/.config}/janus
+envfile=$envdir/heartbeat.env
+service=janus-heartbeat.service
+timer=janus-heartbeat.timer
+
+usage() {
+  cat <<EOF
+usage: $0 [--uninstall]
+
+Installs $timer and $service in $unitdir and enables the timer
+(systemctl --user enable --now). Re-running is safe.
+
+Configuration is read from the environment and written to $envfile:
+  HEARTBEAT_FILE HEARTBEAT_MAX_AGE HEARTBEAT_STATE HEARTBEAT_OUTBOX
+  HEARTBEAT_AGENT HEARTBEAT_ALERT_CMD HEARTBEAT_HOST
+Values already in $envfile are kept when the variable is not set here.
+
+--uninstall disables and removes the units (the env file is kept).
+EOF
+}
+
+need_systemd() {
+  command -v systemctl >/dev/null 2>&1 || {
+    echo "install-watchdog: systemctl not found; this installer targets a systemd user session" >&2
+    exit 1
+  }
+}
+
+write_env() {
+  mkdir -p "$envdir"
+  tmp=$envfile.tmp.$$
+  : >"$tmp"
+  for k in HEARTBEAT_FILE HEARTBEAT_MAX_AGE HEARTBEAT_STATE HEARTBEAT_OUTBOX \
+           HEARTBEAT_AGENT HEARTBEAT_ALERT_CMD HEARTBEAT_HOST; do
+    eval "v=\${$k:-}"
+    if [ -n "$v" ]; then
+      # systemd EnvironmentFile: double quotes, backslash escapes; no shell expansion
+      esc=$(printf '%s' "$v" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      printf '%s="%s"\n' "$k" "$esc" >>"$tmp"
+    elif [ -f "$envfile" ] && grep -q "^$k=" "$envfile"; then
+      grep "^$k=" "$envfile" >>"$tmp"
+    else
+      printf '# %s=\n' "$k" >>"$tmp"
+    fi
+  done
+  mv "$tmp" "$envfile"
+}
+
+install_units() {
+  need_systemd
+  mkdir -p "$unitdir"
+  write_env
+  cat >"$unitdir/$service" <<EOF
+[Unit]
+Description=janus heartbeat watchdog
+
+[Service]
+Type=oneshot
+EnvironmentFile=-$envfile
+ExecStart=/bin/sh "$watchdog"
+EOF
+  cat >"$unitdir/$timer" <<EOF
+[Unit]
+Description=Run the janus heartbeat watchdog every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$timer"
+  echo "installed $timer (every 5 min); config: $envfile"
+}
+
+uninstall_units() {
+  need_systemd
+  systemctl --user disable --now "$timer" 2>/dev/null || true
+  rm -f "$unitdir/$timer" "$unitdir/$service"
+  systemctl --user daemon-reload 2>/dev/null || true
+  echo "removed $timer and $service (config kept: $envfile)"
+}
+
+case ${1:-} in
+  '') install_units ;;
+  --uninstall) uninstall_units ;;
+  -h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

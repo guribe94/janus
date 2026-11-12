@@ -1,0 +1,52 @@
+#!/bin/sh
+# heartbeat/beat: record one coordinator watcher run and copy it to the watchdog host.
+#
+# Run by the coordinator's watcher (janus watch) after each pass. It appends one line
+#   <epoch> <host> <check_exit>
+# to the heartbeat file and, when a remote is configured, copies that file to the
+# watchdog host over the existing ssh (scp, or rsync with HEARTBEAT_RSYNC=1).
+#
+# It must never break the watcher: every failure is swallowed and the exit is always 0.
+#
+# Environment:
+#   HEARTBEAT_FILE         local heartbeat file (default: ${JANUS_STATE:-.janus}/heartbeat)
+#   HEARTBEAT_CHECK_EXIT   the check's exit code (default: $1, else 0)
+#   HEARTBEAT_HOST         host name to record (default: hostname -s)
+#   HEARTBEAT_REMOTE       ssh target of the watchdog host, e.g. user@host (unset: local only)
+#   HEARTBEAT_REMOTE_PATH  heartbeat file path on the watchdog host (required with HEARTBEAT_REMOTE)
+#   HEARTBEAT_SSH          ssh command (default: ssh)
+#   HEARTBEAT_SCP          copy command taking <src> <dst> (default: scp; rsync works too)
+#   HEARTBEAT_SSH_OPTS     extra options for ssh/scp (default: none)
+#
+# The line is append-only; the watchdog reads the last line. Epoch seconds make the
+# age comparison independent of the two hosts' clocks' formatting (not their skew).
+
+set +e
+trap 'exit 0' EXIT HUP INT TERM
+
+file=${HEARTBEAT_FILE:-${JANUS_STATE:-.janus}/heartbeat}
+rc=${HEARTBEAT_CHECK_EXIT:-${1:-0}}
+host=${HEARTBEAT_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}
+now=$(date +%s 2>/dev/null || echo 0)
+
+mkdir -p "$(dirname "$file")" 2>/dev/null
+printf '%s %s %s\n' "$now" "$host" "$rc" >>"$file" 2>/dev/null
+
+remote=${HEARTBEAT_REMOTE:-}
+rpath=${HEARTBEAT_REMOTE_PATH:-}
+if [ -n "$remote" ] && [ -n "$rpath" ]; then
+  ssh=${HEARTBEAT_SSH:-ssh}
+  scp=${HEARTBEAT_SCP:-scp}
+  opts=${HEARTBEAT_SSH_OPTS:-}
+  # shellcheck disable=SC2086
+  $scp $opts "$file" "$remote:$rpath" >/dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    # the target directory may not exist yet on a fresh watchdog host
+    # shellcheck disable=SC2086
+    $ssh $opts "$remote" "mkdir -p '$(dirname "$rpath")'" >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    $scp $opts "$file" "$remote:$rpath" >/dev/null 2>&1
+  fi
+fi
+
+exit 0
