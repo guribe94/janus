@@ -280,6 +280,22 @@ def run_outcomes(cfg):
             out.append((pn, k, u["name"], float(cost or 0), o, t))
     return out
 
+def first_review_pass(cfg):
+    """{implementer model: (passes, fails)}: for each unit with a review of it (a unit launched `--of <name>`), the EARLIEST
+    review's outcome (its verdict DONE = pass, else fail). The outcome data routing should read (S3 model-routing-policy): route
+    by the model whose work passes review first, not only by cost."""
+    au = all_units(cfg); by_of = {}
+    for r in au.values():
+        if r.get("of"): by_of.setdefault(r["of"], []).append(r)
+    out = {}
+    for name, x in au.items():
+        revs = sorted(by_of.get(name, []), key=lambda r: r.get("started", 0))
+        if not revs or not x.get("model"): continue
+        p, f = out.get(x["model"], (0, 0))
+        ok = "DONE" in (verdict(cfg, revs[0]) or "")
+        out[x["model"]] = (p + (1 if ok else 0), f + (0 if ok else 1))
+    return out
+
 def waste_state(cfg, outs=None):
     """(capped-without-verdict dollars, all dollars, share %) of the runs of the last [report] recent_h hours."""
     outs = run_outcomes(cfg) if outs is None else outs; cut = now() - rset(cfg, "recent_h") * 3600

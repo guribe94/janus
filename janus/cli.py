@@ -6,12 +6,13 @@ from janus.actions.jobs import LANES
 from janus.context import Cfg, Err, Run, find_root, projects, say, session_root
 from janus.decisions import cmd_answer, cmd_ask, cmd_decide, cmd_decisions
 from janus.hooks import cmd_hook
+from janus.issue import cmd_issue
 from janus.memory import MEM_SECTIONS
 from janus.setup import doctor, init_project
 from janus.actions.backlog import cmd_backlog, cmd_fill
 from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_hosts, cmd_run, cmd_thrash
-from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_scope, cmd_land
-from janus.actions.launch import cmd_api_run, cmd_launch
+from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_log, cmd_gate_scope, cmd_land
+from janus.actions.launch import cmd_api_run, cmd_launch, cmd_qualify
 from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd_park, cmd_resume as cmd_resume_unit, cmd_stop
 from janus.actions.swarm import cmd_forget, cmd_index, cmd_introduce, cmd_learned, cmd_ledger, cmd_memory, cmd_peers, cmd_remember, cmd_report, cmd_transcript
 from janus.actions.tidy import cmd_tidy
@@ -22,7 +23,7 @@ from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
 WRITERS = {"ack", "launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
-           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report"}
+           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue", "qualify"}
 
 def cmd_resume(cfg, a):
     """janus resume: a parked unit when one is named, else the orchestration itself (janus/setup.cmd_resume_orch): continue it
@@ -39,12 +40,12 @@ def main():
         if dry: p.add_argument("--dry-run", action="store_true")
         return p
     A = lambda *n, **k: (n, k)
-    add("check", cmd_check, A("--brief", action="store_true"), A("--escalate", action="store_true"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent, ackable, open_since)"))
+    add("check", cmd_check, A("--brief", action="store_true"), A("--escalate", action="store_true"), A("--acked", action="store_true", help="list the findings a live ack is hiding (key, decision, age, ttl)"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent, ackable, open_since)"))
     add("hosts", cmd_hosts, A("--refresh", action="store_true", help="discover every host again now"), A("--json", action="store_true"))
     add("capacity", cmd_capacity); add("status", cmd_status); add("watch", cmd_watch, A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"),
         A("--reset", action="store_true", help="the Stop hook's context reset: /clear once the turn ended, then the wake prompt"))
     add("learned", cmd_learned, A("--reject", help="reject learned post <agent>:<n> (check stops listing it)"), A("--why", help="why it is rejected"))
-    add("launch", cmd_launch, A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
+    add("launch", cmd_launch, A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup", "qualify"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
         A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--new-worktree", metavar="REPO", help="make a fresh worktree of this repo (a new branch named after the unit) for the unit"), A("--from", dest="from_ref", metavar="REF", help="--new-worktree: the branch or commit to start from (default main)"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
         A("--test-host", help="host where the unit's builds and tests run; the agent is placed there"), A("--allow-main", action="store_true", help="allow a main checkout as cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"),
         A("--report", help="a resumed unit: the report it continues (default out/<unit>/REPORT.md)"), A("--resume-of", help="a resumed unit: the unit whose report it continues"),
@@ -71,18 +72,23 @@ def main():
         A("--allow-unmerged", action="store_true", help="run on a tree with a merge in progress, conflict markers or far behind the landing branch"),
         A("command", nargs=argparse.REMAINDER), dry=True)
     add("gate", cmd_gate, A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $JANUS_UNIT)"), A("--priority", type=int, default=10),
+        A("--baseline", help="name of a recorded run of the landing branch on the same host: its failures are main's, not the unit's (decision 0002); 'none' clears it"),
         A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"),
         A("--timeout-min", type=float, help="stop the gate after this long (default [landing] gate_timeout_min; 0: none)"),
         A("--quick", action="store_true", help="a short gate: the gates-quick slot when [landing] quick_gate_min is set"),
         A("--allow-unmerged", action="store_true", help="gate a tree mid-merge, with conflict markers or far behind the landing branch"), dry=True)
     add("gate-judge", cmd_gate_judge, A("name"), A("rc", type=int))
+    add("gate-log", cmd_gate_log, A("name", help="the gate whose output to read (out/<name>/task.txt, or --task)"),
+        A("--task", help="read this <host>:<task pueue id>'s log instead of the recorded one"))
     # gate-exec's command is "*", never REMAINDER: REMAINDER comes after the positional <name> and swallows the
     # --timeout-min option into a.command, so the wrapper ran `sh -c '--timeout-min 0 -- <cmd>'` and sh refused it
     # ('sh: --: invalid option', exit 2, item 26) with the limit never applied
     add("gate-exec", cmd_gate_exec, A("name"), A("--timeout-min", type=float, default=0), A("command", nargs="*"))
     add("gate-scope", cmd_gate_scope, A("unit"), A("--name", help="the gate's name (default land-<unit>)"), dry=True)
     add("thrash", cmd_thrash, dry=True)
-    add("tidy", cmd_tidy, dry=True)
+    add("tidy", cmd_tidy, A("action", nargs="?", choices=["hold", "unhold", "holds"], help="hold/unhold one item so tidy never removes it, or list the holds"),
+        A("target", nargs="?", help="hold/unhold: the item to keep (a worktree path, a host:name, a test root)"),
+        A("--why", help="hold: why it is kept"), dry=True)
     add("busy", cmd_busy, A("wt", help="a worktree: exit 0 while a janus job, a unit's job or a mutation run uses it, else 1"))
     add("cancel", cmd_cancel, A("job", help="<host>:<task id> of a janus run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", cmd_fill, A("--max", type=int, help="launch at most this many"), dry=True)
@@ -102,6 +108,10 @@ def main():
         A("--topic", help="the regex each reads in the other's transcript (default: a path named in --why)"), dry=True)
     add("quality", cmd_quality, A("action", choices=["lint", "review"], help="lint: a brief alone; review: the pre-landing review"),
         A("arg", nargs="?", help="lint: a brief path or unit name; review: the unit"), A("--override", help="review: accept the findings with this reason"), dry=True)
+    add("issue", cmd_issue, A("text", help="what happened, in generic terms (no project, host or person)"),
+        A("--evidence", help="a path, commit sha or job the row points at"), A("--key", help="a finding key the row is for; a row for the same key is written once"), dry=True)
+    add("qualify", cmd_qualify, A("model", help="a model with [models.<m>] qualified = false"),
+        A("--fail", action="store_true", help="record a failed qualification (the model stays skipped)"), A("note", nargs="?", help="what the model did"), dry=True)
     add("soak", cmd_soak, A("--minutes", type=float, default=1.0, help="run this many minutes (0: one pass)"),
         A("--live", action="store_true", help="also run one watcher pass (default: read-only)"))
     add("transcript", cmd_transcript, A("unit"), A("--grep", help="only the lines matching this regex (case-insensitive)"), A("--tail", type=int, default=40, help="the last N lines (0: all)"))

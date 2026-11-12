@@ -72,9 +72,24 @@ def report_findings(cfg, units):
                       f"{'work was written' if work_written(cfg, u) else 'nothing was written'}: read its report, resume it with --resume-of and a larger budget, or close it"))
     why = waste_paused(cfg)
     if why: F.append(("waste-pause", "launch and fill PAUSED: " + why))
-    cp = last_checkpoint(cfg)
-    if cp and cfg.mtime("report_sent") < cp: F.append(("report-due", f"a status report to the owner is due (checkpoint {ts(cp)}): janus report, send it, then janus report --sent"))
+    # A status report is due at the clock checkpoints ([report] at / every_h) AND at event checkpoints: a landing, a close, an
+    # owner instruction or a decision since the last report is worth telling the owner at once, not at the next clock tick.
+    cp = last_checkpoint(cfg); sent = cfg.mtime("report_sent")
+    if cp and sent < cp:
+        F.append(("report-due", f"a status report to the owner is due (checkpoint {ts(cp)}): janus report, send it, then janus report --sent"))
+    else:
+        k, t = report_event(cfg)
+        if t and sent < t:
+            F.append(("report-due", f"a status report to the owner is due (a {k} event at {ts(t)}): janus report, send it, then janus report --sent"))
     return F
+
+REPORT_EVENTS = ("landing", "close", "instruction", "decision")   # events worth telling the owner at once; launch is routine
+
+def report_event(cfg):
+    """(kind, time) of the newest report-worthy event (a landing, a close, an owner instruction, a decision: REPORT_EVENTS)
+    recorded in events.json, or (None, 0). report-due fires at these event checkpoints, not only at the clock."""
+    ev = cfg.jget("events.json"); xs = sorted((t, k) for k, t in ev.items() if k in REPORT_EVENTS)
+    return (xs[-1][1], xs[-1][0]) if xs else (None, 0)
 
 def unit_changes(cfg, u, units=()):
     """(branch, [files changed so far]) of a unit's tree: locally its commits since it left the landing branch plus uncommitted

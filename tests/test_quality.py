@@ -2,7 +2,7 @@
 review and janus soak. Each test names the failure it catches. Standard library only; no network, no API spend.
 
 Run by ./check (it discovers tests/test_*.py)."""
-import json, os, subprocess, sys, tempfile, textwrap, unittest
+import json, os, subprocess, sys, tempfile, textwrap, time, unittest
 from pathlib import Path
 
 from janusload import load
@@ -178,6 +178,172 @@ class LandReview(unittest.TestCase):
         rc, L = janus.review_unit(cfg, "u")
         rj = json.loads((d / "out/u/review.json").read_text())
         self.assertEqual(rj["findings"][0]["kind"], "test"); self.assertEqual(rc, 1); self.assertEqual(rj["head"], self.head())
+
+
+class QualityFinding(unittest.TestCase):
+    """ranked gap 8: a finished unit whose diff changed test files but whose report.json names no test it added (or names one
+    without the failure it catches) is listed before it lands. The failure caught: tests with no failure named slipping into a
+    landing unreviewed (the rule every brief header states)."""
+
+    def setUp(self):
+        self.d, self.cfg = project()
+        self.r = self.d / "repo"; self.r.mkdir()
+        self.g("init", "-q", "-b", "main")
+        (self.r / "a").write_text("1\n"); self.g("add", "a"); self.g("commit", "-qm", "base")
+        self.wt = self.d / "repo-wt"
+        self.g("worktree", "add", "-q", "-b", "wk/u", str(self.wt))
+        self.u = {"id": "x-1", "name": "u", "host": "here", "cwd": str(self.wt), "verdict": "VERDICT: DONE"}
+        (self.d / "out/u").mkdir(parents=True)
+        (self.d / "out/u/REPORT.md").write_text("work\nVERDICT: DONE\n")
+
+    def g(self, *a): return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(self.r), *a], capture_output=True, text=True)
+
+    def commit(self, f, body="new\n"):
+        p = self.wt / f; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(body)
+        self.gw("add", f); self.gw("commit", "-qm", f"u: {f}")
+
+    def gw(self, *a):
+        return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(self.wt), *a], capture_output=True, text=True)
+
+    def keys(self): return [k for k, _ in janus.quality_findings(self.cfg, [self.u])]
+
+    def test_flags_test_files_without_named_failures(self):
+        self.assertEqual(self.keys(), [])                                        # nothing changed yet: no finding
+        self.commit("src/a.py")                                                  # a non-test change: not judged
+        (self.d / "out/u/report.json").write_text(json.dumps({"verdict": "DONE", "tests_added": []}))
+        self.assertEqual(self.keys(), [])
+        self.commit("tests/test_u.py")                                           # adds a test file, report.json still lists none
+        self.assertEqual(self.keys(), ["quality:u"])
+        (self.d / "out/u/report.json").write_text(json.dumps({"verdict": "DONE", "tests_added": [{"name": "t", "catches": ""}]}))
+        self.assertEqual(self.keys(), ["quality:u"])                             # an entry without a catches text
+        (self.d / "out/u/report.json").write_text(json.dumps({"verdict": "DONE", "tests_added": [{"name": "t", "catches": "a bad parse crashes main"}]}))
+        self.assertEqual(self.keys(), [])                                        # named failure: clean
+
+    def test_no_report_json_is_not_judged(self):
+        self.commit("tests/test_u.py")
+        self.assertEqual(self.keys(), [])                                        # the report.json rule is prompted, not enforced, without it
+
+
+class RemoteBriefText(unittest.TestCase):
+    """ranked gap 12 / S2 remote-unit-no-git: a brief for an agent on a host without a git tree states there is no git and to
+    list the files it changed, so a remote unit does not waste a run on git commands that cannot work there. The failure caught:
+    a remote unit running git in a `.git`-less copy and losing its work."""
+
+    def test_remote_header_says_no_git_and_local_does_not(self):
+        d, cfg = project('\n[hosts.ra]\nssh = "nowhere"\nroot = "/x"\n')
+        hd = janus.brief_header(cfg, "ra", cfg.hosts["ra"], "u", "/x/worktrees/u", False, report="/x/out/u/REPORT.md")
+        self.assertIn("No git here", hd)
+        self.assertIn("list every file you changed", hd)
+        loc = janus.brief_header(cfg, "here", cfg.hosts["here"], "u", str(d), True)
+        self.assertNotIn("No git here", loc)
+
+
+class ReportCheckpoint(unittest.TestCase):
+    """ranked gap 12 / S1 the-orchestrator-reports-status: report-due fires at event checkpoints (a landing, a close, an owner
+    instruction, a decision) and not only at the clock. The failure caught: a landing or a unit ending with no report to the
+    owner until the next time checkpoint."""
+
+    def test_event_checkpoints_trigger_report_due(self):
+        d, cfg = project('\n[report]\nevery_h = 0\n')
+        cfg.touch("report_sent")
+        self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], [])           # nothing new: no report
+        old = time.time() - 1000; os.utime(cfg.f("report_sent"), (old, old))
+        cfg.jput("events.json", {"launch": time.time()})                               # a launch is routine: no report
+        self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], [])
+        cfg.jput("events.json", {"landing": time.time()})                              # a landing: report to the owner
+        self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], ["report-due"])
+        cfg.touch("report_sent")
+        self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], [])           # sent after the event: clear
+
+
+class ReviewFinding(unittest.TestCase):
+    """ranked 9 / S3 expert-panel-quality-bar: a tier critical unit that finished DONE with no later review of its final code is
+    listed. The failure caught: critical work landing without a re-review after the last change."""
+
+    def setUp(self):
+        self.d, self.cfg = project()
+        self.r = self.d / "repo"; self.r.mkdir()
+        self.g("init", "-q", "-b", "main"); (self.r / "a").write_text("1\n")
+        self.g("add", "a"); self.g("commit", "-qm", "base")
+        self.wt = self.d / "repo-wt"; self.g("worktree", "add", "-q", "-b", "wk/u", str(self.wt))
+        (self.d / "out/u").mkdir(parents=True); (self.d / "out/u/REPORT.md").write_text("x\nVERDICT: DONE\n")
+        self.commit_t = int(self.g("log", "-1", "--format=%ct").stdout.strip())
+
+    def g(self, *a): return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(self.r), *a], capture_output=True, text=True)
+
+    def u(self, **k): return {"id": "x-1", "name": "u", "cwd": str(self.wt), "verdict": "VERDICT: DONE", "tier": "critical", **k}
+
+    def keys(self, units): return [k for k, _ in janus.review_findings(self.cfg, units)]
+
+    def test_critical_unit_needs_a_later_review(self):
+        self.assertEqual(self.keys([self.u()]), ["review:u"])
+        self.assertEqual(self.keys([self.u(tier="normal")]), [])                                # only critical
+        rev_early = {"name": "u-rev", "kind": "review", "of": "u", "started": self.commit_t - 100}
+        self.assertEqual(self.keys([self.u(), rev_early]), ["review:u"])                        # a review before the last commit does not count
+        rev_after = {"name": "u-rev", "kind": "review", "of": "u", "started": self.commit_t + 5}
+        self.assertEqual(self.keys([self.u(), rev_after]), [])
+
+
+class LandFirst(unittest.TestCase):
+    """ranked 9 / S1 finish-and-land: with [landing] hold_h set and a provider under 25 % of its cap, a NEW implement unit is
+    refused while a gated DONE unit has waited over hold_h. The failure caught: starting new work while done work waits unlanded."""
+
+    def test_refuses_only_when_old_unlanded_work_meets_a_tight_cap(self):
+        d, cfg = project('\n[landing]\nhold_h = 2\n')
+        (d / "out/u").mkdir(parents=True); rp = d / "out/u/REPORT.md"; rp.write_text("x\nVERDICT: DONE\n")
+        old = time.time() - 3 * 3600; os.utime(rp, (old, old))
+        u = {"name": "u", "verdict": "VERDICT: DONE", "cwd": str(d)}
+        real = janus.landing_findings; janus.landing_findings = lambda cfg, units, hs=None: [("landing:u:unlanded", "why")]
+        try:
+            (d / "out/ledger.tsv").write_text("2026-01-01 00:00:00\tu\t8.0\tdone rc=0\tu.1\n")   # $8 of a $10 cap: over 75 %
+            self.assertIn("land first: u", janus.land_first_block(cfg, [u], {}) or "")
+            (d / "out/ledger.tsv").write_text("2026-01-01 00:00:00\tu\t1.0\tdone rc=0\tu.1\n")    # $1 of $10: not tight
+            self.assertIsNone(janus.land_first_block(cfg, [u], {}))
+        finally: janus.landing_findings = real
+
+    def test_inert_without_hold_h(self):
+        d, cfg = project()
+        self.assertIsNone(janus.land_first_block(cfg, [], {}))
+
+
+class QualifyRoute(unittest.TestCase):
+    """ranked 10 / S1 free-first: a model marked unqualified is skipped for normal work until a pass is recorded; a qualify unit
+    may still use it. The failure caught: a free/new model doing real work before anyone saw what it can do."""
+
+    def test_unqualified_model_skipped_until_a_pass(self):
+        d, cfg = project('\n[models.free]\nprovider = "api"\nkind = "claude"\nqualified = false\n[routing]\nnormal = ["free"]\n')
+        with self.assertRaises(janus.Err) as e: janus.pick_model(cfg, "normal", "implement", None)
+        self.assertIn("not qualified", str(e.exception))
+        self.assertEqual(janus.pick_model(cfg, "normal", "qualify", None), "free")     # a qualify unit may use it
+        janus.cmd_qualify(cfg, type("A", (), {"model": "free", "fail": False, "note": "did a small task"})())
+        self.assertEqual(janus.pick_model(cfg, "normal", "implement", None), "free")   # a recorded pass clears the skip
+
+    def test_first_review_pass_uses_the_earliest_review(self):
+        d, cfg = project()
+        for n, v in (("u1", "DONE"), ("r1", "DONE"), ("u2", "DONE"), ("r2", "BLOCKED")):
+            (d / f"out/{n}").mkdir(parents=True); (d / f"out/{n}/report.json").write_text(json.dumps({"verdict": v}))
+        cfg.run.all_units = {"u1": {"name": "u1", "model": "m1"}, "r1": {"name": "r1", "of": "u1", "started": 5},
+                             "u2": {"name": "u2", "model": "m1"}, "r2": {"name": "r2", "of": "u2", "started": 5},
+                             "u3": {"name": "u3", "model": "m2"}}                             # no review of u3: not counted
+        self.assertEqual(janus.first_review_pass(cfg), {"m1": (1, 1)})
+
+
+class DeferredLaunch(unittest.TestCase):
+    """S3 first-collection-means-working: an owner deferral labelled on the instruction stops a unit it names from being started
+    silently. The failure caught: starting work the owner deferred until after a milestone."""
+
+    def test_a_deferral_naming_the_unit_or_its_item_refuses(self):
+        d, cfg = project()
+        class B:
+            def __init__(s, c): pass
+            def issues(s, label, status="open"):
+                return [{"id": "g-1", "title": "defer u (item:x) until after first collection", "labels": ["deferral"]}]
+        real = janus.Beads; janus.Beads = B
+        try:
+            self.assertIn("deferred", janus.deferred_block(cfg, "u", None) or "")       # the unit is named
+            self.assertIn("deferred", janus.deferred_block(cfg, "other", "item:x") or "")   # its item is named
+            self.assertIsNone(janus.deferred_block(cfg, "other", "item:y"))
+        finally: janus.Beads = real
 
 
 class Soak(unittest.TestCase):

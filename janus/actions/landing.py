@@ -5,8 +5,8 @@ from janus.actions.jobs import cmd_run, ensure_lanes, tree_guard
 from janus.actions.launch import cmd_launch
 from janus.actions.swarm import write_index
 from janus.beads import Beads
-from janus.context import Err, JANUS_SELF, X, atomic_write, note_event, now, pq, say, sh, ts
-from janus.gates import GATE_DEFAULT, GATE_LINE, judge_gate, landed
+from janus.context import Err, JANUS_SELF, X, atomic_write, hrun, note_event, now, pq, say, sh, ts
+from janus.gates import GATE_DEFAULT, GATE_LINE, baseline_failures, gate_baseline, gate_ids, judge_gate, landed
 from janus.project import tag
 from janus.probe import pueue
 from janus.quality import land_review
@@ -14,10 +14,51 @@ from janus.units import all_units, get_unit, own_tree
 
 def cmd_gate_judge(cfg, a):
     r, new, known = judge_gate(cfg, a.name, a.rc)
-    extra = (f" KNOWN={len(known)}" if known else "") + (f" NEW={','.join(new[:20])[:400]}" if new and new != [f"exit {a.rc}"] else "")
+    b = gate_baseline(cfg, a.name)
+    base = (f" BASE={b}({len(baseline_failures(cfg, a.name))})" if b else "")
+    extra = (f" KNOWN={len(known)}" if known else "") + base + (f" NEW={','.join(new[:20])[:400]}" if new and new != [f"exit {a.rc}"] else "")
     return 0 if r == "PASS" else 1, [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {a.name} EXIT_tests={a.rc}{extra} RESULT: {r}"]
 
 def gate_times(cfg): return cfg.jget("gate-times.json")
+
+# The lines of a gate's own output that look like the first error (the soak-40 need: `janus queue --log <gate task>` printed only
+# host headers and gate-judge only the RESULT line, so nothing showed why a gate failed).
+GERR_RX = re.compile(r"(?i)\b(error|failed|failure|assert(ion)?|panic|traceback|not found|no such file|expected|"
+                     r"exit(ed)? [1-9]|exit code [1-9])\b")
+
+def cmd_gate_log(cfg, a):
+    """janus gate-log <name> [--task <host>:<id>]: a failed gate's per-step summary and first error line. The RESULT line and
+    failing/passing test ids come from the gate log and out/<name>/{failed,passed}.txt; the per-step EXIT_<step>=<rc> lines and
+    the first error come from the gate's own output (the pueue task it was queued as, recorded in out/<name>/task.txt, or
+    --task, or a saved out/<name>/log). Read-only."""
+    name = a.name; out = cfg.p("out", "out"); L = []
+    try: ls = [l for l in cfg.p("gate_log").read_text().splitlines() if (m := GATE_LINE.match(l)) and m.group(1) == name]
+    except OSError: ls = []
+    last = ls[-1] if ls else None
+    if last: L.append("result: " + last)
+    else: L.append(f"gate {name}: no RESULT line in {cfg.p('gate_log')}")
+    f_ids = gate_ids(cfg, name, "failed")
+    if f_ids: L.append(f"failed test(s) ({len(f_ids)}): " + ", ".join(f_ids[:20]) + ("..." if len(f_ids) > 20 else ""))
+    p_ids = gate_ids(cfg, name, "passed")
+    if p_ids is not None: L.append(f"passed test(s): {len(p_ids)}")
+    log = None; ref = a.task or ((out / name / "task.txt").read_text().strip() if (out / name / "task.txt").is_file() else "")
+    if ref:
+        hn, _, tid = ref.partition(":"); h = cfg.hosts.get(hn)
+        if h and tid.strip().isdigit():
+            rc, o, e = hrun(h, f"{pueue(h)} log {int(tid)}", timeout=30)
+            if rc == 0: log = o
+    if log is None:
+        for f in (out / name / "log", out / name / "gate.log"):
+            if f.is_file(): log = f.read_text(errors="replace"); break
+    if log is None:
+        L.append("no gate output found (recorded task out/<name>/task.txt, --task <host>:<id>, or out/<name>/log)")
+    else:
+        steps = re.findall(r"EXIT_(\w+)=(\d+)", log)
+        if steps: L.append("steps: " + ", ".join(f"{s}=rc{r}" for s, r in steps))
+        errs = [l.strip() for l in log.splitlines() if GERR_RX.search(l)]
+        L.append("first error line(s):" if errs else "no error-looking line; last lines:")
+        for l in (errs[:5] if errs else log.splitlines()[-8:]): L.append("  " + l[:220])
+    return (0 if last and last.endswith("RESULT: PASS") else 1), L
 
 def gate_estimate(cfg, name):
     """Minutes a gate is expected to take: the median of its own last runs, else of the gates of the same family (the name with
@@ -95,6 +136,15 @@ def cmd_gate(cfg, a):
     --unit (default $JANUS_UNIT) records the gate on that unit, for the landing check."""
     out = cfg.p("out", "out"); t = out / a.name / "tests.sh"
     if not t.is_file(): raise Err(f"{t} not found")
+    # Baseline (decision 0002): --baseline <name> records a run of the landing branch on the same host whose failures are main's,
+    # not the unit's; --baseline none clears it. The gate script's gate-judge reads out/<name>/baseline.txt.
+    bl = getattr(a, "baseline", None)
+    if bl == "none": (out / a.name / "baseline.txt").unlink(missing_ok=True)
+    elif bl:
+        if not (out / bl / "failed.txt").is_file() and not (out / bl / "tests.sh").is_file():
+            raise Err(f"--baseline {bl}: no recorded gate out/{bl} (a run of the landing branch on the same host); run it first")
+        (out / a.name).mkdir(parents=True, exist_ok=True); atomic_write(out / a.name / "baseline.txt", bl + "\n")
+        say(f"gate {a.name}: baseline {bl} (its failures are treated as the branch's, not the unit's)")
     h = cfg.hosts[next(n for n, x in cfg.hosts.items() if x.get("local"))]
     env = {"JANUS_LANE": "gates", "JANUS_ROOT": str(cfg.root)} | ({cfg.paths.get("gate_host_env", "JANUS_TEST_HOST"): a.host} if a.host else {})
     pre = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
@@ -125,6 +175,7 @@ def cmd_gate(cfg, a):
     if cfg.run.dry: return
     tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid} in {group}"
                          + (f" (expected {est:g} min)" if est is not None else "") + (f", limit {lim} min" if lim else ""))
+    atomic_write(out / a.name / "task.txt", f"{next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid}\n")   # janus gate-log reads its output
     if not a.wait: return
     subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {tid}"])
     lines = [l for l in cfg.p("gate_log").read_text().splitlines() if (m := GATE_LINE.match(l)) and m.group(1) == a.name]
