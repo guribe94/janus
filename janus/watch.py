@@ -4,7 +4,7 @@ import argparse, os
 from janus.actions.backlog import cmd_fill
 from janus.actions.jobs import cancel_job, job_state, orphan_jobs, task_rc, tend_thrash, wrap_token, wrapped_jobs
 from janus.actions.launch import new_tab, wait_shell
-from janus.actions.lifecycle import tend_checkpoint, tend_parked
+from janus.actions.lifecycle import tend_checkpoint, tend_parked, tend_resumable
 from janus.actions.tidy import tend_tidy
 from janus.board import board, board_alerts, board_dir, board_files
 from janus.autopilot import record, tend_autopilot
@@ -33,6 +33,7 @@ def watch_pass(cfg, log):
     board_alerts(cfg, log)
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (janus-fixes9)
     tend_checkpoint(cfg, hs, units, log)   # a run near its budget is ordered once to commit, report and park (budget-follow item 6)
+    tend_resumable(cfg, hs, units, log)   # units stopped by their budget: recorded, and resumed first when the cap has room (item 7)
     tend_autopilot(cfg, hs, units, F, log)   # [autopilot] enabled: the ending policy's fixed-rule actions (janus/autopilot.py)
     tend_thrash(cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job (fixes10 item 3)
     tend_tidy(cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)

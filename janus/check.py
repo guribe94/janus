@@ -19,7 +19,7 @@ from janus.findings.memory import memory_findings, rule_findings
 from janus.findings.quality import test_signal_findings
 from janus.findings.sched import overrun_findings
 from janus.findings.units import (budget_findings, cap_findings, card_findings, ledger_findings, peer_findings,
-    report_findings, reserve_findings, spend_findings, unit_findings)
+    report_findings, reserve_findings, resumable_findings, spend_findings, unit_findings)
 from janus.findings.work import (backlog_findings, gate_findings, git_findings, known_failure_findings, landing_findings,
     orchestrator_findings, session_findings)
 from janus.ledger import committed
@@ -63,7 +63,7 @@ def collect_findings(cfg, hs, units, ag, bd_err, bd=None):
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
     F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running)
     F += decision_findings(cfg)
-    F += spend_findings(cfg) + reserve_findings(cfg, units)
+    F += spend_findings(cfg) + reserve_findings(cfg, units) + resumable_findings(cfg, units)
     if not cfg.run.ro and not cfg.run.dry: F = enforce(cfg, F, viol)
     return [finding(k, t) for k, t in F]
 

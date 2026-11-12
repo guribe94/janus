@@ -401,4 +401,85 @@ class Item9ResumeFigures(unittest.TestCase):
         janus.unit_findings(self.cfg, hs, [u], {})
         self.assertNotEqual(u.get("state"), "parked", u.get("_park")); self.assertTrue(janus.wrap_due(self.cfg, u))
 
+class Item7Resumable(unittest.TestCase):
+    """A unit stopped by its budget is recorded resumable, its money is kept, and it is resumed before any new work."""
+    def setUp(self):
+        self.d, self.cfg = project('\n[autopilot]\nenabled = true\n[backlog]\nfile = "S.md"\n[routing]\nnormal = ["m"]\ncritical = ["m"]\n')
+        self.pv = self.cfg.prov["api"]; self.mc = self.cfg.models["m"]; rates(self.d)
+        for run, c in (("u1.1.100", 2.0), ("u1.r2.200", 0.3)):            # a $2 run stopped at its cap, then its wrap-up run
+            janus.reserve_budget(self.cfg, self.mc, "u1", 2, run); janus.ledger_done(self.cfg, self.pv, run, "u1", c, 0)
+        self.u = api_unit(self.d, budget=2.0, state="done", verdict="VERDICT: BLOCKED - stopped at the budget", run="u1.r2.200", runs=["u1.1.100", "u1.r2.200"], wrapup="u1.r2.200")
+        (self.d / "out/u1").mkdir(); (self.d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\nstep 1 done\nVERDICT: BLOCKED - stopped at the budget\n")
+        (self.d / "out/u1/api.json").write_text(json.dumps({"total_cost_usd": 2.3, "session_id": "sid", "subtype": "success"}))
+        FakeBeads.units_ = [self.u]; self.real = janus.Beads; janus.Beads = FakeBeads; self.log = []; self.got = {}
+        self.home = FakeHome(self.d); transcript(self.home.__enter__(), self.d, "sid", 100000)      # loading it again: $0.50
+    def tearDown(self): janus.Beads = self.real; self.home.__exit__()
+
+    def tend(self, *units):
+        with contextlib.ExitStack() as st:
+            for m in resume_stubs(self.got): st.enter_context(m)
+            janus.tend_resumable(self.cfg, {}, list(units or [self.u]), self.log.append)
+        return [c for c in self.got.get("cmds", []) if "--resume-session" in c]
+
+    def test_a_capped_unit_is_recorded_resumable_and_its_money_is_kept(self):
+        """Catches (item 7): a unit stopped at its budget was only reported (waste:<unit>); nothing recorded that it could go on,
+        and new units took the cap's last money, so it never could."""
+        self.pv["cap_usd"] = 4.0                                          # $2.30 committed: no room for the $1.50 it needs ($1.80 held)
+        self.assertEqual(self.tend(), [], self.log)
+        self.assertEqual(self.u["resumable"]["need"], 1.5)                # a new unit's $1 plus $0.50 to load its context again
+        self.assertEqual(janus.finish_reserve(self.cfg, "api", [self.u]), (1.8, {"u1": 1.8}))
+        F = dict(janus.resumable_findings(self.cfg, [self.u]))
+        self.assertIn("resumed first", F.get("unit:u1:resumable", ""), F); janus.finding("unit:u1:resumable", "x")
+        self.pv["cap_usd"] = 5.0                                          # room for u1 OR one new $1 unit: u1 comes first
+        (self.d / "S.md").write_text("| # | item | status |\n|---|---|---|\n| X1 | one | READY |\n")
+        (self.d / "briefs/x1-a.md").write_text("# x1\nITEM: X1\n"); self.cfg.hosts["here"].update(ram_gb=64, cores=16)
+        plan, stops = janus.fill_plan(self.cfg, {"here": host_probe(name="here")}, [self.u])
+        self.assertEqual(plan, [], "a new unit was planned on the money a resumable unit waits for"); self.assertIn("kept for 1 open unit(s)", str(stops))
+
+    def test_it_is_resumed_in_its_own_session_when_budget_is_freed_or_added(self):
+        """Catches (item 7): after the cap was raised (or other runs ended under their budgets) a capped unit stayed stopped
+        until the orchestrator relaunched it by hand, as a new agent without its context."""
+        self.pv["cap_usd"] = 4.0; self.tend(); self.assertEqual(self.tend(), [])
+        self.pv["cap_usd"] = 5.0                                          # budget added
+        cmds = self.tend()
+        self.assertEqual(len(cmds), 1, self.log); self.assertIn("--resume-session sid", cmds[0]); self.assertIn("--budget 1.5", cmds[0])
+        self.assertNotIn("resumable", self.u); self.assertEqual(self.u["topups"], 1); self.assertEqual(self.u["budget"], 3.5)
+        self.assertEqual(list(held(self.d, self.cfg).values()), [1.5]); self.assertNotIn("wrapup", self.u)   # a later cap is wrapped up again
+        self.assertIn("continue", (self.d / "out/u1/resume-3.md").read_text())
+
+    def test_the_oldest_resumable_unit_goes_first_and_the_resumes_are_bounded(self):
+        """Catches (item 7): two resumable units each kept the other from the cap's room (neither resumed), and a unit that is
+        capped every time must not be given new money without end."""
+        for run, c in (("u2.1.300", 2.0), ("u2.r2.400", 0.3)): janus.reserve_budget(self.cfg, self.mc, "u2", 2, run); janus.ledger_done(self.cfg, self.pv, run, "u2", c, 0)
+        u2 = {**self.u, "name": "u2", "run": "u2.r2.400", "runs": ["u2.1.300", "u2.r2.400"], "wrapup": "u2.r2.400"}
+        (self.d / "out/u2").mkdir(); (self.d / "out/u2/REPORT.md").write_text("VERDICT: BLOCKED - stopped at the budget\n")
+        (self.d / "out/u2/api.json").write_text(json.dumps({"total_cost_usd": 2.3, "session_id": "sid", "subtype": "success"}))
+        self.pv["cap_usd"] = 6.5; self.u["resumable"] = {"why": "capped", "need": 1.5, "at": 5}; u2["resumable"] = {"why": "capped", "need": 1.5, "at": 9}
+        cmds = self.tend(u2, self.u)                                      # $4.60 committed: room for one $1.80 hold, not two
+        self.assertEqual(len(cmds), 1, self.log); self.assertIn("u1.r3.", cmds[0]); self.assertIn("resumable", u2)
+        u2["topups"] = 2; self.pv["cap_usd"] = 20
+        self.assertEqual(len(self.tend(u2)), 1, "a unit already resumed [autopilot] relaunch_max times got new money again")   # still u1's one
+        self.assertNotIn("resumable", u2); self.assertIn("unit:u2:resume-limit", dict(janus.resumable_findings(self.cfg, [u2])))
+
+    def test_a_parked_unit_whose_budget_cannot_pay_its_resume_is_resumed_with_a_new_one(self):
+        """Catches (item 7): a parked unit whose jobs had finished but whose budget could no longer pay for loading its context
+        was refused the resume on every watcher pass, for ever."""
+        u = {**self.u, "verdict": None, "_park": ["here:5"], "state": "parked", "parked": {"jobs": ["here:5"]}}; u.pop("wrapup")
+        (self.d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\nWAITING here:5\n")
+        hs = {"here": {"ok": True, "pueue": {"tasks": {"5": {"status": {"Done": {"result": "Success"}}}}}}}
+        with contextlib.ExitStack() as st:
+            for m in resume_stubs(self.got): st.enter_context(m)
+            st.enter_context(mock.patch.object(janus, "refresh_remote", lambda *a, **k: None)); st.enter_context(mock.patch.object(janus, "job_result", lambda *a: (0, "/log")))
+            janus.tend_parked(self.cfg, hs, [u], self.log.append)
+            self.assertEqual(u.get("resumable", {}).get("need"), 1.5, self.log)   # $2.30 of $2 used: nothing left for the reload
+            janus.tend_resumable(self.cfg, hs, [u], self.log.append)
+        text = (self.d / "out/u1/resume-3.md").read_text()
+        self.assertIn("Your jobs finished", text); self.assertIn("here:5: exit 0", text); self.assertEqual(u.get("handled_jobs"), ["here:5"])
+
+    def test_without_the_unattended_loop_it_is_recorded_and_left_to_the_orchestrator(self):
+        """Catches (item 7): with the loop off the orchestrator must be told the unit is resumable and how."""
+        self.cfg.c["autopilot"]["enabled"] = False
+        self.assertEqual(self.tend(), []); self.assertEqual(self.u["resumable"]["need"], 1.5)
+        self.assertIn("janus resume u1 --budget 1.5", dict(janus.resumable_findings(self.cfg, [self.u])).get("unit:u1:resumable", ""))
+
 if __name__ == "__main__": unittest.main()

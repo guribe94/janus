@@ -3,6 +3,7 @@ a verdict, the waste pause and a due report, unreconciled ledger runs, and peers
 import concurrent.futures as cf, json, re, time
 from pathlib import Path
 from janus.actions.jobs import job_state, unit_jobs
+from janus.autopilot import apc, held
 from janus.board import board_dir, board_questions, board_rows
 from janus.budgets import bset, finish_reserve, last_checkpoint, names_some, unit_spend, waste_paused, work_written
 from janus.context import DIFF_X, atomic_write, fl, hrun, now, qp, sh, ts
@@ -225,6 +226,25 @@ def ledger_findings(cfg, units):
             done = sum(r["cost"] or 0.0 for r in runs.values() if r["done"])
             if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (done ${done:.2f} vs committed ${spend(runs):.2f}; ${sum(x[2] for x in ur):.2f} held as running: "
                              + ", ".join(f"{x[0]} {x[3]}" for x in ur[:3])[:240] + "): janus ledger reconcile"))
+    return F
+
+def resumable_findings(cfg, units):
+    """unit:<n>:resumable: a unit stopped by its budget waits for money (budget-follow item 7); unit:<n>:resume-limit: it was given a
+    new budget [autopilot] relaunch_max times and stopped at it each time."""
+    F = []
+    for u in units:
+        n = u["name"]; r = u.get("resumable"); p = cfg.models.get(u.get("model"), {}).get("provider")
+        if u.get("resume_limit"):
+            F.append((f"unit:{n}:resume-limit", f"{n} was given a new budget {u['resume_limit']} time(s) and was stopped at it each time ([autopilot] relaunch_max): "
+                      f"read its report; split the work, resume it by hand (janus resume {n} --budget <usd>), or close it (janus close {n})"))
+        if not r or u.get("state") in ("working", "queued"): continue
+        need = r.get("need") or 0; kept = f"${reserved(cfg, need):.2f} of {p}'s cap is kept for it (${need:g} and the overshoot margin)"
+        if apc(cfg, "enabled") and not held(cfg, n):
+            F.append((f"unit:{n}:resumable", f"{n} was stopped by its budget ({r.get('why')}) and is resumable: it is resumed first, before any new unit, in its own "
+                      f"session and tree, as soon as {p} has room; {kept}. To give it room now ask the owner to raise {p}'s cap_usd, or close it (janus close {n})"))
+        else:
+            F.append((f"unit:{n}:resumable", f"{n} was stopped by its budget ({r.get('why')}) and is resumable; {kept}: janus resume {n} --budget {need:g} continues it "
+                      f"in its own session and tree, or close it (janus close {n})"))
     return F
 
 def reserve_findings(cfg, units):
