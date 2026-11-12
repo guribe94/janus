@@ -519,9 +519,17 @@ def wrap_token(t):
     """The token under which a task records the jobs it queues: its job id (job scripts), or JANUS_WRAP=<token> (gates)."""
     m = WRAP_RX.search((t or {}).get("command", "")); return m.group(1) if m else job_of(t)
 
-def wrapped_jobs(cfg, tok):
-    try: return [l.split()[0] for l in (cfg.f("runs") / "wrap" / tok).read_text().splitlines() if l.strip()]
+def wrapped_records(cfg, tok):
+    """[(<host>:<task>, <job id>)] a wrapper recorded (the job id is "" in an old record that has none)."""
+    try: return [(l.split()[0], l.split()[1] if len(l.split()) > 1 else "") for l in (cfg.f("runs") / "wrap" / tok).read_text().splitlines() if l.strip()]
     except OSError: return []
+
+def wrapped_jobs(cfg, tok): return [r for r, _ in wrapped_records(cfg, tok)]
+
+def same_job(t, jid):
+    """Whether live task t is the job a wrapper recorded under jid: pueue reuses task ids, so an id alone can name another job
+    (even of the same project) by now; the job's script path in its command carries its job id. An old record without one: yes."""
+    return not jid or job_of(t) == jid
 
 def stop_job_cmd(h, jid):
     """Shell that stops what a job left behind, by name: its podman container (runner podman) or its systemd scope (Linux)."""
@@ -541,7 +549,8 @@ def cancel_job(cfg, ref, force=False, depth=0):
         raise Err(f"refused: {hn}:{tid} ({t.get('label')}) is " + ("machine state (no project id)" if untagged(t) else "another project's job")
                   + f": janus acts only on its own; if it must go, pueue kill {tid} on {hn} by hand")
     if t.get("group") not in LANES and not str(own_label(cfg, t)).startswith(("unit:", "run:", "gate:")): raise Err(f"{hn}:{tid} is not a janus lane job ({t.get('label')}); stop units with janus stop")
-    jid = job_of(t); tok = wrap_token(t); inner = wrapped_jobs(cfg, tok) if tok else []; out = []
+    jid = job_of(t); tok = wrap_token(t); out = []
+    recs = wrapped_records(cfg, tok) if tok else []; inner = [r for r, _ in recs]
     if cfg.run.dry:
         out.append(f"+ save {hn}:{tid}'s files; {stop_job_cmd(h, jid)}{pueue(h)} kill {tid}; remove" + (f"; then follow its jobs {', '.join(inner)}" if inner else ""))
     else:
@@ -552,11 +561,11 @@ def cancel_job(cfg, ref, force=False, depth=0):
         elif not jid: save_task_log(cfg, h, {"name": f"_cancelled/{hn}-{tid}"}, tid)
         hrun(h, f"{pueue(h)} kill {tid} 2>/dev/null; {stop_job_cmd(h, jid)}sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true", timeout=60)
         out.append(f"cancelled {hn}:{tid} ({t.get('label')}); its files are in {cfg.f('runs') if jid and not h.get('local') else runs_dir(cfg, h) if jid else cfg.p('out', 'out') / '_cancelled'}")
-    for r in inner:
+    for r, rj in recs:
         if depth > 3: break
         try:
-            st = task_rc(task_status(cfg.hosts[r.split(':')[0]], r.split(':')[1])) if r.split(":")[0] in cfg.hosts else 0
-            if st is None: out += cancel_job(cfg, r, force, depth + 1)
+            it = task_status(cfg.hosts[r.split(':')[0]], r.split(':')[1]) if r.split(":")[0] in cfg.hosts else None
+            if it and task_rc(it) is None and same_job(it, rj): out += cancel_job(cfg, r, force, depth + 1)   # not a reused id
         except Err as e: out.append(f"{r}: {e}")
     return out
 
@@ -684,9 +693,9 @@ def orphan_jobs(cfg, hs, units):
     except OSError: recs = []
     for f in recs:
         if f.name in live: continue
-        for r in wrapped_jobs(cfg, f.name):
-            hn, _, tid = r.partition(":")
-            if own_label(cfg, (((hs.get(hn) or {}).get("pueue") or {}).get("tasks") or {}).get(tid)) is None: continue   # a reused id
+        for r, jid in wrapped_records(cfg, f.name):
+            hn, _, tid = r.partition(":"); lt = (((hs.get(hn) or {}).get("pueue") or {}).get("tasks") or {}).get(tid)
+            if own_label(cfg, lt) is None or not same_job(lt, jid): continue   # a reused id (another project's, or another job of this one)
             st = job_state(hs, r)[0]
             if st in ("queued", "admission", "running") and r not in {x for x, _ in out}: out.append((r, f"its wrapper {f.name} has ended"))
             # records of wrappers that ended long ago and whose jobs are done are cleared by the watcher
