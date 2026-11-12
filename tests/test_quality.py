@@ -2,7 +2,7 @@
 review and janus soak. Each test names the failure it catches. Standard library only; no network, no API spend.
 
 Run by ./check (it discovers tests/test_*.py)."""
-import json, os, subprocess, sys, tempfile, textwrap, unittest
+import json, os, subprocess, sys, tempfile, textwrap, time, unittest
 from pathlib import Path
 
 from janusload import load
@@ -222,6 +222,38 @@ class QualityFinding(unittest.TestCase):
     def test_no_report_json_is_not_judged(self):
         self.commit("tests/test_u.py")
         self.assertEqual(self.keys(), [])                                        # the report.json rule is prompted, not enforced, without it
+
+
+class RemoteBriefText(unittest.TestCase):
+    """ranked gap 12 / S2 remote-unit-no-git: a brief for an agent on a host without a git tree states there is no git and to
+    list the files it changed, so a remote unit does not waste a run on git commands that cannot work there. The failure caught:
+    a remote unit running git in a `.git`-less copy and losing its work."""
+
+    def test_remote_header_says_no_git_and_local_does_not(self):
+        d, cfg = project('\n[hosts.ra]\nssh = "nowhere"\nroot = "/x"\n')
+        hd = janus.brief_header(cfg, "ra", cfg.hosts["ra"], "u", "/x/worktrees/u", False, report="/x/out/u/REPORT.md")
+        self.assertIn("No git here", hd)
+        self.assertIn("list every file you changed", hd)
+        loc = janus.brief_header(cfg, "here", cfg.hosts["here"], "u", str(d), True)
+        self.assertNotIn("No git here", loc)
+
+
+class ReportCheckpoint(unittest.TestCase):
+    """ranked gap 12 / S1 the-orchestrator-reports-status: report-due fires at event checkpoints (a landing, a close, an owner
+    instruction, a decision) and not only at the clock. The failure caught: a landing or a unit ending with no report to the
+    owner until the next time checkpoint."""
+
+    def test_event_checkpoints_trigger_report_due(self):
+        d, cfg = project('\n[report]\nevery_h = 0\n')
+        cfg.touch("report_sent")
+        self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], [])           # nothing new: no report
+        old = time.time() - 1000; os.utime(cfg.f("report_sent"), (old, old))
+        cfg.jput("events.json", {"launch": time.time()})                               # a launch is routine: no report
+        self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], [])
+        cfg.jput("events.json", {"landing": time.time()})                              # a landing: report to the owner
+        self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], ["report-due"])
+        cfg.touch("report_sent")
+        self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], [])           # sent after the event: clear
 
 
 class Soak(unittest.TestCase):
