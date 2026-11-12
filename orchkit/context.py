@@ -57,7 +57,7 @@ class Cfg:
         self.state = root / pr.get("state", ".orch"); self.state.mkdir(exist_ok=True)
         self.beads = root / pr.get("beads", ".")
         self.cycle = pr.get("cycle_min", 15) * 60; self.deadline = pr.get("deadline_min", 30) * 60
-        self.silent = pr.get("silent_min", 30) * 60; self.unreach = pr.get("unreachable_min", 20) * 60
+        self.silent = pr.get("silent_min", 30) * 60
         self.reset_tokens = pr.get("reset_tokens", 150000)
         self.hosts = self.c.get("hosts", {}); self.prov = self.c.get("providers", {})
         self.models = self.c.get("models", {}); self.route = self.c.get("routing", {})
@@ -82,8 +82,6 @@ class Cfg:
 # never the caller's: pueue stores a task's whole environment in its state file, so a caller's ANTHROPIC_API_KEY, messaging
 # token or HERDR_PANE_ID would be written to disk (audit H1, M2).
 ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SSH_AUTH_SOCK", "TZ", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME")
-
-SECRET_ENV = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.I)
 
 def clean_env(extra=None):
     e = {k: os.environ[k] for k in ENV_KEEP if k in os.environ}
@@ -230,4 +228,4 @@ def slug(t): return re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:40]
 def refuse_agent(what):
     if os.environ.get("ORCH_ROLE") == "agent": raise Err(f"refused: {what} is the orchestrator's (an agent proposes with board.sh post <you> learned <text>)")
 
-__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "SECRET_ENV", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "ORCH_SELF", "ORCH_MARK", "handoff_path", "notes_state", "handoff_stale", "DIFF_X", "slug", "refuse_agent"]
+__all__ = ["SSH", "EXCL", "WAKE", "LB", "LE", "NOTES_H", "NOTES0", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "ORCH_SELF", "ORCH_MARK", "handoff_path", "notes_state", "handoff_stale", "DIFF_X", "slug", "refuse_agent"]

@@ -96,7 +96,7 @@ def cmd_gate(cfg, a):
     h = cfg.hosts[next(n for n, x in cfg.hosts.items() if x.get("local"))]
     env = {"ORCH_LANE": "gates", "ORCH_ROOT": str(cfg.root)} | ({cfg.paths.get("gate_host_env", "ORCH_TEST_HOST"): a.host} if a.host else {})
     pre = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-    rh = cfg.paths.get("gate_runner") or cfg.paths.get("run_handoff")
+    rh = cfg.paths.get("gate_runner", "")
     run = (shlex.quote(str(cfg.root / rh)) + " " + shlex.quote(a.name)) if rh else \
           shlex.join(["sh", "-c", GATE_DEFAULT, "gate", str(t), a.name, str(cfg.p("gate_log", "out/gates.log")), sys.executable, str(ORCH_SELF)])
     ld = cfg.c.get("landing", {}); lim = a.timeout_min if a.timeout_min is not None else ld.get("gate_timeout_min", 0)
