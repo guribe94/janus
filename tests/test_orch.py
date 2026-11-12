@@ -685,6 +685,17 @@ class Board(unittest.TestCase):
         p = orch.agent_prompt(cfg, "u", "/b.md", "far")
         self.assertIn("/r/bin/board.sh post u status", p); self.assertNotIn(str(orch.ORCH_SELF.parent), p)
 
+    def test_board_contract_is_python_with_one_validator(self):
+        """Step 3b: board.sh is a thin shim over the Python module; one name validator refuses path names and '..'."""
+        d, cfg = project(); cfg.run.ro = False
+        names = dict(orch.board_shipped(cfg))
+        self.assertEqual(set(names), {"board.sh", "msgboard.py"})
+        self.assertIn("msgboard.py", names["board.sh"])          # the shim execs the module next to it
+        self.assertIn("- state: open", names["msgboard.py"])     # the card schema and the question ids live here (one place)
+        for bad in ("../evil", "a/b", "..", "."):
+            rc, o, e = orch.board(cfg, "post", bad, "status", "x"); self.assertEqual(rc, 2, bad); self.assertIn("bad agent name", e)
+
+
 class ReviewFixes9(unittest.TestCase):
     """review-fixes9 findings: each test failed before its fix."""
     def fake_remote(self, d):

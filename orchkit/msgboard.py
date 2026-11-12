@@ -51,8 +51,16 @@ def epoch_of(t):
     except (ValueError, OverflowError): return 0
 
 
+NAME_RX = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def goodname(a):
+    """The one card-name rule: every command and every merged outbox line uses it (no path separators, no '..')."""
+    return bool(a) and a not in (".", "..") and bool(NAME_RX.fullmatch(a))
+
+
 def okname(a):
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", a or ""): raise Die(f"bad agent name '{a}'")
+    if not goodname(a): raise Die(f"bad agent name '{a}'")
 
 
 def oneline(words): return re.sub(r"[\n\r\t]", " ", " ".join(words))
@@ -322,7 +330,7 @@ class Board:
             f = l.split(" ", 3)
             if len(f) < 4: continue
             d, tm, a, r = f; k = r.split(":", 1)[0]; x = r.split(": ", 1)[1] if ": " in r else r
-            if k not in KINDS or not re.fullmatch(r"[A-Za-z0-9._-]+", a): continue
+            if k not in KINDS or not goodname(a): continue
             self.apply(f"{d} {tm}", a, k, x, host=host)
 
     def cmd_sync(self, *_):
