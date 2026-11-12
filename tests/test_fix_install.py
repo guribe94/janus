@@ -517,6 +517,56 @@ class Item4Localtest(unittest.TestCase):
         self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
 
 
+class Item5HandoverOrder(unittest.TestCase):
+    def test_a_handover_is_refused_before_the_successor_starts(self):
+        """Catches (finding 5): launch accepted the predecessor's tree, started the successor, and only then refused to close the
+        predecessor (its Err became a 'note:'), so two agents ran in one tree or the successor worked from a stale base."""
+        base, R, g = git_repo("i5a")
+        W = base / "wt"; g("worktree", "add", "-q", str(W), "-b", "u1")
+        d, cfg = launch_cfg(); cfg.run.dry = True
+        b = d / "briefs/u2.md"; b.write_text("TIER: NORMAL\nSCOPE: x\nREPORT.md\nDONE-WHEN: done\n")
+        u1 = {"id": "t-1", "name": "u1", "host": "here", "cwd": str(W), "state": "working"}
+        calls = []
+        saved = {k: getattr(janus, k) for k in ("Beads", "herdr", "choose", "model_ok", "read_secret", "budget_for", "reserve_budget",
+                                                "X", "waste_block", "task_status", "confirm_started", "board")}
+        janus.Beads = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [u1], "create": lambda s, *a: "t-9",
+                                     "run": lambda s, *a: [], "save": lambda s, x: None, "comment": lambda s, *a: None})
+        janus.waste_block = lambda cfg: None; janus.choose = lambda *a, **k: ("here", "here", "ok")
+        janus.model_ok = lambda cfg, m: (True, ""); janus.read_secret = lambda pv: None
+        janus.budget_for = lambda *a, **k: (1.0, "stub"); janus.herdr = lambda *a, **k: None; janus.board = lambda *a, **k: None
+        janus.reserve_budget = lambda *a, **k: (calls.append("reserve"), "u2.r1")[1]
+        janus.X = lambda cfg, h, cmd, **k: (calls.append(str(cmd)[:30]), (0, "", ""))[1]
+        janus.task_status = lambda h, t: {"status": {"Running": {}}}; janus.confirm_started = lambda *a, **k: ("running", "")
+        import argparse
+        ns = argparse.Namespace(unit="u2", kind="implement", tier="normal", host="here", model="m", brief=str(b), cwd=str(W),
+                                budget=None, test_host=None, allow_main=True, of=None, report=None, resume_of="u1", item=None,
+                                new_worktree=None, from_ref=None, probes={"here": probe_of()}, share_with=None)
+        try:
+            with self.assertRaises(janus.Err) as e: janus.cmd_launch(cfg, ns)
+        finally:
+            for k, v in saved.items(): setattr(janus, k, v)
+        self.assertIn("u1", str(e.exception)); self.assertIn("still working", str(e.exception))
+        self.assertEqual(calls, [], "the successor was started before the handover was refused")
+
+    def test_close_refuses_a_handover_whose_state_cannot_be_told(self):
+        """Catches (finding 5): a handover closed a predecessor whose state was 'unknown' (its pueue status or probe failed), so
+        it might still be running in the tree the successor works in."""
+        d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/home/x"\n')
+        u = {"id": "t-1", "name": "u1", "host": "far", "via": "pueue", "task": 5, "model": "m", "cwd": "/w/u1"}
+        saved = {k: getattr(janus, k) for k in ("Beads", "uncollected", "probe_all", "herdr_agents", "unit_state", "X")}
+        janus.Beads = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [u], "comment": lambda s, *a: None,
+                                     "run": lambda s, *a: [], "save": lambda s, x: None, "close": lambda s, *a, **k: None})
+        janus.uncollected = lambda cfg, u: None
+        janus.probe_all = lambda cfg: {}; janus.herdr_agents = lambda cfg: {}; janus.unit_state = lambda u, hs, ag: "unknown"
+        calls = []; janus.X = lambda cfg, h, cmd, **k: (calls.append(cmd), (0, "", ""))[1]
+        try:
+            with self.assertRaises(janus.Err) as e:
+                janus.cmd_close(cfg, type("A", (), {"unit": "u1", "force": True, "handover": True, "reason": "handover"})())
+        finally:
+            for k, v in saved.items(): setattr(janus, k, v)
+        self.assertIn("unknown", str(e.exception)); self.assertFalse(any("rm -rf" in c for c in calls))
+
+
 class Item5ReportSync(unittest.TestCase):
     def _remote(self, state="done", via="pueue", **kw):
         d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/home/x"\n')

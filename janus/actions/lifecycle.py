@@ -177,10 +177,11 @@ def cmd_close(cfg, a):
     # the host, so removing it without collect loses work. Only a plain --force skips the guard.
     why = None if (a.force and not handover) or cfg.run.dry else uncollected(cfg, u)
     if why: raise Err(f"refused: {u['name']}: {why}")
-    if handover and not cfg.run.dry:   # never close a predecessor whose agent is still running (finding 3)
+    if handover and not cfg.run.dry:   # never close a predecessor whose agent is still running (finding 3; finding 5: unknown too)
         st = unit_state(u, probe_all(cfg), herdr_agents(cfg))
-        if st in ("working", "queued", "blocked"):
-            raise Err(f"{u['name']}'s agent is still {st}: stop it first (janus stop {u['name']}), then hand its tree over")
+        if st in ("working", "queued", "blocked", "unknown"):
+            what = f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)"
+            raise Err(f"{u['name']}: cannot hand over its tree: its agent is {what}; stop it first (janus stop {u['name']}), then hand its tree over")
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
     if u.get("tab") or u.get("pane"):
         if cfg.run.dry: say(f"+ herdr tab close {u.get('tab') or u.get('pane')}")
