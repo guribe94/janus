@@ -6,7 +6,7 @@ so capacity, budget, caps and the waste pause apply exactly as for the orchestra
 
 The always-on parts (resume parked units, wrap up a capped run, cancel orphan jobs) live in tend_parked and the watcher;
 they record their actions here too."""
-import argparse, contextlib, io, re
+import argparse, contextlib, io
 from janus.beads import Beads
 from janus.board import board, board_dir, board_questions
 from janus.context import Err, now, ts
@@ -101,10 +101,11 @@ def autopilot_findings(cfg, units):
     return F
 
 def answer_from_memory(cfg, log):
-    """An open board question that names a MEMORY.md subject exactly ([key] or the key as a whole word): answered with it."""
+    """An open board question that asks for a MEMORY.md entry explicitly ([key]): answered with it. A key merely mentioned in the
+    text is not an answer (panel-eng F7: "may I skip the gate?" is not answered by the gate fact)."""
     es = [e for e in memory_read(cfg) if e[2]]
     for q, ag, _, tx in board_questions(cfg) or []:
-        hit = [e for e in es if f"[{e[2]}]" in (tx or "") or re.search(rf"(^|-){re.escape(e[2])}($|-)", re.sub(r"[^a-z0-9]+", "-", (tx or "").lower()))]
+        hit = [e for e in es if f"[{e[2]}]" in (tx or "")]
         if len(hit) != 1: continue   # none, or ambiguous: the orchestrator answers
         e = hit[0]; text = f"(janus autopilot, from MEMORY.md [{e[2]}], {e[1]}) {e[3]}"
         if not record(cfg, f"question:{q}", "answer", f"answered from memory [{e[2]}]", ack=f"question:{q}"): continue
