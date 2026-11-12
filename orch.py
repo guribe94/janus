@@ -1086,9 +1086,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         pk = [] if v else ((u.get("parked") or {}).get("jobs") or (waiting_line_jobs(cfg, u) if st in ENDED or u.get("via") == "tmux" else []))
         if pk:
             u["_park"] = pk; u["state"] = st = "parked"
-            js = {j: job_state(hs, j)[0] for j in pk}
-            if any(x in ("paused", "stashed", "locked") for x in js.values()):
-                F.append((f"parked:{u['name']}", f"{u['name']} is parked on {', '.join(f'{j} {x}' for j, x in js.items())}: a job that is not queued or running never resumes it"))
+            F += parked_findings(cfg, hs, u, pk)
         elif st == "working":   # alive while its own jobs wait for admission: it pays to wait (cannot be acked)
             jw = [j for j in unit_jobs(hs, u["name"]) if job_state(hs, j)[0] in ("queued", "admission")]
             if jw:
@@ -1698,7 +1696,9 @@ def cmd_launch(cfg, a):
         if not local:
             root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
             env["ORCH_REPORT"] = f"{root}/out/{name}/REPORT.md"
-            X(h, "mkdir -p " + " ".join(qp(x) for x in (rcwd, f"{root}/briefs", f"{root}/out/{name}", f"{root}/run", f"{root}/base")))
+            rc_, o_, _ = X(h, "mkdir -p " + " ".join(qp(x) for x in (rcwd, f"{root}/briefs", f"{root}/out/{name}", f"{root}/run", f"{root}/base"))
+                           + f" && cd {qp(rcwd)} && pwd -P")
+            if rc_ == 0 and o_.strip().startswith("/"): u["rcwd_abs"] = o_.strip().splitlines()[-1]   # the transcript folder's name (#4)
             cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
             if DRY: say("+ " + shlex.join(cmd))
             elif sh(cmd, timeout=900)[0]: raise Err("rsync to " + hn + " failed")
@@ -2051,8 +2051,7 @@ def session_of(cfg, u):
     h = cfg.hosts.get(u.get("host"), {})
     if h.get("local"):
         f = transcript_of(cfg, u); return f.stem if f else None
-    esc = re.sub(r"[^A-Za-z0-9-]", "-", u.get("rcwd") or "")
-    rc, o, e = hrun(h, f"{h.get('agent_env', '')}\nls -t \"$HOME/.claude/projects/{esc}\"/*.jsonl 2>/dev/null | head -1")
+    rc, o, e = hrun(h, f"s={remote_slug_sh(u)}\n{h.get('agent_env', '')}\nls -t \"$HOME/.claude/projects/$s\"/*.jsonl 2>/dev/null | head -1")
     return Path(o.strip()).stem if rc == 0 and o.strip() else None
 
 def job_result(cfg, hs, ref, agent_host):
@@ -2205,6 +2204,17 @@ def refresh_remote(cfg, u, bd, log):
         pk = waiting_line_jobs(cfg, u)
         if pk: u["_park"] = pk; u["state"] = "parked"
 
+def parked_findings(cfg, hs, u, pk):
+    """parked:<unit>: a job it waits on can never finish; parked:<unit>:resume: its jobs finished but the resume failed."""
+    js = {j: job_state(hs, j)[0] for j in pk}; F = []
+    if any(x in ("paused", "stashed", "locked") for x in js.values()):
+        F.append((f"parked:{u['name']}", f"{u['name']} is parked on {', '.join(f'{j} {x}' for j, x in js.items())}: a job that is not queued or running never resumes it"))
+    re_ = u.get("resume_error") or {}
+    if re_ and all(x in ("done", "gone") for x in js.values()):
+        F.append((f"parked:{u['name']}:resume", f"{u['name']}'s jobs finished but it cannot be resumed ({re_.get('why', '')[:160]}): "
+                  f"orch launch --resume-of {u['name']} with a new budget, or orch close {u['name']}"))
+    return F
+
 def tend_parked(cfg, hs, units, log):
     """The watcher's part: record parked units, resume those whose jobs all finished, wrap up capped runs (item 2)."""
     bd = Beads(cfg)
@@ -2218,7 +2228,11 @@ def tend_parked(cfg, hs, units, log):
                     if card_fields(cfg, u["name"]).get("state") != "waiting": board(cfg, "post", u["name"], "waiting", " ".join(jobs))   # never SILENT/GONE
                 st = [job_state(hs, j)[0] for j in jobs]
                 if all(x in ("done", "gone") for x in st):
-                    log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs)))
+                    try: log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs)))
+                    except Err as e:   # recorded on the unit: check reports it (review-fixes9 #2: the log was the only trace)
+                        if (u.get("resume_error") or {}).get("why") != str(e): u["resume_error"] = {"why": str(e), "at": int(now())}; bd.save(u)
+                        raise
+                    u.pop("resume_error", None)
                     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
                     bd.comment(u["id"], f"{ts()} resumed: jobs {', '.join(jobs)} finished")
                 continue
@@ -2379,7 +2393,7 @@ def gate_results(cfg):
 
 def landed(cfg, u):
     """True when the unit's worktree HEAD is on the landing branch ([landing] branch, default the main repo's HEAD branch):
-    an ancestor of it, or (squash-landed, orch land) its tree is the tree of one of the branch's last 200 commits. None when
+    an ancestor of it, or (squash-landed, orch land) every file it changed has the tip's content (contained). None when
     it cannot be told (no worktree of its own)."""
     c = Path(u.get("cwd", "/"))
     if c.resolve() == cfg.root.resolve() or not c.is_dir(): return None
@@ -2389,8 +2403,16 @@ def landed(cfg, u):
         br = o.strip() if rc == 0 and o.strip() else "main"
     rc, o, e = sh(["git", "-C", str(c), "merge-base", "--is-ancestor", "HEAD", br])
     if rc != 1: return True if rc == 0 else None
-    t = sh(["git", "-C", str(c), "rev-parse", "HEAD^{tree}"])[1].strip()
-    return t in sh(["git", "-C", str(c), "log", "--format=%T", "-n", "200", br])[1].split()
+    return contained(c, br)
+
+def contained(c, br):
+    """True when every file the tree at c changed since it left br has br's tip content (squash-landed, or the same change is
+    on the branch already: nothing left to land). Tree equality with any of the branch's recent commits was too loose: a
+    unit that reverts a change the tip still has matched an old commit (review-fixes9 #5)."""
+    mb = sh(["git", "-C", str(c), "merge-base", "HEAD", br])[1].strip()
+    if not mb: return None
+    fs = [f for f in sh(["git", "-C", str(c), "diff", "--name-only", mb, "HEAD"])[1].splitlines() if f]
+    return sh(["git", "-C", str(c), "diff", "--quiet", br, "HEAD", "--", *fs])[0] == 0 if fs else True
 
 def landing_findings(cfg, units, hs=None):
     ld = cfg.c.get("landing", {}); mins = ld.get("finished_min", 30); need = ld.get("gates_required", 1)
@@ -3449,7 +3471,6 @@ def read_transcript(cfg, u, grep="", tail=40):
     """(rc, condensed text) of the unit's transcript(s), read on the host that holds them."""
     h = cfg.hosts.get(u.get("host"), {"local": True}); kind = cfg.models.get(u.get("model"), {}).get("kind")
     sids = unit_sessions(cfg, u); cwd = u.get("rcwd") or u.get("cwd") or ""
-    esc = re.sub(r"[^A-Za-z0-9-]", "-", cwd)
     if kind == "opencode": return 3, "(opencode keeps its sessions in its own database: not readable by orch; read the agent's report)"
     codex = kind == "codex" or (kind == "api" and "codex" in json.dumps(cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("cmd", "")))
     if codex:
@@ -3458,10 +3479,12 @@ def read_transcript(cfg, u, grep="", tail=40):
     elif h.get("local"):
         f = transcript_of(cfg, u); mode, pats = "ids", [str(f)] if f else []
         if not f: return 3, "(no transcript found)"
-    else: mode, pats = "newest", [f"~/.claude/projects/{esc}/*.jsonl"]   # a remote Claude agent with no session id yet: its newest there
+    else: mode, pats = "newest", ["~/.claude/projects/$s/*.jsonl"]   # a remote Claude agent with no session id yet: its newest there
     argv = [mode, grep, str(tail), str(u.get("started", 0) - 60), cwd, *pats]
     if h.get("local"): rc, o, e = sh([sys.executable, "-", *argv], inp=CONDENSE, timeout=120)
-    else: rc, o, e = hrun(h, f"{h.get('agent_env', '')}\npython3 - {shlex.join(argv)}", inp=CONDENSE, timeout=120)
+    else:   # $s: the slug of the cwd as expanded on that host (review-fixes9 #4)
+        args = shlex.join(argv).replace(shlex.quote("~/.claude/projects/$s/*.jsonl"), '"$HOME/.claude/projects/$s/*.jsonl"')
+        rc, o, e = hrun(h, f"s={remote_slug_sh(u) if mode == 'newest' else '-'}\n{h.get('agent_env', '')}\npython3 - {args}", inp=CONDENSE, timeout=120)
     return rc, (o or e).rstrip()
 
 def cmd_transcript(cfg, a):
@@ -3514,13 +3537,26 @@ def unit_changes(cfg, u, units=()):
     skip = [cfg.state.resolve(), board_dir(cfg).resolve()]   # orch's own files and the board are nobody's change (as in close)
     return br, sorted(f for f in fs if f and not any((Path(cwd) / f).resolve().is_relative_to(x) for x in skip))
 
+def remote_slug(u):
+    """Claude Code's projects folder name for a remote unit's cwd when it is known here (rcwd_abs, the expanded path recorded at
+    launch; or an rcwd with no $HOME/~ in it), else None."""
+    p = u.get("rcwd_abs") or (u.get("rcwd") if u.get("rcwd") and not re.search(r"[$~]", u["rcwd"]) else None)
+    return re.sub(r"[^A-Za-z0-9-]", "-", p) if p else None
+
+def remote_slug_sh(u):
+    """A shell word that is the slug on the host itself: the cwd expanded there (review-fixes9 #4: $HOME/... gave -HOME-...).
+    Evaluate it before agent_env, which may move HOME."""
+    s = remote_slug(u)
+    return shlex.quote(s) if s else f"\"$(printf %s {qp(u.get('rcwd') or '')} | sed 's/[^A-Za-z0-9-]/-/g')\""
+
 def transcript_where(cfg, u):
     """Where the unit's agent transcript is (for peers.md): a local path, or <host>:<path> on the host that ran it."""
     h = cfg.hosts.get(u.get("host"), {}); sid = api_out(cfg, u).get("session_id")
     if h.get("local"):
         f = transcript_of(cfg, u) if not sid else next(iter((Path.home() / ".claude/projects").glob(f"*/{sid}.jsonl")), None)
         return str(f) if f else "-"
-    esc = re.sub(r"[^A-Za-z0-9-]", "-", u.get("rcwd") or "")
+    esc = remote_slug(u)
+    if not esc: return f"{u['host']}: orch transcript {u['name']} (its folder name depends on that host's $HOME)"
     return f"{u['host']}:~/.claude/projects/{esc}/" + (f"{sid}.jsonl" if sid else "(newest .jsonl)")
 
 def peer_rows(cfg, units):

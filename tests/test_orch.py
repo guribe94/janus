@@ -678,6 +678,76 @@ class Board(unittest.TestCase):
         p = orch.agent_prompt(cfg, "u", "/b.md", "far")
         self.assertIn("/r/bin/board.sh post u status", p); self.assertNotIn(str(orch.ORCH_SELF.parent), p)
 
+class ReviewFixes9(unittest.TestCase):
+    """review-fixes9 findings: each test failed before its fix."""
+    def fake_remote(self, d):
+        """A fake ssh (runs the command here; an `rm` of a sending file is lost, as on a flaky link) and a no-op rsync."""
+        b = d / "fakebin"; b.mkdir()
+        (b / "ssh").write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do case $1 in -n) shift;; -o) shift 2;; *) break;; esac; done\nshift\n'
+                               'case "$*" in "rm -f "*) exit 0;; esac\nexec sh -c "$*"\n')
+        (b / "rsync").write_text("#!/bin/sh\nexit 0\n")
+        for f in b.iterdir(): f.chmod(0o755)
+        return str(b) + ":" + os.environ["PATH"]
+
+    def test_sync_merges_a_surviving_sending_file_once(self):
+        """#1: locked()'s local f shadowed merge()'s $f, so .merged-<host> recorded the lock path and a sending file that
+        survived its rm was merged again (one question, two ids)."""
+        r = Path(tempfile.mkdtemp(prefix="orch-rem-"))
+        d, cfg = project(f'\n[hosts.far]\nssh = "far"\nroot = "{r}"\n'); cfg.ro = False
+        orch.board_upkeep(cfg, []); (orch.board_dir(cfg) / ".notify").write_text("true\n")
+        (r / "board-outbox").mkdir(); (r / "board-outbox/outbox.log").write_text("2026-01-01 10:00 eve question one question\n".replace("question one", "question: one"))
+        env = {"PATH": self.fake_remote(d)}
+        orch.board(cfg, "sync", env=env); orch.board(cfg, "sync", env=env)
+        self.assertEqual(len(orch.board_questions(cfg)), 1, orch.board_questions(cfg))
+
+    def test_close_withdraws_open_questions(self):
+        """#3: closing an agent's card left its open questions open: question:<id> fired forever."""
+        d, cfg = project(); cfg.ro = False; orch.board_upkeep(cfg, []); (orch.board_dir(cfg) / ".notify").write_text("true\n")
+        orch.board(cfg, "post", "carol", "question", "still running?"); self.assertEqual(len(orch.board_questions(cfg)), 1)
+        orch.board(cfg, "close", "carol"); self.assertEqual(orch.board_questions(cfg), [])
+
+    def test_board_usage_is_the_header_only(self):
+        """#6: the usage text printed three lines of code."""
+        o = subprocess.run([str(ORCH_PY.parent / "board.sh")], capture_output=True, text=True).stdout
+        self.assertNotIn("set -u", o); self.assertIn("board.sh sync", o)
+
+    def test_parked_unit_that_cannot_resume_is_reported(self):
+        """#2: a parked unit whose resume raised stayed parked with no finding (the watch log was the only trace)."""
+        d, cfg = project(); (d / "out/u").mkdir(parents=True); (d / "out/u/REPORT.md").write_text("VERDICT: PENDING\nWAITING here:7\n")
+        u = {"id": "x-1", "name": "u", "host": "here", "via": "pueue", "model": "m", "rcwd": str(d / "nowhere"), "started": 0, "_park": ["here:7"],
+             "parked": {"jobs": ["here:7"], "since": 0, "by": "report"}}
+        hs = {"here": {"ok": True, "pueue": {"tasks": {"7": {"status": {"Done": {"result": "Success"}}}}}}}
+        saved = []; real = (orch.Beads.save, orch.Beads.comment)
+        orch.Beads.save = lambda s, x: saved.append(dict(x)); orch.Beads.comment = lambda s, *a: None
+        try: logs = []; orch.tend_parked(cfg, hs, [u], logs.append)
+        finally: orch.Beads.save, orch.Beads.comment = real
+        self.assertIn("no session id", u.get("resume_error", {}).get("why", ""))
+        self.assertTrue(saved and "resume_error" in saved[-1])
+        f = orch.parked_findings(cfg, hs, u, ["here:7"])
+        self.assertEqual([k for k, _ in f], ["parked:u:resume"]); self.assertIn("no session id", f[0][1])
+
+    def test_landed_needs_the_units_change_on_the_tip(self):
+        """#5: a unit whose tree equals an OLD commit's tree on the branch (it reverts a change main still has) counted as landed."""
+        d, cfg = project('\n[landing]\nbranch = "main"\n'); r = d / "repo"; r.mkdir(); wt = d / "wt"
+        g = lambda *a, cwd=r: subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *a], capture_output=True, text=True)
+        g("init", "-q", "-b", "main"); (r / "a").write_text("1\n"); g("add", "a"); g("commit", "-qm", "base")
+        (r / "a").write_text("2\n"); g("commit", "-qam", "main: a=2")
+        g("worktree", "add", "-q", "-b", "wk/u", str(wt))
+        (wt / "a").write_text("1\n"); g("commit", "-qam", "u: revert a", cwd=wt)     # its tree is the base commit's tree
+        u = {"name": "u", "cwd": str(wt)}
+        self.assertIs(orch.landed(cfg, u), False)
+        (r / "a").write_text("1\n"); g("commit", "-qam", "main: the same revert")   # the change is on the tip now: nothing to land
+        self.assertIs(orch.landed(cfg, u), True)
+
+    def test_remote_transcript_dir_uses_the_expanded_cwd(self):
+        """#4: a remote rcwd under $HOME gave the slug -HOME-...; Claude Code's folder is the expanded absolute path's slug."""
+        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "$HOME/o"\n')
+        u = {"name": "u", "host": "far", "rcwd": "$HOME/o/worktrees/u", "rcwd_abs": "/home/me/o/worktrees/u"}
+        self.assertIn("/.claude/projects/-home-me-o-worktrees-u/", orch.transcript_where(cfg, u))
+        sl = orch.remote_slug_sh({"rcwd": "$HOME/o/worktrees/u"})
+        o = subprocess.run(["sh", "-c", f"HOME=/home/me; echo {sl}"], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(o, "-home-me-o-worktrees-u")
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         """No project, host or path names in the skill: code, tests, board, docs (the project's own history lives in the project)."""
