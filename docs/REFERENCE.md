@@ -277,6 +277,15 @@ acked unit:parser:finished
 `.janus/decisions/INDEX.md`; `janus decisions [--grep <regex>]` lists the records, newest first. The index is injected at
 session start, so the record chain is in front of the orchestrator before it decides anything those records touch.
 
+**`janus introduce <a> <b> --why <text> [--topic <regex>]`**: record that two units' work meets and tell both (the `--why`
+goes to both agents as a `RELATED:` pointer; `--topic` is the regex each reads in the other's transcript, default a path named
+in `--why`). `check` raises `related:<a>:<b>` while both run and their work meets (same file or module, branch, gate area or a
+learned post).
+
+**`janus migrate [<project>] [--retire]`**: move a project still on the old `orch.toml`/`.orch` layout to `janus.toml`/`.janus`
+(projects, state and config are rewritten). `--retire` also stops the old orch's standing processes on this machine. An
+extracted release of the toolkit ships alongside it so a migrated project's own scripts keep working.
+
 **Notes.** After each decision, update the *Orchestrator notes* part of `.janus/HANDOFF.md` (see section 5).
 
 **A unit failed — what now.** The command depends on how it ended:
@@ -380,6 +389,73 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
 - **Use every machine.** The machines exist to speed work up: each agent runs on the host where its builds and tests run, and
   jobs go to whichever host has room. `janus launch` places agents by test host and measured room, and `janus check` reports
   hosts idle while work waits and lanes free on one host while another has a backlog: act on those lines.
+
+## 4b. Finding families
+
+Every `janus check` line has a family (the key up to `:`): the findings registry `janus/findings/__init__.py` declares each,
+whether the watcher treats it as urgent (an idle orchestrator is prompted for it) and how long an ack hides it (0: it cannot be
+acked). A key of an unregistered family is refused in code, so a new key can never silently become non-urgent or ackable. This
+table is the plain-language list of the families the reference must name; the recipes are in section 4a.
+
+| family | what it means |
+|---|---|
+| `age` | a lane job queued or running over its class age limit (`[lanes] age`) |
+| `backlog` | the checklist is not imported, or changed since the last import |
+| `beads` | `bd` is unavailable: units cannot be read |
+| `board` | a board card is blocked, has a question, is gone or is silent |
+| `budget80` | a unit spent over `[budget] warn_pct` of its budget and its report is stale |
+| `burner` | a CPU burner an agent started (or orphaned) outside the lanes on this machine |
+| `cap` | more agents than the owner's total or per-host cap |
+| `decision-missing` | an owner instruction classified as a decision has no decision record |
+| `direct` | an agent runs a build or test directly on a remote host, outside its lane |
+| `context` | the orchestrator's context is over `[project] reset_tokens` and no reset was asked |
+| `disk` | a host is over its disk budget (tidy's last pass) |
+| `gate` | a gate failed in the last 12 h (its latest result) |
+| `gate-common` | the same failure appears in two or more gates: suspect the test or fixture |
+| `git` | the project's repository is dirty, unpushed or has no upstream |
+| `handoff` | the orchestrator notes are stale or too long, or the state folder has no `HANDOFF.md` |
+| `host` | a host is unreachable |
+| `idle` | a host or lane has room while work waits |
+| `idle-backlog` | ready backlog items without briefs while hosts have room, or held by budget |
+| `idle-with-backlog` | ready backlog units with briefs would fit now (`janus fill`) |
+| `instructions` | unclassified owner instructions in beads |
+| `known-failure` | a known failure with no open unit fixing it, or one that passes now |
+| `landing` | a finished DONE unit has no gate, or passed its gates and is not landed |
+| `learned` | an agent's learned post awaits remember or reject |
+| `ledger` | a provider ledger is malformed, implausible or holds unreconciled runs |
+| `localtest` | a test or build runs on this machine outside the lanes |
+| `machine` | a job or tmux session on a shared host with no project id (listed, never acted on) |
+| `margin` | a host is over its disk or memory-pressure margins |
+| `memory-long` | `MEMORY.md` holds more entries than `[memory] cap_lines` |
+| `memory-review` | a memory entry is older than `[memory] review_days` |
+| `memory-source` | a memory entry cites a path that is gone |
+| `memory-subject` | two memory entries share one subject |
+| `note` | an agent left a shared-file note on another agent's card |
+| `old-rule` | jobs still wait under the old cap rule |
+| `orchestrator` | the registered orchestrator's kind differs from janus.toml, or one the watcher started never registered |
+| `orphan` | a job, tmux session or agent pane with no open unit |
+| `overlap` | two running units change the same file |
+| `overrun` | a running job is far over its expected run time (its class's history on that host) |
+| `owner-question` | a question for the owner waits in `.janus/owner-queue.md` |
+| `parked` | a parked unit's job can never finish, or its resume failed |
+| `pressure` | a host's admission is paused by back-pressure |
+| `provider` | a unit runs on a disabled provider |
+| `question` | an open board question |
+| `related` | two units whose work meets (same file or module, branch, gate area or a learned post) |
+| `report-due` | a status report to the owner is due |
+| `rule-subject` | two standing rules (beads memories) share one subject |
+| `scheduler` | job-running work outside a host's janus lanes |
+| `script` | a running script's file was changed after it started |
+| `spend` | a provider's committed spend is at its cap or over 80/90 % of it, or an API process janus did not start |
+| `stalled` | queued work with free slots, or an old queue that does not drain |
+| `test-signal` | a long gate/test step that has not failed in N runs: scope or trim it |
+| `thrash` | the watcher stopped and re-queued a job on a thrashing shared host |
+| `tidy` | what `janus tidy` can reclaim |
+| `unit` | a unit is blocked, finished, or stopped by a limit without a verdict |
+| `waiting` | a live agent waits for its jobs' admission and pays for it |
+| `waste` | a run ended at its budget cap without a verdict |
+| `waste-pause` | launch and fill are paused by the waste limit |
+| `watcher` | the watcher is not running |
 
 ## 5. Handoff, instructions, rules, memory and the board
 
