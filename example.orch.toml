@@ -44,6 +44,7 @@ args = []
 # ready = ["READY", "FIX"]   # statuses an agent can start; default every unfinished one. Others wait (on the owner, say)
 
 # [landing]              # "finished, not landing" in orch check
+# kinds = ["implement"]  # unit kinds that land (reviews, audits and cleanups do not)
 # finished_min = 30      # a unit with VERDICT DONE this long ago needs a gate, or landing once its gates passed
 # gates_required = 1
 # gate_names = ["{unit}", "land-{unit}", "land-{unit}-*", "{unit}-*"]   # gate names that belong to a unit (plus orch gate --unit)
