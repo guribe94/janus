@@ -11,6 +11,7 @@ from janus.beads import Beads
 from janus.board import board, board_dir, board_questions
 from janus.context import Err, now, ts
 from janus.memory import memory_read
+from janus.project import own_card, own_label
 from janus.transcripts import card_fields
 from janus.units import agent_ended, api_out, report_path
 
@@ -156,7 +157,8 @@ def move_off_down_hosts(cfg, hs, units, log):
     st = cfg.jget("autopilot.json"); last = st.get("unstarted", {}); moved = st.get("moved", {}); down = cfg.jget("hosts.json")
     for hn, p in hs.items():
         if p.get("ok"):
-            last[hn] = [r for r in (f"{hn}:{tid}" for tid in ((p.get("pueue") or {}).get("tasks") or {})) if job_state(hs, r)[0] in ("queued", "admission")]
+            last[hn] = [f"{hn}:{tid}" for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items()
+                        if own_label(cfg, t) is not None and job_state(hs, f"{hn}:{tid}")[0] in ("queued", "admission")]   # own jobs only
             for old in [r for r in moved if r.startswith(hn + ":")]:   # back: the old copy must not run twice
                 if job_state(hs, old)[0] not in ("done", "gone"):
                     try: log(f"autopilot: {hn} is back: cancelled the moved job {old}: " + "; ".join(cancel_job(cfg, old)))
@@ -186,7 +188,8 @@ def archive_cards(cfg, units, log):
     """A board card that is not an open unit and whose agent posted done: archived."""
     names = {u["name"] for u in units}; ad = board_dir(cfg) / "agents"
     for c in ad.glob("*.md") if ad.is_dir() and not cfg.paths.get("board") else []:
-        if c.stem in names or card_fields(cfg, c.stem).get("state") != "done": continue
+        cf = card_fields(cfg, c.stem)
+        if c.stem in names or cf.get("state") != "done" or not own_card(cfg, cf): continue   # only this project's cards
         rc, o, e = board(cfg, "close", c.stem)
         if not rc and record(cfg, f"board:{c.stem}", "archive", "finished card archived (not an open unit)"): log(f"autopilot: archived the finished card {c.stem}")
 

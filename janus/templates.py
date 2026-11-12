@@ -172,8 +172,8 @@ fi'''
 CLEAN_PUEUE = r'''#!/bin/sh
 # pueue with an allow-listed environment (written by janus): a task never stores the caller's ANTHROPIC_API_KEY or tokens
 real=%(real)s
-# an agent's own `pueue add` gets its unit's label, so janus check never calls it an orphan (issue 24)
-if [ "$1" = add ] && [ -n "$JANUS_UNIT" ]; then case " $* " in *" -l "*|*" --label "*|*" --label="*) ;; *) shift; set -- add -l "unit:$JANUS_UNIT" "$@";; esac; fi
+# an agent's own `pueue add` gets its unit's label and the project's id, so janus check never calls it an orphan (issue 24)
+if [ "$1" = add ] && [ -n "$JANUS_UNIT" ]; then case " $* " in *" -l "*|*" --label "*|*" --label="*) ;; *) shift; set -- add -l "unit:$JANUS_UNIT${JANUS_PROJECT:+@$JANUS_PROJECT}" "$@";; esac; fi
 exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" PATH="$PATH" LANG="${LANG:-C.UTF-8}" SHELL="${SHELL:-/bin/sh}" \
   TMPDIR="${TMPDIR:-/tmp}" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} ${XDG_CONFIG_HOME:+XDG_CONFIG_HOME="$XDG_CONFIG_HOME"} ${JANUS_UNIT:+JANUS_UNIT="$JANUS_UNIT"} ${JANUS_ROLE:+JANUS_ROLE="$JANUS_ROLE"} "$real" "$@"
 '''

@@ -44,6 +44,7 @@ FAMILIES = {
     "learned": Family("an agent's learned post awaits remember or reject"),
     "ledger": Family("a provider ledger is malformed, implausible or holds unreconciled runs", urgent=True),
     "localtest": Family("a test or build runs on this machine outside the lanes"),
+    "machine": Family("a job or tmux session on a shared host with no project id (made before ids, or by hand): listed, never acted on"),
     "margin": Family("a host is over its disk or memory-pressure margins", urgent=True, ack_ttl=H // 2),
     "memory-long": Family("MEMORY.md holds more entries than [memory] cap_lines"),
     "memory-review": Family("a memory entry is older than [memory] review_days"),

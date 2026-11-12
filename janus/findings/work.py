@@ -8,6 +8,7 @@ from janus.context import Err, LE, handoff_path, handoff_stale, now, sh
 from janus.gates import gate_ids, gate_results, kf_active, known_failures, landed
 from janus.platform import watcher_loaded, watcher_service
 from janus.probe import room
+from janus.project import own_label
 from janus.units import report_path
 
 def gate_findings(cfg, hs=None):
@@ -15,8 +16,8 @@ def gate_findings(cfg, hs=None):
     running (a superseded failure never comes back after its ack expires)."""
     try: lines = cfg.p("gate_log").read_text().splitlines()[-200:]
     except OSError: return []
-    busy = {(t.get("label") or "")[5:] for p in (hs or {}).values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values()
-            if (t.get("label") or "").startswith("gate:") and any(k in str(t.get("status")) for k in ("Queued", "Running"))}
+    busy = {(own_label(cfg, t) or "")[5:] for p in (hs or {}).values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values()
+            if (own_label(cfg, t) or "").startswith("gate:") and any(k in str(t.get("status")) for k in ("Queued", "Running"))}
     latest = {}
     for l in lines:
         if "RESULT:" in l and len(l) > 20: latest[l[20:].split()[0]] = l
@@ -93,7 +94,7 @@ def landing_findings(cfg, units, hs=None):
     res = gate_results(cfg); queued = set()
     for p in (hs or {}).values():
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
-            lab = t.get("label") or ""
+            lab = own_label(cfg, t) or ""
             if lab.startswith("gate:") and any(k in str(t.get("status")) for k in ("Queued", "Running")): queued.add(lab[5:])
     F = []
     for u in units:

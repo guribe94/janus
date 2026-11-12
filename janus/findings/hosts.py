@@ -3,6 +3,7 @@ lane stalls, idle slots and job ages, thrash acts, tidy and disk; enforce (warn,
 import os, re, time
 from pathlib import Path
 from janus.actions.jobs import LANES, lane_age, orphan_jobs, slots
+from janus.project import label_owner, own_label, tmux_name, unit_tmux, untagged
 from janus.backlog import ready_work
 from janus.beads import Beads
 from janus.board import board
@@ -179,7 +180,7 @@ def lane_findings(cfg, hs, units=()):
                 s = x["status"]; info = s.get(st(x), {}) if isinstance(s, dict) else {}
                 try: since = time.mktime(time.strptime(info.get("enqueued_at", "")[:19], "%Y-%m-%dT%H:%M:%S"))
                 except ValueError: continue
-                if st(x) in ("Queued", "Running") and now() - since > lane_age(cfg, lane) * 60:
+                if st(x) in ("Queued", "Running") and now() - since > lane_age(cfg, lane) * 60 and own_label(cfg, x) is not None:   # own jobs only
                     F.append((f"age:{n}:{x['id']}", f"{n}:{x['id']} {lane} {x.get('label')} {st(x).lower()} {int((now() - since) / 60)} min, over the {lane_age(cfg, lane)} min limit: janus cancel {n}:{x['id']} and re-queue it, or ack with why it is right"))
         if int(p.get("old_rule", 0) or 0):
             F.append((f"old-rule:{n}", f"{n}: {p['old_rule']} job(s) still wait under the old cap rule ({p.get('old_rule_jobs', '').strip()[:120]}): "
@@ -231,21 +232,31 @@ def host_findings(cfg, hs, units, viol):
             viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
-            lab = t.get("label") or ""
+            if k not in ("Running", "Queued"): continue
+            lab = own_label(cfg, t)   # cross-project safety: only this project's jobs; one with no project id is machine state
+            if lab is None:
+                if untagged(t): F.append((f"machine:job:{n}:{t.get('id')}", f"job {t.get('id')} on {n} ({t.get('label') or t.get('command', '')[:40]}) carries no project id: machine state, not this project's; janus does not act on it"))
+                continue
             owned = lab in names or (lab.startswith("unit:") and lab[5:] in names) or (t.get("group") in LANES and ":" in lab and not lab.startswith("unit:"))
-            if k in ("Running", "Queued") and not owned:   # a lane job labelled unit:<name> whose unit is closed is an orphan too (M3)
+            if not owned:   # a lane job labelled unit:<name> whose unit is closed is an orphan too (M3)
                 F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({lab or t.get('command', '')[:40]}) has no open unit: janus cancel {n}:{t.get('id')}"))
+        mine = {unit_tmux(u) for u in units}
         for s in p.get("tmux", []):
-            if s.startswith("janus-") and s[6:] not in names: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: collect what it wrote, then stop it (janus stop, or relaunch its unit)"))
+            if not s.startswith("janus-") or s in mine: continue
+            base, pid = label_owner(s)
+            if pid is None: F.append((f"machine:tmux:{n}:{s}", f"tmux session {s} on {n} carries no project id: machine state, not this project's; janus does not act on it"))
+            elif pid == tmux_name(cfg, "x").rpartition("@")[2]: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: collect what it wrote, then stop it (janus stop, or relaunch its unit)"))
     return F
 
 def pane_findings(cfg, units, ag):
-    """orphan:pane: an agent in this project's herdr workspace with no open unit (not the orchestrator)."""
+    """orphan:pane: an agent in this project's herdr workspace with no open unit (not the orchestrator). Without the project's
+    workspace no pane is this project's: nothing is reported (cross-project safety)."""
     F = []; ws = ws_id(cfg); names = {u["name"] for u in units}
+    if not ws: return F
     janus_pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
     pane_units = {u.get("pane") for u in units}
     for k, a in ag.items():
-        if ws and a.get("workspace_id") != ws: continue
+        if a.get("workspace_id") != ws: continue
         if k in names or a.get("pane_id") in pane_units or a.get("pane_id") == janus_pane or k == "orchestrator": continue
         F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit: janus tidy closes panes of closed units; otherwise register it as a unit or close it"))
     return F

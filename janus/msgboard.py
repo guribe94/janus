@@ -38,7 +38,7 @@ Usage:
 Every write on the coordinating machine takes one flock (.lock)."""
 
 KINDS = ("status", "step", "blocked", "question", "waiting", "learned", "done", "note")
-FIELDS = ("task", "brief", "machine", "state", "step", "blockers", "report", "check", "notes", "updated")
+FIELDS = ("task", "brief", "machine", "state", "step", "blockers", "report", "check", "notes", "updated", "project")
 GROUP = {"question": 1, "blocked": 2, "working": 3, "waiting": 4, "done": 5}
 NOTE_SEP = " || "   # notes on one card are one field value, notes separated (a card is rewritten from FIELDS alone)
 SSH = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
@@ -174,6 +174,7 @@ class Board:
         if machine: card["machine"] = machine
         if not card["machine"]: card["machine"] = host
         if check: card["check"] = check
+        if not card["project"]: card["project"] = os.environ.get("BOARD_PROJECT") or os.environ.get("JANUS_PROJECT") or ""   # its creator's project id
         st = {"status": dict(state="working", blockers=""), "step": dict(state="working", step=x, blockers=""),
               "blocked": dict(state="blocked", blockers=x), "question": dict(state="question", blockers=x),
               "waiting": dict(state="waiting", step=f"waiting on {x}", blockers=""), "done": dict(state="done", step=x, blockers=""),

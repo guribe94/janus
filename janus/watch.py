@@ -28,6 +28,7 @@ def watch_pass(cfg, log):
         if (board_dir(cfg) / ".hosts").read_text().strip() or (board_dir(cfg).parent / "board-outbox" / "outbox.log").is_file(): board(cfg, "sync", timeout=180)
     sync()   # the shipped board: merge the hosts' outboxes (their questions alert at once through .notify) before the check
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
+    F = [f for f in F if f.family != "machine"]   # machine state (no project id) never wakes or starts an orchestrator
     heartbeat_beat(cfg)   # the watchdog host sees this pass (inert until heartbeat/ ships and [heartbeat] watchdog is set)
     board_alerts(cfg, log)
     tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (janus-fixes9)
