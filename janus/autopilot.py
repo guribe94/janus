@@ -123,9 +123,19 @@ def requeue_stuck(cfg, hs, units, F, log):
         if spec.get("unit"): board(cfg, "direct", spec["unit"], f"janus autopilot: your job {ref} was stuck past its age limit; re-queued as {new}: wait on that id")
         log(f"autopilot: stuck {ref} re-queued on {to}: {new}")
 
+def device_bound(cfg, hn, spec):
+    """A job with a device need (--usb, --needs device=<d>, or a bare --needs word that is one of host hn's devices)."""
+    from janus.actions.jobs import parse_needs
+    from janus.probe import FACTS
+    if spec.get("usb"): return True
+    try: n = parse_needs(spec.get("needs"))
+    except Err: return True
+    return bool(n.get("devices") or n.get("features", set()) & set((cfg.jget(FACTS).get(hn) or {}).get("devices") or []))
+
 def move_off_down_hosts(cfg, hs, units, log):
     """A host unreachable past [autopilot] host_down_min: its unstarted jobs (queued or waiting for admission at the last pass
-    that saw it) are re-queued elsewhere; running ones wait. When the host is back, the old copies are cancelled."""
+    that saw it) are re-queued elsewhere; running ones and jobs with a device need (--usb, --needs device=...) wait. When the host
+    is back, every old copy not done or gone is cancelled (it may have started during a partition: never run twice, panel-eng F3)."""
     from janus.actions.jobs import cancel_job, job_state, requeue, requeue_host
     import json
     st = cfg.jget("autopilot.json"); last = st.get("unstarted", {}); moved = st.get("moved", {}); down = cfg.jget("hosts.json")
@@ -133,7 +143,7 @@ def move_off_down_hosts(cfg, hs, units, log):
         if p.get("ok"):
             last[hn] = [r for r in (f"{hn}:{tid}" for tid in ((p.get("pueue") or {}).get("tasks") or {})) if job_state(hs, r)[0] in ("queued", "admission")]
             for old in [r for r in moved if r.startswith(hn + ":")]:   # back: the old copy must not run twice
-                if job_state(hs, old)[0] in ("queued", "admission"):
+                if job_state(hs, old)[0] not in ("done", "gone"):
                     try: log(f"autopilot: {hn} is back: cancelled the moved job {old}: " + "; ".join(cancel_job(cfg, old)))
                     except Err as e: log(f"autopilot: {hn} is back: {old} not cancelled: {e}"); continue
                 moved.pop(old)
@@ -147,6 +157,7 @@ def move_off_down_hosts(cfg, hs, units, log):
                 except ValueError: continue
                 if s.get("host") == hn and str(s.get("task")) == ref.split(":", 1)[1]: spec = s; break
             if not spec or (spec.get("unit") and held(cfg, spec["unit"])): continue
+            if device_bound(cfg, hn, spec): continue   # pinned to its host by nature: it waits for it
             to = requeue_host(cfg, hs, units, hn, spec)
             if to == hn: continue
             try: new = requeue(cfg, spec, to)
