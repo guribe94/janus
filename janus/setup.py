@@ -231,20 +231,25 @@ def cmd_init(cfg, a):
 OLD_CFG, NEW_CFG = "orch.toml", "janus.toml"   # the old names are quoted here on purpose: this is the one-time migration off them
 OLD_STATE, NEW_STATE = ".orch", ".janus"
 
-# Item 1 (finding 1): the old names a config value can carry. Only the old state folder `.orch` and the old file/folder names
-# (`orch.py`, `orch.toml`, `orchkit`) are rewritten, and only as a whole path component (or the whole value) -- never a bare
-# `orch` token inside a path, host, keychain name or word (`root = "/home/x/orch"`, `research.orchard`, `torch.py`, `me@orch`,
-# the keychain name `orch` and `ORCH_API` all stay). `com.orch.watch` is a specific label, replaced as it is.
-OLD_VALUE = [(".orch", ".janus"), ("orch.py", "janus.py"), ("orchkit", "janus"), ("orch.toml", "janus.toml"),
-             ("com.orch.watch", "com.janus.watch")]
+# Item 1 (finding 1): the old names a config value can carry. Only the old file names and the launchd label are rewritten, and
+# only as a whole path component -- never a bare `orch` token inside a path, host, keychain name or word (`root = "/home/x/orch"`,
+# `research.orchard`, `torch.py`, `me@orch`, the keychain name `orch` and `ORCH_API` all stay). Finding 10: a kit folder
+# (`/opt/orchkit`) is NOT rewritten (migrate renames no kit folder), and the state folder `.orch` only when it is this project's
+# own (the whole value, a path relative to the root, or under <root>): a remote or another project's `.orch` stays.
+OLD_VALUE = [("orch.py", "janus.py"), ("orch.toml", "janus.toml"), ("com.orch.watch", "com.janus.watch")]
 
-def old_value(v):
-    """One config value with the old names replaced (item 1, finding 1): each only as a whole path component (a `.orch` path,
-    `orch.py`), so a bare `orch` token, `research.orchard` and `scripts/torch.py` stay. Only a value reaches here: comments are
-    never rewritten."""
+def old_value(v, root=None):
+    """One config value with the old names replaced (item 1, finding 1, finding 10): each only as a whole path component (an
+    `orch.py`), so a bare `orch` token, `research.orchard` and `scripts/torch.py` stay. The state folder `.orch` is replaced only
+    where migrate really renames it -- the whole value, a leading `.orch/` (relative to the project root), or `<root>/.orch` --
+    so `/opt/orchkit`, `/home/dev/orch/.orch` and another project's `.orch` are left as they are."""
     for a, b in OLD_VALUE:
         if a == "com.orch.watch": v = v.replace(a, b); continue   # a specific launchd label, not a bare token
         v = re.sub(r"(?<![\w.-])" + re.escape(a) + r"(?![\w.-])", b, v)
+    v = re.sub(r'^(\s*["\']?)\.orch(?![\w.-])(?=[/\s"\']|$)', lambda m: m.group(1) + ".janus", v)
+    if root is not None:
+        r = re.escape(str(root).rstrip("/"))
+        v = re.sub(r"(?<![\w.-])(" + r + r")/\.orch(?![\w.-])", r"\1/.janus", v)
     return v
 
 ASSIGN = re.compile(r"^(\s*[A-Za-z0-9_.-]+\s*=\s*)(.*)$")
@@ -277,7 +282,7 @@ def rewrite_config(path, dry=False):
             head, rest = m.group(1), m.group(2); key = head.split("=", 1)[0].strip()
         else: head, rest = "", line   # a continuation line of a value that started on an earlier line
         val, com, q, d = value_comment(rest, q); depth += d
-        new = old_value(val)
+        new = old_value(val, path.parent)
         if new == val: continue
         changes.append(f"{path}: {key}: {val.strip()} -> {new.strip()}")
         lines[i] = head + new + com
@@ -486,14 +491,21 @@ def _local_pueue(cfg):
     h = next((x for x in cfg.hosts.values() if x.get("local")), {})
     return [real, *(["-c", str(h["pueue_config"])] if h.get("pueue_config") else [])]
 
-def _under(root, path):
-    """True when a pueue task's working directory is the project root or under it (finding 6: a job is this project's only when
-    both its unit and its path are)."""
+def _under(root, path, cwds=()):
+    """True when a pueue task's working directory is the project root, under it, or an open unit's own tree (finding 10: a unit
+    tree outside the root, as every unit's worktree is, used to be left alone; finding 6: a job is this project's only when both
+    its unit and its path are)."""
     if not path: return False
     try: p = Path(path).resolve()
     except OSError: return False
     r = Path(root).resolve()
-    return p == r or r in p.parents
+    if p == r or r in p.parents: return True
+    for c in cwds:
+        if not c: continue
+        try: q = Path(c).resolve()
+        except OSError: continue
+        if p == q or q in p.parents: return True
+    return False
 
 def _gate_unit(name, units):
     """The unit a gate job's name belongs to (finding 6): `land-<unit>`/`<unit>-...`, or a unit named as a whole token of the
@@ -525,7 +537,8 @@ def adopt_items(root, dry=False, config=None):
     the relabel is verified (a pueue edit that did not take is reported, never claimed). A tmux session named janus-<unit> or
     orch-<unit> is renamed (…@<id>) and the unit record follows it; a card of such a unit gets its project field. Returns one
     line per adoption and one per item left alone; changes nothing in dry mode."""
-    view = _adopt_view(root, config); pid = project_id(view); units = set(all_units(view)); out = []
+    view = _adopt_view(root, config); pid = project_id(view); au = all_units(view); units = set(au); out = []
+    cwds = [m.get("cwd") for m in au.values() if m.get("cwd")]   # finding 10: a unit tree outside the root is this project's too
     pq_cmd = _local_pueue(view)
     rc, o, e = sh([*pq_cmd, "status", "--json"])
     if rc == 0 and o.strip():
@@ -538,8 +551,8 @@ def adopt_items(root, dry=False, config=None):
             name = _gate_unit(base, units) if lab.startswith("gate:") else base
             if name not in units:
                 out.append(f"job {tid} ({lab or (t.get('command') or '')[:40]}): not one of this project's units; left alone"); continue
-            if not _under(view.root, t.get("path")):
-                out.append(f"job {tid} ({lab}): its path {t.get('path')} is not under {view.root}; another project's, left alone"); continue
+            if not _under(view.root, t.get("path"), cwds):
+                out.append(f"job {tid} ({lab}): its path {t.get('path')} is not under {view.root} or a unit's tree; another project's, left alone"); continue
             new = f"{lab}@{pid}"; st = t.get("status"); st = st if isinstance(st, str) else next(iter(st), "")
             if st not in ("Queued", "Stashed", "Locked"):
                 out.append(f"job {tid} ({lab} -> {new}): {st.lower() or 'running'}, pueue relabels only a queued or stashed task; adopt it by hand (pueue edit {tid})"); continue

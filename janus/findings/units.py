@@ -93,7 +93,9 @@ def unit_changes(cfg, u, units=()):
     # (or a committed merge) is not the landing branch's: its base stays the merge base.
     mh = sh(["git", "-C", cwd, "rev-parse", "-q", "--verify", "MERGE_HEAD"])[1].strip()
     lbt = sh(["git", "-C", cwd, "rev-parse", "-q", "--verify", lb])[1].strip()
-    merged = bool(mh and lbt and mh == lbt)
+    # finding 10 (old 14): the landing branch may have moved on since `git merge`; MERGE_HEAD is still its own side of the merge
+    # while it is in the landing branch's history, so it never falls back to the merge base (which counted the branch's files).
+    merged = bool(mh and lbt and (mh == lbt or sh(["git", "-C", cwd, "merge-base", "--is-ancestor", mh, lbt])[0] == 0))
     base = lb if merged else sh(["git", "-C", cwd, "merge-base", "HEAD", lb])[1].strip()
     fs = set(sh(["git", "-C", cwd, "diff", "--relative", "--name-only", base, "--", "."])[1].split("\n")) if base else set()
     top = sh(["git", "-C", cwd, "rev-parse", "--show-toplevel"])[1].strip()

@@ -28,6 +28,17 @@ BUDGET_DEFAULTS = {"margin_pct": 30, "min_runs": 3, "min_usd": 0.5, "max_usd": N
 
 def bset(cfg, k): return cfg.c.get("budget", {}).get(k, BUDGET_DEFAULTS[k])
 
+def run_capped(cfg, u, run):
+    """Whether ledger run `run` of unit u ended at its budget cap (finding 10): that run's own api-<run>.json; the shared
+    api.json only when `run` is the unit's latest run, so an earlier run of a unit whose LAST run was capped is not counted
+    capped too (api.json carries only the latest run's subtype)."""
+    od = cfg.p("out", "out") / u["name"]; p = od / f"api-{run}.json"
+    if not p.is_file():
+        if u.get("run") != run: return False
+        p = od / "api.json"
+    try: return json.loads(p.read_text()).get("subtype") == "error_max_budget_usd"
+    except (OSError, ValueError): return False
+
 def cost_history(cfg, provider):
     """{(kind, tier): [cost of each finished run]} of a provider, oldest first. A done run counts when its unit ended with a
     verdict, when it ended at its budget cap (a capped run shows the budget was too small, so it raises it), or when it cost at
@@ -41,7 +52,7 @@ def cost_history(cfg, provider):
         if not r["done"] or r["cost"] is None: continue
         u = byrun.get(k) or us.get(r["unit"])
         if not u or not u.get("kind"): continue
-        capped = api_out(cfg, u).get("subtype") == "error_max_budget_usd"
+        capped = run_capped(cfg, u, k)
         if not (verdict(cfg, {**u, "resume": False}) or capped or r["cost"] >= bset(cfg, "min_usd")): continue
         out.setdefault((u["kind"], u.get("tier") or "normal"), []).append(r["cost"])
     return out
