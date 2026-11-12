@@ -809,6 +809,26 @@ class Item2ResumeGuard(unittest.TestCase):
         with self.assertRaises(janus.Err) as e: self._run(u, units=[u, u2], state="gone", job="done", message="go")
         self.assertIn("u2", str(e.exception)); self.assertEqual(self.calls, [])
 
+    def test_a_review_unit_sharing_the_tree_is_not_another_units_tree(self):
+        """Catches (finding 6, fix-install6): the H9 exception was for the RESUMED unit's kind only, so a unit whose tree held
+        its own review unit (which shares the tree it reviews by design) could not resume: `resume work1 --message answer` was
+        refused, with --force too."""
+        W = self.d / "wt"; W.mkdir()
+        work = {"id": "t-1", "name": "work1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0, "cwd": str(W)}
+        rev = {"id": "t-2", "name": "rev1", "host": "here", "via": "pueue", "task": 6, "model": "m", "started": 0, "cwd": str(W), "kind": "review"}
+        self._run(work, units=[work, rev], state="gone", job="done", message="answer")
+        self.assertEqual(len(self.calls), 1, "a unit could not resume in a tree its own reviewer shares")
+
+    def test_resume_refuses_an_agent_task_that_is_not_known_ended(self):
+        """Catches (finding 6, fix-install6): the guard refused only working/queued, so a Paused, Stashed or Locked agent task (a
+        live agent janus never pauses itself) and an unknown state (a failed probe) were resumed, starting a second agent on the
+        same session."""
+        for st in ("Paused", "Stashed", "Locked", "unknown"):
+            u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0, "cwd": str(self.d / "wt")}
+            with self.assertRaises(janus.Err) as e: self._run(u, state=st, job="done", message="go")
+            self.assertIn("u1", str(e.exception))
+            self.assertEqual(self.calls, [], f"a {st} agent task was resumed")
+
     def test_hand_resume_works_for_tmux_a_blocked_herdr_unit_and_a_review_unit(self):
         """Catches (finding 2): a tmux unit read as 'working' for as long as its session existed, a herdr unit blocked on a
         question could not be answered, and a review unit that shares the tree it reviews was refused -- so the routine answer
