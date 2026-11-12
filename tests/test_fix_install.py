@@ -175,4 +175,16 @@ class Item10UnitChanges(unittest.TestCase):
         self.assertIn("a", fs); self.assertNotIn("c", fs, "the landing branch's own file counted as the unit's change")
 
 
+class Item8ResumeDryRun(unittest.TestCase):
+    def test_dry_run_says_would_prompt(self):
+        """Catches: janus resume --dry-run <herdr unit> printed '<unit>: prompted in its herdr pane' although nothing was prompted."""
+        d, cfg = project(); cfg.run.dry = True
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "herdr", "pane": "p1", "model": "m", "started": 0}
+        called = []; real = janus.herdr; janus.herdr = lambda *a, **k: called.append(a)
+        try: line = janus.resume_unit(cfg, u, "go")
+        finally: janus.herdr = real
+        self.assertIn("would prompt", line); self.assertNotIn(": prompted", line)
+        self.assertEqual(called, [], "the dry run prompted the pane")
+
+
 if __name__ == "__main__": unittest.main()
