@@ -242,25 +242,27 @@ class Item7BlockedLane(unittest.TestCase):
 
 
 class Item7CallerWait(unittest.TestCase):
-    def test_a_running_task_is_not_reported_as_waiting_in_admission(self):
-        """Catches (finding 7): the caller's bounded wait reported a task that had STARTED as 'still waiting' in admission (and
-        probed its host) after each 300 s, which is a false alarm that leaves work behind on a remote host."""
+    def test_a_task_held_by_admission_is_reported_but_one_not_yet_started_is_not(self):
+        """Catches (finding 9): the caller's notice fired only when the pueue task was NOT Running, so a job held in janus's own
+        admission (Running in pueue) was waited for in silence, and a task merely queued behind the group's slots was reported
+        as 'still waiting for admission' although admission said yes (the same rule the check uses)."""
         d, cfg = project(); h = cfg.hosts["here"]
-        calls = []
-        def fake_run(cmd, **k): raise subprocess.TimeoutExpired(cmd, k.get("timeout", 0))
-        states = [{"status": {"Running": {}}}, {"status": {"Done": {"result": "Success"}}}]
-        saved_run, saved_status, saved_probe = subprocess.run, janus.task_status, janus.probe
-        subprocess.run = fake_run
-        janus.task_status = lambda h_, tid: states.pop(0) if states else {"status": {"Done": {"result": "Success"}}}
-        janus.probe = lambda n, h_, **k: (calls.append(n), {"cap_admit": "disk", "cap_pause": "", "disk_gb": "9"})[1]
-        out = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(out): rc = janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
-        finally:
-            subprocess.run, janus.task_status, janus.probe = saved_run, saved_status, saved_probe
-        self.assertEqual(rc, 0)
-        self.assertEqual(calls, [], "the host was probed for a task that had already started")
-        self.assertNotIn("still waiting", out.getvalue(), out.getvalue())
+        def run_case(state, adm):
+            states = [state, {"status": {"Done": {"result": "Success"}}}]
+            def fake_run(cmd, **k): raise subprocess.TimeoutExpired(cmd, k.get("timeout", 0))
+            saved = (subprocess.run, janus.task_status, janus.probe)
+            subprocess.run = fake_run
+            janus.task_status = lambda h_, tid: states.pop(0) if states else {"status": {"Done": {"result": "Success"}}}
+            janus.probe = lambda n, h_, **k: {"cap_admit": adm, "cap_pause": ""}
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(out): rc = janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
+            finally: subprocess.run, janus.task_status, janus.probe = saved
+            return rc, out.getvalue()
+        rc, msg = run_case({"status": {"Running": {}}}, "disk")   # a running task held in janus admission: reported
+        self.assertEqual(rc, 0); self.assertIn("held by admission", msg)
+        rc, msg = run_case({"status": {"Queued": {}}}, "yes")     # not started yet, admission says yes: silent
+        self.assertEqual(rc, 0); self.assertEqual(msg, "", "a task not yet started was reported while admission said yes")
 
 
 class Item8ResumeDryRun(unittest.TestCase):
