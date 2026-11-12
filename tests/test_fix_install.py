@@ -1015,10 +1015,10 @@ class Item10Residues(unittest.TestCase):
         self.assertIn("job 1: unit:u1 -> unit:u1@proj", out); self.assertNotIn("left alone", out)
 
     def test_a_placeholder_already_quoted_in_the_config_is_not_quoted_twice(self):
-        """Catches (finding 10, old 7): a config that already quotes the placeholder (`--wt "{wt}"`) became `--wt "'/path'"`, a
-        path with literal quotes."""
+        """Catches (finding 6 = review finding 10's follow-up): a config that quotes the placeholder (`--wt "{wt}"`) must give a
+        single shell-quoted path, not the raw value inside the config's quotes (which ran `$(...)`)."""
         self.assertEqual(janus.final_gate_cmd({"final_gate": 'gate.sh --wt "{wt}" --branch {branch}'}, "u", "/Users/me/My Code/wt", "b"),
-                         'gate.sh --wt "/Users/me/My Code/wt" --branch b')
+                         "gate.sh --wt '/Users/me/My Code/wt' --branch b")
 
     def test_an_earlier_run_of_a_capped_unit_is_not_counted_as_capped(self):
         """Catches (finding 10, old 9): capped was read from the unit's latest api.json, so an earlier tiny run of a unit whose
