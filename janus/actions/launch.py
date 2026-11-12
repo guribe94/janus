@@ -551,7 +551,10 @@ def cmd_launch(cfg, a):
         try: cmd_close(cfg, argparse.Namespace(unit=handover, force=True, handover=True, reason=f"handed its worktree to {name} (janus launch --resume-of)"))
         except Err as ex: say(f"note: {handover} not closed: {ex}")
 
-PATH_RX = re.compile(r"(?<![\w.:/~$>)\]}*-])(/[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*)")
+# Item 30: a `/`-word must not be read as a path when it is only the separator of a KEY= list in prose (`FMT=/CLIPPY=`
+# was read as the absolute path `/CLIPPY`, and a remote launch was refused for a path the brief never named): the trailing
+# lookahead rejects a candidate whose next character is still a path character (a maximal word) or `=` (a KEY= boundary).
+PATH_RX = re.compile(r"(?<![\w.:/~$>)\]}*-])(/[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*)(?![A-Za-z0-9._@+/-=])")
 
 def brief_paths(text):
     """Every absolute path the brief names (trailing dots stripped), in order, once."""
