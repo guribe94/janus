@@ -54,3 +54,27 @@ Agents post state changes only (status, waiting, blocked, question, learned, don
 ids and stay open until answered; a new question or block wakes the orchestrator at once (`.notify` -> `orch watch --alert`).
 `direct all` broadcasts. `learned` posts become memory entries once the orchestrator accepts them. `summary` groups cards by
 what needs attention; `digest` tells a human what happened.
+
+## Keeping work moving: the ending policy (spec for the autopilot round)
+
+Owner rule (core): the orchestrator never leaves a unit, job, gate or host broken, held or idle without action; on any error it
+fixes, restarts, re-queues or routes around it, and records what it did. Every `orch check` finding names the action that
+resolves it. The next round makes the safe actions automatic: the watcher's **autopilot** applies this policy on each pass,
+writes one line per action to `.orch/autopilot.log` and the unit's beads comments, posts the change to the board, and leaves
+everything it does not cover to the orchestrator (as findings). Each rule acts once per cause (a record in
+`.orch/autopilot.json` keyed by unit/job and cause), never on a unit the owner or orchestrator paused (`orch ack <key> hold`),
+and within capacity, budget and caps exactly like `orch launch`.
+
+| Situation (finding) | Automatic action | Limits |
+|---|---|---|
+| Capped: an API run ended at its budget cap without a verdict (`budget`, `wrap_due`) | wrap-up resume once (`[budget] wrapup_usd`), then relaunch with `--resume-of <unit>` and its report, budget from history | at most `[autopilot] relaunch_max` (2) per unit; the waste pause stops it |
+| Crashed or gone: the agent ended without a verdict (`unit:<u>:finished` no verdict, `board:<a>:gone`) | relaunch from its report (`--resume-of`), same host when it has room, else another | as above; never when its remote copy is uncollected (collect first) |
+| Question whose answer is in memory (`question:<id>`) | answer with the MEMORY.md entry it matches (subject key or exact rule), cite it | only exact subject matches; anything else waits for the orchestrator |
+| Job stuck or orphaned (`orphan:job`, `age:`, `parked:<u>` on a job not queued or running) | cancel (files saved), re-queue the recorded job (`.orch/runs/jobs`) on a host with room | once per job; a job that failed twice is reported, not re-queued |
+| Host down (`host:<n>` unreachable past `unreachable_min`) | cancel its unstarted jobs and re-queue them elsewhere; running ones wait | never stops running work on a host that may come back |
+| Lane idle beside a backlog (`idle:<n>:<lane>:vs`) | move waiting jobs to the free host | same lane kind, local vs remote as today |
+| Reclaimable (`tidy:<n>`, `disk:<host>`) | `orch tidy` (its safe rules only) on a schedule | branch and remote deletions only with `[tidy] branches` set |
+| Thrash on a shared host (`thrash:`) | already automatic (fixes10 item 3) | |
+
+Out of scope for the autopilot (stays with the orchestrator): landing decisions, owner instructions, rules, briefs, any
+destructive action outside the rules above.

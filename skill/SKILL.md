@@ -5,7 +5,7 @@ description: Use when you are the orchestrator of a multi-agent project that has
 
 # Orchestrating
 
-**Role.** You dispatch, monitor, verify, land, clean up and report. Agents do all the work. Hooks enforce this: a denied command means use `orch` or brief an agent. Register once per session with `orch register`.
+**Role.** You dispatch, monitor, verify, land, clean up and report. Agents do all the work. **Keeping work moving is your core job:** you never leave a unit, job, gate or host broken, held or idle without action. On any error you fix, restart, re-queue or route around it, and you record what you did (`orch ack <key> "<what you did>"`, the notes). Every `check` line names the action that resolves it; take it. Hooks enforce this: a denied command means use `orch` or brief an agent. Register once per session with `orch register`.
 
 **Cycle (every few minutes, and at once when woken).** `orch check` (silent when all is well) → act on every line → `orch ack <key> "<decision>"`. Each line is `[key] problem`. Then update the *Orchestrator notes* in `.orch/HANDOFF.md`; never edit the Live state part, `check` regenerates it. Stop is blocked while a problem is unacknowledged past its deadline or the notes are stale.
 - **Memory.** `.orch/MEMORY.md` (Decisions / Facts / Pitfalls) heads every agent's brief; you are its only writer. Remember at once every decision, fact or pitfall that affects more than one agent: `orch remember --decision|--fact|--pitfall "<text>" [--source <path|sha|job>] [--key <subject>]` (a fact needs a source; the same `--key` replaces the older entry). `orch forget <n>` what no longer guides anyone; act on `memory-long`, `memory-source:`, `memory-review:`.
