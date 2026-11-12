@@ -17,6 +17,7 @@ briefs = "briefs"        # <briefs>/<unit>.md
 out = "out"              # <out>/<unit>/REPORT.md, api.json, api.err
 worktrees = "worktrees"  # <worktrees>/<unit> is the unit's cwd when it exists
 board = "bin/board.sh"   # optional message board script (post/read/summary/rule/close); agents post progress through it
+# board_dir = "board"     # the board's files: orch close never counts them as a unit's uncommitted changes (nor the state dir)
 gate_log = "out/gates.log"   # lines: 'YYYY-MM-DD HH:MM:SS <name> EXIT_x=0 ... RESULT: PASS|FAIL' (orch gate writes them)
 # gate_runner = "bin/run-gate.sh"   # a project script orch gate calls with <name>; default: orch runs out/<name>/tests.sh itself
 # gate_host_env = "ORCH_TEST_HOST"  # the variable `orch gate --host` sets

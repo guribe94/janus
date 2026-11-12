@@ -217,6 +217,17 @@ class LaunchQuoting(unittest.TestCase):
                     orch.job_script(cfg, "far", cfg.hosts["far"], r, "wt (`q) x", "cat x", "j-1")):
             self.assertEqual(subprocess.run(["bash", "-n"], input=txt, text=True, capture_output=True).returncode, 0, txt)
 
+class Close(unittest.TestCase):
+    def test_close_counts_only_the_units_subtree(self):
+        """board 18:51: a unit whose cwd lies inside the project's repo could never close (other agents' board files and reports
+        kept that repo dirty). Only the unit's cwd subtree counts, minus orch's state dir and the board folder."""
+        d, cfg = project(); g = lambda *x: subprocess.run(["git", "-C", str(d), *x], capture_output=True, text=True)
+        g("init", "-q"); (d / "bin").mkdir(); (d / "bin/tool.sh").write_text("x\n"); g("add", "-A"); g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i")
+        for f in ("board/card.md", ".orch/acks.json", "out/other/REPORT.md", "bin/.orch-note"): (d / f).parent.mkdir(parents=True, exist_ok=True)
+        (d / "board/card.md").write_text("post\n"); (d / ".orch/acks.json").write_text("{}\n"); (d / "out/other/REPORT.md").write_text("x\n")
+        self.assertEqual(orch.unit_dirty(cfg, d / "bin"), ([], True))
+        (d / "bin/tool.sh").write_text("y\n"); self.assertEqual(orch.unit_dirty(cfg, d / "bin")[0], ["bin/tool.sh"])
+
 class SelfSafety(unittest.TestCase):
     def test_in_place_edit_flagged_rename_not(self):
         d = Path(tempfile.mkdtemp()); s = d / "loop.sh"; s.write_text("#!/bin/bash\nsleep 30\necho done\n")

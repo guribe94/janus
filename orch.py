@@ -1810,15 +1810,33 @@ def own_tree(cfg, u, units):
     c = Path(u["cwd"]).resolve()
     return c != cfg.root.resolve() and not any(Path(x.get("cwd", "/")).resolve() == c for x in units if x["id"] != u["id"])
 
+def unit_dirty(cfg, cwd):
+    """(uncommitted paths the unit owns, whether its tree lies in the project's own repo). Only the unit's cwd subtree counts,
+    never orch's state dir or the board's folder (paths.board_dir, default board/): a unit whose cwd is inside the project's
+    repo could otherwise never close while other agents' board posts keep that repo dirty. The project's repo is committed and
+    pushed by orch commit-state, so its unpushed commits are not the unit's either."""
+    rc, top, _ = sh(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"])
+    if rc: return [], False
+    top = Path(top.strip()).resolve()
+    rc, o, e = sh(["git", "status", "--porcelain", "-uall", "--", "."], cwd=cwd)
+    if rc: return [], False
+    skip = [cfg.state.resolve(), (cfg.root / cfg.paths.get("board_dir", "board")).resolve()]
+    out = []
+    for l in o.splitlines():
+        f = l[3:].split(" -> ")[-1].strip().strip('"'); p = (top / f).resolve()
+        if not any(p.is_relative_to(s_) for s_ in skip): out.append(f)
+    rc2, ptop, _ = sh(["git", "-C", str(cfg.root), "rev-parse", "--show-toplevel"])
+    return out, rc2 == 0 and Path(ptop.strip()).resolve() == top and Path(cwd).resolve() != top
+
 def cmd_close(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
     mine = own_tree(cfg, u, units)
     if a.force and not mine: raise Err(f"--force refused: {u['cwd']} is shared (project root or another open unit's cwd)")
     if mine:
-        rc, o, e = sh(["git", "status", "--porcelain"], cwd=u["cwd"])
-        if rc == 0 and o.strip() and not a.force: raise Err(f"{u['cwd']} has uncommitted changes; commit and push, or --force")
+        dirty, state_repo = unit_dirty(cfg, u["cwd"])
+        if dirty and not a.force: raise Err(f"{u['cwd']} has uncommitted changes ({', '.join(dirty[:3])}); commit and push, or --force")
         rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=u["cwd"])
-        if rc == 0 and o.strip() != "0" and not a.force: raise Err("unpushed commits; push first, or --force")
+        if rc == 0 and o.strip() != "0" and not a.force and not state_repo: raise Err("unpushed commits; push first, or --force")
     elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
         raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
     why = None if a.force else uncollected(cfg, u)
