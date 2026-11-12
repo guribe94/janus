@@ -4,6 +4,7 @@ import argparse, os, sys, tomllib
 from pathlib import Path
 from janus.actions.jobs import LANES
 from janus.context import Cfg, Err, Run, find_root, say
+from janus.decisions import cmd_answer, cmd_ask, cmd_decide, cmd_decisions
 from janus.hooks import cmd_hook
 from janus.memory import MEM_SECTIONS
 from janus.setup import doctor, init_project
@@ -76,6 +77,15 @@ def main():
     add("index", cmd_index, dry=True); add("peers", cmd_peers)
     add("transcript", cmd_transcript, A("unit"), A("--grep", help="only the lines matching this regex (case-insensitive)"), A("--tail", type=int, default=40, help="the last N lines (0: all)"))
     add("memory", cmd_memory, A("--keep", type=int, help="re-date entry N after review (it stays)"), dry=True)
+    add("decide", cmd_decide, A("title"), A("--by", choices=["owner", "orchestrator"], required=True),
+        A("--context", help="what was true and what forced the decision"), A("--options", action="append", help="one option with its trade-off (repeatable)"),
+        A("--decision", help="what was decided, in one sentence"), A("--why", help="the ruling, constraint or measurement that decided it"),
+        A("--consequences", help="what it makes easy, forbids or requires"), A("--supersedes", type=int, help="the record this one replaces; its status is marked"),
+        A("--instruction", help="the owner instruction (beads id) this settles: it is linked and labelled"), dry=True)
+    add("decisions", cmd_decisions, A("--grep", help="only records matching this regex (case-insensitive)"))
+    add("ask", cmd_ask, A("question"), A("--options", action="append", help="one option for the owner (repeatable)"),
+        A("--recommend", help="what you recommend"), dry=True)
+    add("answer", cmd_answer, A("id", type=int), A("answer"), A("--decide", action="store_true", help="also write a decision record of the answer"), dry=True)
     add("init", cmd_init, A("--name", help="project name for a new janus.toml (default: the folder's name)"), dry=True)
     add("migrate", migrate, A("project", nargs="?", help="a project with an old orch.toml/.orch to move to janus (default: here)"))
     add("board-close", cmd_board_close, A("agent", help="a board card that is not an open unit"), dry=True)

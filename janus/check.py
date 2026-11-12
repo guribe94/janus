@@ -8,6 +8,7 @@ from janus.backlog import ready_work
 from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
 from janus.context import Err, LB, LE, NOTES0, handoff_path, hrun, is_orchestrator, now, say, ts
+from janus.decisions import decision_findings
 from janus.findings import ackable, finding, live_acks
 from janus.findings.hosts import (enforce, host_findings, lane_findings, orphan_job_findings, pane_findings, proc_findings,
     script_findings, thrash_findings, tidy_findings)
@@ -49,6 +50,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     F += ledger_findings(cfg, units)
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
     F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running)
+    F += decision_findings(cfg)
     F += spend_findings(cfg)
     if not cfg.run.ro and not cfg.run.dry: F = enforce(cfg, F, viol)
     return [finding(k, t) for k, t in F]

@@ -220,6 +220,7 @@ def swarm_header(cfg, hn, h, name, rcwd, local):
     L += ["## Other agents and shared knowledge (janus)",
           f"- Project instructions: read the root {' / '.join(docs)} of your tree ({rcwd}) and the one in each folder you touch, where present.",
           f"- Reports index: {bdir}/index.md (one line per unit: verdict, result, report path).",
+          f"- Decisions: {bdir}/decisions.md (one line per decision record; read the record before you decide anything it touches).",
           f"- Peers: {bdir}/peers.md (each running unit: host, model, branch, files it changed, step, jobs it waits on, report, transcript).",
           ("- Another agent's transcript: `janus transcript <unit> --grep '<regex>'` or `janus transcript <unit> --tail 20` (condensed)." if local else
            "- Another agent's transcript: peers.md names where it is; when it is on this host, grep or tail it (never read it whole); "

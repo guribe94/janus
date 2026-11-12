@@ -210,3 +210,6 @@ stop_direct = false      # a build or test an agent runs outside the lanes on a 
 cap_lines = 30           # check raises memory-long over this many entries
 review_days = 14         # check raises memory-review:<n> for an entry older than this (janus memory --keep <n> re-dates it)
 agent_docs = ["AGENTS.md"]   # the project's agent instructions every brief points at (the root one and one per folder touched)
+
+[owner]                  # the owner's decision queue (.janus/owner-queue.md): janus ask "<question>", janus answer <n> "<answer>"
+# notify = "osascript -e 'display notification \"<question>\"'"   # run with the question on stdin when one is asked; unset: no notification
