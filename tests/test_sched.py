@@ -154,6 +154,38 @@ class CpuScheduling(unittest.TestCase):
         self.h["_rd"] = str(self.rd / "not" / "yet"); (self.rd / "fresh.sh").write_text(janus.cap_lib(self.cfg, "b", self.h))
         out = subprocess.run(["bash", "-c", f"RD={self.rd}/not/yet; . {self.rd}/fresh.sh; cap_measure; echo $DF"], capture_output=True, text=True).stdout
         self.assertGreater(int(out.strip()), 0)
+    def test_a_job_records_the_shape_of_its_command(self):
+        """Catches (item 32) the recording half: history carried only the class and the probe's reservation line nothing about
+        the command, so a running job could only be compared with every job of its class (a 3-crate `cargo test` with a
+        20-minute test binary was flagged 121x against a `cargo_test` median of 1 min)."""
+        import shlex
+        a = type("A", (), {"lane": "jobs", "subdir": None, "wt": str(self.d), "usb": False, "broad": None})()
+        cmd = "true cargo test -p a -p b --no-fail-fast"   # `true` keeps it harmless; cap_class and cap_shape read the whole text
+        (self.rd / "t-9.sh").write_text(janus.job_script(self.cfg, "b", self.h, a, "t", cmd, "t-9"))
+        env = {k: v for k, v in os.environ.items() if k not in ("JANUS_CORES", "MAKEFLAGS", "CARGO_BUILD_JOBS", "RUST_TEST_THREADS",
+                                                               "NEXTEST_TEST_THREADS", "PYTEST_XDIST_AUTO_NUM_WORKERS", "OMP_NUM_THREADS")}
+        env["JANUS_POLL_S"] = "1"
+        r = subprocess.run(["bash", str(self.rd / "t-9.sh")], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.rd / "t-9.cmd").read_text().strip(), cmd, "the job did not write its command to <jid>.cmd")
+        want = self.sh(f"cap_shape {shlex.quote(cmd)}")
+        f = (self.rd / "history.tsv").read_text().splitlines()[0].split("\t")
+        self.assertEqual(len(f), 8, f"the history line has no shape column: {f}")
+        self.assertEqual(f[7], want, "the recorded shape is not the command's signature")
+        (self.rd / "w-9.res").write_text(f"{os.getpid()} 2 500 {int(time.time())} cargo_test\n"); (self.rd / "w-9.cmd").write_text(cmd)
+        self.assertIn(want, self.sh('res_sum; echo "$RL"'), "the reservation line the probe reports carries no shape")
+    def test_overrun_uses_comparable_jobs_not_the_class_median(self):
+        """Catches (item 32): the expected run time was the median of EVERY job of the class on the host, so a 3-crate
+        `cargo test` with a 20-minute test binary was flagged as stuck (121x) against a cargo_test median of 1 min."""
+        t = int(time.time())
+        hist = [f"{i}\tcargo_test\t500\t60\t0\t50\t1\t111" for i in range(5)]      # five 1-minute runs of one command (shape 111)
+        hist += ["9\tcargo_test\t900\t1200\t0\t1100\t1\t222"]                      # one 20-minute run of another command (shape 222)
+        p = probe_of(hist=hist, res=[f"1 2 500 {t - 1200} cargo_test w-1.res 222",   # comparable: 1200 s expected -> not stuck
+                                     f"2 2 500 {t - 1200} cargo_test w-2.res 111",   # its own command takes 60 s -> stuck
+                                     f"3 2 500 {t - 1200} cargo_test w-3.res 333"])  # no comparable run: not judged
+        F = janus.overrun_findings(self.cfg, {"here": p})
+        self.assertEqual([k for k, _ in F], ["overrun:here:w-2"])
+        self.assertIn("comparable", F[0][1])
     def test_overrun_flagged_from_class_history(self):
         """Catches: a job stuck for hours unnoticed although its class normally takes minutes."""
         t = int(time.time())
