@@ -19,6 +19,11 @@ GOLDEN = [
     "spend:api", "tidy:1", "unit:u2:finished", "unit:u2:limit",
 ]
 
+# the watcher's urgent prefixes before the registry (orch.py URGENT): the registry must keep the same findings urgent
+URGENT_BEFORE = ("unit:", "board:", "question:", "overlap:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads",
+                 "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:", "idle-with-backlog", "scheduler:", "pressure:",
+                 "direct:", "budget80:", "waiting:", "waste", "report-due", "parked:")
+
 PS = (" 501     1   501  99.0 20:00 /opt/miner --all\n"                      # an orphaned CPU burner, 20 min
       " 502     1   502   1.0 00:30 cargo test -p x\n")                       # a test run outside the lanes
 
@@ -90,7 +95,7 @@ class Golden(unittest.TestCase):
             orch.board_rows = lambda cfg: {"u1": {"state": "blocked", "silent": False, "gone": False, "text": "needs a key"},
                                            "x9": {"state": "working", "silent": False, "gone": True, "text": ""}}
             orch.board_questions = lambda cfg: [("3", "u1", "2026-01-01 00:00", "which branch?")]
-            orch.proc_findings = lambda cfg, ps_text=None: real_proc(cfg, PS)
+            orch.proc_findings = lambda cfg, ps_text=None, viol=None: real_proc(cfg, PS, viol)
             orch.script_findings = lambda: []
             orch.launchd_watcher_loaded = lambda *a: True
             orch.rule_findings = lambda cfg: []
@@ -98,7 +103,10 @@ class Golden(unittest.TestCase):
         finally:
             for k, v in saved.items(): setattr(orch, k, v)
         want = sorted(k.format(t=t[11:]) for k in GOLDEN); self.maxDiff = None
-        self.assertEqual(sorted(k for k, *_ in F), want)
+        self.assertEqual(sorted(f.key for f in F), want)
+        self.assertEqual([f.key for f in F if f.urgent], [f.key for f in F if f.key.startswith(URGENT_BEFORE)])
+        self.assertEqual([f for f, x in orch.FAMILIES.items() if x.urgent], [f for f in orch.FAMILIES if (f + ":").startswith(URGENT_BEFORE)])
+        self.assertEqual([f for f in orch.FAMILIES if not orch.ackable(f + ":x")], ["waiting"])
 
 
 if __name__ == "__main__":

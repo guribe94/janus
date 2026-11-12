@@ -12,6 +12,7 @@ from orchkit.probe import *
 from orchkit.cap import *
 from orchkit.beads import *
 from orchkit.context import *
+from orchkit.findings import *   # the Finding registry (section 7, seam 1)
 
 
 
@@ -259,9 +260,10 @@ def via_lane(cfg, c):
     return bool(VIA_LANE.search(c)) or any(os.path.basename(x) in c for x in cfg.paths.get("lane_scripts", []))
 
 
-def proc_findings(cfg, ps_text=None):
+def proc_findings(cfg, ps_text=None, viol=None):
     """On this machine (the Mac): CPU burners an agent started (busy over 10 min, under an agent or orphaned from one), and test
-    or build runs outside the pueue lanes (orch run / orch gate put them in a lane). ps_text: a ps table (tests)."""
+    or build runs outside the pueue lanes (orch run / orch gate put them in a lane). ps_text: a ps table (tests). viol: a list
+    that gets each burner's process data for enforce."""
     o = ps_text if ps_text is not None else sh(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,pcpu=,etime=,command="], timeout=10)[1]
     t, pg = {}, {}
     for l in o.splitlines():
@@ -280,7 +282,7 @@ def proc_findings(cfg, ps_text=None):
         lane = any("pueued" in t[q][3] for q in anc)
         if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
             F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; it is stopped after [enforce] grace_min unless it moves to a lane (orch run)"))
-            cfg._viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
+            if viol is not None: viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
                               "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": env_unit(p)})
         if TEST_RX.search(c) and not lane and not via_lane(cfg, c) and not any(TEST_RX.search(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc) and not lane_below(p):
             F.append((f"localtest:{p}", f"test/build run on this machine outside the pueue lanes (pid {p}, {et}): {c[:70]}; use orch run"))
@@ -296,13 +298,13 @@ def env_unit(pid):
 # Stop a process group after one warning (register item 23): TERM the group, KILL what is left after 5 s. When the group also
 # holds an agent (claude, codex) or pueued, only the process and its descendants are stopped, never the agent.
 
-def enforce(cfg, F):
+def enforce(cfg, F, viol):
     """Warn, then stop (orch-fixes8; register items 22, 23). The first time a violation is seen its unit gets a board direction;
     when it is still there [enforce] grace_min (default 5) later, a CPU burner's process group is stopped (stop_burners,
     default true) and a remote direct build's (stop_direct, default false: flagged and warned only). Running lane jobs are
     never touched. Only the registered orchestrator's check and the watcher act; anyone else only reports."""
     ec = cfg.c.get("enforce", {}); grace = ec.get("grace_min", 5) * 60; st = cfg.jget("enforce.json"); new = {}; notes = {}
-    for v in getattr(cfg, "_viol", []):
+    for v in viol:
         s = st.get(v["key"]) or {}; stop_ok = ec.get("stop_burners", True) if v["kind"] == "burner" else ec.get("stop_direct", False)
         u = v.get("unit")
         if not s.get("warned"):
@@ -360,7 +362,7 @@ def script_findings():
     return F
 
 def collect_findings(cfg, hs, units, ag, bd_err):
-    F = []; cfg._viol = []
+    F = []; viol = []   # viol: the processes enforce may stop (burner, direct), found on the way
     if bd_err: F.append(("beads", f"beads unavailable: {bd_err}; fix bd (orch doctor), units cannot be read until then"))
     ws = ws_id(cfg); names = {u["name"] for u in units}
     for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no build position (host_cap)
@@ -396,7 +398,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             if len(f) < 4 or not f[0].isdigit(): continue
             F.append((f"direct:{n}:{f[0]}", f"agent {f[2]} runs a build or test directly on {n} (pid {f[0]}, {int(fl(f[3])) // 60} min, outside the lanes): "
                       f"{(f[4] if len(f) > 4 else '')[:80]}; it must use {cfg.hosts[n].get('root', '~')}/run/{f[2]}.lane"))
-            cfg._viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
+            viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
             lab = t.get("label") or ""
@@ -460,7 +462,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
     F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg) + tidy_findings(cfg)
     F += lane_findings(cfg, hs, units)
-    if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg) + script_findings()
+    if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg, viol=viol) + script_findings()
     for n, pv in cfg.prov.items():
         if "ledger" in pv:
             bad = ledger_read(cfg, pv)[1]
@@ -485,8 +487,8 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     if sys.platform == "darwin" and not launchd_watcher_loaded(): F.append(("watcher", "watcher com.orch.watch is not running: run install"))
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap: launch on another provider, or ask the owner to raise the cap"))
-    if not cfg.ro and not DRY: F = enforce(cfg, F)
-    return F
+    if not cfg.ro and not DRY: F = enforce(cfg, F, viol)
+    return [finding(k, t) for k, t in F]
 
 def git_findings(cfg):
     """git:dirty, git:unpushed, git:noupstream of the project's own repository."""
@@ -541,12 +543,10 @@ def write_handoff(cfg, live):
     new = f"# HANDOFF: {cfg.name}\n{LB}\n{live}\n{LE}{notes}"
     if new != t and not cfg.ro: p.write_text(new)
 
-ACK_TTL = {"margin": 30 * 60}   # margin acks last 30 min, others 4 h, and every ack ends when its finding clears (audit H12)
-
 def live_acks(cfg, keys=None):
     """Acks still in force. keys: the findings seen now; an ack whose finding is gone is dropped (only a writer saves that)."""
     acks = {k: (v if isinstance(v, dict) else {"t": v}) for k, v in cfg.jget("acks.json").items()}
-    return {k: v for k, v in acks.items() if now() - v["t"] < ACK_TTL.get(k.split(":")[0], 4 * 3600) and (keys is None or k in keys)}
+    return {k: v for k, v in acks.items() if now() - v["t"] < ack_ttl(k) and (keys is None or k in keys)}
 
 def run_check(cfg, cycle=True, writer=None):
     """Returns (findings not acknowledged, live text, probes, units). writer (default: the caller is the registered orchestrator,
@@ -560,7 +560,7 @@ def run_check(cfg, cycle=True, writer=None):
     F = collect_findings(cfg, hs, units, ag, bd_err)
     if not cfg.ro: tune_pueue(cfg, hs, units)
     acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
-    F = [(k, t) for k, t in F if k not in acks or k.startswith(NO_ACK)]
+    F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)
     op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
     live = live_state(cfg, hs, units, F); write_handoff(cfg, live)
     if cycle: cfg.touch("last_cycle")
@@ -570,6 +570,8 @@ def cmd_check(cfg, a):
     F, live, hs, units = run_check(cfg)
     op = cfg.jget("open.json")
     if a.escalate: F = [(k, t) for k, t in F if now() - op.get(k, now()) > cfg.deadline]
+    if a.json:
+        say(json.dumps({"read_only": cfg.ro, "findings": [{**f.data(), "open_since": int(op.get(f.key, now()))} for f in F]}, indent=1)); return
     if a.brief and len(F) > 8: F = F[:8] + [("more", f"+{len(F) - 8} more: run orch check")]
     for k, t in F: say(f"[{k}] {t}")
     if cfg.ro: say("(read-only: not the registered orchestrator session, so nothing was saved, tuned or stamped)")
@@ -597,7 +599,7 @@ def cmd_board_close(cfg, a):
 
 def cmd_ack(cfg, a):
     k, d = a.problem, a.decision
-    if k.startswith(NO_ACK): raise Err(f"{k} cannot be acked: it costs money every hour; act on it (orch park {k.split(':', 1)[1]})")
+    if not ackable(k): raise Err(f"{k} cannot be acked: it costs money every hour; act on it (orch park {k.split(':', 1)[1]})")
     acks = live_acks(cfg); acks[k] = {"t": now()}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
     try:
         bd = Beads(cfg); m = re.match(r"unit:([^:]+)", k)
@@ -1553,7 +1555,6 @@ def cmd_tidy(cfg, a):
 ENDED = ("done", "failed", "gone", "idle")
 WAIT_RX = re.compile(r"^[\s*>-]*WAITING\b\**:?\s*(.*)$", re.M)
 JOBREF = re.compile(r"(?<![\w/.-])([A-Za-z0-9][\w.-]*):(\d+)\b")
-NO_ACK = ("waiting:",)   # findings an ack cannot hide: they cost money every hour until acted on
 WRAPUP = ("Your budget is used up. Do no more work: write your report now ({report}): what is done, the state it is in, what is "
           "left, the real exit codes of everything you ran, and the final line 'VERDICT: BLOCKED' (or DONE if it is done). Then stop.")
 
@@ -3949,8 +3950,6 @@ def hook_kind(d):
     return "codex" if ("codex" in tp or os.environ.get("CODEX_THREAD_ID")) else "claude"
 
 # ---------------------------------------------------------------- watch (launchd, one pass)
-URGENT = ("unit:", "board:", "question:", "overlap:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:",
-          "idle-with-backlog", "scheduler:", "pressure:", "direct:", "budget80:", "waiting:", "waste", "report-due", "parked:")
 
 def cmd_watch(cfg, a):
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
@@ -4015,7 +4014,7 @@ def cmd_watch(cfg, a):
     if st == "working": return
     tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
     big = tr and os.path.exists(tr) and os.path.getsize(tr) / 4 > cfg.reset_tokens
-    urgent = [k for k, _ in F if k.startswith(URGENT)]   # acked findings are already out of F; informational ones do not hold a reset (L4)
+    urgent = [f.key for f in F if f.urgent]   # the registry says which (findings/__init__.py); acked findings are already out of F; informational ones do not hold a reset (L4)
     if big and not urgent and not handoff_stale(cfg, False):
         if cfg.f("reset_asked").exists():
             cfg.f("reset_asked").unlink(); log("context reset: /clear"); herdr("agent", "prompt", pane, "/clear"); return
@@ -4033,7 +4032,7 @@ def main():
         if dry: p.add_argument("--dry-run", action="store_true")
         return p
     A = lambda *n, **k: (n, k)
-    add("check", A("--brief", action="store_true"), A("--escalate", action="store_true"))
+    add("check", A("--brief", action="store_true"), A("--escalate", action="store_true"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent, ackable, open_since)"))
     add("capacity"); add("status"); add("watch", A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"))
     add("learned", A("--reject", help="reject learned post <agent>:<n> (check stops listing it)"), A("--why", help="why it is rejected"))
     add("launch", A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
