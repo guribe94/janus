@@ -13,13 +13,16 @@ description: Use when you are the orchestrator of a multi-agent project that has
 - Stop orphans, stalled agents and thrashing jobs: `orch stop <unit>`.
 - Re-queue failed gates; `orch collect <unit>` results of finished or returned remote units.
 - Land green units; `orch close <unit>` once committed and pushed.
-- Launch within safe capacity and any owner caps: `orch launch <unit> --kind implement|review|audit --tier critical|normal [--host h]`. `orch capacity` shows room; a full host refuses. Reviews use a different vendor from the implementer (`--of <unit>`).
+- Launch within safe capacity and any owner caps: `orch launch <unit> --kind implement|review|audit|cleanup --tier critical|normal [--host h] [--test-host h]`. `orch capacity` shows room; a full host refuses (a `cleanup` unit is exempt from the load and disk limits). Reviews use a different vendor from the implementer (`--of <unit>`). Each unit needs its own worktree.
+- Answer every board question and blocker `check` reports (`board.sh direct <agent> <text>`); archive cards that are not units with `orch board-close <agent>`.
 - Classify owner instructions: close the beads issue as done, or make it a standing rule with `bd remember`.
 
-**Forbidden.** No operations by hand: no `rm -r`, `kill`, in-place edits of code or worktrees, loops over worktrees, destructive ssh, `sparse-checkout`, no running tests or builds yourself, no launching agents outside `orch launch`, no using a disabled provider or going past a cap, and no stopping anything because an ssh connection dropped. Stop only a unit's recorded agent with `orch stop`. Never ask the owner for what a rule already says (`bd prime`).
+**Forbidden.** No operations by hand: no `rm -r`, `kill`, in-place edits of code or worktrees, loops over worktrees, destructive ssh, `sparse-checkout`, no running tests or builds yourself, no launching agents outside `orch launch`, no using a disabled provider or going past a cap, and no stopping anything because an ssh connection dropped. Stop only a unit's recorded agent with `orch stop` (it ends the unit's whole process tree, detached children included). Never ask the owner for what a rule already says (`bd prime`).
 
 **Token rules.** Read `orch` output, never panes, logs or board files directly (`orch status` for the whole picture). Briefs are short: goal, scope, tier line, report path, done-criteria. Spend sparingly; critical work goes to the top models only.
 
 **Handoff.** `.orch/HANDOFF.md` is your working memory: Live state (generated) plus your notes (goal, per unit why and what done means, decisions with reasons latest first, next steps, things to watch), under 150 lines; move old notes to `.orch/history.md`. Update the notes after every decision and before going idle. After a reset or `/clear`, SessionStart reloads it with the rules and `orch check`; resume from it.
+
+**Use every machine.** The machines exist to speed work up: each agent runs on the host where its builds and tests run, and jobs go to whichever host has room. `orch launch` places agents by test host and measured room, and `orch check` reports hosts idle while work waits and lanes free on one host while another has a backlog: act on those lines.
 
 **herdr.** Panes and tabs are managed by `orch`; for CLI syntax see the herdr skill (`~/.claude/skills/herdr/SKILL.md`).
