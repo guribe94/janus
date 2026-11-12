@@ -101,6 +101,11 @@ def remote_wt(h, name):
     if h.get("runner") == "podman": return f"{ctr(h)['mount']}/worktrees/{name}"
     return f"{h.get('worktrees', h.get('root', '$HOME/janus') + '/worktrees')}/{name}"
 
+def land_disk_floor(cfg, h):
+    """The land lane's free-disk floor (finding 9): [hosts.<h>] min_disk_gb when set (the Mac's 5), else [capacity] min_disk_gb,
+    else 5 -- the land lane's own default: a landing is a short local merge, so it keeps 5 rather than admission's 10."""
+    return h["min_disk_gb"] if "min_disk_gb" in h else (cfg.capc.get("min_disk_gb") if cfg and "min_disk_gb" in cfg.capc else 5)
+
 def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     """The bash script pueue runs on the host. Output is tee'd to <runs>/<jid>.log, the exit code written to <jid>.rc.
     Every lane on every host (the Mac too, register item 5) waits for admission by reservations (ADMIT, runs/cap.sh), holds
@@ -120,10 +125,14 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
         pre = ""
         if a.lane == "land":   # the local landing lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
             ck = h.get("admit_check", ""); base = h.get("legacy_lanes", ""); ce = h.get("admit_check_env", "")
-            pre = (f"said=\nwhile :; do d=$(df -Pk {q(str(cfg.root))} | awk 'NR==2{{print int($4/1048576)}}'); busy=\n"
+            lfloor = land_disk_floor(cfg, h); lmax = int(lane_age(cfg, "land") * 60)
+            pre = (f"start=$(date +%s); last=0\nwhile :; do d=$(df -Pk {q(str(cfg.root))} | awk 'NR==2{{print int($4/1048576)}}'); busy=\n"
                    f"  for s in {base}; do o=$(cat $s/pid 2>/dev/null); [ -n \"$o\" ] && kill -0 $o 2>/dev/null && busy=$s; done\n"
-                   f"  [ \"$d\" -ge {capv(cfg, h, 'min_disk_gb')} ] && {{ [ -z {q(ck)} ] || {ce + ' ' if ce else ''}sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
-                   f"  [ \"$said\" ] || {{ echo \"janus: land lane waiting (disk ${{d}} GB, floor {capv(cfg, h, 'min_disk_gb')}; old lane busy: ${{busy:-none}})\"; said=1; }}; sleep 15; done\n")
+                   f"  [ \"$d\" -ge {lfloor} ] && {{ [ -z {q(ck)} ] || {ce + ' ' if ce else ''}sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
+                   f"  nowt=$(date +%s); WR=${{JANUS_LAND_REPORT_S:-60}}; WM=${{JANUS_LAND_MAX_S:-{lmax}}}\n"
+                   f"  [ $((nowt - last)) -ge \"$WR\" ] && {{ echo \"janus: land lane waiting $((nowt - start))s (disk ${{d}} GB, floor {lfloor}; old lane busy: ${{busy:-none}})\"; last=$nowt; }}\n"
+                   f"  [ \"$WM\" -gt 0 ] && [ $((nowt - start)) -ge \"$WM\" ] && {{ echo \"janus: land lane not admitted after $((nowt - start))s (disk ${{d}} GB, floor {lfloor}; old lane busy: ${{busy:-none}}): giving up (exit 121)\"; exit 121; }}\n"
+                   f"  sleep ${{JANUS_LAND_POLL_S:-15}}; done\n")
         body = f"{pre}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n {nice} bash -c {q(cmd)}\n"
     else:
         cap = int(h.get("job_gb", 2) * 1024)
