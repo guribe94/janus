@@ -128,5 +128,25 @@ class Autopilot(unittest.TestCase):
         self.assertIn("question:7", self.cfg.jget("acks.json"))
 
 
+class OnceOnly(unittest.TestCase):
+    def test_resume_and_wrapup_once_even_when_the_unit_record_save_fails(self):
+        """Catches (panel-eng F1): bd.save failing after a resume or a wrap-up, so the next pass derives the same state and
+        starts a second agent run on the same session and worktree."""
+        import copy
+        d, cfg = project(); (d / "out/u").mkdir(parents=True); (d / "out/u/REPORT.md").write_text("VERDICT: PENDING\nWAITING here:7\n")
+        rec = {"id": "x-1", "name": "u", "host": "here", "via": "pueue", "model": "m", "started": 0, "parked": {"jobs": ["here:7"], "since": 0, "by": "report"}}
+        hs = {"here": {"ok": True, "pueue": {"tasks": {"7": {"status": {"Done": {"result": "Success"}}}}}}}
+        calls = []
+        def resume(cfg, u, msg, wrapup=False): calls.append(wrapup); u.update(task=99, run="u.r2"); return "queued a new run"
+        def bad_save(self, u): raise janus.Err("bd update: database is locked")
+        with mock.patch.object(janus, "resume_unit", resume), mock.patch.object(janus.Beads, "save", bad_save), \
+             mock.patch.object(janus.Beads, "comment", lambda s, *a: None), mock.patch.object(janus, "wrap_due", lambda c, u: not u.get("_park")):
+            for _ in range(2):
+                u = copy.deepcopy(rec); u["_park"] = ["here:7"]; janus.tend_parked(cfg, hs, [u], lambda m: None)
+            self.assertEqual(calls, [False], "a parked unit was resumed twice")
+            for _ in range(2): janus.tend_parked(cfg, hs, [copy.deepcopy(rec)], lambda m: None)
+            self.assertEqual(calls, [False, True], "a capped run was wrapped up twice")
+
+
 if __name__ == "__main__":
     unittest.main()

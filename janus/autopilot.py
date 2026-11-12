@@ -31,6 +31,16 @@ def record(cfg, key, cause, reason, unit=None, ack=None):
         except Err: pass
     return True
 
+def forget(cfg, key, cause, why, ack=None):
+    """Undo a record made before an action that then failed before doing anything (the next pass may try again)."""
+    rec = cfg.jget("autopilot.json")
+    if rec.get("done", {}).pop(f"{key}|{cause}", None) is None: return
+    cfg.jput("autopilot.json", rec)
+    if ack:
+        acks = cfg.jget("acks.json")
+        if acks.pop(ack, None) is not None: cfg.jput("acks.json", acks)
+    with cfg.f("autopilot.log").open("a") as f: f.write(f"{ts()} {key} {cause}: not done ({why}); may be tried again\n")
+
 def held(cfg, name):
     """The orchestrator paused this unit: an ack whose key names it, with the decision 'hold'."""
     return any(name in k.split(":") and str((v or {}).get("d", "")).strip().lower().startswith("hold")
@@ -55,15 +65,18 @@ def relaunch(cfg, u, cause, log):
     a = argparse.Namespace(unit=new, kind=u.get("kind") or "implement", tier=u.get("tier") or "normal", host=None, model=u.get("model"),
                            brief=u.get("brief"), cwd=u.get("cwd"), budget=None, test_host=None, allow_main=False, of=None,
                            report=str(report_path(cfg, u)), resume_of=None, item=u.get("item"), share_with=u["name"])
+    # once only (panel-eng F1): recorded before the launch, the unit record saved best-effort after
+    if not record(cfg, f"unit:{u['name']}", "relaunch", f"{cause}: relaunching from its report as {new}", u, ack=f"unit:{u['name']}:finished"): return
     try: out = quiet(cmd_launch, cfg, a)
-    except Err as e:   # no room, budget, waste pause: tried again next pass (not recorded)
+    except Err as e:   # no room, budget, waste pause: tried again next pass
+        forget(cfg, f"unit:{u['name']}", "relaunch", str(e), ack=f"unit:{u['name']}:finished")
         log(f"autopilot: relaunch of {u['name']} ({cause}) not possible now: {e}"); return
-    bd = Beads(cfg); u["relaunched"] = new; bd.save(u)
-    try:
-        nu = next(x for x in bd.units() if x["name"] == new); nu.update(relaunch_of=base, relaunches=k + 1); bd.save(nu)
-    except (Err, StopIteration): pass
-    record(cfg, f"unit:{u['name']}", f"relaunch:{cause}", f"relaunched from its report as {new} ({out})", u, ack=f"unit:{u['name']}:finished")
+    record(cfg, f"unit:{u['name']}", f"relaunch:{cause}", f"relaunched from its report as {new} ({out})")
     log(f"autopilot: {u['name']} {cause}: relaunched as {new}")
+    try:
+        bd = Beads(cfg); u["relaunched"] = new; bd.save(u)
+        nu = next(x for x in bd.units() if x["name"] == new); nu.update(relaunch_of=base, relaunches=k + 1); bd.save(nu)
+    except (Err, StopIteration) as e: log(f"autopilot: {u['name']}: saving the relaunch on the unit records failed ({e})")
 
 def ending(cfg, u):
     """Why a finished unit is relaunched: 'capped' (its wrap-up run ended too), 'crashed' (ended with no verdict), or None."""
