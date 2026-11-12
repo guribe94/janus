@@ -595,6 +595,11 @@ class Memory(unittest.TestCase):
         rh = orch.brief_header(cfg, "far", {"root": "/r", "ssh": "x"}, "u2", "/r/worktrees/u2", False)
         self.assertIn("tests run on linux only", rh); self.assertIn("/r/board/peers.md", rh)
 
+    def test_rule_subject(self):
+        S = orch.rule_subject
+        self.assertEqual(S("claude-api-on-the-new-key-cap-175"), S("claude-api-on-the-new-key-keychain-orch"))   # one subject, two rules
+        self.assertNotEqual(S("keep-build-output-in-the-shared-build-cache"), S("keep-herdr-tidy-one-labelled-tab-per-running"))
+
 class Peers(unittest.TestCase):
     def test_peers_file_and_overlap(self):
         d, cfg = project(); (d / "board").mkdir(); cfg.ro = False
