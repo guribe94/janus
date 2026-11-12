@@ -1,6 +1,29 @@
-"""The bd (beads) wrapper: one place that reads units, saves their record and adds comments (section 7, Step 1)."""
+"""The bd (beads) wrapper: one place that reads units, saves their record and adds comments (section 7, Step 1).
+
+A unit's record is the JSON in its issue's notes. It carries its version (v); unit_record() reads one and migrate_unit()
+brings an older version up to UNIT_V, so a renamed or added field is one migration step here, never a .get() guess at
+every reader (section 7, seam 6)."""
 from orchkit.context import sh, Err
 import json
+
+UNIT_V = 2
+
+
+def migrate_unit(m):
+    """A unit record at UNIT_V. v1 (no v): launch wrote only the current run id (run), and resumes added the list (runs); v2 lists
+    every run id in runs, the current one last. A newer record than this orch knows is returned as it is."""
+    if m.get("v", 1) < 2:
+        runs = list(dict.fromkeys([*m.get("runs", []), *([m["run"]] if m.get("run") else [])]))
+        m = {**m, "v": 2, **({"runs": runs} if runs else {})}
+    return m
+
+
+def unit_record(i):
+    """The record of a unit issue (its notes; an old one its description), migrated; {} when it cannot be read."""
+    try: m = json.loads(i.get("notes") or i.get("description") or "{}")
+    except Exception: m = {}
+    return migrate_unit(m) if isinstance(m, dict) and m else {}
+
 
 class Beads:
     def __init__(self, cfg): self.cfg = cfg
@@ -18,9 +41,7 @@ class Beads:
         for i in self.issues("unit", "open,in_progress"):
             t = i.get("title", "")
             if not t.startswith("unit:"): continue
-            try: m = json.loads(i.get("notes") or i.get("description") or "{}")
-            except Exception: m = {}
-            out.append({**m, "id": i["id"], "name": t[5:]})
+            out.append({**unit_record(i), "id": i["id"], "name": t[5:]})
         return out
     def save(self, u):
         """The unit's record (beads notes). What check computes on the fly (state, verdict, keys starting with _) is never saved."""
@@ -31,4 +52,4 @@ class Beads:
         return (r[0] if isinstance(r, list) else r)["id"]
     def comment(self, i, text): sh(["bd", "comments", "add", i, text], cwd=self.cfg.beads)
 
-__all__ = ["Beads"]
+__all__ = ["UNIT_V", "migrate_unit", "unit_record", "Beads"]

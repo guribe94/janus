@@ -4,11 +4,12 @@ unit_state (from the live source it runs in), verdict (a resumed report only cou
 started; PENDING is not a verdict), report_path, herdr_agents, ws_id (the workspace agents run in); get_unit/unit_any/
 all_units (open units, the latest record of any unit), unit_runs/unit_spent, api_out, the WAITING line of its report
 (waiting_line_jobs), agent_ended, and whether its tree is its own (own_tree, main_checkout)."""
-from orchkit.context import herdr, Err, sh
+from orchkit.beads import Beads, unit_record
+from orchkit.context import Err, sh
+from orchkit.ledger import ledger_read
+from orchkit.platform import herdr
 import json, re
 from pathlib import Path
-from orchkit.ledger import ledger_read
-from orchkit.beads import Beads
 
 def unit_state(u, ps, agents):
     """working | idle | blocked | queued | done | failed | gone, from the live source the unit runs in."""
@@ -118,9 +119,7 @@ def all_units(cfg):
         for i in sorted(r, key=lambda i: i.get("created_at", "")):
             t = i.get("title", "")
             if not t.startswith("unit:"): continue
-            try: m = json.loads(i.get("notes") or "{}")
-            except Exception: m = {}
-            out[t[5:]] = {**m, "id": i["id"], "name": t[5:], "status": i.get("status")}
+            out[t[5:]] = {**unit_record(i), "id": i["id"], "name": t[5:], "status": i.get("status")}
         cfg.run.all_units = out
     return cfg.run.all_units
 
