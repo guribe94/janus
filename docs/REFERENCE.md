@@ -726,6 +726,14 @@ It also covers the rest of the mess orchestration makes, each by a safe rule:
 - test roots (`/tmp/janus-test-fixture-*`, and older `janus-test-*` / `janus-rem-*`) over a day old;
 - `[hosts.X] disk_budget_gb`: the host's janus root plus its `cache_dirs` (build targets, compiler caches); over budget, the
   oldest top-level entries of the cache dirs go until it fits.
+- `janus tidy hold <target> [--why <text>]` records a hold so tidy never removes that item (a worktree path, a `host:name`, a
+  test root; a hold matches a target equal to it, under it or containing it); `janus tidy holds` lists them, `janus tidy unhold
+  <target>` clears one. It is how one clean worktree an open unit still depends on (not as its cwd) is kept while the rest is
+  tidied, instead of skipping the whole pass.
+- `[tidy] auto = true` lets the watcher remove the safe kinds itself — a clean landed worktree and a landed branch — each
+  `every_min`, so `tidy:<n>` does not keep firing for bookkeeping nobody does; every other kind still needs `janus tidy`.
+- `[tidy] artifacts = ["target", ...]`: globs of rebuildable output removed inside a CLOSED unit's own worktree (an open unit's
+  tree is never touched); inert unless set. It keeps a worktree that stays around from pinning build output.
 The watcher refreshes the list every `[tidy] every_min` (60); `janus check` raises `disk:<host>` over a budget and `tidy:<n>`
 with what is reclaimable.
 
