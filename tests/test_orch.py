@@ -349,6 +349,17 @@ class Park(unittest.TestCase):
         self.assertEqual(sorted(orch.unit_jobs(hs, "u")), ["here:8", "here:9"])
         r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\n"); self.assertEqual(orch.verdict(cfg, u), "VERDICT: DONE")
 
+    def test_wrapup_once_when_capped_without_verdict(self):
+        """item 2: a run that ended at its budget cap with no final verdict is wrapped up once; not with a verdict, not twice."""
+        d, cfg = project(); o = d / "out/u"; o.mkdir(parents=True); (o / "REPORT.md").write_text("VERDICT: PENDING\nstep 1\n")
+        (o / "api.json").write_text(json.dumps({"subtype": "error_max_budget_usd", "total_cost_usd": 1.0}))
+        u = {"name": "u", "via": "pueue", "model": "m", "state": "failed", "verdict": None, "started": 0}
+        self.assertTrue(orch.wrap_due(cfg, u))
+        self.assertFalse(orch.wrap_due(cfg, {**u, "wrapup": "u.r2.1"}))
+        self.assertFalse(orch.wrap_due(cfg, {**u, "verdict": "VERDICT: BLOCKED"}))
+        self.assertFalse(orch.wrap_due(cfg, {**u, "state": "working"}))
+        (o / "api.json").write_text(json.dumps({"subtype": "success"})); self.assertFalse(orch.wrap_due(cfg, u))
+
     def test_resume_argv_and_no_ack(self):
         mc = {"api_id": "x"}
         a = orch.api_argv({}, mc, 1, "go", "S1")
