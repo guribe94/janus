@@ -144,7 +144,9 @@ def park_jobs(cfg, text):
     out = (None, [])
     for m in WAIT_RX.finditer(text):
         jobs = [f"{h}:{t}" for h, t in JOBREF.findall(m.group(1)) if h in cfg.hosts]
-        if jobs: out = (text.count("\n", 0, m.start()), jobs)
+        # finding A: the line index is a splitlines index, exactly like verdict's `text.splitlines()` (a form feed, U+2028 or
+        # \x1c-\x1e counts as a line break in splitlines but not in `count("\n")`, so the two indexes must use one model).
+        if jobs: out = (len(text[:m.start()].splitlines()), jobs)
     return out
 
 def report_text(cfg, u):

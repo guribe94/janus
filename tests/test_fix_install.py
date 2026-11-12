@@ -792,6 +792,24 @@ class Item1ParkedAfterDone(unittest.TestCase):
         self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
         self.assertIn("last line", janus.PARK_RULE, "the brief header must say the closing VERDICT line is the last line")
 
+    def test_a_unicode_line_separator_does_not_free_a_parked_units_job(self):
+        """Catches (finding A, regression of 03a763c): verdict counted the lines with `splitlines` while the park line index
+        counted `\\n`, so a form feed (or U+2028, \\x1c-\\x1e, U+0085) before the last VERDICT line pushed the verdict index up
+        and the park line compared as not after it: a parked unit read as finished and its still-running job was orphaned,
+        which the watcher cancels."""
+        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
+        head = "VERDICT: PENDING\npage\x0cbreak\nVERDICT: DONE - items 1-6\n"
+        for tail in ("WAITING here:9\n", "WAITING\u2028here:9\n"):
+            p.write_text(head + tail)
+            self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), repr(tail))
+        p.write_text(head + "WAITING here:9\n")
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0}
+        hs = {"here": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}},
+                                               "9": {"status": {"Running": {}}, "label": "unit:u1@" + janus.project_id(cfg)}}})}
+        F, _ = janus.unit_findings(cfg, hs, [u], {})
+        self.assertEqual(u.get("state"), "parked")
+        self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [u])], [], "the parked unit's job was orphaned (cancelled)")
+
 
 class Item2ResumeGuard(unittest.TestCase):
     """Finding 2 (medium-high): `janus resume <u> --message ...` had no guard: it started a second agent beside a running one
