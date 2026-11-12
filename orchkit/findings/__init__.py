@@ -4,9 +4,10 @@ Every problem check reports is a Finding(key, text). Its family is the key up to
 legal families and the one spec of how each is handled: urgent (the watcher prompts an idle orchestrator for it, and it holds a
 context reset), ack_ttl (seconds an ack hides it; every ack also ends when its finding clears; 0: it cannot be acked). A key of
 an unregistered family is refused (finding() raises), so a new key can never silently become non-urgent or ackable.
-`orch check --json` serialises the findings with these properties. This module imports nothing of orch (it is the bottom of the
-findings layer)."""
+`orch check --json` serialises the findings with these properties; live_acks applies ack_ttl. It imports only context (the
+bottom of the findings layer; the family modules beside it and check.py build on it)."""
 from typing import NamedTuple
+from orchkit.context import now
 
 H = 3600
 
@@ -105,4 +106,10 @@ def ack_ttl(key):
 def ackable(key): return ack_ttl(key) > 0
 
 
-__all__ = ["Family", "FAMILIES", "Finding", "family", "finding", "ack_ttl", "ackable"]
+def live_acks(cfg, keys=None):
+    """Acks still in force. keys: the findings seen now; an ack whose finding is gone is dropped (only a writer saves that)."""
+    acks = {k: (v if isinstance(v, dict) else {"t": v}) for k, v in cfg.jget("acks.json").items()}
+    return {k: v for k, v in acks.items() if now() - v["t"] < ack_ttl(k) and (keys is None or k in keys)}
+
+
+__all__ = ["Family", "FAMILIES", "Finding", "family", "finding", "ack_ttl", "ackable", "live_acks"]

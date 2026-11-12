@@ -4,11 +4,12 @@ Templates live in orchkit/templates.py; the renders here exercise each one with 
 The renderers themselves (cap_lib, clean_pueue_script, job_script, scope_script, tidy_host, gate) stay with their concern;
 this test is the honest minimum the seam promises: a template that no longer parses fails here, not on a host at runtime.
 Standard library only; no network, no API spend."""
-import importlib.util, os, subprocess, sys, tempfile, textwrap, unittest
+import os, subprocess, sys, tempfile, textwrap, unittest
 from pathlib import Path
 
-ORCH_PY = Path(os.environ.get("ORCH_PY") or Path(__file__).resolve().parent.parent / "orch.py")
-spec = importlib.util.spec_from_file_location("orch", ORCH_PY); orch = importlib.util.module_from_spec(spec); spec.loader.exec_module(orch)
+from orchload import load
+
+orch = load()
 
 
 def project(extra=""):

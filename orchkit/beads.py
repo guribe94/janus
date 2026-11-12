@@ -1,7 +1,6 @@
 """The bd (beads) wrapper: one place that reads units, saves their record and adds comments (section 7, Step 1)."""
 from orchkit.context import sh, Err
-import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
-from pathlib import Path
+import json
 
 class Beads:
     def __init__(self, cfg): self.cfg = cfg

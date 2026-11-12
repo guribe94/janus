@@ -4,12 +4,13 @@ Cfg.jput writes straight to the file today (orch.py:52-53), so a kill during the
 returns {} — every ack, open problem, the 3-strike Stop counter and learned.json reset without a word. This test injects a crash
 into the write of a new value and asserts the previous value is still on disk. It is an expected failure until jput writes a temp
 file and renames it (the writer-lock/atomic-state seam); then it flips to a real guard. Standard library only; no network."""
-import importlib.util, json, os, tempfile, textwrap, unittest
+import json, os, tempfile, textwrap, unittest
 from pathlib import Path
 from unittest import mock
 
-ORCH_PY = Path(os.environ.get("ORCH_PY") or Path(__file__).resolve().parent.parent / "orch.py")
-spec = importlib.util.spec_from_file_location("orch", ORCH_PY); orch = importlib.util.module_from_spec(spec); spec.loader.exec_module(orch)
+from orchload import load
+
+orch = load()
 
 
 def project():

@@ -4,8 +4,16 @@ CAP_DEFAULTS/capv/cap_nums, cap_lib (renders templates.CAP_LIB for runs/cap.sh),
 host_cap/next_free/build_room. build_room's refusal names when room is expected (section 9: keep that)."""
 from orchkit.context import fl, ts, now, sh
 from orchkit.templates import CAP_LIB
-import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
+import re, shlex
 from pathlib import Path
+
+# "Launch as much as we can, but no more." Admission is by reservations, never by a momentary reading: each running job holds
+# cores_per_job cores and the memory its job class needed before (the peak resident memory of past runs of that class on that
+# host, plus margin_pct), each agent with a reservation file holds the agent class's figure; a job is admitted while the sum
+# fits cores and ram_gb - services_gb. Back-pressure pauses admission (memory PSI avg10 over psi_pause, or load over
+# load_pause x cores for hold_s); a running job is never killed for it. One shell library per host (runs/cap.sh) holds the
+# rule: every waiting job sources it each poll, and every probe carries it inline, so orch check, launch and fill read the
+# same numbers the admission uses. Settings: per host, else [capacity], else the default below.
 
 CAP_DEFAULTS = {"cores": 4, "cores_per_job": 1, "ram_gb": 4, "services_gb": 0, "job_gb": 2, "agent_gb": 1.0, "psi_pause": 10,
                 "load_pause": 1.25, "hold_s": 60, "history_n": 5, "margin_pct": 15, "min_disk_gb": 10}

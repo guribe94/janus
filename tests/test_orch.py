@@ -1,20 +1,11 @@
 """Checks for orch.py, run before every release (./check, and install runs them against the copy it installs).
 ORCH_PY names the orch.py under test (default: the one next to tests/). Standard library only; no network, no API spend."""
-import importlib.util, json, os, stat, subprocess, sys, tempfile, textwrap, time, unittest
+import json, os, stat, subprocess, sys, tempfile, textwrap, time, unittest
 from pathlib import Path
 
-ORCH_PY = Path(os.environ.get("ORCH_PY") or Path(__file__).resolve().parent.parent / "orch.py")
-spec = importlib.util.spec_from_file_location("orch", ORCH_PY); orch = importlib.util.module_from_spec(spec); spec.loader.exec_module(orch)
+from orchload import ORCH_PY, load
 
-# The package split (orchkit/) moved functions into modules, so a test that patches `orch.X` must reach the caller wherever it now
-# lives (board.py calls herdr, cap.py calls sh, ...). Broadcast every setattr on the shim to each loaded orchkit module holding the name.
-import types as _types
-class _Broadcast(_types.ModuleType):
-    def __setattr__(self, name, value):
-        super().__setattr__(name, value)
-        for _m in list(sys.modules.values()):
-            if getattr(_m, "__name__", "").startswith("orchkit.") and hasattr(_m, name): setattr(_m, name, value)
-orch.__class__ = _Broadcast
+orch = load()
 # Every fixture (temp project, script, daemon) lives under one root named with orch's fixture mark, so a live orch check running
 # meanwhile skips the processes started here (fixes10 item 6); ORCH_IN_TESTS lets the suite itself see them.
 import atexit, shutil

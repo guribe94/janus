@@ -3,21 +3,25 @@
 Every OS- or tool-specific choice lives here, so a second platform is a new function, not a new branch inside the tool:
 process listing (`ps`), the elapsed-time flavour `ps` prints, the terminal/pane tool (`herdr`), the secret store (the macOS
 keychain) and the service manager (launchd/systemd). Only the macOS/Linux variants that already exist are implemented;
-behaviour is unchanged. `sh` is imported inside the functions so `platform` stays below `context` (no import cycle), and
-`context` re-exports `ps_table`/`secs`/`herdr`, so existing call sites are unchanged. Still to fold in during the split:
-containers/scopes (`podman`, `systemd-run`) and the host-discovery variants.
+behaviour is unchanged. run() is the one subprocess call (context.sh adds the environment policy on top of it), so this module
+imports nothing of orch and sits at the bottom of the package. Still to fold in: containers/scopes (`podman`, `systemd-run`) and
+the host-discovery variants.
 """
-import json
+import json, subprocess, sys
 
 
-def _sh():
-    from orchkit.context import sh as _s
-    return _s
+def run(cmd, cwd=None, inp=None, timeout=25, env=None):
+    """(rc, stdout, stderr) of a command; 127 when it is not installed, 124 when it timed out."""
+    try:
+        r = subprocess.run(cmd, cwd=cwd, input=inp, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError: return 127, "", f"{cmd[0]}: not installed"
+    except subprocess.TimeoutExpired: return 124, "", f"{cmd[0]}: timeout"
 
 
 def ps_table():
     """{pid: (ppid, pgid, started, command)} for every process (one ps call)."""
-    rc, o, e = _sh()(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,lstart=,command="], timeout=10)
+    rc, o, e = run(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,lstart=,command="], timeout=10)
     t = {}
     for l in o.splitlines():
         f = l.split(None, 8)   # pid ppid pgid + lstart is 5 words (Wed Nov 11 15:31:02 2026) + command
@@ -34,27 +38,26 @@ def secs(et):
 
 def herdr(*a, timeout=20):
     """The herdr CLI (panes, agents, workspaces): its JSON result, or None."""
-    rc, o, e = _sh()(["herdr", *a], timeout=timeout)
+    rc, o, e = run(["herdr", *a], timeout=timeout)
     try: return json.loads(o).get("result", {}) if rc == 0 else None
     except Exception: return None
 
 
 def keychain_get(item):
     """(rc, password) from the macOS keychain, or None where there is no keychain (not macOS)."""
-    import sys
     if sys.platform != "darwin": return None
-    rc, o, e = _sh()(["security", "find-generic-password", "-s", item, "-w"])
+    rc, o, e = run(["security", "find-generic-password", "-s", item, "-w"])
     return rc, o
 
 
 def launchd_watcher_loaded(name="com.orch.watch"):
     """True when the launchd watcher job is loaded (macOS)."""
-    return _sh()(["launchctl", "list", name])[0] == 0
+    return run(["launchctl", "list", name])[0] == 0
 
 
 def systemd_watcher_active(name="orch-watch.timer"):
     """True when the systemd user timer is active (Linux)."""
-    return _sh()(["systemctl", "--user", "is-active", name])[0] == 0
+    return run(["systemctl", "--user", "is-active", name])[0] == 0
 
 
-__all__ = ["ps_table", "secs", "herdr", "keychain_get", "launchd_watcher_loaded", "systemd_watcher_active"]
+__all__ = ["run", "ps_table", "secs", "herdr", "keychain_get", "launchd_watcher_loaded", "systemd_watcher_active"]

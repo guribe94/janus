@@ -4,8 +4,7 @@ board_script/board_dir/board, board_rows/board_questions/learned_posts, board_fi
 may still override paths.board (section 9: board.sh stays a callable path); board_upkeep and cmd_learned stay with their
 callers until the memory/actions split."""
 from orchkit.context import ORCH_SELF, sh, now, herdr, atomic_write, ORCH_MARK
-import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
-from pathlib import Path
+import hashlib, os, re, shlex, sys, time
 
 def board_script(cfg):
     """The message board script: paths.board (a project's own), else the board.sh shipped next to orch.py (orch-swarm item 6)."""
