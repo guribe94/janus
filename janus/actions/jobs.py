@@ -566,8 +566,23 @@ def requeue(cfg, spec, to):
     with contextlib.redirect_stdout(buf): cmd_run(cfg, args)
     return (buf.getvalue().strip().splitlines()[-1:] or ["?"])[0]
 
+def thrash_log(cfg, h, jid, line):
+    """Finding 8: write the stop/re-queue where the job's own record is -- its log (locally the collected copy) and the host's
+    job_log, when it has one -- so a stopped job's log says what happened to it and who did it."""
+    txt = f"{ts()} janus thrash: {line}"
+    if jid:
+        loc = Path(runs_dir(cfg, h)) / f"{jid}.log" if h.get("local") else cfg.f("runs") / f"{jid}.log"
+        try:
+            loc.parent.mkdir(parents=True, exist_ok=True)
+            with loc.open("a") as f: f.write(txt + "\n")
+        except OSError: pass
+    jl = h.get("job_log")
+    if jl and jl != "/dev/null": hrun(h, f"printf '%s\\n' {qp(txt)} >> {qp(jl)}", timeout=30)
+
 def tend_thrash(cfg, hs, units, log, dry=False):
-    """Lines saying what was (or, dry, would be) done on each shared host over its thrash limit."""
+    """Lines saying what was (or, dry, would be) done on each shared host over its thrash limit. Finding 8: the stop and the
+    re-queue are written to the job's own log and named in the line (the check's finding reads it), and the over-since clock is
+    reset after an action, so one pass never stops the next newest job too."""
     out = []
     for n, (psi, mins) in thrash_track(cfg, hs).items():
         lim, need = thrash_cfg(cfg, cfg.hosts[n])
@@ -578,12 +593,16 @@ def tend_thrash(cfg, hs, units, log, dry=False):
         if not jobs: out.append(f"{n}: memory PSI {psi} over {lim:g} for {mins:.0f} min, but no job of this project runs there: nothing to stop"); continue
         ref, jid, spec, _ = jobs[0]; to = requeue_host(cfg, hs, units, n, spec)
         msg = f"{n} thrashing (memory PSI {psi} over {lim:g} for {mins:.0f} min): stop {ref} ({jid}, newest of {len(jobs)}), re-queue on {to}"
+        if to == n: msg += " (no other host has room or meets it: re-queued on the SAME host, which is still over the limit)"
         if dry: out.append("would " + msg); continue
         try:
             done = cancel_job(cfg, ref, force=True); new = [requeue(cfg, spec, to)]
             line = f"{msg}: {'; '.join(done)}; now {new[0]}"
             rec = cfg.jget("thrash-acts.json"); rec[str(int(now()))] = line; cfg.jput("thrash-acts.json", dict(list(rec.items())[-50:]))
             if spec.get("unit"): board(cfg, "direct", spec["unit"], f"your job {ref} was stopped on {n} (host thrashing) and re-queued as {new[0]}: wait on that id")
+            st = cfg.jget("thrash.json"); st[n] = int(now()); cfg.jput("thrash.json", st)   # finding 8: reset the over-since clock
+            try: thrash_log(cfg, cfg.hosts[n], jid, line)
+            except Err as e: out.append(f"{msg}: (its job log could not be written: {e})")
             out.append(line)
         except Err as e: out.append(f"{msg}: failed: {e}")
         log(out[-1])
