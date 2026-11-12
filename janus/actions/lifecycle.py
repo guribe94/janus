@@ -342,6 +342,21 @@ def refresh_remote(cfg, u, bd, log):
         pk = waiting_line_jobs(cfg, u)
         if pk: u["_park"] = pk; u["state"] = "parked"
 
+def sync_remote_outputs(cfg, units, bd):
+    """Item 11 addendum: before check judges a remote unit parked vs orphan, bring its report here once its agent ended (the local
+    report has no WAITING line until janus collect, so its jobs looked orphaned). A writer only; the save is recorded so the next
+    pass does not repeat it."""
+    if cfg.run.ro: return
+    for u in units:
+        if cfg.hosts.get(u.get("host"), {}).get("local") or u.get("via") in ("failed", "starting"): continue
+        if u.get("state") not in ENDED or u.get("saved") == u.get("task"): continue
+        try:
+            if not save_output(cfg, u): continue
+        except Err: continue
+        u["saved"] = u.get("task"); u["saved_at"] = int(now())
+        try: bd.save(u)
+        except Err: pass
+
 def tend_parked(cfg, hs, units, log):
     """The watcher's part: record parked units, resume those whose jobs all finished, wrap up capped runs (item 2)."""
     bd = Beads(cfg)

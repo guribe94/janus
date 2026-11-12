@@ -151,8 +151,10 @@ def unit_findings(cfg, hs, units, ag):
     for u in units:
         st = unit_state(u, hs, ag); v = verdict(cfg, u); u["state"] = st; u["verdict"] = v
         age = now() - u.get("started", now())
-        # parked (janus-fixes9 item 1): recorded, or its turn ended with a WAITING line; no verdict yet
-        pk = [] if v else ((u.get("parked") or {}).get("jobs") or (waiting_line_jobs(cfg, u) if st in ENDED or u.get("via") == "tmux" else []))
+        # parked (janus-fixes9 item 1): recorded, or its turn ended with a WAITING line; no verdict yet. A recorded park wins over
+        # a verdict (item 11): a resumed-then-parked unit is parked, not finished.
+        rec = (u.get("parked") or {}).get("jobs")
+        pk = rec or ([] if v else (waiting_line_jobs(cfg, u) if st in ENDED or u.get("via") == "tmux" else []))
         if pk:
             u["_park"] = pk; u["state"] = st = "parked"
             F += parked_findings(cfg, hs, u, pk)
