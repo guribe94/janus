@@ -132,9 +132,16 @@ def known_failure_findings(cfg, names):
                 seen.add(i); F.append((f"known-failure:{i}:passes", f"known failure {i} passed in gate {n}: remove it from {cfg.c['landing']['known_failures']}"))
     return F
 
+ORCH_WAIT = 3   # watcher passes an unregistered orchestrator (pane present without an agent, or session pending) is tolerated
+
 def orchestrator_findings(cfg):
-    """orchestrator:kind: the registered orchestrator's kind differs from janus.toml [orchestrator] kind."""
+    """orchestrator:kind: the registered orchestrator's kind differs from janus.toml [orchestrator] kind; orchestrator:unregistered:
+    the watcher has not seen the orchestrator it started (or the recorded pane's agent) for ORCH_WAIT passes and starts none."""
     F = []
+    w = cfg.jget("orch_wait.json")
+    if w.get("passes", 0) >= ORCH_WAIT:
+        F.append(("orchestrator:unregistered", f"no orchestrator seen for {w['passes']} watcher passes ({w.get('why')}); the watcher starts no other while it "
+                  "may be starting: look at its pane, then run janus register in it, or close the pane (herdr pane close) so the watcher starts a new one"))
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but janus.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))

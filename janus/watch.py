@@ -61,6 +61,14 @@ def watch_pass(cfg, log):
     present = pane in {p.get("pane_id") for p in pl.get("panes", [])}
     ag = herdr("agent", "get", pane) if pane and present else None
     if present and ag is None: log(f"herdr agent get {pane} failed: nothing started"); return
+    sess = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
+    if present and (ag or {}).get("agent"): cfg.f("orch_wait.json").unlink(missing_ok=True)
+    elif present or sess.startswith("pending:"):
+        # never a second orchestrator next to one that may be starting (panel-eng F2): its pane still exists, or the session it
+        # was started for has not registered yet. Logged each pass; check raises orchestrator:unregistered after ORCH_WAIT passes.
+        w = cfg.jget("orch_wait.json"); why = f"pane {pane} exists but herdr shows no agent in it" if present else "the started orchestrator has not registered (session pending)"
+        cfg.jput("orch_wait.json", {"since": w.get("since") or int(now()), "passes": w.get("passes", 0) + 1, "why": why})
+        log(f"orchestrator not seen ({why}): nothing started, pass {w.get('passes', 0) + 1}"); return
     if not present or not (ag or {}).get("agent"):
         # A new orchestrator only when every sign says the registered one is gone (H4, fixes5 item 1): its pane is absent from
         # a successful pane list, its process (pid and start time recorded at register) is not running, and its transcript has

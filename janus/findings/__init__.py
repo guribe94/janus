@@ -51,7 +51,7 @@ FAMILIES = {
     "memory-subject": Family("two memory entries share one subject"),
     "note": Family("an agent left a shared-file note on another agent's card (board.sh note)"),
     "old-rule": Family("jobs still wait under the old cap rule", urgent=True),
-    "orchestrator": Family("the registered orchestrator's kind differs from janus.toml"),
+    "orchestrator": Family("the registered orchestrator's kind differs from janus.toml, or one the watcher started never registered"),
     "orphan": Family("a job, tmux session or agent pane with no open unit", urgent=True),
     "overlap": Family("two running units change the same file", urgent=True),
     "owner-question": Family("a question for the owner waits in .janus/owner-queue.md", urgent=True),
