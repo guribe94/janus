@@ -124,7 +124,13 @@ Project launchers (an older `launcher` key) are no longer used; doctor says so.
 **`[models.<name>]`**: `provider`, `vendor`, `kind`. `kind = "api"` is an API agent run by janus (`api_id` is the model id
 the API takes).
 `claude`, `codex` and `opencode` are agents in a herdr pane (in tmux on remote hosts); `args` are extra command-line
-arguments. `hosts` limits where a model may run.
+arguments. `hosts` limits where a model may run. `qualified = false` marks a free or new model unqualified: routing skips it
+for normal work until `janus qualify <name> "<what it did>"` records a pass (`.janus/qualified.json`); a `qualify` unit may use
+it. Unset means qualified (inert).
+
+**`janus qualify <model> [--fail] "<what it did>"`**: record that a model passed (or failed) a small real task before it does
+real work. It clears the `qualified = false` skip for that model on a pass; `--fail` keeps it skipped. `janus report` shows each
+implementer model's first-review pass rate (`First review per implementer model`), the outcome data routing should read.
 
 **`[routing]`**: ordered lists per tier: `critical`, `normal`, and `review`. The first model whose provider is enabled
 and within budget wins. A review skips models of the implementer's vendor.

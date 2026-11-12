@@ -306,6 +306,28 @@ class LandFirst(unittest.TestCase):
         self.assertIsNone(janus.land_first_block(cfg, [], {}))
 
 
+class QualifyRoute(unittest.TestCase):
+    """ranked 10 / S1 free-first: a model marked unqualified is skipped for normal work until a pass is recorded; a qualify unit
+    may still use it. The failure caught: a free/new model doing real work before anyone saw what it can do."""
+
+    def test_unqualified_model_skipped_until_a_pass(self):
+        d, cfg = project('\n[models.free]\nprovider = "api"\nkind = "claude"\nqualified = false\n[routing]\nnormal = ["free"]\n')
+        with self.assertRaises(janus.Err) as e: janus.pick_model(cfg, "normal", "implement", None)
+        self.assertIn("not qualified", str(e.exception))
+        self.assertEqual(janus.pick_model(cfg, "normal", "qualify", None), "free")     # a qualify unit may use it
+        janus.cmd_qualify(cfg, type("A", (), {"model": "free", "fail": False, "note": "did a small task"})())
+        self.assertEqual(janus.pick_model(cfg, "normal", "implement", None), "free")   # a recorded pass clears the skip
+
+    def test_first_review_pass_uses_the_earliest_review(self):
+        d, cfg = project()
+        for n, v in (("u1", "DONE"), ("r1", "DONE"), ("u2", "DONE"), ("r2", "BLOCKED")):
+            (d / f"out/{n}").mkdir(parents=True); (d / f"out/{n}/report.json").write_text(json.dumps({"verdict": v}))
+        cfg.run.all_units = {"u1": {"name": "u1", "model": "m1"}, "r1": {"name": "r1", "of": "u1", "started": 5},
+                             "u2": {"name": "u2", "model": "m1"}, "r2": {"name": "r2", "of": "u2", "started": 5},
+                             "u3": {"name": "u3", "model": "m2"}}                             # no review of u3: not counted
+        self.assertEqual(janus.first_review_pass(cfg), {"m1": (1, 1)})
+
+
 class Soak(unittest.TestCase):
     """item 6: one soak pass exercises every read path, prints one line each, and writes nothing. The failure caught: a soak
     that mutates the live project it is checking."""

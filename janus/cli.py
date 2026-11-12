@@ -12,7 +12,7 @@ from janus.setup import doctor, init_project
 from janus.actions.backlog import cmd_backlog, cmd_fill
 from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_hosts, cmd_run, cmd_thrash
 from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_log, cmd_gate_scope, cmd_land
-from janus.actions.launch import cmd_api_run, cmd_launch
+from janus.actions.launch import cmd_api_run, cmd_launch, cmd_qualify
 from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd_park, cmd_resume as cmd_resume_unit, cmd_stop
 from janus.actions.swarm import cmd_forget, cmd_index, cmd_introduce, cmd_learned, cmd_ledger, cmd_memory, cmd_peers, cmd_remember, cmd_report, cmd_transcript
 from janus.actions.tidy import cmd_tidy
@@ -23,7 +23,7 @@ from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
 WRITERS = {"ack", "launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
-           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue"}
+           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue", "qualify"}
 
 def cmd_resume(cfg, a):
     """janus resume: a parked unit when one is named, else the orchestration itself (janus/setup.cmd_resume_orch): continue it
@@ -45,7 +45,7 @@ def main():
     add("capacity", cmd_capacity); add("status", cmd_status); add("watch", cmd_watch, A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"),
         A("--reset", action="store_true", help="the Stop hook's context reset: /clear once the turn ended, then the wake prompt"))
     add("learned", cmd_learned, A("--reject", help="reject learned post <agent>:<n> (check stops listing it)"), A("--why", help="why it is rejected"))
-    add("launch", cmd_launch, A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
+    add("launch", cmd_launch, A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup", "qualify"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
         A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--new-worktree", metavar="REPO", help="make a fresh worktree of this repo (a new branch named after the unit) for the unit"), A("--from", dest="from_ref", metavar="REF", help="--new-worktree: the branch or commit to start from (default main)"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
         A("--test-host", help="host where the unit's builds and tests run; the agent is placed there"), A("--allow-main", action="store_true", help="allow a main checkout as cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"),
         A("--report", help="a resumed unit: the report it continues (default out/<unit>/REPORT.md)"), A("--resume-of", help="a resumed unit: the unit whose report it continues"),
@@ -110,6 +110,8 @@ def main():
         A("arg", nargs="?", help="lint: a brief path or unit name; review: the unit"), A("--override", help="review: accept the findings with this reason"), dry=True)
     add("issue", cmd_issue, A("text", help="what happened, in generic terms (no project, host or person)"),
         A("--evidence", help="a path, commit sha or job the row points at"), A("--key", help="a finding key the row is for; a row for the same key is written once"), dry=True)
+    add("qualify", cmd_qualify, A("model", help="a model with [models.<m>] qualified = false"),
+        A("--fail", action="store_true", help="record a failed qualification (the model stays skipped)"), A("note", nargs="?", help="what the model did"), dry=True)
     add("soak", cmd_soak, A("--minutes", type=float, default=1.0, help="run this many minutes (0: one pass)"),
         A("--live", action="store_true", help="also run one watcher pass (default: read-only)"))
     add("transcript", cmd_transcript, A("unit"), A("--grep", help="only the lines matching this regex (case-insensitive)"), A("--tail", type=int, default=40, help="the last N lines (0: all)"))

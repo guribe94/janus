@@ -4,7 +4,7 @@ import json, os, re, time
 from janus.backlog import backlog_items, item_actors, unit_items
 from janus.beads import Beads
 from janus.board import board, board_dir, learned_posts
-from janus.budgets import OUTCOMES, rset, run_outcomes, waste_block, waste_state
+from janus.budgets import OUTCOMES, first_review_pass, rset, run_outcomes, waste_block, waste_state
 from janus.context import Err, Locked, NUM, atomic_write, note_event, now, refuse_agent, say, slug, ts
 from janus.findings.awareness import introduced_recently, related_cases
 from janus.findings.units import peer_rows, peers_text, unreconciled
@@ -102,6 +102,12 @@ def cmd_report(cfg, a):
         us = Beads(cfg).units()
         L.append(f"Open units: {len(us)}" + ("" if a.brief else ": " + ", ".join(u["name"] for u in us)[:300]))
     except Err as e: L.append(f"Open units: unavailable ({e})")
+    if not a.brief:
+        fr = first_review_pass(cfg)
+        if fr:
+            L.append("First review per implementer model (route by outcome, not only cost):")
+            for m, (p, f) in sorted(fr.items(), key=lambda x: (-x[1][0], sum(x[1]))):
+                L.append(f"  {m:24} {p} pass, {f} fail ({100 * p // max(p + f, 1)} %)")
     return 0, L
 
 def Counter_(it):
