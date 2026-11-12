@@ -18,6 +18,19 @@ from janus.templates import CLEAN_PUEUE
 from janus.transcripts import predecessor_name, related_pointers, transcript_of
 from janus.units import herdr_agents, main_checkout, report_path, unit_state, ws_id
 
+def model_qualified(cfg, m):
+    """Whether a model may do normal work: [models.<m>] qualified = false marks a free or new model unqualified until
+    `janus qualify <m>` records a pass (.janus/qualified.json). Unset means qualified (inert for a one-machine setup)."""
+    c = cfg.models.get(m, {}); q = cfg.jget("qualified.json").get(m, {})
+    return True if q.get("pass") else c.get("qualified", True) is not False
+
+def cmd_qualify(cfg, a):
+    """janus qualify <model> [--fail] "<what it did>": record that a model passed (or failed) a small real task before it is used
+    for real work. A model with [models.<m>] qualified = false is skipped by routing for normal work until this records a pass."""
+    if a.model not in cfg.models: raise Err(f"unknown model {a.model}")
+    q = cfg.jget("qualified.json"); q[a.model] = {"pass": not a.fail, "at": ts(), "note": a.note or ""}; cfg.jput("qualified.json", q)
+    return 0, [f"{a.model}: qualification {'failed' if a.fail else 'passed'} ({a.note or 'no note'})"]
+
 def pick_model(cfg, tier, kind, of_vendor, host=None):
     lst = cfg.route.get("review" if kind == "review" else tier, [])
     why = []
@@ -25,6 +38,7 @@ def pick_model(cfg, tier, kind, of_vendor, host=None):
         c = cfg.models.get(m, {})
         if host and host not in c.get("hosts", list(cfg.hosts)): why.append(f"{m}: not allowed on {host}"); continue
         if kind == "review" and of_vendor and c.get("vendor") == of_vendor: why.append(f"{m}: same vendor as implementer"); continue
+        if not model_qualified(cfg, m) and kind != "qualify": why.append(f"{m}: not qualified (janus qualify {m})"); continue
         ok, w = model_ok(cfg, m)
         if ok: return m
         why.append(f"{m}: {w}")
