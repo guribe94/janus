@@ -146,6 +146,11 @@ gates the merged tree and squash-lands it. Write REPORT.md with what each confli
 
 def git(wt, *a, timeout=120): return sh(["git", "-C", str(wt), *a], timeout=timeout)
 
+def final_gate_cmd(ld, unit, wt, branch):
+    """The [landing] final_gate command with {unit}, {wt} and {branch} substituted (item 12): a project that gates per unit (one
+    gate per landed unit) gets the unit it is landing, not one fixed command."""
+    return (ld.get("final_gate") or "").replace("{unit}", unit).replace("{wt}", str(wt)).replace("{branch}", branch)
+
 def cmd_land(cfg, a):
     """janus land <unit>: in the unit's worktree, merge the current landing branch ([landing] branch, default main); on a conflict
     stop (the tree is left as it was) and dispatch a merge unit merge-<unit> (--no-dispatch: only say so); gate the merged tree
@@ -199,7 +204,7 @@ def cmd_land(cfg, a):
             if rc: git(wt, "merge", "--abort"); raise Err(f"git merge {br} failed although merge-tree was clean: {(e or o).strip()[-160:]}; aborted")
             say(f"merged {br} into {branch}")
     # 2. gate the merged tree on the final-gate host
-    gh, gc = ld.get("final_gate_host"), ld.get("final_gate")
+    gh, gc = ld.get("final_gate_host"), final_gate_cmd(ld, a.unit, wt, branch)
     if a.no_gate: say("gate skipped (--no-gate)")
     elif not gh or not gc: raise Err("set [landing] final_gate_host and final_gate (the command that gates a merged tree) in janus.toml, or --no-gate")
     else:

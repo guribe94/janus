@@ -127,4 +127,13 @@ class Item13Handover(unittest.TestCase):
         self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u15-seams", resume_of="merge-u15"), ([], "merge-u15"))
 
 
+class Item12FinalGate(unittest.TestCase):
+    def test_final_gate_substitutes_unit_tree_and_branch(self):
+        """Catches: janus land took one fixed [landing] final_gate command, so a project that gates per unit could not use it."""
+        ld = {"final_gate": "bin/run-handoff.sh out/land-{unit}-linux --tree {wt} --branch {branch}"}
+        self.assertEqual(janus.final_gate_cmd(ld, "u15-seams", "/w/u15", "wk/u15"),
+                         "bin/run-handoff.sh out/land-u15-seams-linux --tree /w/u15 --branch wk/u15")
+        self.assertEqual(janus.final_gate_cmd({}, "u", "/w", "b"), "")
+
+
 if __name__ == "__main__": unittest.main()

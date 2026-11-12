@@ -500,7 +500,8 @@ pane left without an agent for 20 minutes is closed first (section 2). A live se
 - **Budgets from history.** A unit's default budget is the median cost of its kind and tier + `[budget] margin_pct`; `budget80:<unit>`
   warns at 80 % with a stale report.
 - **Landing.** `janus land <unit>` merges the landing branch (stops and dispatches `merge-<unit>` on a conflict), gates the merged
-  tree on `[landing] final_gate_host`, then squash-lands.
+  tree on `[landing] final_gate_host`, then squash-lands. `final_gate` may name `{unit}`, `{wt}` and `{branch}`, substituted per
+  land, so a project that gates per unit (`out/land-{unit}-linux/...`) gets the unit it is landing (item 12).
 
 ### Hosts, queues and outages
 
