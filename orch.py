@@ -566,7 +566,7 @@ def ledger_parse(text):
         f = l.split("\t")
         if len(f) != 5 or not f[1].strip() or not f[4].strip():
             bad.append(f"line {i}: {len(f)} field(s), want 5 (ts, unit, running|cost, budget|done rc=, run id): {l[:80]!r}"); continue
-        r = runs.setdefault(f[4], {"unit": f[1], "running": [], "done": [], "budget": None, "cost": None})
+        r = runs.setdefault(f[4], {"unit": f[1], "running": [], "done": [], "budget": None, "cost": None, "ts": f[0]})
         if r["unit"] != f[1]: bad.append(f"line {i}: run id {f[4]} belongs to {r['unit']}, not {f[1]}"); continue
         if f[2] == "running":
             if not NUM.match(f[3].strip()): bad.append(f"line {i}: running row without a numeric budget: {f[3][:20]!r}"); continue
@@ -1013,11 +1013,10 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}"))
         elif st in ("done", "failed", "gone", "idle"):
             F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
-            try: aj = json.loads((cfg.p("out", "out") / u["name"] / "api.json").read_text())
-            except Exception: aj = {}
-            if str(aj.get("subtype", "")).startswith("error") and not v:   # issue 32: out of budget (or turns) before the report
-                F.append((f"unit:{u['name']}:budget", f"{u['name']} stopped by its limit ({aj.get('subtype')}, ${aj.get('total_cost_usd', '?')}) without a final verdict: "
-                          "resume it with a larger --budget (--resume-of keeps its report)"))
+            aj = api_out(cfg, u)   # issue 32: another limit than the budget (turns) before the report; the budget cap is waste:<unit>
+            if str(aj.get("subtype", "")).startswith("error") and aj.get("subtype") != "error_max_budget_usd" and not v:
+                F.append((f"unit:{u['name']}:limit", f"{u['name']} stopped by its limit ({aj.get('subtype')}, ${aj.get('total_cost_usd', '?')}) without a final verdict: "
+                          "resume it (orch resume --message, or --resume-of keeps its report)"))
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}"))
     seen = {k for k, _ in F}
@@ -1040,7 +1039,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
             if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
                 F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
                           + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": orch ledger check"))
-    F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units)
+    F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
@@ -1480,6 +1479,8 @@ def cmd_launch(cfg, a):
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
     bd = Beads(cfg); units = bd.units(); prev = next((u for u in units if u["name"] == name), None)
     if prev and a.kind != "review": raise Err(f"{name} already launched on {prev.get('host')}")
+    wp = waste_paused(cfg)
+    if wp: raise Err(f"refused (waste pause): {wp}")
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
     of = next((u for u in units if u["name"] == (a.of or name)), None)
@@ -2040,7 +2041,7 @@ def backlog_cfg(cfg):
     b = dict(cfg.c.get("backlog", {})); b.setdefault("file", cfg.paths.get("checklist"))
     return b
 
-def backlog_items(cfg):
+def backlog_items(cfg, actors=None):
     """[(id, title, status, done, ready)] from the checklist ([backlog] file, default paths.checklist): markdown table rows (the
     header row names the columns: id_col '#', title_col 'item', status_col 'status') and '- [ ] item' / '- [x] item' lines.
     done: status starts with one of [backlog] done (default DONE). ready: not done, and the status starts with one of
@@ -2049,7 +2050,7 @@ def backlog_items(cfg):
     if not b.get("file"): return None
     try: text = (cfg.root / b["file"]).read_text()
     except OSError: return None
-    idc, tc, sc = (b.get(k, d).lower() for k, d in (("id_col", "#"), ("title_col", "item"), ("status_col", "status")))
+    idc, tc, sc, ac = (b.get(k, d).lower() for k, d in (("id_col", "#"), ("title_col", "item"), ("status_col", "status"), ("actor_col", "actor")))
     dn = [x.upper() for x in b.get("done", ["DONE"])]; rd = [x.upper() for x in b.get("ready", [])]
     items, hdr, seen = [], None, set()
     def add(i, t, st):
@@ -2067,10 +2068,23 @@ def backlog_items(cfg):
             if hdr and len(cells) >= len(hdr):
                 r = dict(zip(hdr, cells)); t = r.get(tc, "")
                 add(r.get(idc) or slug(t), t, r.get(sc, ""))
+                if actors is not None and r.get(ac, "").strip(): actors[r.get(idc) or slug(t)] = r[ac].strip().lower()
             continue
         m = re.match(r"^[-*] \[( |x|X)\] (.+)$", s)
         if m: add(slug(m.group(2)), m.group(2), "DONE" if m.group(1) != " " else "OPEN")
     return items
+
+def item_actors(cfg):
+    """{item id: actor} (row 54): who does the item. The checklist's actor column ([backlog] actor_col, default "actor"), else
+    the beads label actor:<x> that `orch backlog set <id> actor=<x>` sets (the label wins). Unset: agent. Only agent items
+    count as idle backlog or are filled; owner, hardware and any other actor never are."""
+    a = {}; backlog_items(cfg, a)
+    try:
+        for r, i in backlog_issues(cfg).items():
+            x = next((l[6:] for l in (i.get("labels") or []) if l.startswith("actor:")), None)
+            if x: a[r[8:]] = x
+    except Err: pass
+    return a
 
 def backlog_issues(cfg):
     r = Beads(cfg).run("list", "--label", "backlog", "--all", "-n", "0")
@@ -2078,10 +2092,18 @@ def backlog_issues(cfg):
     return {i.get("external_ref"): i for i in r if str(i.get("external_ref", "")).startswith("backlog:")}
 
 def cmd_backlog(cfg, a):
+    if a.action == "set":   # orch backlog set <id> actor=<x>
+        if not a.args or len(a.args) != 2 or not a.args[1].startswith("actor="): raise Err("usage: orch backlog set <item id> actor=<agent|owner|hardware|...>")
+        x = backlog_issues(cfg).get(f"backlog:{a.args[0]}")
+        if not x: raise Err(f"no backlog item {a.args[0]} in beads (orch backlog import first)")
+        v = slug(a.args[1][6:]) or "agent"; labels = [l for l in (x.get("labels") or []) if not l.startswith("actor:")] + ([f"actor:{v}"] if v != "agent" else [])
+        if DRY: say(f"+ bd update {x['id']} --set-labels {','.join(labels)}"); return
+        Beads(cfg).run("update", x["id"], "--set-labels", ",".join(labels)); cfg.touch("changed"); say(f"{a.args[0]}: actor {v}"); return
     items = backlog_items(cfg)
     if items is None: raise Err("no checklist: set [backlog] file (or paths.checklist) in orch.toml")
     if a.action == "list":
-        for i, t, st, d, rd in items: say(f"{'done ' if d else 'ready' if rd else 'wait '} {i:8} {st[:24]:24} {t[:90]}")
+        act = item_actors(cfg)
+        for i, t, st, d, rd in items: say(f"{'done ' if d else 'ready' if rd else 'wait '} {i:8} {act.get(i, 'agent'):8} {st[:24]:24} {t[:90]}")
         return
     bd = Beads(cfg); ex = backlog_issues(cfg); n = {"created": 0, "updated": 0, "closed": 0, "reopened": 0, "same": 0}
     for i, t, st, d, rd in items:
@@ -2095,6 +2117,7 @@ def cmd_backlog(cfg, a):
             r = bd.run("create", title, "-l", ",".join(labels), "-d", f"From {backlog_cfg(cfg)['file']}: {t}\nstatus: {st}", "--external-ref", ref)
             n["created"] += 1; continue
         if x.get("status") == "closed": bd.run("reopen", x["id"]); n["reopened"] += 1
+        labels += [l for l in (x.get("labels") or []) if l.startswith("actor:")]   # set by orch backlog set: kept
         if sorted(x.get("labels") or []) != sorted(labels) or x.get("title") != title:
             bd.run("update", x["id"], "--title", title, "--set-labels", ",".join(labels)); n["updated"] += 1
         else: n["same"] += 1
@@ -2120,9 +2143,10 @@ def backlog_findings(cfg, hs, units):
     F = []
     if (cfg.root / b["file"]).exists() and (cfg.root / b["file"]).stat().st_mtime > cfg.mtime("backlog_imported") + 60:
         F.append(("backlog:stale", f"{b['file']} changed since the last orch backlog import: run it again"))
-    cov = unit_items(cfg, units)
+    cov = unit_items(cfg, units); act = item_actors(cfg)
     todo = [(r[8:], i.get("title", "")[9:]) for r, i in iss.items()
-            if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or []) and r[8:] not in cov]
+            if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or []) and r[8:] not in cov
+            and act.get(r[8:], "agent") == "agent"]   # owner and hardware items are never idle backlog (row 54)
     if not todo: return F
     plan, stops = fill_plan(cfg, hs, units)
     if plan:   # orch-fixes8 item 4: how many ready units with briefs fit now
@@ -2323,6 +2347,125 @@ def budget_findings(cfg, units):
                       f"or stop it and resume with a larger --budget (--resume-of keeps its report)"))
     return F
 
+# ---------------------------------------------------------------- report: completeness, remaining work, spend by outcome (item 6)
+# Every ledger run gets one outcome: "verdict" (its unit ended with a final verdict), "capped-partial" / "capped-nothing" (it
+# ended at its budget cap and its unit has no final verdict: with or without work written: report lines, a patch), "open"
+# (its unit is still open, no verdict yet), "no-verdict" (ended, not capped, unit closed without a verdict), "unknown" (no done
+# row: its end was never recorded). check raises waste:<unit> for an open unit whose run ended at its cap without a verdict,
+# report-due at [report] checkpoints, and waste-pause when capped-without-verdict spend passes [report] waste_pause (default
+# 25 %) of the spend of the last recent_h hours: launch and fill are refused until the orchestrator acks waste-pause.
+OUTCOMES = (("verdict", "finished with a verdict"), ("capped-partial", "capped, partial work"), ("capped-nothing", "capped, nothing written"),
+            ("open", "open unit, no verdict yet"), ("no-verdict", "ended without a verdict"), ("unknown", "unknown (no done row)"))
+REPORT_DEFAULTS = {"every_h": 4, "at": [], "waste_pause": 25, "recent_h": 24}
+
+def rset(cfg, k): return cfg.c.get("report", {}).get(k, REPORT_DEFAULTS[k])
+
+def work_written(cfg, u, since=0):
+    """The unit left work: report lines beyond its VERDICT line, a non-empty patch of its changes, or in its worktree a commit
+    made since the run started (since) or uncommitted changes."""
+    t = [l for l in report_text(cfg, u).splitlines() if l.strip() and not l.startswith("VERDICT:") and not l.startswith("WAITING")]
+    od = cfg.p("out", "out") / u["name"]
+    if len(t) >= 2 or any((od / f).is_file() and (od / f).stat().st_size > 0 for f in ("changes.patch", "backup.patch")): return True
+    c = Path(u.get("cwd") or "/nonexistent")
+    if not c.is_dir() or c.resolve() == cfg.root.resolve(): return False
+    if since and sh(["git", "-C", str(c), "log", f"--since={int(since)}", "--format=%H", "-1"])[1].strip(): return True
+    return bool(sh(["git", "-C", str(c), "status", "--porcelain", "--untracked-files=no"])[1].strip())
+
+def run_outcomes(cfg):
+    """[(provider, run id, unit name, dollars, outcome, time)] for every ledger run."""
+    us = all_units(cfg); open_ = {u["name"] for u in us.values() if u.get("status") in ("open", "in_progress")}
+    byrun = {k: u for u in us.values() for k in unit_runs(u)}; out = []
+    for pn, pv in cfg.prov.items():
+        if "ledger" not in pv: continue
+        for k, r in ledger_read(cfg, pv)[0].items():
+            u = byrun.get(k) or us.get(r["unit"]) or {"name": r["unit"]}
+            try: t = time.mktime(time.strptime(r["ts"][:19], "%Y-%m-%d %H:%M:%S"))
+            except (ValueError, TypeError): t = 0
+            cost = r["cost"] if r["done"] else (r["budget"] or 0.0)
+            od = cfg.p("out", "out") / u["name"]
+            try: aj = json.loads((od / f"api-{k}.json").read_text())
+            except Exception: aj = api_out(cfg, u) if k == (u.get("run") or k) else {}
+            v = verdict(cfg, {**u, "resume": False}) if u.get("name") else None
+            if v: o = "verdict"
+            elif aj.get("subtype") == "error_max_budget_usd": o = "capped-partial" if work_written(cfg, u, t) else "capped-nothing"
+            elif not r["done"]: o = "open" if u["name"] in open_ else "unknown"
+            elif u["name"] in open_: o = "open"
+            else: o = "no-verdict"
+            out.append((pn, k, u["name"], float(cost or 0), o, t))
+    return out
+
+def waste_state(cfg, outs=None):
+    """(capped-without-verdict dollars, all dollars, share %) of the runs of the last [report] recent_h hours."""
+    outs = run_outcomes(cfg) if outs is None else outs; cut = now() - rset(cfg, "recent_h") * 3600
+    rec = [x for x in outs if x[5] >= cut]; tot = sum(x[3] for x in rec); w = sum(x[3] for x in rec if x[4].startswith("capped"))
+    return w, tot, (100 * w / tot if tot else 0.0)
+
+def waste_paused(cfg):
+    """Why launch and fill are paused (wasted spend over [report] waste_pause % of recent spend, not acked), or None."""
+    w, tot, pct = waste_state(cfg)
+    if pct <= rset(cfg, "waste_pause") or "waste-pause" in live_acks(cfg): return None
+    return (f"${w:.2f} of ${tot:.2f} ({pct:.0f} %) of the last {rset(cfg, 'recent_h')} h went to runs that ended at their budget cap without a "
+            f"verdict (limit {rset(cfg, 'waste_pause')} %): find the cause (orch report), then orch ack waste-pause \"<cause and fix>\"")
+
+def last_checkpoint(cfg):
+    """The latest report checkpoint passed: [report] at (local HH:MM times) and every every_h hours from midnight."""
+    t = now(); lt = time.localtime(t); mid = time.mktime((*lt[:3], 0, 0, 0, 0, 0, -1)); cps = []
+    for x in rset(cfg, "at"):
+        try: h, m = map(int, str(x).split(":")); c = mid + h * 3600 + m * 60; cps.append(c if c <= t else c - 86400)
+        except ValueError: pass
+    if rset(cfg, "every_h"): e = rset(cfg, "every_h") * 3600; cps.append(mid + ((t - mid) // e) * e)
+    return max(cps) if cps else None
+
+def report_findings(cfg, units):
+    F = []
+    for u in units:
+        if u.get("state") in ENDED and not u.get("verdict") and api_out(cfg, u).get("subtype") == "error_max_budget_usd":
+            w = "a wrap-up resume did not write one either" if u.get("wrapup") else "the watcher resumes it once to write its report"
+            F.append((f"waste:{u['name']}", f"{u['name']} ended at its budget cap (${fl(api_out(cfg, u).get('total_cost_usd')):.2f}) without a verdict ({w}); "
+                      f"{'work was written' if work_written(cfg, u) else 'nothing was written'}: read its report, resume it with --resume-of and a larger budget, or close it"))
+    why = waste_paused(cfg)
+    if why: F.append(("waste-pause", "launch and fill PAUSED: " + why))
+    cp = last_checkpoint(cfg)
+    if cp and cfg.mtime("report_sent") < cp: F.append(("report-due", f"a status report to the owner is due (checkpoint {ts(cp)}): orch report, send it, then orch report --sent"))
+    return F
+
+def cmd_report(cfg, a):
+    """The owner's status report: backlog completeness and remaining work, spend by outcome, the waste rule, open units.
+    --brief: the summary lines only. --sent: record that it was sent (clears report-due until the next checkpoint)."""
+    if a.sent: cfg.touch("report_sent"); say("report marked sent"); return 0
+    L = [f"orch report: {cfg.name}, {ts()}"]
+    items = backlog_items(cfg)
+    if items is not None:
+        act = item_actors(cfg); done = [x for x in items if x[3]]; left = [x for x in items if not x[3]]
+        try: cov = unit_items(cfg, Beads(cfg).units())
+        except Err: cov = set()
+        L.append(f"Backlog: {len(done)} of {len(items)} items done ({100 * len(done) // max(len(items), 1)} %); {len(left)} left: "
+                 + ", ".join(f"{n} {k}" for k, n in sorted(Counter_(act.get(i, 'agent') for i, *_ in left).items())) + f"; {sum(1 for i, *_ in left if i in cov)} in open units")
+        if not a.brief:
+            for i, t, st, d, rd in left[:40]: L.append(f"  {'*' if i in cov else ' '} {i:10} [{act.get(i, 'agent')}] {st[:20]:20} {t[:80]}")
+    outs = run_outcomes(cfg)
+    for pn in dict.fromkeys(x[0] for x in outs):
+        mine = [x for x in outs if x[0] == pn]; tot = sum(x[3] for x in mine)
+        L.append(f"Spend {pn}: ${tot:.2f} in {len(mine)} run(s)")
+        for k, lab in OUTCOMES:
+            xs = [x for x in mine if x[4] == k]
+            if xs: L.append(f"  {lab:28} ${sum(x[3] for x in xs):8.2f}  {len(xs):3} run(s)  {100 * sum(x[3] for x in xs) / max(tot, 1e-9):4.0f} %"
+                            + ("" if a.brief or k in ("verdict",) else ": " + ", ".join(dict.fromkeys(x[2] for x in xs))[:120]))
+    w, tot, pct = waste_state(cfg, outs)
+    L.append(f"Last {rset(cfg, 'recent_h')} h: ${w:.2f} of ${tot:.2f} ({pct:.0f} %) capped without a verdict; limit {rset(cfg, 'waste_pause')} %"
+             + (": launch and fill PAUSED until orch ack waste-pause" if waste_paused(cfg) else ""))
+    try:
+        us = Beads(cfg).units()
+        L.append(f"Open units: {len(us)}" + ("" if a.brief else ": " + ", ".join(u["name"] for u in us)[:300]))
+    except Err as e: L.append(f"Open units: unavailable ({e})")
+    for l in L: say(l)
+    return 0
+
+def Counter_(it):
+    c = {}
+    for x in it: c[x] = c.get(x, 0) + 1
+    return c
+
 # ---------------------------------------------------------------- fill: launch ready work up to capacity (orch-fixes8 item 4)
 BRIEF_KEYS = re.compile(r"^(ITEM|KIND|TIER|TEST-HOST|PRIORITY):\s*(\S+)", re.M)
 
@@ -2346,9 +2489,9 @@ def fill_candidates(cfg, units):
     if iss: items = [(int(i.get("priority", 2) if i.get("priority") is not None else 2), n, r[8:], i.get("title", "")[9:]) for n, (r, i) in enumerate(iss.items())
                      if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or [])]
     else: items = [(int(2), n, i, t) for n, (i, t, st, d, rd) in enumerate(backlog_items(cfg) or []) if rd]
-    cov = unit_items(cfg, units); ever = all_units(cfg); out = []; idx = brief_index(cfg); taken = set()
+    cov = unit_items(cfg, units); ever = all_units(cfg); out = []; idx = brief_index(cfg); taken = set(); act = item_actors(cfg)
     for pr, order, item, title in sorted(items):
-        if item in cov: continue
+        if item in cov or act.get(item, "agent") != "agent": continue
         for f, name, keys, head in idx:
             if keys.get("ITEM", "").lower() != item.lower(): continue
             if name in ever or name in taken or (cfg.p("out", "out") / name).exists(): continue
@@ -2395,6 +2538,8 @@ def cmd_fill(cfg, a):
     if DRY: cfg.ro = True   # a dry run changes nothing anywhere (the probe leaves the hosts' reservation files alone)
     hs = probe_all(cfg); units = Beads(cfg).units(); ag = herdr_agents(cfg)
     for u in units: u["state"] = unit_state(u, hs, ag)
+    wp = waste_paused(cfg)
+    if wp: say(f"fill: PAUSED: {wp}"); return 1
     plan, stops = fill_plan(cfg, hs, units, a.max)
     say(f"fill: {len(plan)} unit(s) fit now" + (" (dry run: nothing launched)" if DRY else ""))
     for name, item, m, hn, b, budget, why, kind, tier, f in plan:
@@ -3401,7 +3546,7 @@ def hook_kind(d):
 
 # ---------------------------------------------------------------- watch (launchd, one pass)
 URGENT = ("unit:", "board:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads", "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:",
-          "idle-with-backlog", "scheduler:", "pressure:", "direct:", "budget80:")
+          "idle-with-backlog", "scheduler:", "pressure:", "direct:", "budget80:", "waiting:", "waste", "report-due", "parked:")
 
 def cmd_watch(cfg, a):
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
@@ -3488,7 +3633,7 @@ def main():
     add("resume", A("unit"), A("--message", help="resume with this text instead of its jobs' results"), A("--force", action="store_true", help="resume although its jobs have not finished"), dry=True)
     add("ledger", A("action", choices=["check", "repair"]), A("--provider"), dry=True)
     add("doctor", A("--no-hosts", action="store_true", help="skip the ssh checks"))
-    add("backlog", A("action", choices=["import", "list"]), dry=True)
+    add("backlog", A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...>"), dry=True)
     add("queue", A("host", nargs="?"), A("--log", type=int, help="print this task's log"))
     add("stop", A("unit"), A("--force", action="store_true", help="stop although its remote copy has uncollected work"), dry=True)
     add("collect", A("unit", help="a unit, or <host>:<task id> for an orch run job"), dry=True)
@@ -3502,6 +3647,7 @@ def main():
         A("--allow-unmerged", action="store_true", help="gate a tree mid-merge, with conflict markers or far behind the landing branch"), dry=True)
     add("cancel", A("job", help="<host>:<task id> of an orch run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", A("--max", type=int, help="launch at most this many"), dry=True)
+    add("report", A("--brief", action="store_true", help="summary lines only"), A("--sent", action="store_true", help="record that the report was sent (clears report-due)"))
     add("land", A("unit"), A("--no-gate", action="store_true", help="skip the final gate (it is still refused mid-merge)"),
         A("--no-dispatch", action="store_true", help="on a conflict, only say what merge unit to dispatch"), dry=True)
     add("close", A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
