@@ -236,7 +236,7 @@ def resume_unit(cfg, u, msg, wrapup=False):
     name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); text = JANUS_MARK + msg
     if via == "herdr":
         if not cfg.run.dry: herdr("agent", "prompt", name, text)
-        return f"{name}: prompted in its herdr pane"
+        return f"{name}: " + ("prompted in its herdr pane" if not cfg.run.dry else "would prompt in its herdr pane")
     if via == "tmux":
         tm = shlex.quote(unit_tmux(u)); X(cfg, h, f"tmux send-keys -t {tm} -l {shlex.quote(text)} && tmux send-keys -t {tm} Enter")
         return f"{name}: resumed in tmux {unit_tmux(u)} on {u['host']}"
