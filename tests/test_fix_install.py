@@ -453,6 +453,20 @@ class Item8ResumeDryRun(unittest.TestCase):
         self.assertIn("would prompt", line); self.assertNotIn(": prompted", line)
         self.assertEqual(called, [], "the dry run prompted the pane")
 
+    def test_dry_run_of_a_tmux_unit_says_would_resume(self):
+        """Catches (item 28): janus resume --dry-run <tmux unit> printed '<unit>: resumed in tmux <session> on <host>',
+        the same line a real resume prints, although nothing was typed into the session."""
+        d, cfg = project()
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "tmux", "model": "m", "started": 0}
+        real = janus.X
+        janus.X = lambda *a, **k: (0, "", "")
+        try:
+            cfg.run.dry = False; real_line = janus.resume_unit(cfg, u, "go")
+            cfg.run.dry = True; dry = janus.resume_unit(cfg, u, "go")
+        finally: janus.X = real
+        self.assertIn("resumed in tmux", real_line)          # a real resume still reads as the action it took
+        self.assertIn("would resume", dry); self.assertNotIn(": resumed", dry)
+
 
 class Item14OldOrch(unittest.TestCase):
     def test_old_orch_standing_loops_are_listed_not_waiters_or_editors(self):
