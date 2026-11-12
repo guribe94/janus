@@ -49,9 +49,46 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
 # [hosts.X] disk_budget_gb: the host's janus root plus its cache_dirs; over it, check raises disk:<host> and tidy removes the
 # oldest top-level entries of cache_dirs (build targets, compiler caches) until under budget. Containers: our own stopped ones
 # (name prefix janus-run-) only. Remote copies of closed units: only when nothing is uncollected.
-TIDY_DEFAULTS = {"branches": [], "remote": "origin", "keep_days": 14, "every_min": 60}
+TIDY_DEFAULTS = {"branches": [], "remote": "origin", "keep_days": 14, "every_min": 60, "auto": False, "artifacts": []}
 
 def tset(cfg, k): return cfg.c.get("tidy", {}).get(k, TIDY_DEFAULTS[k])
+
+# Recorded holds (soak 41): `janus tidy hold <target>` keeps one item a clean worktree an open unit still depends on (not as its
+# cwd) would otherwise be removed with the rest, so the orchestrator no longer skips the whole tidy and tidy:<n> keeps firing.
+# A hold matches a target equal to it, under it (a path prefix) or containing it; `janus tidy holds` lists them, `unhold` clears.
+def tidy_holds(cfg): return cfg.jget("tidy-holds.json")
+
+def hold_item(cfg, target, why=""):
+    h = tidy_holds(cfg); h[target] = {"why": why, "at": int(now())}; cfg.jput("tidy-holds.json", h)
+
+def unhold_item(cfg, target):
+    h = tidy_holds(cfg)
+    if target in h: del h[target]; cfg.jput("tidy-holds.json", h); return True
+    return False
+
+def held_by(cfg, target, holds=None):
+    """The hold string that keeps this target, or None."""
+    hs = tidy_holds(cfg) if holds is None else holds
+    return next((h for h in hs if target == h or target.startswith(h.rstrip("/") + "/") or h in target), None)
+
+def apply_holds(cfg, P, holds=None):
+    """P without the items a recorded hold keeps."""
+    hs = tidy_holds(cfg) if holds is None else holds
+    return [x for x in P if not held_by(cfg, x[1], hs)]
+
+def tidy_artifacts(cfg, units):
+    """[(kind, target, why, 0)]: per-worktree rebuildable output ([tidy] artifacts globs, e.g. target/ and node_modules/) inside
+    a CLOSED unit's own worktree, so a worktree that stays around does not pin build output (keep-build-output rule; inert unless
+    [tidy] artifacts is set). An open unit's tree is never touched."""
+    pats = [p for p in (tset(cfg, "artifacts") or []) if p]
+    if not pats: return []
+    names = {u["name"] for u in units}; au = all_units(cfg); P = []; wd = cfg.p("worktrees", "worktrees")
+    for d in sorted(wd.iterdir()) if wd.is_dir() else []:
+        if d.name in names or not d.is_dir() or au.get(d.name, {}).get("status") != "closed": continue
+        for pat in pats:
+            for m in d.glob(pat):
+                if m.is_dir(): P.append(("artifact", str(m), f"rebuildable output ({pat}) in closed unit {d.name}'s worktree", 0))
+    return P
 
 TIDY_HOST = r'''root=%(root)s; rd=%(rd)s; kd=%(kd)d
 [ -n "$root" ] && [ -d "$root/worktrees" ] && for d in "$root"/worktrees/*/; do [ -d "$d" ] && n=${d%%/}; [ -d "$d" ] && echo "copy ${n##*/} $(du -sm "$d" 2>/dev/null | cut -f1)"; done
@@ -138,19 +175,30 @@ def tidy_roots(cfg):
     return P
 
 def tidy_all(cfg, units, hs=None):
-    """Everything tidy would do: tidy_plan (worktrees, panes, cards) + branches + per-host items + test roots."""
-    au = all_units(cfg); P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units)] + tidy_branches(cfg, units) + tidy_roots(cfg)
+    """Everything tidy would do: tidy_plan (worktrees, panes, cards) + branches + per-host items + test roots + per-worktree
+    rebuildable artifacts."""
+    au = all_units(cfg); P = ([(k, t, w, 0) for k, t, w in tidy_plan(cfg, units)] + tidy_branches(cfg, units)
+                              + tidy_roots(cfg) + tidy_artifacts(cfg, units))
     for n, h in cfg.hosts.items():
         if hs is not None and not (hs.get(n) or {}).get("ok"): continue
         P += tidy_host(cfg, n, h, units, au)
     return P
 
+# The kinds the watcher may remove on its own with [tidy] auto = true: a clean landed worktree and a landed branch. Every other
+# kind (a remote copy, a container, a cache entry, a board card, a pane) still needs the orchestrator's `janus tidy`.
+TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch")
+
 def tend_tidy(cfg, hs, units, log):
-    """The watcher refreshes the reclaimable list every [tidy] every_min (the autopilot of a later round may act on it)."""
+    """The watcher refreshes the reclaimable list every [tidy] every_min; with [tidy] auto = true it also removes the safe kinds
+    (a clean landed worktree, a landed branch) itself, so the tidy:<n> finding does not keep firing for bookkeeping nobody does."""
     if now() - cfg.jget("tidy.json").get("at", 0) < tset(cfg, "every_min") * 60: return
-    try: P = tidy_all(cfg, units, hs)
+    try: P = apply_holds(cfg, tidy_all(cfg, units, hs))
     except Exception as e: log(f"tidy pass failed: {e}"); return
     cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P]})
+    if tset(cfg, "auto") and not cfg.run.dry and not cfg.run.ro:
+        for kind, t, why, mb in P:
+            if kind not in TIDY_AUTO_KINDS: continue
+            rc, e = tidy_do(cfg, kind, t); log(f"tidy auto {kind} {t}: {'removed' if rc == 0 else 'NOT removed ' + (e or '').strip()[:80]}")
 
 def tidy_do(cfg, kind, t):
     """Carry out one tidy item; (rc, detail)."""
@@ -180,13 +228,27 @@ def tidy_do(cfg, kind, t):
     if kind == "cache":
         if not any(x.startswith(c.rstrip("/") + "/") for c in h.get("cache_dirs", [])): return 1, "not under a cache_dirs entry"
         return hrun(h, f"rm -rf {qp(x)}", timeout=600)[0], ""
+    if kind == "artifact":
+        wd = cfg.p("worktrees", "worktrees").resolve(); q = Path(t)
+        if not (q.is_dir() and q.resolve().is_relative_to(wd)): return 1, "not a worktree artifact"
+        import shutil; shutil.rmtree(t, ignore_errors=True); return 0, ""
     return 1, f"unknown kind {kind}"
 
 def cmd_tidy(cfg, a):
+    act = getattr(a, "action", None)
+    if act == "holds":
+        return 0, ([f"hold {h}: {v.get('why') or '-'} (since {ts(v.get('at', 0))})" for h, v in tidy_holds(cfg).items()] or ["(no tidy holds)"])
+    if act in ("hold", "unhold"):
+        if not (getattr(a, "target", None) or "").strip(): raise Err(f"janus tidy {act} <target> [--why <text>]")
+        if cfg.run.dry: say(f"+ {act} {a.target}"); return
+        if act == "hold": hold_item(cfg, a.target, getattr(a, "why", "") or ""); say(f"held {a.target}: tidy will not remove it (janus tidy unhold {a.target})")
+        else: say(f"released {a.target}" if unhold_item(cfg, a.target) else f"no hold on {a.target}")
+        return
     if not cfg.run.dry: refuse_agent("janus tidy")   # --dry-run only reads
     units = Beads(cfg).units(); kept = []; au = all_units(cfg)
-    P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg)
+    P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg) + tidy_artifacts(cfg, units)
     for n, h in cfg.hosts.items(): P += tidy_host(cfg, n, h, units, au)
+    P = apply_holds(cfg, P)
     for d, why in kept: say(f"kept worktree {d}: {why}")
     if not cfg.run.dry and not cfg.run.ro: cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P if x[0] == "disk"]})
     if not [x for x in P if x[0] != "disk"]: say("nothing to tidy" + "".join(f"; {x[1]}: {x[2]}" for x in P if x[0] == "disk")); return

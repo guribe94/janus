@@ -84,7 +84,9 @@ def main():
     add("gate-exec", cmd_gate_exec, A("name"), A("--timeout-min", type=float, default=0), A("command", nargs="*"))
     add("gate-scope", cmd_gate_scope, A("unit"), A("--name", help="the gate's name (default land-<unit>)"), dry=True)
     add("thrash", cmd_thrash, dry=True)
-    add("tidy", cmd_tidy, dry=True)
+    add("tidy", cmd_tidy, A("action", nargs="?", choices=["hold", "unhold", "holds"], help="hold/unhold one item so tidy never removes it, or list the holds"),
+        A("target", nargs="?", help="hold/unhold: the item to keep (a worktree path, a host:name, a test root)"),
+        A("--why", help="hold: why it is kept"), dry=True)
     add("busy", cmd_busy, A("wt", help="a worktree: exit 0 while a janus job, a unit's job or a mutation run uses it, else 1"))
     add("cancel", cmd_cancel, A("job", help="<host>:<task id> of a janus run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", cmd_fill, A("--max", type=int, help="launch at most this many"), dry=True)
