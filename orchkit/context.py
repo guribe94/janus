@@ -6,6 +6,7 @@ mutable flag object so --dry-run set by main (and the temporary disable around a
 module-level `global` (section 7, seam 2)."""
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
+from orchkit.platform import herdr, ps_table, secs   # re-exported: the OS/tool adapter (owner direction 2026-11-11)
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
@@ -107,11 +108,6 @@ def X(h, script, **k):
     if DRY: say(f"+ [{h.get('ssh', 'local')}] " + "".join(f"{k}=... " for k in (k.get("env") or {})) + script); return 0, "", ""
     return hrun(h, script, **k)
 
-def herdr(*a, timeout=20):
-    rc, o, e = sh(["herdr", *a], timeout=timeout)
-    try: return json.loads(o).get("result", {}) if rc == 0 else None
-    except Exception: return None
-
 def findkey(o, sub):
     if isinstance(o, dict):
         for k, v in o.items():
@@ -126,15 +122,6 @@ def findkey(o, sub):
 def fl(x, d=0.0):
     try: return float(x)
     except Exception: return d
-
-def ps_table():
-    """{pid: (ppid, pgid, started, command)} for every process (one ps call)."""
-    rc, o, e = sh(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,lstart=,command="], timeout=10)
-    t = {}
-    for l in o.splitlines():
-        f = l.split(None, 8)   # pid ppid pgid + lstart is 5 words (Wed Nov 11 15:31:02 2026) + command
-        if len(f) >= 8 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), int(f[2]), " ".join(f[3:8]), f[8] if len(f) > 8 else "")
-    return t
 
 def ancestors(t, pid):
     out = []
@@ -196,11 +183,6 @@ class Locked:
     def __exit__(self, *e): self.f.close()
 
 FIXTURE_MARK = "orch-test-fixture"
-
-def secs(et):
-    d, _, r = et.rpartition("-"); p = [int(x) for x in r.split(":")]
-    while len(p) < 3: p.insert(0, 0)
-    return (int(d) if d else 0) * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
 
 def pq(cmd):
     """The command part of `pueue add -- <command>`, as one word of the caller's shell. pueue joins its arguments with spaces and

@@ -4,6 +4,7 @@ Reads orch.toml from the current directory or a parent. See docs/DESIGN.md and s
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
 from orchkit.templates import *   # the shell/Python templates orch writes (section 7, Step 1: templates.py)
+from orchkit.platform import launchd_watcher_loaded, systemd_watcher_active   # the OS/tool adapter (owner direction 2026-11-11)
 from orchkit.board import *
 from orchkit.units import *
 from orchkit.ledger import *
@@ -481,7 +482,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done, or bd remember --key <subject>: same subject replaces): " + "; ".join(i['title'][:50] for i in ins[:3])))
     except Err: pass
     for s in handoff_stale(cfg, running): F.append(("handoff", s))
-    if sys.platform == "darwin" and sh(["launchctl", "list", "com.orch.watch"])[0]: F.append(("watcher", "watcher com.orch.watch is not running: run install"))
+    if sys.platform == "darwin" and not launchd_watcher_loaded(): F.append(("watcher", "watcher com.orch.watch is not running: run install"))
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap: launch on another provider, or ask the owner to raise the cap"))
     if not cfg.ro and not DRY: F = enforce(cfg, F)
@@ -3530,8 +3531,8 @@ def doctor(cfg, a):
     except Exception: hk = {}
     miss = [ev for ev in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop") if not any("orch hook " + ev in h.get("command", "") for e in hk.get(ev, []) for h in e.get("hooks", []))]
     r(not miss, "Claude Code hooks " + ("installed" if not miss else "missing: " + ", ".join(miss)), "run ./install")
-    if sys.platform == "darwin": r(sh(["launchctl", "list", "com.orch.watch"])[0] == 0 or None, "watcher com.orch.watch loaded", "run ./install")
-    else: r(sh(["systemctl", "--user", "is-active", "orch-watch.timer"])[0] == 0 or None, "watcher orch-watch.timer active", "run ./install")
+    if sys.platform == "darwin": r(launchd_watcher_loaded() or None, "watcher com.orch.watch loaded", "run ./install")
+    else: r(systemd_watcher_active() or None, "watcher orch-watch.timer active", "run ./install")
     if cfg is None:
         r(False, f"no orch.toml in {Path.cwd()} or a parent", "orch init"); return 1
     say(f"-- project {cfg.name} ({cfg.root})")
