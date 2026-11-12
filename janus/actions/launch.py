@@ -347,6 +347,14 @@ def cwd_taken(cfg, units, cwd, name, resume_of=None, share_with=None):
     handover = resume_of if resume_of in shared else None
     return [x for x in shared if x != handover], handover
 
+def new_worktree(repo, cwd, name, ref="main"):
+    """Item 16b: make a fresh worktree of repo at cwd on a new branch name, started from ref. A unit that gets a tree of its own
+    (janus launch had no way to; without --cwd it defaulted to the project state root)."""
+    cwd.parent.mkdir(parents=True, exist_ok=True)
+    rc, o, e = sh(["git", "-C", str(repo), "worktree", "add", "-b", name, str(cwd), ref], timeout=300)
+    if rc: raise Err(f"git worktree add -b {name} {cwd} {ref} in {repo} failed: {(e or o).strip()[-160:]}")
+    return cwd.resolve()
+
 def cmd_launch(cfg, a):
     name = a.unit
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
@@ -369,7 +377,13 @@ def cmd_launch(cfg, a):
     hn, build, why_place = choose(cfg, a, brief, mc, units, hs)
     h = cfg.hosts[hn]; local = h.get("local", False)
     cwd = cfg.p("worktrees", "worktrees") / name
-    cwd = (Path(a.cwd) if a.cwd else cwd if cwd.is_dir() else cfg.root).resolve()
+    if getattr(a, "new_worktree", None):   # item 16b: a fresh worktree of <repo> on a new branch, from <ref>
+        ref = getattr(a, "from_ref", None) or "main"
+        if cfg.run.dry: say(f"+ git -C {a.new_worktree} worktree add -b {name} {cwd} {ref}"); cwd = cwd.resolve()
+        else: cwd = new_worktree(Path(a.new_worktree).resolve(), cwd, name, ref)
+    elif a.cwd: cwd = Path(a.cwd).resolve()
+    elif cwd.is_dir(): cwd = cwd.resolve()
+    else: cwd = cfg.root.resolve()
     shared, handover = cwd_taken(cfg, units, cwd, name, getattr(a, "resume_of", None), getattr(a, "share_with", None))
     if shared and not (local and a.kind in ("review", "audit")):
         raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}; give the unit its own worktree (H9)")

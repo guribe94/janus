@@ -45,7 +45,7 @@ def main():
         A("--reset", action="store_true", help="the Stop hook's context reset: /clear once the turn ended, then the wake prompt"))
     add("learned", cmd_learned, A("--reject", help="reject learned post <agent>:<n> (check stops listing it)"), A("--why", help="why it is rejected"))
     add("launch", cmd_launch, A("unit"), A("--kind", choices=["implement", "review", "audit", "cleanup"], required=True), A("--tier", choices=["critical", "normal"], default="normal"),
-        A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
+        A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--new-worktree", metavar="REPO", help="make a fresh worktree of this repo (a new branch named after the unit) for the unit"), A("--from", dest="from_ref", metavar="REF", help="--new-worktree: the branch or commit to start from (default main)"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
         A("--test-host", help="host where the unit's builds and tests run; the agent is placed there"), A("--allow-main", action="store_true", help="allow a main checkout as cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"),
         A("--report", help="a resumed unit: the report it continues (default out/<unit>/REPORT.md)"), A("--resume-of", help="a resumed unit: the unit whose report it continues"),
         A("--item", help="the backlog item this unit works on (janus backlog)"), dry=True)

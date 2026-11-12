@@ -112,27 +112,27 @@ class Item13Handover(unittest.TestCase):
         g("init", "-q"); (R / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a")
         W = base / "wt"; g("worktree", "add", "-q", str(W), "-b", "unit")
         d, cfg = project()
-        u = {"id": "t-1", "name": "merge-u15", "cwd": str(W)}
+        u = {"id": "t-1", "name": "u1", "cwd": str(W)}
         real = janus.Beads; janus.Beads = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [u]})
         try:
-            self.assertTrue(janus.force_close_ok(cfg, ["close", "merge-u15", "--force", "--reason", "a; b", "2"]))
+            self.assertTrue(janus.force_close_ok(cfg, ["close", "u1", "--force", "--reason", "a; b", "2"]))
         finally: janus.Beads = real
 
     def test_resume_of_takes_the_predecessors_cwd(self):
-        """Catches: 'janus launch u15-seams --resume-of merge-u15 --cwd <its tree>' was refused by H9, so no route handed a unit's
+        """Catches: 'janus launch <successor> --resume-of <u> --cwd <its tree>' was refused by H9, so no route handed a unit's
         dirty worktree to a successor."""
         d, cfg = project(); W = d / "wt"; W.mkdir()
-        units = [{"id": "t-1", "name": "merge-u15", "cwd": str(W)}]
-        self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u15-seams"), (["merge-u15"], None))
-        self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u15-seams", resume_of="merge-u15"), ([], "merge-u15"))
+        units = [{"id": "t-1", "name": "u1", "cwd": str(W)}]
+        self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u2"), (["u1"], None))
+        self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u2", resume_of="u1"), ([], "u1"))
 
 
 class Item12FinalGate(unittest.TestCase):
     def test_final_gate_substitutes_unit_tree_and_branch(self):
         """Catches: janus land took one fixed [landing] final_gate command, so a project that gates per unit could not use it."""
         ld = {"final_gate": "bin/run-handoff.sh out/land-{unit}-linux --tree {wt} --branch {branch}"}
-        self.assertEqual(janus.final_gate_cmd(ld, "u15-seams", "/w/u15", "wk/u15"),
-                         "bin/run-handoff.sh out/land-u15-seams-linux --tree /w/u15 --branch wk/u15")
+        self.assertEqual(janus.final_gate_cmd(ld, "u1", "/w/u1", "wk/u1"),
+                         "bin/run-handoff.sh out/land-u1-linux --tree /w/u1 --branch wk/u1")
         self.assertEqual(janus.final_gate_cmd({}, "u", "/w", "b"), "")
 
 
@@ -160,7 +160,7 @@ class Item9ResumeCard(unittest.TestCase):
 class Item10UnitChanges(unittest.TestCase):
     def test_a_staged_landing_merge_does_not_count_the_branchs_files(self):
         """Catches: a unit holding a staged merge of the landing branch counted all of the branch's files as its changes, so it
-        overlapped every other such unit (merge-u15 vs merge-pico2: +73 files)."""
+        overlapped every other such unit."""
         base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u10-")); R = base / "repo"; R.mkdir()
         g = lambda *a: subprocess.run(["git", "-C", str(R), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
         g("init", "-q", "-b", "main"); (R / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a")
@@ -201,6 +201,78 @@ class Item14OldOrch(unittest.TestCase):
         try: janus.retire_old_orch(dry=False, retire=True, ps_text=ps)
         finally: janus.run = real
         self.assertEqual(kills, [["kill", "-TERM", "101"]])
+
+
+class Item15ReadyWork(unittest.TestCase):
+    def test_log_beads_are_not_ready_work(self):
+        """Catches: backlog.ready_work counted the decisions-log bead ('orch: decisions' when the old orch made it, label
+        orch-log), so idle:<host> fired with '1 unit(s) are ready' when nothing was."""
+        d, cfg = project()
+        items = [{"title": "orch: decisions", "labels": ["orch-log"]}, {"title": "janus: decisions", "labels": ["janus-log"]},
+                 {"title": "unit:x", "labels": ["unit"]}, {"title": "backlog: A1", "labels": ["backlog"]},
+                 {"title": "instr: do it", "labels": ["instruction"]}, {"title": "real work", "labels": []}]
+        real = janus.Beads; janus.Beads = type("B", (), {"__init__": lambda s, c: None, "run": lambda s, *a: items})
+        try: got = [i["title"] for i in janus.ready_work(cfg)]
+        finally: janus.Beads = real
+        self.assertEqual(got, ["real work"])
+
+
+class Item16RelatedRepos(unittest.TestCase):
+    def test_related_compares_only_units_in_the_same_repository(self):
+        """Catches (item 16a): related:<a>:<b> matched a module name across different repositories (two projects that both change
+        a docs module)."""
+        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u16a-"))
+        def repo(n):
+            R = base / n; R.mkdir()
+            g = lambda *a: subprocess.run(["git", "-C", str(R), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
+            g("init", "-q", "-b", "main"); (R / "docs").mkdir(); (R / "docs/a.md").write_text("x\n"); g("add", "."); g("commit", "-qm", "a")
+            return R, g
+        R1, g1 = repo("r1")
+        W1 = base / "w1"; g1("worktree", "add", "-q", str(W1), "-b", "u1"); (W1 / "docs/a.md").write_text("y\n")
+        W2 = base / "w2"; g1("worktree", "add", "-q", str(W2), "-b", "u2"); (W2 / "docs/a.md").write_text("y2\n")
+        R2, _ = repo("r2"); (R2 / "docs/a.md").write_text("z\n")
+        d, cfg = project()
+        units = [{"id": "t-1", "name": "u1", "host": "here", "cwd": str(W1), "state": "working"},
+                 {"id": "t-2", "name": "u2", "host": "here", "cwd": str(W2), "state": "working"},
+                 {"id": "t-3", "name": "u3", "host": "here", "cwd": str(R2), "state": "working"}]
+        saved = {k: getattr(janus, k) for k in ("all_units", "gate_results", "learned_posts")}
+        janus.all_units = lambda cfg: {}; janus.gate_results = lambda cfg: {}; janus.learned_posts = lambda cfg: []
+        try: cases = janus.related_cases(cfg, units)
+        finally:
+            for k, v in saved.items(): setattr(janus, k, v)
+        self.assertEqual(sorted(cases), [("u1", "u2")], "units in different repositories were called related")
+
+
+class Item16NewWorktree(unittest.TestCase):
+    def test_new_worktree_makes_a_fresh_branch(self):
+        """Catches (item 16b): janus launch had no fresh-worktree option (without --cwd it defaulted to the project state root)."""
+        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u16b-")); R = base / "repo"; R.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(R), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
+        g("init", "-q", "-b", "main"); (R / "f").write_text("x\n"); g("add", "."); g("commit", "-qm", "a")
+        d, cfg = project(); wt = d / "worktrees/u1"
+        janus.new_worktree(R, wt, "u1", "main")
+        self.assertTrue((wt / "f").is_file())
+        head = subprocess.run(["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(head, "u1")
+
+
+class Item16Budget(unittest.TestCase):
+    def test_budget_ignores_tiny_and_verdictless_runs(self):
+        """Catches (item 16c): the default budget for implement/normal was $0.50 from a median of $0.09 over 23 runs that ended
+        without a verdict, so a real unit started at a cap (the waste cause)."""
+        d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 15\nledger = "out/ledger.tsv"\nkey_file = "k"\n[models.m]\nprovider = "api"\nkind = "api"\n')
+        mc = cfg.models["m"]; runs = {}; au = {}
+        for i in range(23):
+            n = f"tiny{i}"; (d / "out" / n).mkdir(parents=True); (d / "out" / n / "REPORT.md").write_text("VERDICT: PENDING\n")
+            runs[f"{n}.1"] = {"done": True, "cost": 0.09, "unit": n}; au[n] = {"name": n, "kind": "implement", "tier": "normal", "run": f"{n}.1", "status": "closed"}
+        for i in range(3):
+            n = f"real{i}"; (d / "out" / n).mkdir(parents=True); (d / "out" / n / "REPORT.md").write_text("VERDICT: DONE\ndone\n")
+            runs[f"{n}.1"] = {"done": True, "cost": 2.0, "unit": n}; au[n] = {"name": n, "kind": "implement", "tier": "normal", "run": f"{n}.1", "status": "closed"}
+        cfg.run.all_units = au
+        real = janus.ledger_read; janus.ledger_read = lambda cfg, pv: (runs, [], [])
+        try: b, why = janus.budget_for(cfg, mc, "implement", "normal")
+        finally: janus.ledger_read = real
+        self.assertGreaterEqual(b, 2.0, f"the tiny/verdictless runs skewed the budget: {b} ({why})")
 
 
 if __name__ == "__main__": unittest.main()
