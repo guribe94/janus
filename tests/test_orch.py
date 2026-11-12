@@ -217,7 +217,7 @@ class Capacity(unittest.TestCase):
         holder = subprocess.Popen(["sleep", "60"])
         rd = self.d / "rd"; (rd / "h.res").write_text(f"{holder.pid} 8 100 1 x\n")   # all cores reserved by another job
         a = type("A", (), {"lane": "jobs", "subdir": None, "wt": str(self.d), "usb": False})()
-        cmd = sys.executable + " -c 'import time; b = bytearray(60 * 1024 * 1024); time.sleep(6)'"
+        cmd = sys.executable + " -c 'import os, time; b = bytearray(os.urandom(60 * 1024 * 1024)); time.sleep(6)'"   # incompressible: macOS compresses zero pages under pressure
         js = orch.job_script(self.cfg, "b", self.h, a, "t", cmd, "t-1"); (rd / "t-1.sh").write_text(js)
         p = subprocess.Popen(["bash", str(rd / "t-1.sh")], env={**os.environ, "ORCH_POLL_S": "1"}, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
