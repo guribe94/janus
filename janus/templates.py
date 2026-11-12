@@ -244,9 +244,13 @@ while :; do
     ulk; nowt=$(date +%%s)
     if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): $why"; said=$BLK; last=$nowt; fi
   else
-    # finding 10: a jobs-lane job yields while a gates job waits; say why (the old branch left BLK empty, so the give-up message
-    # read "no reason reported"), and treat it as a yield -- the queue is moving (the gate is progressing), so the clock clears.
-    Y=1; BLK="a gates job is waiting on this host"
+    # finding 10: a jobs-lane job yields while a gates job waits, and says why (the old branch left BLK empty, so the give-up
+    # message read "no reason reported"). finding 7 (fix-install6): the yield is BOUNDED and names the gate's OWN cause -- a gate
+    # that is waiting is not progressing, and one itself blocked on disk/memory must not hold a jobs job forever (the old `Y=1`
+    # cleared the give-up clock on every poll, so the job exited only after the gate gave up plus its own limit; a new gate
+    # restarted that). So the clock runs here, and `why` is the same admission cause the gate is waiting on.
+    lk; CAP_RO=; . "$RD/cap.sh"; admit_ok "$CLS" >/dev/null 2>&1; ulk
+    BLK="a gates job is waiting on this host (${why:-admission blocked})"
     nowt=$(date +%%s)
     if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): a jobs job yields while a gates job waits and goes after it"; said=$BLK; last=$nowt; fi
   fi

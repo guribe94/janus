@@ -307,9 +307,11 @@ class Item10GiveUpResidues(unittest.TestCase):
         finally: janus.job_result = saved
         self.assertIn("never admitted", msg, msg)
 
-    def test_a_jobs_job_yielding_to_a_gates_job_says_why_and_does_not_give_up(self):
-        """Catches (finding 10): while a gates job waited, a jobs-lane job skipped the admission test -- its blocked clock ran
-        with 'no reason reported' and it gave up (exit 121) although the gate in front of it was progressing."""
+    def test_a_jobs_job_yielding_to_a_gates_job_is_bounded_and_names_the_cause(self):
+        """Catches (finding 7, fix-install6): while any gates job waited (even one itself blocked on disk/memory), a jobs-lane
+        job cleared its blocked clock on every poll, so it printed only 'a gates job is waiting' (never the gate's own cause) and
+        gave up only after the gate gave up plus its own limit -- a new gate restarted that. The yield is now bounded (the clock
+        runs) and names the gate's own admission cause."""
         import argparse
         d, cfg = project('\n[capacity]\nmin_disk_gb = 0\n')
         h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
@@ -323,10 +325,33 @@ class Item10GiveUpResidues(unittest.TestCase):
                              env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"})
         p.stdin.write(js); p.stdin.close()
         try:
-            time.sleep(4.5)
-            self.assertIsNone(p.poll(), "the job gave up while a gates job waited: the yield should clear the blocked clock")
-            (rd / "g.gwait").unlink()
-            p.wait(timeout=30); out = p.stdout.read()
+            out, _ = p.communicate(timeout=30)
+        finally:
+            gate.kill(); p.kill()
+        self.assertEqual(p.returncode, 121, out)
+        self.assertIn("a gates job is waiting", out, out)
+        self.assertIn("not admitted after", out, out)
+        self.assertIn("disk", out, "the gate's own admission cause was not named: " + out)
+
+    def test_a_jobs_job_runs_once_a_gates_job_is_gone(self):
+        """Catches (finding 7, fix-install6): the bounded yield must not block a jobs job when the gate does progress -- once the
+        gate is admitted (its `.gwait` gone) the jobs job runs."""
+        import argparse
+        d, cfg = project('\n[capacity]\nmin_disk_gb = 0\n')
+        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
+        rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True)
+        gate = subprocess.Popen(["sleep", "30"])
+        (rd / "g.gwait").write_text(f"{gate.pid} 60 {int(time.time())} 256 1\n")
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-3")
+        p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "30", "JANUS_ADMIT_REPORT_S": "1"})
+        p.stdin.write(js); p.stdin.close()
+        try:
+            time.sleep(2.5)
+            (rd / "g.gwait").unlink()   # the gate was admitted: the jobs job may run now
+            out, _ = p.communicate(timeout=30)
         finally:
             gate.kill(); p.kill()
         self.assertEqual(p.returncode, 0, out)
