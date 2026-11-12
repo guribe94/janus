@@ -42,6 +42,8 @@ args = []
 # status_col = "status"
 # done = ["DONE"]        # statuses (prefixes) that are finished
 # ready = ["READY", "FIX"]   # statuses an agent can start; default every unfinished one. Others wait (on the owner, say)
+# actor_col = "actor"    # optional column: who does the item (agent, owner, hardware, ...); `orch backlog set <id> actor=owner`
+#                        # sets it too. Only agent items (the default) count as idle backlog or are launched by orch fill.
 
 # [landing]              # "finished, not landing" in orch check
 # kinds = ["implement"]  # unit kinds that land (reviews, audits and cleanups do not)
@@ -167,6 +169,12 @@ warn_pct = 80            # check: budget80:<unit> at this share of its budget ..
 report_stale_min = 10    # ... while its report has not changed for this long
 wrapup_usd = 0.5         # a run that ends at its budget cap without a final verdict is resumed once with this, to write its report
 resume_min_usd = 0.1     # a parked unit is resumed (same session) only while this much of its budget is left
+
+[report]                 # orch report (to the owner): backlog completeness, remaining work, spend by outcome
+every_h = 4              # check raises report-due at these checkpoints (every_h hours from midnight, and the times in at)
+# at = ["09:00", "18:00"]  # until `orch report --sent`
+waste_pause = 25         # launch and fill pause while runs capped without a verdict took over this % of the spend ...
+recent_h = 24            # ... of the last recent_h hours, until `orch ack waste-pause "<cause and fix>"`
 
 [collect]                # remote units: the watcher saves out/<unit>/ and the agent's changes as out/<unit>/backup.patch this often;
 backup_min = 30          # stop and close refuse while a remote copy has work orch collect has not brought here (--force overrides)
