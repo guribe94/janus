@@ -19,37 +19,88 @@ from janus.units import all_units, ws_id
 # mark, unless the checker is the test suite (which must see its own fixtures).
 def fixture_proc(cmd): return FIXTURE_MARK in (cmd or "") and not os.environ.get("JANUS_IN_TESTS")
 
-TEST_WRAP = {"nice", "env", "timeout", "nohup", "time", "command", "exec", "ionice", "stdbuf", "caffeinate", "setsid", "doas", "sudo"}
+TEST_WRAP = {"nice", "env", "timeout", "nohup", "time", "command", "exec", "ionice", "stdbuf", "caffeinate", "setsid",
+             "doas", "sudo", "xargs", "arch", "node"}
 TEST_SUB = ("test", "nextest", "build", "clippy", "bench")
+TEST_RUN = re.compile(r"^(?:pytest[\d.]*|py\.test)$")
+PY_RUN = re.compile(r"^(?:python|python\d+(?:\.\d+)?|Python)$")
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+OPTS_WITH_ARG = {"-n", "-u", "-g", "-p", "-c", "-o", "-e", "-t", "-s", "-k", "-C", "-L", "-P", "-I", "-d", "-a", "-i",
+                 "--signal", "--kill-after", "--user", "--group", "--max-args", "--max-procs", "--delimiter", "--arg-file",
+                 "--replace", "--eof", "--lines"}
 
-def test_command(c):
-    """True when a command *in* c is a test or build command (its command word, after wrappers and assignments, is cargo/a
-    cargo subcommand, pytest, npm/pnpm test or xcodebuild ... test). Item 23: a line that merely *mentions* pytest (an
-    orchestrator's `janus ack ... "pytest"`, a commit message) is not a test run."""
-    for seg in re.split(r"[;&|()\n]+", c):
-        w = seg.split(); i = 0
-        while i < len(w):
-            b = os.path.basename(w[i])
-            if re.match(r"^[A-Za-z_]\w*=", w[i]): i += 1; continue
-            if b in TEST_WRAP:
-                i += 1
-                while i < len(w):
-                    x = w[i]
-                    if x.startswith("-"):
-                        i += 2 if x in ("-n", "-u", "-g", "-p", "-c", "-o", "-e", "-t", "-s", "-k", "-C", "--signal", "--kill-after", "--user", "--group") and i + 1 < len(w) else 1
-                        continue
-                    if re.match(r"^[A-Za-z_]\w*=", x) or re.fullmatch(r"[\d.]+[smhd]?", x): i += 1; continue
-                    break
-                continue
-            rest = [os.path.basename(x) for x in w[i + 1:]]
-            if b in ("sh", "bash", "zsh", "dash", "ksh") and "-c" in w[i + 1:]:
-                j = w.index("-c", i + 1)
-                if test_command(" ".join(w[j + 1:])): return True   # a shell shim that runs a test (`sh -c 'cargo test'`)
-                break
-            if b == "cargo" and any(x in TEST_SUB for x in rest): return True
-            if re.fullmatch(r"pytest[\d.]*", b) or (b in ("npm", "pnpm") and "test" in rest) or (b == "xcodebuild" and "test" in rest): return True
-            break
+def _segments(c):
+    """The commands in c, each a list of words: quoting and backslash escapes are honoured, so a ; or | inside a quoted
+    argument (an ack or a commit message) never starts a new command (finding 4)."""
+    segs, cur, w, q, esc = [], [], "", None, False
+    for ch in c:
+        if esc: w += ch; esc = False; continue
+        if q:
+            if ch == q: q = None
+            elif ch == "\\" and q == '"': esc = True
+            else: w += ch
+        elif ch in "'\"": q = ch
+        elif ch == "\\": esc = True
+        elif ch in ";&|()\n":
+            if w: cur.append(w); w = ""
+            if cur: segs.append(cur); cur = []
+        elif ch.isspace():
+            if w: cur.append(w); w = ""
+        else: w += ch
+    if w: cur.append(w)
+    if cur: segs.append(cur)
+    return segs
+
+def _after_opts(w, i):
+    """The index after w[i] (a command word) and its options, assignments and a bare duration (a wrapper's own arguments)."""
+    i += 1
+    while i < len(w):
+        x = w[i]
+        if x.startswith("-") and x not in ("-", "--"): i += 2 if x in OPTS_WITH_ARG and i + 1 < len(w) else 1; continue
+        if re.match(r"^[A-Za-z_]\w*=", x) or re.fullmatch(r"[\d.]+[smhd]?", x): i += 1; continue
+        break
+    return i
+
+def _test_argv(w, depth):
+    """True when the words w (one command, quotes already removed) are a test or build run (finding 4: the review's cases)."""
+    if depth > 6: return False
+    i = 0
+    while i < len(w) and re.match(r"^[A-Za-z_]\w*=", w[i]): i += 1   # leading assignments
+    while i < len(w):
+        b = os.path.basename(w[i])
+        if b in SHELLS:   # a shell shim: the -c (or -lc, -cl) string is the command (recurse)
+            j = next((k for k in range(i + 1, len(w)) if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", w[k])), None)
+            return j is not None and test_command(" ".join(w[j + 1:]), depth + 1)
+        if b == "eval": return test_command(" ".join(w[i + 1:]), depth + 1)
+        if PY_RUN.match(b):   # python -m pytest, or a Python-app console script (.../Python .../bin/pytest)
+            rest = w[i + 1:]
+            if "-m" in rest and any(TEST_RUN.match(os.path.basename(x)) for x in rest[rest.index("-m") + 1:]): return True
+            return any(TEST_RUN.match(os.path.basename(x)) for x in rest if not x.startswith("-"))
+        if b in ("uv", "poetry", "pipenv", "pdm", "hatch", "rye", "bundle", "just"):
+            j = _after_opts(w, i)
+            if j < len(w) and w[j] in ("run", "exec", "x"): j += 1
+            i = j; continue
+        if b == "rustup":
+            j = _after_opts(w, i)
+            if j < len(w) and w[j] == "run": j += 1
+            i = j + 1 if j < len(w) else j; continue   # the toolchain name
+        if b == "flock": i = _after_opts(w, i) + 1; continue   # the lock file
+        if b in TEST_WRAP: i = _after_opts(w, i); continue
+        if b == "cargo" or b.startswith("cargo-"):
+            rest = [x for x in w[i + 1:] if not x.startswith("+")]   # cargo +nightly test
+            return bool(rest) and rest[0] in TEST_SUB
+        if b in ("npm", "pnpm", "yarn", "bun"): return "test" in w[i + 1:]
+        if b == "xcodebuild": return "test" in w[i + 1:]
+        return bool(TEST_RUN.match(b))
     return False
+
+def test_command(c, depth=0):
+    """True when a command *in* c is a test or build command: its command word (after wrappers and assignments, a shell -c, an
+    interpreter's -m or console script) is cargo/a cargo subcommand, pytest, npm/pnpm test or xcodebuild ... test. Item 23: a
+    line that merely *mentions* pytest (an orchestrator's `janus ack ... "pytest"`, a commit message) is not a test run.
+    Finding 4: a word inside a quoted argument never starts a command, and a real run behind uv/poetry/rustup/xargs/arch/flock/
+    node/a shell shim is judged one."""
+    return any(_test_argv(w, depth) for w in _segments(c))
 
 VIA_LANE = re.compile(r"janus(\.py)? (run|gate)\b|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")   # plus paths.lane_scripts (project wrappers)
 
