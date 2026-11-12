@@ -80,6 +80,18 @@ def gate_ids(cfg, name, which):
     try: return [l.strip() for l in (cfg.p("out", "out") / name / f"{which}.txt").read_text(errors="replace").splitlines() if l.strip()]
     except OSError: return None
 
+def gate_baseline(cfg, name):
+    """The gate name recorded as this gate's baseline (out/<name>/baseline.txt, written by `janus gate --baseline <name>`), or
+    None. The baseline is a run of the same gate on the landing branch and the same host: the failures it saw are main's, not
+    the unit's (decision 0002, the gate-baseline mechanism)."""
+    try: return (cfg.p("out", "out") / name / "baseline.txt").read_text().strip() or None
+    except OSError: return None
+
+def baseline_failures(cfg, name):
+    """The test ids the gate's baseline run failed, or [] (none recorded, or the baseline named no failures)."""
+    b = gate_baseline(cfg, name)
+    return set(gate_ids(cfg, b, "failed") or []) if b else set()
+
 def gate_signals(cfg, runs=5, min_min=20):
     """[(gate, minutes, runs)] of gates whose last `runs` recorded results all passed and whose median recorded length is over
     min_min minutes: a long step that has not failed in runs, proposed for scoping or trimming (deletion stays the owner's call)."""
@@ -100,10 +112,13 @@ def gate_signals(cfg, runs=5, min_min=20):
     return sorted(out, key=lambda x: -x[1])
 
 def judge_gate(cfg, name, rc):
-    """(PASS|FAIL, new failures, known failures that occurred): PASS when rc is 0, or when the gate named its failing tests and
-    every one is a known failure with a fixing unit. A non-zero gate that names no failing test is a failure (build, timeout)."""
+    """(PASS|FAIL, new failures, failures set aside): PASS when rc is 0, or when the gate named its failing tests and every one
+    is a known failure with a fixing unit OR a failure the gate's recorded baseline also saw (the landing branch's own failure on
+    the same host: decision 0002, `janus gate --baseline <name>`). A non-zero gate that names no failing test is a failure
+    (build, timeout). The third element is every failure set aside (known + baseline)."""
     if int(rc) == 0: return "PASS", [], []
     fs = gate_ids(cfg, name, "failed")
     if not fs: return "FAIL", [f"exit {rc}"], []
-    kf = known_failures(cfg); new = [i for i in fs if not (i in kf and kf_active(kf[i]))]
+    kf = known_failures(cfg); base = baseline_failures(cfg, name)
+    new = [i for i in fs if not (i in kf and kf_active(kf[i])) and i not in base]
     return ("FAIL" if new else "PASS"), new, [i for i in fs if i not in new]

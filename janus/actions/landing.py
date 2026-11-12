@@ -6,7 +6,7 @@ from janus.actions.launch import cmd_launch
 from janus.actions.swarm import write_index
 from janus.beads import Beads
 from janus.context import Err, JANUS_SELF, X, atomic_write, note_event, now, pq, say, sh, ts
-from janus.gates import GATE_DEFAULT, GATE_LINE, judge_gate, landed
+from janus.gates import GATE_DEFAULT, GATE_LINE, baseline_failures, gate_baseline, judge_gate, landed
 from janus.project import tag
 from janus.probe import pueue
 from janus.quality import land_review
@@ -14,7 +14,9 @@ from janus.units import all_units, get_unit, own_tree
 
 def cmd_gate_judge(cfg, a):
     r, new, known = judge_gate(cfg, a.name, a.rc)
-    extra = (f" KNOWN={len(known)}" if known else "") + (f" NEW={','.join(new[:20])[:400]}" if new and new != [f"exit {a.rc}"] else "")
+    b = gate_baseline(cfg, a.name)
+    base = (f" BASE={b}({len(baseline_failures(cfg, a.name))})" if b else "")
+    extra = (f" KNOWN={len(known)}" if known else "") + base + (f" NEW={','.join(new[:20])[:400]}" if new and new != [f"exit {a.rc}"] else "")
     return 0 if r == "PASS" else 1, [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {a.name} EXIT_tests={a.rc}{extra} RESULT: {r}"]
 
 def gate_times(cfg): return cfg.jget("gate-times.json")
@@ -95,6 +97,15 @@ def cmd_gate(cfg, a):
     --unit (default $JANUS_UNIT) records the gate on that unit, for the landing check."""
     out = cfg.p("out", "out"); t = out / a.name / "tests.sh"
     if not t.is_file(): raise Err(f"{t} not found")
+    # Baseline (decision 0002): --baseline <name> records a run of the landing branch on the same host whose failures are main's,
+    # not the unit's; --baseline none clears it. The gate script's gate-judge reads out/<name>/baseline.txt.
+    bl = getattr(a, "baseline", None)
+    if bl == "none": (out / a.name / "baseline.txt").unlink(missing_ok=True)
+    elif bl:
+        if not (out / bl / "failed.txt").is_file() and not (out / bl / "tests.sh").is_file():
+            raise Err(f"--baseline {bl}: no recorded gate out/{bl} (a run of the landing branch on the same host); run it first")
+        (out / a.name).mkdir(parents=True, exist_ok=True); atomic_write(out / a.name / "baseline.txt", bl + "\n")
+        say(f"gate {a.name}: baseline {bl} (its failures are treated as the branch's, not the unit's)")
     h = cfg.hosts[next(n for n, x in cfg.hosts.items() if x.get("local"))]
     env = {"JANUS_LANE": "gates", "JANUS_ROOT": str(cfg.root)} | ({cfg.paths.get("gate_host_env", "JANUS_TEST_HOST"): a.host} if a.host else {})
     pre = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())

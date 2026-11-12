@@ -72,6 +72,7 @@ def main():
         A("--allow-unmerged", action="store_true", help="run on a tree with a merge in progress, conflict markers or far behind the landing branch"),
         A("command", nargs=argparse.REMAINDER), dry=True)
     add("gate", cmd_gate, A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $JANUS_UNIT)"), A("--priority", type=int, default=10),
+        A("--baseline", help="name of a recorded run of the landing branch on the same host: its failures are main's, not the unit's (decision 0002); 'none' clears it"),
         A("--wait", action="store_true", help="wait and print the RESULT line; exit 0 on PASS"),
         A("--timeout-min", type=float, help="stop the gate after this long (default [landing] gate_timeout_min; 0: none)"),
         A("--quick", action="store_true", help="a short gate: the gates-quick slot when [landing] quick_gate_min is set"),
