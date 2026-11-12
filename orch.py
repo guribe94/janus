@@ -766,16 +766,23 @@ def board_rows(cfg):
                       "text": re.sub(r"\s+", " ", l.split(None, 4)[-1] if len(f) > 4 else "")[:140]}
     return rows
 
-def gate_findings(cfg):
-    try: lines = cfg.p("gate_log").read_text().splitlines()[-60:]
+def gate_findings(cfg, hs=None):
+    """Failed gates of the last 12 h: only each gate's latest result counts, and none while a newer run of that gate is queued or
+    running (a superseded failure never comes back after its ack expires)."""
+    try: lines = cfg.p("gate_log").read_text().splitlines()[-200:]
     except OSError: return []
-    fails, cut = [], now() - 12 * 3600
+    busy = {(t.get("label") or "")[5:] for p in (hs or {}).values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values()
+            if (t.get("label") or "").startswith("gate:") and any(k in str(t.get("status")) for k in ("Queued", "Running"))}
+    latest = {}
     for l in lines:
-        if "RESULT: FAIL" not in l: continue
+        if "RESULT:" in l and len(l) > 20: latest[l[20:].split()[0]] = l
+    fails, cut = [], now() - 12 * 3600
+    for n, l in latest.items():
+        if "RESULT: FAIL" not in l or n in busy: continue
         try:
             if time.mktime(time.strptime(l[:19], "%Y-%m-%d %H:%M:%S")) < cut: continue
         except ValueError: continue
-        fails.append((l[:19], l[20:].split()[0], [t.split("=")[0] for t in l.split() if re.match(r"EXIT_\w+=(?!0$)", t)]))
+        fails.append((l[:19], n, [t.split("=")[0] for t in l.split() if re.match(r"EXIT_\w+=(?!0$)", t)]))
     out = [(f"gate:{n}@{t[11:]}", f"gate {n} FAILED at {t[11:]} ({' '.join(x[5:] for x in k[:4])}{'...' if len(k) > 4 else ''}); re-queue or classify")
            for t, n, k in fails]
     cnt = {}
@@ -1003,7 +1010,7 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     for n, c in cfg.caps.get("host", {}).items():
         k = sum(1 for u in units if u.get("host") == n)
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
-    F += gate_findings(cfg)
+    F += gate_findings(cfg, hs)
     F += lane_findings(cfg, hs, units)
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg) + script_findings()
     for n, pv in cfg.prov.items():
@@ -1020,7 +1027,12 @@ def collect_findings(cfg, hs, units, ag, bd_err):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
     rc, o, e = sh(["git", "status", "--porcelain"], cwd=cfg.root)
     if rc == 0:
-        if o.strip(): F.append(("git:dirty", f"{len(o.splitlines())} uncommitted path(s) in {cfg.root.name}"))
+        dirty = o.splitlines()
+        hp = handoff_path(cfg).relative_to(cfg.root) if handoff_path(cfg).is_relative_to(cfg.root) else None
+        if hp and any(l[3:].strip() == str(hp) for l in dirty):   # check's own rewrite of the Live block is not a change (row 50)
+            rc2, old, _ = sh(["git", "show", f"HEAD:{hp}"], cwd=cfg.root)
+            if rc2 == 0 and old.split(LE, 1)[-1] == handoff_path(cfg).read_text().split(LE, 1)[-1]: dirty = [l for l in dirty if l[3:].strip() != str(hp)]
+        if dirty: F.append(("git:dirty", f"{len(dirty)} uncommitted path(s) in {cfg.root.name}"))
         rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=cfg.root)
         if rc == 0 and o.strip() != "0": F.append(("git:unpushed", f"{o.strip()} unpushed commit(s)"))
         elif rc: F.append(("git:noupstream", "git has no upstream: add a remote, then orch commit-state (it pushes with --set-upstream)"))

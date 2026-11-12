@@ -138,3 +138,34 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
 critical = ["claude"]
 review = ["codex", "claude"]   # skips the implementer's vendor
 normal = ["codex"]
+
+# ---- capacity (orch-fixes8): admission by reservations on every host and lane, never by one reading.
+# Per host (or here as defaults): cores, cores_per_job, ram_gb, services_gb (memory not managed by orch: desktop, system,
+# daemons), job_gb (each job's MemoryMax and its reservation until its class is learned), agent_gb, min_disk_gb,
+# schedulers = ["<regex>"] (other job-running processes: check raises scheduler:<host> while one runs).
+[capacity]
+psi_pause = 10           # memory PSI avg10 over this pauses admission (macOS: the kernel's warn level counts as 50)
+load_pause = 1.25        # load over this x cores ...
+hold_s = 60              # ... held this long pauses admission; running jobs are never killed for it
+history_n = 5            # a job class reserves the max of its last 5 recorded peaks (agents: the median) ...
+margin_pct = 15          # ... plus this margin
+# no_build_kinds = ["review"]   # unit kinds that never hold a build reservation (default: all kinds do)
+# [capacity.classes]     # optional: class name = regex over the job's command (default: its first command words)
+# rust_test = "cargo (test|nextest)"
+
+[fill]                   # orch fill: ready backlog units with an ITEM: <id> brief, by priority, up to capacity and budget
+watcher = false          # true: the watcher runs orch fill when check finds idle-with-backlog (owner: "launch within capacity")
+every_min = 10
+
+[budget]                 # an API unit's default budget: median cost of past runs of its kind and tier + margin_pct
+margin_pct = 30
+min_runs = 3             # fewer past runs: the provider's budget_per_unit
+warn_pct = 80            # check: budget80:<unit> at this share of its budget ...
+report_stale_min = 10    # ... while its report has not changed for this long
+
+[enforce]                # warn first (a board direction), stop after grace_min
+grace_min = 5
+stop_burners = true      # a CPU burner's process group (never a group that holds the agent)
+stop_direct = false      # a build or test an agent runs outside the lanes on a remote host (flagged and warned either way)
+
+# [landing] final_gate_host = "<host>"; final_gate = "<command>"   # orch land gates the merged tree there before it squash-lands
