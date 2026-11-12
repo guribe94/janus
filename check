@@ -1,5 +1,6 @@
 #!/bin/sh
-# The checks a change must pass before ./install --release-only makes it live: parse, --help, a hook call, tests/test_orch.py.
+# The checks a change must pass before ./install --release-only makes it live: parse, --help, a hook call, and every
+# tests/test_*.py (discover, so a branch that adds a test file is covered too).
 set -e
 cd "$(dirname "$0")"
 python3 -c 'import ast, sys; ast.parse(open("orch.py").read()); ast.parse(open("install").read())'
@@ -7,6 +8,6 @@ python3 orch.py --help >/dev/null
 echo '{}' | python3 orch.py hook PreToolUse >/dev/null
 # the tests' exit code is the check's (a pipe into tail used to hide a failure)
 set +e
-out=$(env -u ORCH_ROOT -u ORCH_UNIT -u ORCH_ROLE -u ORCH_REPORT PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_orch 2>&1); rc=$?
+out=$(env -u ORCH_ROOT -u ORCH_UNIT -u ORCH_ROLE -u ORCH_REPORT PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v 2>&1); rc=$?
 printf '%s\n' "$out" | tail -25
 exit $rc

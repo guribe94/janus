@@ -40,7 +40,8 @@ acyclic: a module never imports a higher one, and no module calls `say()` from a
 | Module | Holds | State |
 |---|---|---|
 | `orchkit/__init__.py` | `__version__` | moved |
-| `orchkit/context.py` | Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X/herdr, the registered-session process identity, pq/qp/secs/fl/findkey, Locked, atomic_write, ORCH_SELF/FIXTURE_MARK/NUM, and DRY as one shared flag object | moved |
+| `orchkit/context.py` | Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X, the registered-session process identity, pq/qp/fl/findkey, Locked, atomic_write, ORCH_SELF/FIXTURE_MARK/NUM, and DRY as one shared flag object (it re-exports ps_table/secs/herdr from `platform`) | moved |
+| `orchkit/platform.py` | the one OS/tool adapter (owner direction 2026-11-11): process listing (`ps`), the `ps` elapsed-time flavour, the terminal/pane tool (`herdr`), the secret store (macOS keychain), the service manager (launchd/systemd) | moved |
 | `orchkit/templates.py` | the nine shell/Python templates orch writes (PROBE, DIRECT_PROBE, CAP_LIB, ADMIT, STOP_GROUP, CLEAN_PUEUE, UNIT_PROCS, FINGERPRINT, CONDENSE) | moved |
 | `orchkit/beads.py` | `Beads` | moved |
 | `orchkit/cap.py` | CAP_DEFAULTS/capv/cap_nums, cap_lib, class_mb/class_secs, record_history, host_cap/next_free/build_room | moved |
@@ -77,6 +78,13 @@ new dependency; keep custom code only where no standard tool fits, with the reas
 | Test runner | Python stdlib `unittest` (`./check`, `tools/check_all.sh`) | used |
 
 New dependencies added: **none**.
+
+**The platform adapter (owner direction 2026-11-11).** Every OS- or tool-specific choice sits behind one module,
+`orchkit/platform.py`, so a second platform is a new function, not a new branch in the tool. `process listing`, `stat/date
+flavours`, `terminal/panes (herdr)`, `secrets (keychain)` and `the service manager (launchd/systemd)` are there now; `sh` is
+imported inside its functions so it stays below `context` (no import cycle), and `context` re-exports `ps_table`/`secs`/`herdr`
+so call sites are unchanged. Still to fold in during the split: `containers/scopes (podman, systemd-run)`, host discovery, the
+`PROBE` script's macOS/Linux branches, and `install`'s service-manager half.
 
 ## State (in the project, under `[project] state`, default `.orch/`)
 

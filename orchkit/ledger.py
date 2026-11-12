@@ -4,6 +4,7 @@ parse/read/spend/committed/append, reserve_budget/ledger_done (one row per run u
 settle_run, read_secret/model_ok. Every row is written once under the fcntl lock (section 9: keep the lock and per-run
 idempotency). unreconciled() stays with its callers until the findings split (it reads budgets/park helpers)."""
 from orchkit.context import NUM, DRY, Locked, Err, say, now
+from orchkit.platform import keychain_get
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, signal, subprocess, sys, tempfile, time, tomllib
 from pathlib import Path
 
@@ -98,10 +99,11 @@ def read_secret(pv):
     key_keychain (macOS keychain item, `security find-generic-password -s <item> -w`), else key_file (lines VAR=value; refused
     unless only its owner can read it, mode 600)."""
     var = pv.get("key_env", "ANTHROPIC_API_KEY"); tried = []
-    if pv.get("key_keychain") and sys.platform == "darwin":
-        rc, o, e = sh(["security", "find-generic-password", "-s", pv["key_keychain"], "-w"])
-        if rc == 0 and o.strip(): return var, o.strip()
-        tried.append(f"keychain item {pv['key_keychain']} (not found)")
+    if pv.get("key_keychain"):
+        r = keychain_get(pv["key_keychain"])   # the OS secret store lives in orchkit/platform.py
+        if r is not None:
+            if r[0] == 0 and r[1].strip(): return var, r[1].strip()
+            tried.append(f"keychain item {pv['key_keychain']} (not found)")
     if pv.get("key_file"):
         p = Path(os.path.expanduser(pv["key_file"]))
         try: st = p.stat()
