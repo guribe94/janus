@@ -68,6 +68,12 @@ def reserved(cfg, budget):
     """What a run's budget holds in the ledger while it runs: the budget plus [budget] overshoot_pct (default 20 %)."""
     return round(float(budget) * (1 + cfg.c.get("budget", {}).get("overshoot_pct", OVERSHOOT_PCT) / 100), 2)
 
+def budget_of(cfg, held):
+    """The plain budget a `running` row's held amount stands for. The row holds the reservation (`reserved`), which is a cap
+    margin, not money: a unit's spend must never be read from it (item 31: a unit launched with --budget 1.5 read 'spent $1.80
+    of $1.5' while its run had reported $0.10)."""
+    return round(float(held) / (1 + cfg.c.get("budget", {}).get("overshoot_pct", OVERSHOOT_PCT) / 100), 2)
+
 def reserve_budget(cfg, mc, name, budget, run=None):
     """Under the ledger's lock: refuse when the ledger is malformed or the reservation (the budget plus the overshoot margin)
     would pass the cap, else write the run's one running row holding the reservation. Idempotent: a run id that already has its
@@ -146,4 +152,4 @@ def model_ok(cfg, m):
 
 RECONCILED = "done unknown"   # a reconciled run: its agent is gone with no done row; its budget is counted as the upper bound
 
-__all__ = ["OVERSHOOT_PCT", "reserved", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_cost", "settle_run", "read_secret", "model_ok", "RECONCILED"]
+__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_cost", "settle_run", "read_secret", "model_ok", "RECONCILED"]

@@ -7,7 +7,7 @@ api_out, the WAITING line of its report (waiting_line_jobs), agent_ended, and wh
 main_checkout)."""
 from janus.beads import Beads, unit_record
 from janus.context import Err, sh
-from janus.ledger import ledger_read
+from janus.ledger import budget_of, ledger_read
 from janus.platform import herdr
 from janus.project import unit_tmux
 import json, re
@@ -182,11 +182,12 @@ def unit_runs(u): return list(dict.fromkeys([*u.get("runs", []), *([u["run"]] if
 
 def unit_spent(cfg, u, wrapup=False):
     """Dollars the unit's runs have used (ledger: each run's done cost, its budget while it runs), over all its resumes; the
-    wrap-up run is outside the unit's budget and counted only with wrapup=True."""
+    wrap-up run is outside the unit's budget and counted only with wrapup=True. A still-open run counts at its BUDGET, never at
+    the ledger's reservation (budget + [budget] overshoot_pct: a cap margin, not money, item 31)."""
     pv = cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {})
     if "ledger" not in pv: return 0.0
     runs = ledger_read(cfg, pv)[0]
-    return sum((r["cost"] or 0.0) if r["done"] else (r["budget"] or 0.0) for k in unit_runs(u)
+    return sum((r["cost"] or 0.0) if r["done"] else budget_of(cfg, r["budget"] or 0.0) for k in unit_runs(u)
                if (r := runs.get(k)) and (wrapup or k != u.get("wrapup")))
 
 def api_out(cfg, u):

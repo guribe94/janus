@@ -679,6 +679,23 @@ class Item16Budget(unittest.TestCase):
         self.assertGreaterEqual(b, 2.0, f"the tiny/verdictless runs skewed the budget: {b} ({why})")
 
 
+class Item31BudgetOvershoot(unittest.TestCase):
+    def test_a_running_run_counts_at_its_budget_not_its_reservation(self):
+        """Catches (item 31): a unit launched with --budget 1.5 read 'spent $1.80 of $1.5' (its own report step 4) because
+        unit_spent counted the ledger's `running` row -- the RESERVATION (the budget plus [budget] overshoot_pct, 20 %) -- as
+        money the unit had spent, while the run's own api.json reported $0.10."""
+        d, cfg = project('\n[providers.api]\nledger = "out/ledger.tsv"\n[budget]\novershoot_pct = 20\n')
+        cfg.models["m"] = {"provider": "api", "kind": "api", "api_id": "m"}
+        u = {"name": "u1", "model": "m", "run": "u1.1", "runs": ["u1.1"], "budget": 1.5}
+        held = janus.reserved(cfg, 1.5)
+        self.assertEqual(held, 1.8, "the ledger holds the reservation while a run is open")
+        runs = {"u1.1": {"running": [1], "done": [], "budget": held, "cost": None, "unit": "u1"}}
+        real = janus.ledger_read; janus.ledger_read = lambda cfg, pv: (runs, [], [])
+        try: spent = janus.unit_spent(cfg, u)
+        finally: janus.ledger_read = real
+        self.assertLessEqual(spent, 1.5, f"the reservation (${held}) was counted as spend: the unit reads over its own ${1.5} budget")
+
+
 class Item25Soak(unittest.TestCase):
     def test_a_broad_run_passes_a_negative_priority_pueue_accepts(self):
         """Catches (item 25a): `janus run --broad` passed the priority as `-o -5`, which pueue 4 rejects ('to pass -5 as a
