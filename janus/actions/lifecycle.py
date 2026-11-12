@@ -7,7 +7,7 @@ from janus.actions.launch import api_remote, confirm_started, cwd_taken
 from janus.autopilot import forget, record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
-from janus.budgets import bset
+from janus.budgets import reload_usd, session_usage, bset
 from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
     sh, ts)
 from janus.ledger import keep_run_json, ledger_done, reserve_budget, run_cost, settle_run
@@ -295,10 +295,15 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
         if rep: keep_run_json(cfg, od, u["run"])   # the next run of this session is charged against it
         ledger_done(cfg, pv, u["run"], name, cost, "resumed")
     spent = unit_spent(cfg, u); explicit = budget is not None
-    if wrapup: budget = bset(cfg, "wrapup_usd")
+    # The agent CLI stops a resumed run when THIS run's spend reaches its cap, and the first request of a resume loads the whole
+    # context again: a cap under that cost stops at turn 1 with nothing done. So the wrap-up gets its budget on top of the
+    # reload, and any other resume is refused when what is left cannot pay for the reload plus [budget] resume_min_usd.
+    use = session_usage(cfg, u, sid=sid); reload = reload_usd(cfg, use); floor = round(reload + bset(cfg, "resume_min_usd"), 2)
+    if wrapup: budget = round(bset(cfg, "wrapup_usd") + reload, 2)
     elif budget is None: budget = round((u.get("budget") or pv.get("budget_per_unit", 0)) - spent, 2)
-    if budget < bset(cfg, "resume_min_usd"):
-        raise Err(f"{name}: ${budget:.2f} budget left (under [budget] resume_min_usd): resume it with janus resume {name} --budget <usd> (same tree), or janus launch --resume-of and a new budget")
+    if budget < floor:
+        need = f", and a resume needs ${floor:.2f} (${reload:.2f} to load its {use['ctx']}-token context again)" if reload else " (under [budget] resume_min_usd)"
+        raise Err(f"{name}: ${budget:.2f} budget {'given' if explicit else 'left'}{need}: resume it with janus resume {name} --budget <usd> (same tree), or janus launch --resume-of and a new budget")
     k = len(unit_runs(u)) + 1; run = f"{name}.r{k}.{int(now())}"
     run = reserve_budget(cfg, mc, name, budget, run)
     local = h.get("local", False); old = u.get("task")
