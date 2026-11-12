@@ -412,6 +412,15 @@ def save_output(cfg, u):
     if u.get("report") and (od / "REPORT.md").is_file(): atomic_write(Path(u["report"]), (od / "REPORT.md").read_text())
     return True
 
+def settle_remote(cfg, u):
+    """A remote API unit whose agent ended and whose output was just brought here: its run is closed in the ledger at the cost
+    its json reports (its own cost, run_cost), so it no longer holds its whole reservation until someone runs janus collect. A
+    run that reported no cost stays open: collect, stop, close or janus ledger reconcile close it (never undercounted)."""
+    mc = cfg.models.get(u.get("model"), {}); pv = cfg.prov.get(mc.get("provider"), {})
+    if cfg.run.dry or u.get("via") != "pueue" or mc.get("kind") != "api" or not u.get("run") or "ledger" not in pv: return
+    od = cfg.p("out", "out") / u["name"]; cost, reported = run_cost(od / "api.json", None, u["run"])
+    if reported: keep_run_json(cfg, od, u["run"]); ledger_done(cfg, pv, u["run"], u["name"], cost, "ended")
+
 def saved_marker(u):
     """What `saved` records when a remote unit's output was brought here: its pueue task, else 'tmux' (a tmux unit has no task,
     finding 5, so `saved == task` is never None == None)."""
@@ -426,7 +435,7 @@ def refresh_remote(cfg, u, bd, log):
     remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
     if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed"); return
     u["saved_at"] = int(now())
-    if fin: u["saved"] = saved_marker(u)
+    if fin: u["saved"] = saved_marker(u); settle_remote(cfg, u)   # its run is closed when it ends, not at collect
     bd.save(u)
     u["verdict"] = v = verdict(cfg, u)
     if not v and not u.get("_park") and (fin or u.get("via") == "tmux"):
@@ -449,7 +458,7 @@ def sync_remote_outputs(cfg, units, bd):
         except Err:
             u["_sync_failed"] = True; continue
         u["saved"] = saved_marker(u); u["saved_at"] = int(now())
-        try: bd.save(u)
+        try: settle_remote(cfg, u); bd.save(u)
         except Err: pass
 
 def tend_parked(cfg, hs, units, log):

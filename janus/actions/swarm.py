@@ -8,7 +8,7 @@ from janus.budgets import OUTCOMES, rset, run_outcomes, waste_block, waste_state
 from janus.context import Err, Locked, NUM, atomic_write, note_event, now, refuse_agent, say, slug, ts
 from janus.findings.awareness import introduced_recently, related_cases
 from janus.findings.units import peer_rows, peers_text, unreconciled
-from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, committed, recost, recost_plan, spend
+from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, committed, recost, recost_plan, run_cost, spend
 from janus.memory import MEM_SECTIONS, learned_mark, mem_line, memory_history, memory_path, memory_read, memory_write
 from janus.probe import probe_all
 from janus.transcripts import pointer_text, read_transcript
@@ -40,6 +40,12 @@ def cmd_ledger(cfg, a):
             rs = unreconciled(cfg, pv, units)
             if not rs: say(f"{n}: nothing to reconcile"); continue
             for k, un, b, why in rs:
+                od = cfg.p("out", "out") / un; cost, rep = run_cost(od / f"api-{k}.json", b, k)   # what the run itself reported, when its json is here
+                if not rep and next((u.get("run") for u in units if u["name"] == un), None) == k: cost, rep = run_cost(od / "api.json", b, k)
+                if rep:
+                    if cfg.run.dry: say(f"would close {k} ({un}) at ${cost:.2f} (the cost its json reports): {why}"); continue
+                    ok = ledger_done(cfg, pv, k, un, cost, "reconciled")
+                    say(f"{'closed' if ok else 'already done:'} {k} ({un}) at ${cost:.2f} (the cost its json reports): {why}"); continue
                 if cfg.run.dry: say(f"would mark {k} ({un}) {RECONCILED}, ${b:g} counted (its budget, the upper bound): {why}"); continue
                 ok = ledger_done(cfg, pv, k, un, b, "unknown")
                 say(f"{'marked' if ok else 'already done:'} {k} ({un}) {RECONCILED}, ${b:g} counted: {why}")
