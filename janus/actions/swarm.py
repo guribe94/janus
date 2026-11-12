@@ -8,19 +8,30 @@ from janus.budgets import OUTCOMES, rset, run_outcomes, waste_block, waste_state
 from janus.context import Err, Locked, NUM, atomic_write, note_event, now, refuse_agent, say, slug, ts
 from janus.findings.awareness import introduced_recently, related_cases
 from janus.findings.units import peer_rows, peers_text, unreconciled
-from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, spend
+from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, committed, recost, recost_plan, spend
 from janus.memory import MEM_SECTIONS, learned_mark, mem_line, memory_history, memory_path, memory_read, memory_write
 from janus.probe import probe_all
 from janus.transcripts import pointer_text, read_transcript
 from janus.units import ENDED, herdr_agents, report_summary, unit_any, unit_state, verdict, waiting_line_jobs
 
 def cmd_ledger(cfg, a):
-    """janus ledger check: every provider ledger, exit 1 when one is malformed. janus ledger repair: keep the first running row
+    """janus ledger check: every provider ledger, exit 1 when one is malformed. janus ledger recost: correct the done rows that
+    charge a resumed run its session's whole total (--dry-run lists them first). janus ledger repair: keep the first running row
     and the first done row of each run id, drop rows that cannot be parsed, after a backup <ledger>.bak-<time>; the file is
     replaced by write-then-rename under the lock."""
     pvs = [(n, pv) for n, pv in cfg.prov.items() if "ledger" in pv and (not a.provider or n == a.provider)]
     if not pvs: raise Err("no provider has a ledger in janus.toml")
     worst = 0
+    if a.action == "recost":   # rows that charge a resumed run its session's whole total: each run pays its own part (once)
+        if not cfg.run.dry: refuse_agent("janus ledger recost")
+        for n, pv in pvs:
+            plan = recost_plan(cfg, pv); over = sum(c - own for _, _, c, own in plan)
+            if not plan: say(f"{n}: nothing to correct"); continue
+            for k, un, c, own in plan: say(f"{'would correct' if cfg.run.dry else 'corrected'} {k} ({un}): ${c:.2f} (its session's total) -> ${own:.2f} (its own cost)")
+            if cfg.run.dry: say(f"{n}: {len(plan)} row(s), ${over:.2f} charged twice; committed ${committed(cfg, pv):.2f} -> ${committed(cfg, pv) - over:.2f} [dry-run: nothing changed]"); continue
+            bak = recost(cfg, pv, plan)
+            say(f"{n}: corrected {len(plan)} row(s), ${over:.2f} less; committed now ${committed(cfg, pv):.2f}; backup {bak}")
+        return 0
     if a.action == "reconcile":   # runs whose agent is gone and that have no done row: done unknown, budget as the upper bound
         if not cfg.run.dry: refuse_agent("janus ledger reconcile")
         units = Beads(cfg).units(); hs = probe_all(cfg); ag = herdr_agents(cfg)
