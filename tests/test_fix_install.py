@@ -372,6 +372,63 @@ class Item1ParkedAfterDone(unittest.TestCase):
         self.assertEqual(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), "VERDICT: DONE - all done")
 
 
+class Item2ResumeGuard(unittest.TestCase):
+    """Finding 2 (medium-high): `janus resume <u> --message ...` had no guard: it started a second agent beside a running one
+    and marked a still-running job handled (so it became an orphan, cancelled, when the new run parked again)."""
+
+    def setUp(self):
+        self.d, self.cfg = project()
+        self.calls = []
+        self.saved = {k: getattr(janus, k) for k in ("Beads", "probe_all", "herdr_agents", "unit_state", "job_state", "resume_unit", "waiting_line_jobs")}
+
+    def tearDown(self):
+        for k, v in self.saved.items(): setattr(janus, k, v)
+
+    def _run(self, u, **kw):
+        janus.Beads = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: kw.get("units", [u]),
+                                     "comment": lambda s, *a: None, "save": lambda s, x: None})
+        janus.probe_all = lambda cfg: {"here": probe_of()}
+        janus.herdr_agents = lambda cfg: {}
+        janus.unit_state = lambda x, hs, ag: kw.get("state", "gone")
+        janus.job_state = lambda hs, j: (kw.get("job", "done"), "")
+        janus.waiting_line_jobs = lambda cfg, x: kw.get("jobs", ["here:9"])
+        janus.resume_unit = lambda cfg, x, msg, budget=None: (self.calls.append(("resume", msg, budget)), "resumed")[1]
+        a = type("A", (), {"unit": u["name"], "message": kw.get("message", "go"), "force": kw.get("force", False),
+                           "budget": kw.get("budget"), "runtime": None, "here": False})()
+        janus.cmd_resume(self.cfg, a)
+        return u
+
+    def test_message_refuses_while_the_agent_runs(self):
+        """Catches: `resume --message` with a Running agent task started a second agent on the same session in the same tree."""
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0, "cwd": str(self.d / "wt")}
+        with self.assertRaises(janus.Err) as e: self._run(u, state="working", job="running", message="go")
+        self.assertIn("still working", str(e.exception)); self.assertIn("--force", str(e.exception))
+        self.assertEqual(self.calls, [], "a second agent was started beside the running one")
+
+    def test_message_refuses_while_its_jobs_are_unfinished(self):
+        """Catches: the jobs guard was skipped entirely with --message, so a unit whose job still ran was resumed."""
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0, "cwd": str(self.d / "wt")}
+        with self.assertRaises(janus.Err) as e: self._run(u, state="gone", job="running", message="go")
+        self.assertIn("here:9", str(e.exception)); self.assertIn("not finished", str(e.exception)); self.assertEqual(self.calls, [])
+
+    def test_a_forced_resume_never_marks_a_running_job_handled(self):
+        """Catches: resume added every park-line job to handled_jobs even while it ran, so the next park line's same job was an
+        orphan (cancelled)."""
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0, "cwd": str(self.d / "wt")}
+        self._run(u, state="gone", job="running", message="go", force=True)
+        self.assertEqual(len(self.calls), 1, "the forced resume did not run")
+        self.assertNotIn("here:9", u.get("handled_jobs", []), "a still-running job was marked handled")
+
+    def test_resume_refuses_the_tree_of_another_open_unit(self):
+        """Catches: resume had no own-tree check, so a predecessor whose handover was refused was put back into the tree its
+        successor now works in."""
+        W = self.d / "wt"; W.mkdir()
+        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0, "cwd": str(W)}
+        u2 = {"id": "t-2", "name": "u2", "host": "here", "cwd": str(W)}
+        with self.assertRaises(janus.Err) as e: self._run(u, units=[u, u2], state="gone", job="done", message="go")
+        self.assertIn("u2", str(e.exception)); self.assertEqual(self.calls, [])
+
+
 class Item3Handover(unittest.TestCase):
     def _close(self, cfg):
         return janus.cmd_close(cfg, type("A", (), {"unit": "u1", "force": True, "handover": True, "reason": "handover"})())
