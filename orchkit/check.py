@@ -2,23 +2,23 @@
 
 collect_findings returns registered Findings (findings/__init__.py); run_check filters acks, records open problems and writes
 the Live part of HANDOFF.md (a writer only: the registered orchestrator or the watcher)."""
-import json, re, sys
-from orchkit.actions.jobs import LANES, job_state, orphan_jobs, slots, unit_jobs
+import json, re
+from orchkit.actions.jobs import slots
 from orchkit.backlog import ready_work
 from orchkit.beads import Beads
-from orchkit.board import board, board_dir, board_files, board_findings, board_questions, board_rows
-from orchkit.budgets import unit_spend
-from orchkit.cap import host_cap
-from orchkit.context import Err, LB, LE, NOTES0, fl, handoff_path, handoff_stale, herdr, hrun, is_orchestrator, now, say, ts
+from orchkit.board import board, board_dir, board_files, board_findings
+from orchkit.context import Err, LB, LE, NOTES0, handoff_path, hrun, is_orchestrator, now, say, ts
 from orchkit.findings import ackable, finding, live_acks
-from orchkit.findings.hosts import enforce, lane_findings, proc_findings, script_findings, thrash_findings, tidy_findings
+from orchkit.findings.hosts import (enforce, host_findings, lane_findings, orphan_job_findings, pane_findings, proc_findings,
+    script_findings, thrash_findings, tidy_findings)
 from orchkit.findings.memory import memory_findings, rule_findings
-from orchkit.findings.units import budget_findings, parked_findings, peer_findings, report_findings, unreconciled
-from orchkit.findings.work import backlog_findings, gate_findings, git_findings, known_failure_findings, landing_findings
-from orchkit.ledger import committed, ledger_read, spend
-from orchkit.platform import launchd_watcher_loaded
-from orchkit.probe import cap_line, margins, probe_all, pueue, room
-from orchkit.units import ENDED, all_units, api_out, herdr_agents, unit_state, verdict, waiting_line_jobs, ws_id
+from orchkit.findings.units import (budget_findings, cap_findings, card_findings, ledger_findings, peer_findings,
+    report_findings, spend_findings, unit_findings)
+from orchkit.findings.work import (backlog_findings, gate_findings, git_findings, known_failure_findings, landing_findings,
+    orchestrator_findings, session_findings)
+from orchkit.ledger import committed
+from orchkit.probe import cap_line, probe_all, pueue, room
+from orchkit.units import all_units, herdr_agents, unit_state
 
 def board_upkeep(cfg, units):
     """The shipped board's own files (a writer only): .master (this machine's host name), .hosts (other hosts from orch.toml,
@@ -30,131 +30,26 @@ def board_upkeep(cfg, units):
         if c.stem not in names and au.get(c.stem, {}).get("status") == "closed": board(cfg, "close", c.stem)
 
 def collect_findings(cfg, hs, units, ag, bd_err):
+    """Every finding of one pass, as registered Findings, in the order check prints them (findings/*.py hold the families)."""
     F = []; viol = []   # viol: the processes enforce may stop (burner, direct), found on the way
     if bd_err: F.append(("beads", f"beads unavailable: {bd_err}; fix bd (orch doctor), units cannot be read until then"))
-    ws = ws_id(cfg); names = {u["name"] for u in units}
+    names = {u["name"] for u in units}
     for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no build position (host_cap)
-    un = cfg.jget("hosts.json")
-    ready = 0
-    try: ready = len(ready_work(cfg))
-    except Err: pass
-    for n, p in hs.items():
-        if not p["ok"]:
-            qd = [u["name"] for u in units if u.get("host") == n]
-            F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); units there: {', '.join(qd) or 'none'}; place new work elsewhere (unstarted jobs there: cancel and re-queue on another host)"))
-            continue
-        r, why = room(cfg, n, p, units)
-        mg = margins(cfg.hosts[n], p, cfg=cfg)
-        low = r < 1 and p.get("avail_mb") and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6
-        if mg or low:   # the key names the kinds (load, memory, disk), so an ack of one never hides another (H12)
-            kinds = sorted({w.split()[0] for w in mg} | ({"memory"} if low else set()))
-            F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}; launch elsewhere, or free it (orch tidy for disk)"))
-        elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} but {ready} unit(s) are ready: orch launch"))
-        hc = host_cap(cfg, n, p, units)
-        if hc["pause"]:   # back-pressure (orch-fixes8 item 2): reported, never acted on by killing
-            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile"))
-        # one scheduler per host (item 1): any other job-running process, or an old queue that still runs or holds work
-        sch = list(p.get("sched", []))
-        lg, lr = int(fl(p.get("legacy_wait"))), int(fl(p.get("legacy_run")))
-        if lg or lr: sch.append(f"old queue: {lr} running, {lg} waiting (legacy_probe)")
-        unt = [x for x in p.get("res", []) if " untracked " in x]
-        if unt: sch.append(f"{len(unt)} job(s) running without an orch reservation ({', '.join(x.split()[-1] for x in unt[:3])})")
-        if sch: F.append((f"scheduler:{n}", f"host {n} has job-running work outside its orch lanes, which must be the only admission: "
-                          + "; ".join(sch[:4])[:300] + ": retire the old queue (or move its jobs to orch run)"))
-        for d in p.get("direct", []):   # remote lane enforcement (register item 22)
-            f = d.split(None, 4)
-            if len(f) < 4 or not f[0].isdigit(): continue
-            F.append((f"direct:{n}:{f[0]}", f"agent {f[2]} runs a build or test directly on {n} (pid {f[0]}, {int(fl(f[3])) // 60} min, outside the lanes): "
-                      f"{(f[4] if len(f) > 4 else '')[:80]}; it must use {cfg.hosts[n].get('root', '~')}/run/{f[2]}.lane"))
-            viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
-        for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
-            st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
-            lab = t.get("label") or ""
-            owned = lab in names or (lab.startswith("unit:") and lab[5:] in names) or (t.get("group") in LANES and ":" in lab and not lab.startswith("unit:"))
-            if k in ("Running", "Queued") and not owned:   # a lane job labelled unit:<name> whose unit is closed is an orphan too (M3)
-                F.append((f"orphan:job:{n}:{t.get('id')}", f"orphan job {t.get('id')} on {n} ({lab or t.get('command', '')[:40]}) has no open unit: orch cancel {n}:{t.get('id')}"))
-        for s in p.get("tmux", []):
-            if s.startswith("orch-") and s[5:] not in names: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: collect what it wrote, then stop it (orch stop, or relaunch its unit)"))
-    orch_pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
-    pane_units = {u.get("pane") for u in units}
-    for k, a in ag.items():
-        if ws and a.get("workspace_id") != ws: continue
-        if k in names or a.get("pane_id") in pane_units or a.get("pane_id") == orch_pane or k == "orchestrator": continue
-        F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit: orch tidy closes panes of closed units; otherwise register it as a unit or close it"))
-    board = board_rows(cfg); running = 0
-    BF = board_findings(cfg, names); F += BF; qids = board_questions(cfg) is not None
-    for card, r in board.items():   # every card, including those other launchers posted (marked "not a unit")
-        tag = "" if card in names else " (not a unit)"
-        if r["state"] == "blocked" or (r["state"] == "question" and not qids):
-            F.append((f"board:{card}:{r['state']}", f"{card}{tag} is {r['state'].upper()} on the board: {r['text']}; answer with board.sh direct"))
-        if r["gone"]: F.append((f"board:{card}:gone", f"{card}{tag} GONE: its process ended without a done post: relaunch its unit from its report (--resume-of), or orch board-close it"))
-        elif r["silent"] and r["state"] not in ("question", "blocked"):
-            F.append((f"board:{card}:silent", f"{card}{tag} silent over {cfg.silent // 60} min on the board: read its report or transcript (orch transcript), then direct it"))
-    for u in units:
-        st = unit_state(u, hs, ag); v = verdict(cfg, u); u["state"] = st; u["verdict"] = v
-        age = now() - u.get("started", now())
-        # parked (orch-fixes9 item 1): recorded, or its turn ended with a WAITING line; no verdict yet
-        pk = [] if v else ((u.get("parked") or {}).get("jobs") or (waiting_line_jobs(cfg, u) if st in ENDED or u.get("via") == "tmux" else []))
-        if pk:
-            u["_park"] = pk; u["state"] = st = "parked"
-            F += parked_findings(cfg, hs, u, pk)
-        elif st == "working":   # alive while its own jobs wait for admission: it pays to wait (cannot be acked)
-            jw = [j for j in unit_jobs(hs, u["name"]) if job_state(hs, j)[0] in ("queued", "admission")]
-            if jw:
-                sp, how = unit_spend(cfg, u); hrs = max((now() - max(u.get("started", now()), u.get("resumed_at", 0))) / 3600, 1 / 60)
-                rate = f"about ${sp / hrs:.2f}/h ({how})" if sp is not None else f"cost per hour unknown ({how})"
-                F.append((f"waiting:{u['name']}", f"{u['name']} is alive while its job(s) {', '.join(jw[:4])} wait for admission, {rate}: "
-                          f"orch park {u['name']} (stops it; it resumes, same session, when its jobs finish)"))
-        if st in ("working", "queued", "parked"): running += 1
-        if st == "blocked":
-            r = herdr("agent", "read", u["name"], "--source", "detection") or {}
-            F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}; answer it (board.sh direct) or relaunch with what it needs"))
-        elif st in ("done", "failed", "gone", "idle"):
-            F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
-            aj = api_out(cfg, u)   # issue 32: another limit than the budget (turns) before the report; the budget cap is waste:<unit>
-            if str(aj.get("subtype", "")).startswith("error") and aj.get("subtype") != "error_max_budget_usd" and not v:
-                F.append((f"unit:{u['name']}:limit", f"{u['name']} stopped by its limit ({aj.get('subtype')}, ${aj.get('total_cost_usd', '?')}) without a final verdict: "
-                          "resume it (orch resume --message, or --resume-of keeps its report)"))
-        if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
-            F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}: stop it, or relaunch it on an enabled model"))
+    F += host_findings(cfg, hs, units, viol) + pane_findings(cfg, units, ag)
+    F += board_findings(cfg, names) + card_findings(cfg, names)
+    UF, running = unit_findings(cfg, hs, units, ag); F += UF
     F += peer_findings(cfg, units, hs)   # peers.md, overlap:<a>:<b> (orch-swarm item 4)
     board_upkeep(cfg, units)
-    seen = {k for k, _ in F}
-    for r, why in orphan_jobs(cfg, hs, units):   # the watcher cancels these (item 3); check only reports them
-        k = f"orphan:job:{r}"
-        if k not in seen: F.append((k, f"orphan job {r}: {why}; the watcher cancels it (orch cancel {r})"))
+    F += orphan_job_findings(cfg, hs, units, {k for k, _ in F})
     cfg.jput("running.json", {"n": running})
-    if cfg.caps.get("total") is not None and len(units) > cfg.caps["total"]: F.append(("cap:total", f"{len(units)} agents over total cap {cfg.caps['total']}: launch nothing more; close finished units"))
-    for n, c in cfg.caps.get("host", {}).items():
-        k = sum(1 for u in units if u.get("host") == n)
-        if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))
+    F += cap_findings(cfg, units)
     F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg) + tidy_findings(cfg)
     F += lane_findings(cfg, hs, units)
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg, viol=viol) + script_findings()
-    for n, pv in cfg.prov.items():
-        if "ledger" in pv:
-            bad = ledger_read(cfg, pv)[1]
-            if bad: F.append((f"ledger:{n}", f"{n} ledger {pv['ledger']} is malformed ({len(bad)} problem(s): {bad[0][:90]}); every launch is refused: orch ledger check, orch ledger repair"))
-            runs = ledger_read(cfg, pv)[0]; odd = [k for k, r in runs.items() if r["done"] and r["budget"] and r["cost"] > 2 * r["budget"] + 1]
-            if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
-                F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
-                          + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": orch ledger check"))
-            ur = unreconciled(cfg, pv, units)
-            if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (${sum(x[2] for x in ur):.2f} held as running: "
-                             + ", ".join(f"{x[0]} {x[3]}" for x in ur[:3])[:240] + "): orch ledger reconcile"))
+    F += ledger_findings(cfg, units)
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
-    sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
-    if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
-        F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but orch.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
-    F += git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg)
-    try:
-        ins = Beads(cfg).issues("instruction")
-        if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done, or bd remember --key <subject>: same subject replaces): " + "; ".join(i['title'][:50] for i in ins[:3])))
-    except Err: pass
-    for s in handoff_stale(cfg, running): F.append(("handoff", s))
-    if sys.platform == "darwin" and not launchd_watcher_loaded(): F.append(("watcher", "watcher com.orch.watch is not running: run install"))
-    for n, pv in cfg.prov.items():
-        if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap: launch on another provider, or ask the owner to raise the cap"))
+    F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running)
+    F += spend_findings(cfg)
     if not cfg.run.ro and not cfg.run.dry: F = enforce(cfg, F, viol)
     return [finding(k, t) for k, t in F]
 
