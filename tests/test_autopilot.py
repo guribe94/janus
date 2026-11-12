@@ -175,7 +175,7 @@ class MoveOffDownHost(unittest.TestCase):
         jd.joinpath("j1.json").write_text(json.dumps({"host": "far", "task": 5, "unit": "u"}))
         jd.joinpath("j2.json").write_text(json.dumps({"host": "far", "task": 6, "unit": "u", "usb": True}))
         cancels, queued = [], []
-        q = {"status": "Queued", "label": "unit:u"}; r = {"status": "Running", "label": "unit:u"}
+        q = {"status": "Queued", "label": "unit:u@t"}; r = {"status": "Running", "label": "unit:u@t"}
         with mock.patch.object(janus, "cancel_job", lambda cfg, ref: cancels.append(ref) or ["cancelled"]), \
              mock.patch.object(janus, "requeue", lambda cfg, spec, to: queued.append(spec["task"]) or "here:9"), \
              mock.patch.object(janus, "requeue_host", lambda *a: "here"), mock.patch.object(janus, "board", lambda *a, **k: (0, "", "")):
@@ -185,6 +185,29 @@ class MoveOffDownHost(unittest.TestCase):
             self.assertEqual(queued, [5], "the device job was moved, or the plain one was not")
             janus.move_off_down_hosts(cfg, {"far": {"ok": True, "pueue": {"tasks": {"5": r, "6": q}}}, "here": {"ok": True}}, [], lambda m: None)
         self.assertEqual(cancels, ["far:5"], "the old copy that started during the partition was not cancelled")
+
+
+class TwoProjects(unittest.TestCase):
+    def test_project_b_never_touches_project_a_jobs_on_a_shared_queue(self):
+        """Catches (cross-project safety): on one queue shared by projects a and b, b's watcher and autopilot calling a's job an
+        orphan or stuck and cancelling or re-queuing it; and a job with no project id acted on instead of listed."""
+        d, cfg = project("\n[autopilot]\nenabled = true\n"); cfg.c["project"]["id"] = "b"
+        old = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3 * 86400))
+        job = lambda lab, jid: {"id": int(jid[1:]), "group": "jobs", "label": lab, "command": f"bash /r/runs/{jid}.sh", "status": {"Running": {"enqueued_at": old}}}
+        hs = {"here": {"ok": True, "pueue": {"groups": {"jobs": {"status": "Running", "parallel_tasks": 4}},
+                                             "tasks": {"1": job("unit:x@a", "j1"), "2": job("unit:gone@b", "j2"), "3": job("unit:y", "j3")}}}}
+        jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
+        for jid, tid in (("j1", 1), ("j2", 2), ("j3", 3)):   # b's records even name a's task (an id reused across projects)
+            (jd / f"{jid}.json").write_text(json.dumps({"host": "here", "task": tid, "unit": "gone", "wt": str(d), "cmd": "make"}))
+        acted = []
+        with mock.patch.object(janus, "cancel_job", lambda cfg, ref, force=False: acted.append(ref) or ["cancelled"]), \
+             mock.patch.object(janus, "requeue", lambda cfg, spec, to: acted.append(f"requeue {spec['task']}") or "here:9"), \
+             mock.patch.object(janus, "Beads", NoBeads), mock.patch.object(janus, "board", lambda *a, **k: (0, "", "")):
+            self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [])], ["here:2"])
+            F = [janus.finding(k, t) for k, t in janus.lane_findings(cfg, hs, [])]
+            self.assertEqual([f.key for f in F if f.key.startswith("age:")], ["age:here:2"])
+            janus.tend_autopilot(cfg, hs, [], F, lambda m: None)
+        self.assertEqual(acted, ["here:2", "requeue 2"], "b acted on a job that is not b's")
 
 
 if __name__ == "__main__":

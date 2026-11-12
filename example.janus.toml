@@ -4,6 +4,8 @@
 
 [project]
 name = "myproject"
+# id = "myproject"        # the project id every job, tmux session and card janus creates carries (default: name); on a machine
+                         # shared by several janus projects each sees and acts on its own items only. Unique per machine.
 beads = "."              # directory holding .beads/ (units, instructions, rules, backlog); `bd init` there once
 state = ".janus"          # HANDOFF.md, history.md and janus's bookkeeping
 cycle_min = 15           # a check/ack cycle is overdue after this

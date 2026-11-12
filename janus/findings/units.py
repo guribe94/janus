@@ -8,6 +8,7 @@ from janus.budgets import bset, last_checkpoint, unit_spend, waste_paused, work_
 from janus.context import DIFF_X, atomic_write, fl, hrun, now, qp, sh, ts
 from janus.ledger import committed, ledger_read, spend
 from janus.platform import herdr
+from janus.project import project_id
 from janus.transcripts import card_fields, transcript_where
 from janus.units import ENDED, all_units, api_out, own_tree, report_path, unit_runs, unit_state, verdict, waiting_line_jobs
 
@@ -102,7 +103,7 @@ def peer_rows(cfg, units, hs):
     for u, (br, fs) in zip(live, ch):
         c = card_fields(cfg, u["name"])
         rows.append({"name": u["name"], "host": u.get("host"), "model": u.get("model"), "branch": br, "files": fs, "state": u.get("state"),
-                     "step": c.get("step") or c.get("state") or "-", "jobs": u.get("_park") or unit_jobs(hs, u["name"]),
+                     "step": c.get("step") or c.get("state") or "-", "jobs": u.get("_park") or unit_jobs(cfg, hs, u["name"]),
                      "report": str(report_path(cfg, u)) if cfg.hosts.get(u.get("host"), {}).get("local") else f"{u['host']}:{cfg.hosts[u['host']].get('root')}/out/{u['name']}/REPORT.md",
                      "transcript": transcript_where(cfg, u)})
     return rows
@@ -131,7 +132,10 @@ def peer_findings(cfg, units, hs):
 def card_findings(cfg, names):
     """board:<card>:blocked|question|gone|silent for every card on the board, including other launchers' (marked not a unit)."""
     F = []; qids = board_questions(cfg) is not None
+    me = project_id(cfg)
     for card, r in board_rows(cfg).items():   # every card, including those other launchers posted (marked "not a unit")
+        pid = card_fields(cfg, card).get("project")
+        if pid and pid != me: continue   # another project's card (a shared board): not shown
         tag = "" if card in names else " (not a unit)"
         if r["state"] == "blocked" or (r["state"] == "question" and not qids):
             F.append((f"board:{card}:{r['state']}", f"{card}{tag} is {r['state'].upper()} on the board: {r['text']}; answer with board.sh direct"))
@@ -153,7 +157,7 @@ def unit_findings(cfg, hs, units, ag):
             u["_park"] = pk; u["state"] = st = "parked"
             F += parked_findings(cfg, hs, u, pk)
         elif st == "working":   # alive while its own jobs wait for admission: it pays to wait (cannot be acked)
-            jw = [j for j in unit_jobs(hs, u["name"]) if job_state(hs, j)[0] in ("queued", "admission")]
+            jw = [j for j in unit_jobs(cfg, hs, u["name"]) if job_state(hs, j)[0] in ("queued", "admission")]
             if jw:
                 sp, how = unit_spend(cfg, u); hrs = max((now() - max(u.get("started", now()), u.get("resumed_at", 0))) / 3600, 1 / 60)
                 rate = f"about ${sp / hrs:.2f}/h ({how})" if sp is not None else f"cost per hour unknown ({how})"

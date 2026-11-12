@@ -11,6 +11,7 @@ from janus.budgets import bset
 from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
     sh, ts)
 from janus.ledger import ledger_done, reserve_budget, run_cost, settle_run
+from janus.project import project_id, tag, unit_tmux
 from janus.probe import probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
@@ -79,9 +80,9 @@ def cmd_stop(cfg, a):
     roots = task_pid_roots(h, u) if not cfg.run.dry else ""
     if cfg.run.dry: say(f"+ pueue kill / tmux kill-session; TERM then KILL every process group of {u['name']} (roots {roots or '-'}, env JANUS_UNIT)"); return
     if via == "pueue": hrun(h, f"{p} kill {int(u['task'])}")
-    elif via == "tmux": hrun(h, f"tmux kill-session -t janus-{u['name']}")
+    elif via == "tmux": hrun(h, f"tmux kill-session -t {shlex.quote(unit_tmux(u))}")
     # its lane jobs (label unit:<name>) belong to it too
-    hrun(h, f"{p} status --json | python3 -c \"import json,sys; [print(i) for i, t in json.load(sys.stdin)['tasks'].items() if t.get('label') == 'unit:{u['name']}' and ('Running' in str(t['status']) or 'Queued' in str(t['status']))]\" | xargs -r {p} kill 2>/dev/null; true")
+    hrun(h, f"{p} status --json | python3 -c \"import json,sys; [print(i) for i, t in json.load(sys.stdin)['tasks'].items() if t.get('label') == '{tag(cfg, 'unit:' + u['name'])}' and ('Running' in str(t['status']) or 'Queued' in str(t['status']))]\" | xargs -r {p} kill 2>/dev/null; true")
     left = kill_unit(h, u["name"], roots)
     if left: raise Err(f"{u['name']}: {left} process(es) still alive after TERM and KILL")
     for _ in range(10):
@@ -233,8 +234,8 @@ def resume_unit(cfg, u, msg, wrapup=False):
         if not cfg.run.dry: herdr("agent", "prompt", name, text)
         return f"{name}: prompted in its herdr pane"
     if via == "tmux":
-        X(cfg, h, f"tmux send-keys -t janus-{name} -l {shlex.quote(text)} && tmux send-keys -t janus-{name} Enter")
-        return f"{name}: resumed in tmux janus-{name} on {u['host']}"
+        tm = shlex.quote(unit_tmux(u)); X(cfg, h, f"tmux send-keys -t {tm} -l {shlex.quote(text)} && tmux send-keys -t {tm} Enter")
+        return f"{name}: resumed in tmux {unit_tmux(u)} on {u['host']}"
     if via != "pueue" or mc.get("kind") != "api": raise Err(f"{name}: a unit run via {via} cannot be resumed")
     pv = cfg.prov[mc["provider"]]; od = cfg.p("out", "out") / name
     sid = session_of(cfg, u)
@@ -251,13 +252,13 @@ def resume_unit(cfg, u, msg, wrapup=False):
     run = reserve_budget(cfg, mc, name, budget, run)
     local = h.get("local", False); old = u.get("task")
     report = str(report_path(cfg, u)) if local else f"{h['root']}/out/{name}/REPORT.md"
-    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": report, "JANUS_UNIT": name, "JANUS_ROOT": str(cfg.root)}
+    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": report, "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root)}
     if local:
         pf = od / f"resume-{k}.md"
         if not cfg.run.dry: atomic_write(pf, text)
         cmd = shlex.join([sys.executable, str(JANUS_SELF), "api-run", name, "--run", run, "--model", u["model"], "--budget", str(budget),
                           "--brief", u.get("rbrief") or u["brief"], "--cwd", u["rcwd"], "--report", report, "--resume-session", sid, "--prompt-file", str(pf)])
-        rc, o, e = X(cfg, h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(u['rcwd'])} --print-task-id -- {pq(cmd)}", env=env)
+        rc, o, e = X(cfg, h, f"{pueue(h)} add -g agents -l {tag(cfg, name)} -w {shlex.quote(u['rcwd'])} --print-task-id -- {pq(cmd)}", env=env)
     else:
         rc, o, e = api_remote(cfg, h, name, mc, u.get("rbrief") or f"{h['root']}/briefs/{name}.md", u["rcwd"], budget, text, env, session=sid, run=run)
     if rc:
@@ -277,7 +278,7 @@ def cmd_park(cfg, a):
     """Stop a live agent's turn while its jobs wait or run (the remedy for waiting:<unit>); the watcher resumes it, same session,
     when they finish. API units: the run is ended (SIGTERM: its cost is still recorded); herdr and tmux agents: Escape."""
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; n = u["name"]
-    hs = probe_all(cfg); jobs = unit_jobs(hs, n)
+    hs = probe_all(cfg); jobs = unit_jobs(cfg, hs, n)
     if not jobs: raise Err(f"{n} has no queued or running job of its own: nothing to wait for (janus stop {n} to stop it)")
     say(f"park {n}: its jobs {', '.join(jobs)} keep running; it resumes when they finish")
     if cfg.run.dry: return
@@ -290,7 +291,7 @@ def cmd_park(cfg, a):
         else: hrun(h, f"{pueue(h)} kill {int(u['task'])} 2>/dev/null; true")
         if h.get("local"): settle_run(cfg, u, "parked")
     elif via == "herdr": herdr("pane", "send-keys", u["pane"], "Escape")
-    elif via == "tmux": X(cfg, h, f"tmux send-keys -t janus-{n} Escape")
+    elif via == "tmux": X(cfg, h, f"tmux send-keys -t {shlex.quote(unit_tmux(u))} Escape")
     u["parked"] = {"jobs": jobs, "since": int(now()), "by": "janus park"}; bd.save(u)
     bd.comment(u["id"], f"{ts()} parked on {', '.join(jobs)}"); say(f"parked {n}")
 

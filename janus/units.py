@@ -9,6 +9,7 @@ from janus.beads import Beads, unit_record
 from janus.context import Err, sh
 from janus.ledger import ledger_read
 from janus.platform import herdr
+from janus.project import unit_tmux
 import json, re
 from pathlib import Path
 
@@ -20,7 +21,7 @@ def unit_state(u, ps, agents):
         return a.get("agent_status", "unknown") if a else "gone"
     p = ps.get(u.get("host"), {})
     if not p.get("ok"): return "unknown"
-    if via == "tmux": return "working" if f"janus-{u['name']}" in p.get("tmux", []) else "gone"
+    if via == "tmux": return "working" if unit_tmux(u) in p.get("tmux", []) else "gone"
     if via == "pueue":
         t = ((p.get("pueue") or {}).get("tasks") or {}).get(str(u.get("task")))
         if not t: return "gone"

@@ -9,6 +9,7 @@ from janus.board import board
 from janus.cap import cap_lib, cap_nums, capv, class_mb, class_secs, class_usage, host_cap
 from janus.context import Err, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
 from janus.platform import ARCH, MAXRSS_PY
+from janus.project import own_label, tag, untagged
 from janus.probe import host_facts, probe, probe_all, pueue
 from janus.templates import ADMIT
 from janus.units import agent_ended, unit_state
@@ -34,10 +35,10 @@ def job_state(hs, ref):
     if k == "Running": return ("admission" if job_of(t) in p.get("waitjob", []) else "running"), None
     return k.lower(), None
 
-def unit_jobs(hs, name):
-    """The unit's own jobs that have not finished (pueue label unit:<name>, any host): ['<host>:<task>']."""
+def unit_jobs(cfg, hs, name):
+    """The unit's own jobs that have not finished (pueue label unit:<name>@<project>, any host): ['<host>:<task>']."""
     return [f"{hn}:{tid}" for hn, p in hs.items() for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items()
-            if t.get("label") == f"unit:{name}" and task_rc(t) is None]
+            if own_label(cfg, t) == f"unit:{name}" and task_rc(t) is None]
 
 def save_task_log(cfg, h, u, tid, remove=False):
     """Keep a pueue task's log under out/<unit>/task-<id>.log (the agent's stdout and stderr), then optionally remove the task."""
@@ -325,7 +326,7 @@ def cmd_run(cfg, a):
     why = tree_guard(cfg, src, behind=a.lane in ("gates", "land"))   # behind main matters for gates and landing only (item 5)
     if why and not a.allow_unmerged: raise Err(f"refused: {src} {why} (--allow-unmerged to run anyway)")
     jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
-    label = f"unit:{unit}" if unit else f"run:{name}"   # unit:<name>: check reports it once that unit is closed (M3)
+    label = tag(cfg, f"unit:{unit}" if unit else f"run:{name}")   # unit:<name>@<project>: check reports it once that unit is closed (M3)
     if a.host and needs:
         ok, why = host_meets(cfg, a.host, host_facts(cfg, refresh="stale").get(a.host), needs)
         if not ok: raise Err(f"refused: {a.host} does not meet --needs ({why})")
@@ -412,7 +413,7 @@ def busy_reasons(cfg, wt, hs=None, ps=None):
             st = t["status"] if p.get("ok") else None; st = st if isinstance(st, str) else next(iter(st or {}), "")
             why.append(f"job {ref} ({f.name}) " + (f"is {st.lower()}" if p.get("ok") else f"on unreachable {hn}: assumed running"))
     for u in mine:
-        why += [f"unit {u['name']}'s job {j}" for j in unit_jobs(hs, u["name"])]
+        why += [f"unit {u['name']}'s job {j}" for j in unit_jobs(cfg, hs, u["name"])]
     pats = cfg.c.get("busy", {}).get("patterns", BUSY_PATTERNS)
     if pats:
         rx = re.compile("|".join(re.escape(x) for x in pats))
@@ -466,7 +467,10 @@ def cancel_job(cfg, ref, force=False, depth=0):
     if hn not in cfg.hosts or not tid.isdigit(): raise Err("expected <host>:<task id>")
     h = cfg.hosts[hn]; t = task_status(h, tid)
     if t is None: raise Err(f"no task {tid} on {hn}")
-    if t.get("group") not in LANES and not str(t.get("label", "")).startswith(("unit:", "run:", "gate:")): raise Err(f"{hn}:{tid} is not a janus lane job ({t.get('label')}); stop units with janus stop")
+    if own_label(cfg, t) is None:   # cross-project safety: never another project's job, nor one with no project id (machine state)
+        raise Err(f"refused: {hn}:{tid} ({t.get('label')}) is " + ("machine state (no project id)" if untagged(t) else "another project's job")
+                  + f": janus acts only on its own; if it must go, pueue kill {tid} on {hn} by hand")
+    if t.get("group") not in LANES and not str(own_label(cfg, t)).startswith(("unit:", "run:", "gate:")): raise Err(f"{hn}:{tid} is not a janus lane job ({t.get('label')}); stop units with janus stop")
     jid = job_of(t); tok = wrap_token(t); inner = wrapped_jobs(cfg, tok) if tok else []; out = []
     if cfg.run.dry:
         out.append(f"+ save {hn}:{tid}'s files; {stop_job_cmd(h, jid)}{pueue(h)} kill {tid}; remove" + (f"; then follow its jobs {', '.join(inner)}" if inner else ""))
@@ -508,7 +512,7 @@ def own_admitted_jobs(cfg, hs, n):
     jd = cfg.f("runs") / "jobs"; p = hs.get(n) or {}; r = []
     for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items():
         jid = job_of(t); f = jd / f"{jid}.json" if jid else None
-        if not f or not f.is_file() or job_state(hs, f"{n}:{tid}")[0] != "running": continue
+        if own_label(cfg, t) is None or not f or not f.is_file() or job_state(hs, f"{n}:{tid}")[0] != "running": continue
         try: spec = json.loads(f.read_text())
         except ValueError: continue
         if spec.get("host") != n or str(spec.get("task")) != str(tid): continue   # recorded by this project for this very task
@@ -576,7 +580,7 @@ def orphan_jobs(cfg, hs, units):
     names = {u["name"]: u for u in units}; out = []
     for hn, p in hs.items():
         for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items():
-            lab = t.get("label") or ""
+            lab = own_label(cfg, t) or ""   # only this project's jobs (another project's, or none's, are never cancelled)
             if task_rc(t) is not None or not lab.startswith("unit:"): continue
             u = names.get(lab[5:])
             if not u: out.append((f"{hn}:{tid}", f"its unit {lab[5:]} is closed"))
@@ -587,6 +591,8 @@ def orphan_jobs(cfg, hs, units):
     for f in recs:
         if f.name in live: continue
         for r in wrapped_jobs(cfg, f.name):
+            hn, _, tid = r.partition(":")
+            if own_label(cfg, (((hs.get(hn) or {}).get("pueue") or {}).get("tasks") or {}).get(tid)) is None: continue   # a reused id
             st = job_state(hs, r)[0]
             if st in ("queued", "admission", "running") and r not in {x for x, _ in out}: out.append((r, f"its wrapper {f.name} has ended"))
             # records of wrappers that ended long ago and whose jobs are done are cleared by the watcher
