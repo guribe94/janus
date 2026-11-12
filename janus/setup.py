@@ -53,7 +53,7 @@ def init_project(root, a):
     if a.dry_run: print(text); return 0
     atomic_write(t, text)
     for d in (".janus", "briefs", "out"): (root / d).mkdir(exist_ok=True)
-    say(f"wrote {t} (this machine is [hosts.{host}]); created .janus/, briefs/, out/")
+    say(f"wrote {t} (this machine is [hosts.{host}], named after its host name — rename it if you like); created .janus/, briefs/, out/")
     say("next: edit janus.toml (hosts, models, the API key's secret store), run `bd init` here if there is no .beads/, then `janus doctor`")
     return 0
 
@@ -170,7 +170,7 @@ def doctor(cfg, a):
         r(False, f"no janus.toml in {Path.cwd()} or a parent", "janus init"); return 1
     say(f"-- project {cfg.name} ({cfg.root})")
     pl = Path.home() / ".config/janus/projects"
-    r(cfg.root in projects() or None, f"project listed in {pl} (the watcher visits it)", f"run ./install --project {cfg.root}")
+    r(cfg.root in projects() or None, f"project not listed in {pl} (the watcher will not visit it)", f"run ./install --project {cfg.root}")
     if not cfg.hosts: r(False, "no [hosts.*] in janus.toml", "add [hosts.<this machine>] local = true")
     elif not any(h.get("local") for h in cfg.hosts.values()): r(False, "no host has local = true", "mark this machine's [hosts.<name>] local = true")
     for m, c in cfg.models.items():

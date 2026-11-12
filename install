@@ -183,7 +183,12 @@ def main():
     if sys.platform == "darwin": watcher(root)
     else: linux_watcher(root)
     say("== tools ==")
-    if sys.platform == "darwin": run(["brew", "install", "beads", "pueue"]); run(["brew", "services", "start", "pueue"])
+    if sys.platform == "darwin":
+        # install only what is missing (a reinstall every run restarts pueue and disturbs queued jobs)
+        formulas = [f for t, f in (("bd", "beads"), ("pueue", "pueue")) if not shutil.which(t)]
+        if formulas: run(["brew", "install", *formulas])
+        answers = shutil.which("pueue") and subprocess.run(["pueue", "status"], capture_output=True).returncode == 0
+        if not answers: run(["brew", "services", "start", "pueue"])
     if root and not A.no_hosts:
         for n, h in tomllib.loads((root / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, root)
     elif not root: say("no janus.toml found: host tools skipped")
