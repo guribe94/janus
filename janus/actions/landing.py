@@ -152,46 +152,71 @@ def _dq_escape(v):
 
 def final_gate_cmd(ld, unit, wt, branch):
     """The [landing] final_gate command with {unit}, {wt} and {branch} substituted (item 12), each shell-quoted for the quote
-    context it sits in (finding 7, finding 3): an agent names its own branch and the command runs on the final-gate host, so a
-    hostile branch name or a path with a space must not split the command, and a `$(...)` in the value must never run in ANY
-    quoting form. The template is scanned with its quote state tracked (a `"` inside single quotes is literal, a `'` inside double
-    quotes is literal), so `sh -c 'cd "{wt}" && ./check'` (a placeholder inside double quotes inside single quotes) still works: a
-    placeholder alone between matching quotes drops them and is quoted once (shlex.quote), one inside double quotes is escaped for
-    double quotes, one inside single quotes is escaped for single quotes, and one bare is shlex.quote'd. A `${...}` in the config
-    is left intact (only a bare {name} is substituted)."""
+    context it ACTUALLY sits in (finding 7, finding 3, finding D): an agent names its own branch and the command runs on the
+    final-gate host, so a hostile branch name or a path with a space must not split the command, and a `$(...)` in the value must
+    never run in the quoting form it sits in. The template is scanned with a STACK of quote contexts: a `"` inside single quotes
+    is literal, a `'` inside double quotes is literal, and -- the part finding D fixes -- a `$(` or a backtick inside double
+    quotes opens a NEW command context (its own quoting is fresh, and it closes on its `)` or backtick), so a placeholder there is
+    quoted for THAT context, not escaped for the surrounding double quotes. Consequences: `sh -c 'cd "{wt}" && ./check'` (a
+    placeholder inside double quotes inside single quotes) works; `./gate "$(echo {branch})"` passes the value through
+    `shlex.quote` inside the substitution (the value's `$(...)` is literal there); a placeholder alone between matching quotes
+    drops them and is quoted once (shlex.quote); one inside single quotes is escaped for single quotes; one bare is shlex.quote'd.
+    A `${...}` in the config is left intact (only a bare {name} is substituted)."""
     s = ld.get("final_gate") or ""
     vals = {"unit": str(unit), "wt": str(wt), "branch": str(branch)}
-    out, i, q, n = [], 0, None, len(s)   # q: the shell quote context at i (None, "'", '"')
+    out, i, n = [], 0, len(s)
+    stack = [None]   # the quote context of each open level: None (bare command), "'", '"', ")" (inside $() or ( ), "`" (backticks)
     def ph(j):
         if j and s[j - 1] == "$": return None   # `${name}` in the config is not a placeholder
         m = re.match(r"\{(\w+)\}", s[j:])
         return (m.group(1), j + m.end()) if m and m.group(1) in vals else None
     while i < n:
-        c = s[i]
+        c = s[i]; q = stack[-1]
         if q is None:
             if c in "\"'":
                 m = re.match(r"([\"'])\{(\w+)\}\1", s[i:])
                 if m and m.group(2) in vals:   # the placeholder alone between matching quotes: drop the pair, quote once
                     out.append(shlex.quote(vals[m.group(2)])); i += m.end(); continue
-                out.append(c); q = c; i += 1; continue
+                out.append(c); stack.append(c); i += 1; continue
             if c == "\\":
                 out.append(c); i += 1
                 if i < n: out.append(s[i]); i += 1
                 continue
+            if c == "$" and i + 1 < n and s[i + 1] == "(":   # a command substitution: a fresh command context, closes on )
+                out.append("$("); stack.append(")"); i += 2; continue
+            if c == "`": out.append(c); stack.append("`"); i += 1; continue
+            if c == "(": out.append(c); stack.append(")"); i += 1; continue
+            if c == ")" and len(stack) > 1: stack.pop(); out.append(c); i += 1; continue
             g = ph(i)
             if g: out.append(shlex.quote(vals[g[0]])); i = g[1]; continue
         elif q == "'":
-            if c == "'": out.append(c); q = None; i += 1; continue
+            if c == "'": stack.pop(); out.append(c); i += 1; continue
             g = ph(i)
             if g: out.append(vals[g[0]].replace("'", "'\\''")); i = g[1]; continue
-        else:   # q == '"'
-            if c == '"': out.append(c); q = None; i += 1; continue
+        elif q == '"':
+            if c == '"': stack.pop(); out.append(c); i += 1; continue
             if c == "\\":
                 out.append(c); i += 1
                 if i < n: out.append(s[i]); i += 1
                 continue
+            if c == "$" and i + 1 < n and s[i + 1] == "(":
+                out.append("$("); stack.append(")"); i += 2; continue
+            if c == "`": out.append(c); stack.append("`"); i += 1; continue
             g = ph(i)
             if g: out.append(_dq_escape(vals[g[0]])); i = g[1]; continue
+        else:   # a command context inside $() or ( ) (closes on ")") or backticks (closes on "`")
+            if c == q: stack.pop(); out.append(c); i += 1; continue
+            if c in "\"'": stack.append(c); out.append(c); i += 1; continue
+            if c == "\\":
+                out.append(c); i += 1
+                if i < n: out.append(s[i]); i += 1
+                continue
+            if c == "$" and i + 1 < n and s[i + 1] == "(":
+                out.append("$("); stack.append(")"); i += 2; continue
+            if c == "`": out.append(c); stack.append("`"); i += 1; continue
+            if c == "(": out.append(c); stack.append(")"); i += 1; continue
+            g = ph(i)
+            if g: out.append(shlex.quote(vals[g[0]])); i = g[1]; continue
         out.append(c); i += 1
     return "".join(out)
 

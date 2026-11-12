@@ -177,6 +177,24 @@ class Item12FinalGate(unittest.TestCase):
             subprocess.run(["sh", "-c", out], capture_output=True, text=True, cwd=d, env=env, timeout=20)
             self.assertFalse(marker.exists(), f"a $() in the branch ran for {form!r}: {out}")
 
+    def test_a_placeholder_in_a_command_substitution_is_quoted_by_the_inner_context(self):
+        """Catches (finding D, regression of 6f28b15): once the scan was inside `"` it never noticed that `$(...)` or a
+        backtick pair starts a fresh shell context, so a placeholder there was escaped for double quotes (wrong): the value's
+        own `$()` ran and a path with a space broke."""
+        d = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-i12s-"))
+        marker = d / "PWNED"
+        evil = "wk/x$(touch${IFS}" + str(marker) + ")"
+        for form in ('./gate "$(echo {branch})"', './gate "`echo {branch}`"', './gate "$(echo "{branch}")"'):
+            out = janus.final_gate_cmd({"final_gate": form}, "u1", "/w", evil)
+            subprocess.run(["sh", "-c", out], capture_output=True, text=True, cwd=d, timeout=20)
+            self.assertFalse(marker.exists(), f"a $() in the branch ran for {form!r}: {out}")
+        wt = d / "My Code" / "wt"; wt.mkdir(parents=True)
+        (wt / "check").write_text("#!/bin/sh\necho CHECK-RAN\n"); (wt / "check").chmod(0o755)
+        cmd = janus.final_gate_cmd({"final_gate": 'X="$(cd {wt} && pwd)"; cd "$X" && ./check'}, "u1", str(wt), "b")
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, cwd=d, timeout=20)
+        self.assertEqual(r.returncode, 0, cmd + " :: " + r.stderr)
+        self.assertIn("CHECK-RAN", r.stdout)
+
 
 class Item8ThrashExplicit(unittest.TestCase):
     def test_a_thrash_stop_is_written_to_the_job_log_and_names_the_requeue(self):
