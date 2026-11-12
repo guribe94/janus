@@ -11,7 +11,7 @@ from janus.memory import MEM_SECTIONS
 from janus.setup import doctor, init_project
 from janus.actions.backlog import cmd_backlog, cmd_fill
 from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_hosts, cmd_run, cmd_thrash
-from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_scope, cmd_land
+from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_log, cmd_gate_scope, cmd_land
 from janus.actions.launch import cmd_api_run, cmd_launch
 from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd_park, cmd_resume as cmd_resume_unit, cmd_stop
 from janus.actions.swarm import cmd_forget, cmd_index, cmd_introduce, cmd_learned, cmd_ledger, cmd_memory, cmd_peers, cmd_remember, cmd_report, cmd_transcript
@@ -78,6 +78,8 @@ def main():
         A("--quick", action="store_true", help="a short gate: the gates-quick slot when [landing] quick_gate_min is set"),
         A("--allow-unmerged", action="store_true", help="gate a tree mid-merge, with conflict markers or far behind the landing branch"), dry=True)
     add("gate-judge", cmd_gate_judge, A("name"), A("rc", type=int))
+    add("gate-log", cmd_gate_log, A("name", help="the gate whose output to read (out/<name>/task.txt, or --task)"),
+        A("--task", help="read this <host>:<task pueue id>'s log instead of the recorded one"))
     # gate-exec's command is "*", never REMAINDER: REMAINDER comes after the positional <name> and swallows the
     # --timeout-min option into a.command, so the wrapper ran `sh -c '--timeout-min 0 -- <cmd>'` and sh refused it
     # ('sh: --: invalid option', exit 2, item 26) with the limit never applied

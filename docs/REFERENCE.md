@@ -689,6 +689,10 @@ janus runs `tests.sh` itself and appends `<date> <time> <name> EXIT_tests=<rc> R
 hosts' `gates` lanes. `--unit` (default `$JANUS_UNIT`) records the gate on the unit for the landing check. `--wait` prints the
 RESULT line, exit 0 on PASS. **`janus cancel <host>:<task>`** kills and removes a janus job that outlived its intent.
 **`janus queue [host] [--log N]`** prints each host's pueue status (or a task's log), read-only.
+**`janus gate-log <name> [--task <host>:<id>]`** reads a failed gate's per-step summary and first error line: the RESULT line and
+the failing/passing test ids, then the gate's own output (the pueue task it was queued as, recorded in `out/<name>/task.txt`;
+`--task` overrides it; else a saved `out/<name>/log`), showing `EXIT_<step>=<rc>` per step and the first error-looking line.
+Exit 0 on a PASS result. This is the janus way to see why a gate failed (soak 40) without ssh-ing or reading panes.
 **`janus busy <wt>`** exits 0 (and says why) while the tree is in use: a janus job queued or running on it (any host; a host
 that does not answer counts as busy), an open unit's own job when the unit's cwd is that tree, or a local process matching
 `[busy] patterns` (default: mutation testing, which edits sources in place) that runs in or names it; 1 when it is free. A
