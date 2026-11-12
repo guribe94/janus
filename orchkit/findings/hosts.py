@@ -39,11 +39,10 @@ def proc_findings(cfg, ps_text=None, viol=None):
     for k, v in t.items(): kids.setdefault(v[0], []).append(k)
     def lane_below(p, depth=0):   # a descendant runs orch run/gate: the build goes through a lane (a shim, a wrapper script)
         return depth < 6 and any(re.search(r"orch(\.py)? (run|gate)\b", t[c][3]) or lane_below(c, depth + 1) for c in kids.get(p, []))
-    launchers = {os.path.basename(m["launcher"]) for m in cfg.models.values() if m.get("launcher")}   # older project launchers
     F = []
     for p, (pp, cpu, et, c) in t.items():
         if AGENT_RX.search(c) or "pueued" in c or fixture_proc(c): continue
-        anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "orch.py api-run" in t[q][3] or any(x in t[q][3] for x in launchers)), None)
+        anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "orch.py api-run" in t[q][3]), None)
         lane = any("pueued" in t[q][3] for q in anc)
         if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
             F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; it is stopped after [enforce] grace_min unless it moves to a lane (orch run)"))

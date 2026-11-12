@@ -106,7 +106,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     the command), job_log (a line per job start/end), and for runner = "podman" the [hosts.<h>.container] settings."""
     q = shlex.quote; rd = h["_rd"]; sub = a.subdir or "."; sub_ = lambda x: str(x).replace("{name}", name).replace("{jid}", jid)
     head = f"#!/bin/bash\n# orch run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={qp(rd)}; R=\"$RD\"/{q(jid)}\nexport ORCH_WRAP={q(jid)}   # orch run inside records the jobs it queues under this (cancel follows them)\n"
-    setup = h.get("job_setup", ""); log = h.get("job_log", h.get("fleet_log", "/dev/null"))
+    setup = h.get("job_setup", ""); log = h.get("job_log", "/dev/null")
     adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid)}
     if h.get("local"):
         pre = ""
