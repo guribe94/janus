@@ -256,6 +256,56 @@ class ReportCheckpoint(unittest.TestCase):
         self.assertEqual([k for k, _ in janus.report_findings(cfg, [])], [])           # sent after the event: clear
 
 
+class ReviewFinding(unittest.TestCase):
+    """ranked 9 / S3 expert-panel-quality-bar: a tier critical unit that finished DONE with no later review of its final code is
+    listed. The failure caught: critical work landing without a re-review after the last change."""
+
+    def setUp(self):
+        self.d, self.cfg = project()
+        self.r = self.d / "repo"; self.r.mkdir()
+        self.g("init", "-q", "-b", "main"); (self.r / "a").write_text("1\n")
+        self.g("add", "a"); self.g("commit", "-qm", "base")
+        self.wt = self.d / "repo-wt"; self.g("worktree", "add", "-q", "-b", "wk/u", str(self.wt))
+        (self.d / "out/u").mkdir(parents=True); (self.d / "out/u/REPORT.md").write_text("x\nVERDICT: DONE\n")
+        self.commit_t = int(self.g("log", "-1", "--format=%ct").stdout.strip())
+
+    def g(self, *a): return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(self.r), *a], capture_output=True, text=True)
+
+    def u(self, **k): return {"id": "x-1", "name": "u", "cwd": str(self.wt), "verdict": "VERDICT: DONE", "tier": "critical", **k}
+
+    def keys(self, units): return [k for k, _ in janus.review_findings(self.cfg, units)]
+
+    def test_critical_unit_needs_a_later_review(self):
+        self.assertEqual(self.keys([self.u()]), ["review:u"])
+        self.assertEqual(self.keys([self.u(tier="normal")]), [])                                # only critical
+        rev_early = {"name": "u-rev", "kind": "review", "of": "u", "started": self.commit_t - 100}
+        self.assertEqual(self.keys([self.u(), rev_early]), ["review:u"])                        # a review before the last commit does not count
+        rev_after = {"name": "u-rev", "kind": "review", "of": "u", "started": self.commit_t + 5}
+        self.assertEqual(self.keys([self.u(), rev_after]), [])
+
+
+class LandFirst(unittest.TestCase):
+    """ranked 9 / S1 finish-and-land: with [landing] hold_h set and a provider under 25 % of its cap, a NEW implement unit is
+    refused while a gated DONE unit has waited over hold_h. The failure caught: starting new work while done work waits unlanded."""
+
+    def test_refuses_only_when_old_unlanded_work_meets_a_tight_cap(self):
+        d, cfg = project('\n[landing]\nhold_h = 2\n')
+        (d / "out/u").mkdir(parents=True); rp = d / "out/u/REPORT.md"; rp.write_text("x\nVERDICT: DONE\n")
+        old = time.time() - 3 * 3600; os.utime(rp, (old, old))
+        u = {"name": "u", "verdict": "VERDICT: DONE", "cwd": str(d)}
+        real = janus.landing_findings; janus.landing_findings = lambda cfg, units, hs=None: [("landing:u:unlanded", "why")]
+        try:
+            (d / "out/ledger.tsv").write_text("2026-01-01 00:00:00\tu\t8.0\tdone rc=0\tu.1\n")   # $8 of a $10 cap: over 75 %
+            self.assertIn("land first: u", janus.land_first_block(cfg, [u], {}) or "")
+            (d / "out/ledger.tsv").write_text("2026-01-01 00:00:00\tu\t1.0\tdone rc=0\tu.1\n")    # $1 of $10: not tight
+            self.assertIsNone(janus.land_first_block(cfg, [u], {}))
+        finally: janus.landing_findings = real
+
+    def test_inert_without_hold_h(self):
+        d, cfg = project()
+        self.assertIsNone(janus.land_first_block(cfg, [], {}))
+
+
 class Soak(unittest.TestCase):
     """item 6: one soak pass exercises every read path, prints one line each, and writes nothing. The failure caught: a soak
     that mutates the live project it is checking."""
