@@ -1,11 +1,11 @@
 """janus init, doctor, queue and register: a shareable project setup and the one registered orchestrator session."""
-import concurrent.futures as cf, json, os, shlex, sys
+import concurrent.futures as cf, json, os, re, shlex, sys
 from pathlib import Path
 from janus.board import board_dir, board_script
 from janus.context import (Err, JANUS_SELF, atomic_write, clean_env, herdr, hrun, now, projects, record_session_proc, say,
     session_alive, sh, slug, ts)
 from janus.ledger import ledger_read, read_secret, spend
-from janus.platform import launchd_watcher_loaded, systemd_watcher_active
+from janus.platform import launchd_watcher_loaded, run, systemd_watcher_active
 from janus.probe import probe, pueue
 from janus.units import ws_id
 
@@ -68,6 +68,75 @@ def cmd_init(cfg, a):
         k.write_text((k.read_text() if k.exists() else "") + f"\n\n<!-- {ts()} moved from {x} -->\n" + t)
         atomic_write(p, ptr); say(f"{x}: now a pointer (old text in {k})")
     say(f"{cfg.root / 'janus.toml'} exists; run janus doctor to check the setup")
+
+OLD_CFG, NEW_CFG = "orch.toml", "janus.toml"   # the old names are quoted here on purpose: this is the one-time migration off them
+OLD_STATE, NEW_STATE = ".orch", ".janus"
+
+def migrate(project=None):
+    """One-time, idempotent move from orch to janus: the project's orch.toml -> janus.toml and .orch/ -> .janus/, the hook
+    commands a previous install wrote, and the watcher. Safe to run twice; prints what it changed. Stops and says so if both
+    the old and the new file/folder exist (nothing is merged by hand here)."""
+    root = Path(project or os.getcwd()).resolve()
+    old_cfg, new_cfg = root / OLD_CFG, root / NEW_CFG
+    if not old_cfg.is_file() and not new_cfg.is_file():
+        print(f"janus: no {OLD_CFG} or {NEW_CFG} in {root}", file=sys.stderr); return 2
+    if old_cfg.is_file() and new_cfg.exists():
+        print(f"janus: both {OLD_CFG} and {NEW_CFG} exist in {root}; merge them by hand", file=sys.stderr); return 1
+    old_state, new_state = root / OLD_STATE, root / NEW_STATE
+    if old_state.is_dir() and new_state.exists():
+        print(f"janus: both {OLD_STATE}/ and {NEW_STATE}/ exist in {root}; merge them by hand", file=sys.stderr); return 1
+    did = []
+    if old_cfg.is_file(): os.replace(old_cfg, new_cfg); did.append(f"{root}: {OLD_CFG} -> {NEW_CFG}")
+    if old_state.is_dir(): os.replace(old_state, new_state); did.append(f"{root}: {OLD_STATE}/ -> {NEW_STATE}/")
+    did += migrate_hooks() + migrate_watcher()
+    for x in did: say(x)
+    say("janus migrate: " + ("done" if did else "nothing to do (already migrated)"))
+    return 0
+
+def migrate_hooks():
+    """Point the hook commands a previous install wrote (…/orch hook <event>, or an older …/orch.py hook <event>) at janus.
+    A rewritten file is backed up first; returns one line per file changed."""
+    out = []
+    for p in (Path.home() / ".claude/settings.json", Path.home() / ".codex/hooks.json"):
+        if not p.is_file(): continue
+        try: data = json.loads(p.read_text())
+        except Exception: continue
+        n = 0
+        for lst in (data.get("hooks") or {}).values():
+            for ent in lst if isinstance(lst, list) else []:
+                for h in (ent.get("hooks", []) if isinstance(ent, dict) else []):
+                    c = h.get("command", "")
+                    if re.search(r"(^|[/\s])orch(\.py)? hook \w+$", c):
+                        h["command"] = re.sub(r"orch(\.py)? hook ", r"janus\1 hook ", c); n += 1
+        if n:
+            p.with_name(p.name + ".bak-orch").write_text(p.read_text()); atomic_write(p, json.dumps(data, indent=2) + "\n")
+            out.append(f"{p}: {n} hook command(s) -> janus")
+    return out
+
+def migrate_watcher():
+    """Replace the orch watcher with the janus one: macOS boots out com.orch.watch and installs the shipped
+    com.janus.watch.plist; Linux renames the systemd units. Returns one line per change."""
+    out = []
+    if sys.platform == "darwin":
+        old = Path.home() / "Library/LaunchAgents/com.orch.watch.plist"
+        new = Path.home() / "Library/LaunchAgents/com.janus.watch.plist"
+        if old.exists():
+            run(["launchctl", "bootout", f"gui/{os.getuid()}/com.orch.watch"]); old.unlink(); out.append("removed the com.orch.watch watcher")
+        src = JANUS_SELF.parent / "launchd" / "com.janus.watch.plist"
+        if src.is_file() and not new.exists():
+            new.parent.mkdir(parents=True, exist_ok=True); (Path.home() / ".config/janus").mkdir(parents=True, exist_ok=True)
+            new.write_text(src.read_text().replace("__HOME__", str(Path.home())))
+            run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(new)]); out.append("installed the com.janus.watch watcher")
+    else:
+        u = Path.home() / ".config/systemd/user"
+        units = [("orch-watch.service", "janus-watch.service"), ("orch-watch.timer", "janus-watch.timer")]
+        if any((u / a).exists() for a, _ in units):
+            run(["systemctl", "--user", "disable", "--now", "orch-watch.timer"])
+            for a, b in units:
+                if (u / a).exists() and not (u / b).exists(): (u / b).write_text((u / a).read_text().replace("orch", "janus")); (u / a).unlink()
+            run(["systemctl", "--user", "daemon-reload"]); run(["systemctl", "--user", "enable", "--now", "janus-watch.timer"])
+            out.append("renamed the systemd watcher units to janus-watch")
+    return out
 
 def cmd_doctor(cfg, a): return doctor(cfg, a)
 
