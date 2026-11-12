@@ -94,10 +94,42 @@ def cmd_stop(cfg, a):
     if h.get("local"): settle_run(cfg, u, "stopped")   # remote: collect brings back the cost first, close settles the rest
     bd.comment(u["id"], f"{ts()} stopped (every process group of the unit ended)"); say("stopped: no process of the unit is left")
 
+# Item 29: `diff -ruN | sed` wrote a new file as `--- a/<f>` with an epoch date and no `new file mode`, so `git apply` refused
+# the whole patch ("does not exist in index"); a host without `patch` (asgard) could not take it either, and a new EMPTY file
+# never appeared in the diff at all. This builds a patch git apply takes, from the two trees, in the host's own python3: a
+# `diff --git` header per file, `new file mode` / `deleted file mode`, `/dev/null` on the missing side, and no dependency on
+# the host's diff. Excludes are the same names as DIFF_X.
+PATCH_PY = '''import os, sys, difflib
+n, base, wt = sys.argv[1], sys.argv[2], sys.argv[3]
+SKIP = {"target", ".venv", "node_modules", "__pycache__", ".git"}
+def rels(root):
+    s = set()
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP]
+        for f in files: s.add(os.path.relpath(os.path.join(d, f), root))
+    return s
+A, B = rels(base), rels(wt)
+out = []
+for r in sorted(A | B):
+    anew, bnew = r not in A, r not in B
+    a = open(os.path.join(base, r), "rb").read() if not anew else b""
+    b = open(os.path.join(wt, r), "rb").read() if not bnew else b""
+    if a == b and not (anew or bnew): continue
+    if b"\\0" in a or b"\\0" in b: continue
+    L = list(difflib.unified_diff(a.decode(errors="replace").splitlines(True), b.decode(errors="replace").splitlines(True),
+                                  fromfile="/dev/null" if anew else "a/" + r, tofile="/dev/null" if bnew else "b/" + r, n=3))
+    if not L and not (anew or bnew): continue
+    out.append("diff --git a/%s b/%s\\n" % (r, r))
+    if anew: out.append("new file mode 100644\\n")
+    elif bnew: out.append("deleted file mode 100644\\n")
+    out.extend(L)
+sys.stdout.write("".join(out))
+'''
+
 def remote_patch(cfg, h, n, fname):
-    """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>)."""
-    return X(cfg, h, f"cd {qp(h['root'])} && [ -d base/{n} ] && {{ diff -ruN {DIFF_X} base/{n} worktrees/{n} | sed -e 's#^--- base/{n}/#--- a/#' -e 's#^+++ worktrees/{n}/#+++ b/#' "
-                f"-e 's#^diff -ruN .* base/{n}/\\(.*\\) worktrees/{n}/.*#diff --git a/\\1 b/\\1#' > out/{n}/{fname}; true; }}", timeout=300)
+    """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>), in a
+    form `git apply` accepts (new and deleted files included; see PATCH_PY for why the old `diff -ruN | sed` did not)."""
+    return X(cfg, h, f"cd {qp(h['root'])} && [ -d base/{n} ] && {{ python3 -c {shlex.quote(PATCH_PY)} {shlex.quote(n)} base/{n} worktrees/{n} > out/{n}/{fname}; }}", timeout=300)
 
 # A remote copy's fingerprint: the checksum of the agent's changes and of its output folder (janus's own files left out), the
 # number of output files and the report's lines other than PENDING. collect records it; stop and close compare (item 4).
