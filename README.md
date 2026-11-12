@@ -486,3 +486,20 @@ Described in `docs/PLAN.md` or asked for but not in the code: moving unstarted j
 (the setting is read but unused), pushing state to a bare repo, `MemoryMax` for herdr agents (they run on the Mac, which has
 no systemd), host roles (target/build/agents/dev) with parallel gates per host, and the remote agent's git (a remote copy has
 no `.git`; its work comes back as a patch).
+
+## Capacity: use all compute, never overload it (orch-fixes8)
+
+- **Admission by reservations.** Every lane job on every host waits in `runs/cap.sh`'s rule: it holds `cores_per_job` cores and
+  its job class's memory (the max of the class's last 5 recorded peaks + 15 %, from `runs/history.tsv` on that host; `job_gb`
+  until learned) and starts while the sums fit `cores` and `ram_gb - services_gb`. Agents hold the agent class's figure.
+- **Back-pressure.** Memory PSI over `psi_pause`, or load over `load_pause` x cores for `hold_s`, pauses admission; running jobs
+  are never killed; `orch check` reports `pressure:<host>`.
+- **One scheduler per host.** `check` raises `scheduler:<host>` for another job runner or a job that holds no reservation.
+- **Agents count against build capacity.** A unit records its build host; `orch launch` refuses, saying when, unless a build
+  reservation or a queue position (one queued job per running job) is free there.
+- **Fill.** `orch fill --dry-run` lists what fits now and why it stops; `orch fill` launches it; `[fill] watcher = true` lets the
+  watcher do it. `check` reports `idle-with-backlog`.
+- **Budgets from history.** A unit's default budget is the median cost of its kind and tier + `[budget] margin_pct`; `budget80:<unit>`
+  warns at 80 % with a stale report.
+- **Landing.** `orch land <unit>` merges the landing branch (stops and dispatches `merge-<unit>` on a conflict), gates the merged
+  tree on `[landing] final_gate_host`, then squash-lands.
