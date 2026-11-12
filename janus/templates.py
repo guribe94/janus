@@ -231,7 +231,7 @@ else   # no flock: a lock dir holding its owner's pid; a dead owner's dir is tak
 gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cut -d' ' -f1 "$f")" 2>/dev/null && return 0; done; return 1; }
 W="$R.wait"; [ "$lane" = gates ] && W="$R.gwait"; echo "$$ $EXP $(date +%%s) $(cap_mb "$CLS" $CAPMB $CAPMB) $(cap_cores "$CLS")" > "$W"
 HELD=; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
-said=
+said=; last=0; WAITMAX=${JANUS_ADMIT_MAX_S:-%(waitmax)d}; REPORT=${JANUS_ADMIT_REPORT_S:-60}   # item 21: say why at least every REPORT s, give up after WAITMAX
 while :; do
   if [ "$lane" = gates ] || ! gates_waiting; then
     lk; CAP_RO=; . "$RD/cap.sh"
@@ -240,8 +240,11 @@ while :; do
       if [ "$NB" -gt 0 ] && { [ $((RC + CC + BCC)) -gt "$CORES" ] || [ $((RM + RAM + MB + BMB)) -gt "$MEMCAP" ]; }; then BLK="yield to $NB shorter or older job(s)"
       else echo "$$ $CC $MB $(date +%%s) $CLS" > "$R.res.$$" && mv -f "$R.res.$$" "$R.res"; ulk; break; fi
     fi
-    ulk; [ "$said" = "$BLK" ] || { echo "janus: waiting for admission ($CLS; $BLK): $why"; said=$BLK; }
+    ulk; nowt=$(date +%%s)
+    if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): $why"; said=$BLK; last=$nowt; fi
   fi
+  waited=$(( $(date +%%s) - ${TQ:-$(date +%%s)} ))
+  if [ "${WAITMAX:-0}" -gt 0 ] && [ "$waited" -ge "$WAITMAX" ]; then echo "janus: not admitted after ${waited}s (limit ${WAITMAX}s; $CLS; ${BLK:-no reason reported}): $why; giving up (exit 124)"; exit 124; fi
   sleep ${JANUS_POLL_S:-15}
 done
 rm -f "$W"; exec 7>&-; trap 'rm -f "$R.res"' EXIT

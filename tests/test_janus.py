@@ -589,6 +589,54 @@ class DiskFloor(unittest.TestCase):
         self.assertIn('"$d" -ge 3', js, "the land lane used a fixed disk floor, not [capacity] min_disk_gb")
 
 
+class AdmitBound(unittest.TestCase):
+    def test_a_blocked_job_says_why_and_gives_up(self):
+        """Catches (item 21): a job blocked in admission waited forever with no reason and no bound. It now says why (with
+        numbers) at least every REPORT s and gives up with exit 124 after the lane's bound."""
+        import argparse
+        d, cfg = project('\n[capacity]\nmin_disk_gb = 99999\n')
+        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
+        p = subprocess.run(["bash"], input=js, text=True, capture_output=True, timeout=60,
+                           env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"})
+        self.assertEqual(p.returncode, 124, p.stdout + p.stderr)
+        self.assertGreaterEqual(p.stdout.count("waiting for admission"), 2, p.stdout)
+        self.assertIn("disk", p.stdout); self.assertIn("giving up", p.stdout)
+
+    def test_the_caller_reports_a_slow_admission_and_keeps_waiting(self):
+        """Catches (item 21): the caller's pueue wait had no timeout and no output."""
+        d, cfg = project(); h = cfg.hosts["here"]
+        real_run = subprocess.run; n = [0]
+        def fake_run(cmd, **k):
+            if isinstance(cmd, list) and any("wait -q" in str(x) for x in cmd):
+                n[0] += 1
+                if n[0] == 1: raise subprocess.TimeoutExpired(cmd, k.get("timeout", 0))
+                return type("R", (), {"returncode": 0})()
+            return real_run(cmd, **k)
+        states = [{"status": {"Running": {}}}, {"status": {"Done": {"result": "Success"}}}]
+        real = janus.task_status, janus.probe
+        subprocess.run = fake_run
+        janus.task_status = lambda h, tid: states.pop(0) if states else {"status": {"Done": {"result": "Success"}}}
+        janus.probe = lambda n, h, **k: {"cap_admit": "disk", "cap_pause": "", "disk_gb": "9"}
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(out): rc = janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
+        finally: subprocess.run = real_run; janus.task_status, janus.probe = real
+        self.assertEqual(rc, 0)
+        self.assertIn("still waiting", out.getvalue()); self.assertIn("disk", out.getvalue())
+
+    def test_a_blocked_admission_is_a_finding_with_the_reason(self):
+        """Catches (item 21): a job held in admission raised no finding naming why."""
+        d, cfg = project()
+        hs = {"here": {"ok": True, "pueue": {"groups": {"jobs": {"parallel_tasks": 2, "status": "Running"}}, "tasks": {}},
+                       "wait_jobs": "1", "cap_admit": "disk", "cap_pause": "", "disk_gb": "9", "cap_rc": "1", "cap_rm": "2048",
+                       "cap_ram": "0", "cap_psi": "0", "res": [], "hist": [], "sched": [], "direct": [], "tmux": []}}
+        F = dict(janus.lane_findings(cfg, hs))
+        self.assertIn("blocked:here:jobs", F); self.assertIn("disk 9G free, floor 10G", F["blocked:here:jobs"])
+
+
 class Fill(unittest.TestCase):
     def test_fill_until_capacity_or_budget(self):
         d, cfg = project('\n[backlog]\nfile = "S.md"\n[routing]\nnormal = ["m"]\ncritical = ["m"]\n'
