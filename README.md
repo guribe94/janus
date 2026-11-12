@@ -17,7 +17,7 @@ times (the full story is in `docs/PLAN.md`). Reminders in a prompt did not fix i
 - hooks deny hand operations (`rm -r`, `kill`, in-place edits) and refuse to let the orchestrator go idle with open problems;
 - a watcher wakes the orchestrator, and starts a new one only when the registered one is really gone;
 - `orch check` reads the real state (hosts, jobs, panes, gates, git) and prints one line per problem;
-- `orch launch` measures free room and refuses when a machine is full;
+- `orch launch` admits an agent only while the machine's reservations leave room for it, and refuses (saying when room is expected) when full;
 - owner instructions are filed in beads and stay open until classified, so they are not lost.
 
 ```
@@ -120,7 +120,7 @@ reset, 150000).
 (`<out>/<unit>/REPORT.md`), `worktrees` (`<worktrees>/<unit>` is the unit's working directory if it exists; it may be outside the project, e.g.
 `../../worktrees`), `checklist` (the project's status checklist, editable by the orchestrator), `state_docs` (old state docs
 for `orch init`). **`[placement]`**: optional `"<regex>" = "<host>"` rules matched against a unit's name and brief: the host
-where its tests run, where launch places it. Per host, `job_ws_gb` is the working set assumed before one is measured.
+where its tests run, where launch places it.
 
 **`[herdr]`** `workspace` and **`[orchestrator]`** `kind`/`args`: the herdr workspace label, and what the watcher starts
 when the registered orchestrator is gone. It must match the registered session's kind (`check` reports a mismatch; the
@@ -353,15 +353,17 @@ Agents post their progress to it; the orchestrator reads `orch` output rather th
 
 ## 7. Multiple machines, capacity and network outages
 
-Every host in `orch.toml` can run agents. `launch` picks the host with the most room. Room is measured live: free memory
-minus `reserve_gb`, divided by `agent_gb`; a host is full when load exceeds 1.5 x `cores`, memory pressure (`psi`, Linux)
-is 5 or more, or disk is under `min_disk_gb` (load and disk do not hold back a `cleanup` unit). Caps reduce it further. `check` reports "host over its margins" for low disk or high load even when no units are ready. On macOS the probe takes the larger of two readings, `kern.memorystatus_level` (memory_pressure's free percentage, read with sysctl) x `hw.memsize`, and `vm_stat` free + inactive + speculative + purgeable pages, so one reading of 0 under load no longer makes the Mac look full; with no reading at all the memory limit is skipped for that probe and load from `sysctl -n vm.loadavg`. An unreachable host has room 0.
+Every host in `orch.toml` can run agents. `launch` picks the host with the most room. Room is by reservations (see
+"Capacity" below): the memory for reservations (`ram_gb - services_gb`) minus what running jobs and agents reserve, over the
+agent figure (learned, else `agent_gb`); none while admission is paused by back-pressure (memory PSI over `psi_pause`, or
+load over `load_pause` x `cores` for `hold_s`), or while disk is under `min_disk_gb` (disk does not hold back a `cleanup`
+unit). Every agent holds a reservation file (`runs/agent-<unit>.res`), API and interactive alike. Caps reduce it further. `check` reports "host over its margins" for low disk or high load even when no units are ready. On macOS the probe takes the larger of two readings, `kern.memorystatus_level` (memory_pressure's free percentage, read with sysctl) x `hw.memsize`, and `vm_stat` free + inactive + speculative + purgeable pages, so one reading of 0 under load no longer makes the Mac look full; with no reading at all the memory limit is skipped for that probe and load from `sysctl -n vm.loadavg`. An unreachable host has room 0.
 
 Work belongs to the machine's own queue, not to an ssh session:
 - **pueue** runs on each machine (launchd/brew on the Mac, a user systemd service on Linux hosts). API agents run as
-  tasks in the `agents` group and keep running if ssh drops. The watcher and the orchestrator's own `orch check` also adjust the `jobs` group's parallel limit
-  from measured room (at least 1, at most `cores`), and the `agents` group's from (avail - reserve) / `agent_gb` plus running
-  agents, capped by `[caps]`.
+  tasks in the `agents` group and keep running if ssh drops. The watcher and the orchestrator's own `orch check` also set the `jobs` group's parallel limit
+  to `cores // cores_per_job` (admission by reservations decides what starts), and the `agents` group's to the running
+  agents plus the agents that fit by reservations, capped by `[caps]`.
 - **tmux** holds interactive remote agents (session `orch-<unit>`); the herdr tab only attaches to it with
   `ssh -t host tmux attach`, so a dropped view does not stop the agent.
 - **systemd-run** with `MemoryMax` (from `memory_max`) wraps remote API agent tasks, so the kernel stops one that outgrows
@@ -389,14 +391,13 @@ One way to run a build or test job on any machine: that machine's pueue, never a
   podman host first reflink-clones `container.clone_base`. Every `paths.sync_require` path must arrive.
 - writes the job as `<root>/runs/<jid>.sh` and queues it in the host's pueue group: `gates` (priority 10) or `jobs`; `land`
   is the local machine's landing lane (parallel 1). Groups are created on first use (`jobs` and `gates` with one slot per job cap).
-- Linux admission is by measured room: the job waits in its pueue task, one job at a time under `runs/admit.lock`, until
-  MemAvailable >= `reserve_gb` + the measured per-job working set (the largest anonymous memory, `memory.stat anon`, of the
-  orch jobs running now, or on podman hosts of the containers named by `container.name_prefixes`; remembered in
-  `runs/ws_mb`; `job_ws_gb`, default half of `job_gb`, before anything was measured; at most `job_gb`), memory PSI some
-  avg10 < 5, load1 < 1.5 x `cores`, disk >= `min_disk_gb`, and CPU: (running orch jobs + 1) x `cores_per_job` <= `cores` (load
-  lags, because builds ramp up after admission). An admitted job keeps the lock 60 s more so its memory shows before the next
-  is judged. The rule lives in `<root>/runs/admit.sh`, rewritten on every `orch run` (by rename) and re-read by waiting jobs
-  every 15 s. `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Local land
+- admission on every host and lane is by reservations: the job waits in its pueue task, one job at a time under
+  `runs/admit.lock` (a pid-owned lock dir where there is no `flock`), until its reservation fits: running jobs' cores +
+  `cores_per_job` <= `cores`, and their memory + the agents' + this job's class figure (the max of its class's last
+  `history_n` recorded peaks + `margin_pct`, `job_gb` until learned) <= `ram_gb - services_gb`; not while back-pressure
+  pauses admission (memory PSI over `psi_pause`, load over `load_pause` x `cores` for `hold_s`); disk >= `min_disk_gb`. The
+  rule lives in `<root>/runs/cap.sh`, rewritten on every `orch run` and launch (by rename) and re-read by waiting jobs every
+  15 s; each job records its peak memory in `runs/history.tsv`. `MemoryMax` per job is only the runaway guard. A jobs-lane job yields while a gates-lane job waits. Local land
   lane: the disk floor, the host's `admit_check`, and no `legacy_lanes` lane still running.
 - runs the job in `systemd-run --user --scope -p MemoryMax=<job_gb>` after the host's `run_env` and `job_setup`; with
   `runner = "podman"` in the host's container settings (`--memory=<job_gb>`, nice 15 and idle IO; `--usb` adds `usb_args`
@@ -434,7 +435,7 @@ idempotent. `orch backlog list` shows what it reads. `orch check` then reports:
 
 ## 7c. Self-safety
 
-Every script orch writes or replaces (job scripts, lane runners, remote agent scripts, the pueue shim, admit.sh, rewritten
+Every script orch writes or replaces (job scripts, lane runners, remote agent scripts, the pueue shim, cap.sh, rewritten
 reports) is written to a temp file and renamed into place, never edited in place: a running shell keeps reading its old file.
 `orch check` reports `script:<pid>` when a running shell script's file was changed in place after it started (the shell reads
 its script as it goes, so it would continue at its old byte offset of the new text, which is how a launcher once looped and
@@ -461,7 +462,7 @@ never changes the toolkit that runs it. Every hook denial is logged in `.orch/de
 | `no API key: ...` | the provider's `key_keychain` / `key_file` gave no key; `orch doctor` shows which |
 | `[script:<pid>] running script ... was changed after it started` | stop that process and relaunch it; write scripts by rename |
 | `refused: <wt> has conflict markers` / `is N commits behind main` | finish the merge or merge the landing branch first; `--allow-unmerged` overrides |
-| `orch: waiting for admission: MemAvailable A MB (need B = reserve R + working set W), PSI P, load L (limit 1.5 x C cores), disk D GB` (in a job log) | the host has not got that much room yet; it starts by itself when it has |
+| `orch: waiting for admission (<class>; <what blocks>): reserved N job(s): C of K cores, M MB + agents A MB + this job J MB of T MB ...` (in a job log) | the host has not got that much room yet; it starts by itself when it has |
 | `[old-rule:<host>] N job(s) still wait under the old cap rule` | jobs queued before the measured rule; re-queue them with `orch run`, then stop the old tasks |
 | `(read-only: not the registered orchestrator session ...)` after `orch check` | expected for anyone but the orchestrator: nothing was saved, tuned or stamped |
 | `refused: <dir> is the cwd of open unit(s) ...` / `is a main checkout` | give the unit its own worktree |
