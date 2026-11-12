@@ -1,0 +1,126 @@
+#!/bin/sh
+# sandbox/run - run a command with writes confined to an agent's worktree, output folder and caches.
+#
+#   run <worktree> <outdir> -- <cmd...>
+#
+# Reads are allowed broadly except the keychain dirs and the caller's deny list; writes are allowed only in
+# the worktree, the output folder, the temp dir, the tool caches an agent needs (cargo, uv, npm) and the
+# runtime's own state dir. The network stays open. run picks the profile for the OS (sandbox-exec on macOS,
+# bwrap on Linux), renders it and runs the command. See docs/SANDBOX.md.
+#
+# Environment (optional):
+#   SANDBOX_WRITE   colon-separated extra paths the command may write (e.g. another cache)
+#   SANDBOX_DENY    colon-separated extra paths whose reads are denied (e.g. other repositories, secrets)
+#   TMPDIR          the temp dir allowed for writing (default: /tmp)
+set -eu
+set -f   # no pathname expansion: the path lists below are split on ':' only
+
+prog=${0##*/}
+die() { printf '%s: %s\n' "$prog" "$*" >&2; exit 2; }
+
+if [ $# -lt 3 ]; then die "usage: $prog <worktree> <outdir> -- <cmd...>"; fi
+worktree=$1 outdir=$2
+shift 2
+if [ "${1:-}" != "--" ]; then die "usage: $prog <worktree> <outdir> -- <cmd...>"; fi
+shift
+if [ $# -lt 1 ]; then die "no command after --"; fi
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 2
+
+# canon: print the canonical path of $1, which may not exist yet. The profiles match on real paths, so a
+# symlinked prefix (on macOS /var -> /private/var, /tmp -> /private/tmp) must be resolved or nothing matches.
+canon() {
+  _p=$1
+  case $_p in /*) ;; *) _p=$PWD/$_p ;; esac
+  while [ "$_p" != "/" ] && [ "${_p%/}" != "$_p" ]; do _p=${_p%/}; done
+  _head=$_p _tail=
+  while [ "$_head" != "/" ] && [ ! -d "$_head" ]; do   # walk up to the deepest existing directory
+    _tail=/${_head##*/}$_tail
+    _head=${_head%/*}
+    [ -n "$_head" ] || _head=/
+  done
+  _root=$(CDPATH= cd -- "$_head" 2>/dev/null && pwd -P) || _root=$_head
+  case $_root in
+    /) printf '/%s\n' "${_tail#/}" ;;
+    *) printf '%s%s\n' "$_root" "$_tail" ;;
+  esac
+}
+
+# canon_list: a ':'-separated path list -> canonical, deduplicated, ':'-separated.
+canon_list() {
+  _ifs=$IFS; IFS=:
+  _out=
+  for _x in $1; do
+    [ -n "$_x" ] || continue
+    _c=$(canon "$_x")
+    case ":$_out:" in *":$_c:"*) ;; *) _out=${_out:+$_out:}$_c ;; esac
+  done
+  IFS=$_ifs
+  printf '%s' "$_out"
+}
+
+# the paths an agent may write: its worktree, its output folder, its temp dir, the tool caches it needs
+# (cargo, uv, npm) and the runtime's own state dir; SANDBOX_WRITE adds more.
+write_list=$(canon "$worktree"):$(canon "$outdir"):$(canon "${TMPDIR:-/tmp}")
+if [ -n "${HOME:-}" ]; then
+  for _d in .cargo/registry .cache/uv Library/Caches/uv .npm .claude .codex; do
+    write_list=$write_list:$(canon "$HOME/$_d")
+  done
+fi
+if [ -n "${SANDBOX_WRITE:-}" ]; then write_list=$write_list:${SANDBOX_WRITE}; fi
+
+# the paths whose reads are denied: the macOS keychain dirs and SANDBOX_DENY (other repositories, secrets).
+deny_list=
+if [ -n "${HOME:-}" ]; then deny_list=$(canon "$HOME/Library/Keychains"); fi
+if [ -d /Library/Keychains ]; then deny_list=${deny_list:+$deny_list:}$(canon /Library/Keychains); fi
+if [ -n "${SANDBOX_DENY:-}" ]; then deny_list=${deny_list:+$deny_list:}${SANDBOX_DENY}; fi
+
+write_paths=$(canon_list "$write_list")
+deny_paths=$(canon_list "$deny_list")
+
+# sb_escape: quote a path for an SBPL string literal (backslash and double quote).
+sb_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# render_macos: read the template and replace the two markers with one rule per path.
+render_macos() {
+  _tmpl=$HERE/macos.sb.in
+  [ -f "$_tmpl" ] || die "profile template not found: $_tmpl"
+  _ifs=$IFS; IFS=:
+  _deny= _write=
+  for _p in $deny_paths; do
+    [ -n "$_p" ] || continue
+    _deny="$_deny
+(deny file-read* (subpath \"$(sb_escape "$_p")\"))"
+  done
+  for _p in $write_paths; do
+    [ -n "$_p" ] || continue
+    _write="$_write
+(allow file-write* (subpath \"$(sb_escape "$_p")\"))"
+  done
+  IFS=$_ifs
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case $_line in
+      @DENY_READ@) if [ -n "$_deny" ]; then printf '%s\n' "$_deny"; fi ;;
+      @ALLOW_WRITE@) if [ -n "$_write" ]; then printf '%s\n' "$_write"; fi ;;
+      *) printf '%s\n' "$_line" ;;
+    esac
+  done < "$_tmpl"
+}
+
+case $(uname -s) in
+  Darwin)
+    command -v sandbox-exec >/dev/null 2>&1 || die "sandbox-exec not found; refusing to run unsandboxed"
+    profile=$(render_macos)
+    [ -n "$profile" ] || die "rendered an empty profile"
+    exec sandbox-exec -p "$profile" "$@"
+    ;;
+  Linux)
+    # linux.sh applies the same policy with bwrap; it reads these two lists from the environment.
+    SANDBOX_WRITE_PATHS=$write_paths SANDBOX_DENY_PATHS=$deny_paths
+    export SANDBOX_WRITE_PATHS SANDBOX_DENY_PATHS
+    exec "$HERE/linux.sh" "$worktree" "$outdir" -- "$@"
+    ;;
+  *)
+    die "unsupported OS: $(uname -s) (only macOS sandbox-exec and Linux bwrap are supported)"
+    ;;
+esac
