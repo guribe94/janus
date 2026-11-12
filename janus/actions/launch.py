@@ -5,7 +5,7 @@ from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, in_container, job_script, runs_dir, task_rc, task_status, write_cap
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_script, board_shipped
-from janus.budgets import budget_for, transcript_cost, waste_paused
+from janus.budgets import budget_for, transcript_cost, waste_block
 from janus.cap import build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
 from janus.context import EXCL, Err, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, note_event, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
@@ -343,7 +343,7 @@ def cmd_launch(cfg, a):
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
     bd = Beads(cfg); units = bd.units(); prev = next((u for u in units if u["name"] == name), None)
     if prev and a.kind != "review": raise Err(f"{name} already launched on {prev.get('host')}")
-    wp = waste_paused(cfg)
+    wp = waste_block(cfg)
     if wp: raise Err(f"refused (waste pause): {wp}")
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
