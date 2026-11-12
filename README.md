@@ -244,6 +244,11 @@ A `cleanup` unit frees disk and load, so neither `min_disk_gb` nor the load limi
 - **Environment:** every agent gets `ORCH_ROLE=agent`, `ORCH_UNIT`, `ORCH_REPORT` and `ORCH_ROOT`. `pueue add` always runs with
   an allow-listed environment (PATH, HOME, USER, LANG, TMPDIR, SSH_AUTH_SOCK ...) plus those, never the caller's: pueue stores a
   task's whole environment in its state file, so a caller's `ANTHROPIC_API_KEY` or session token would land on disk.
+- **Remote brief paths:** every absolute path the brief names must reach the agent there. A path in the unit's tree becomes
+  the same path in its copy; a file under the project root (reports, logs, briefs) is copied to `<root>/ctx/<unit>/` and the
+  brief rewritten to the copy (a named project root becomes that folder, and its `B/out/x.md`-style files are copied too); a
+  missing path under `out/<unit>` becomes the host's; any other path must exist on the host. Otherwise the launch is refused
+  before anything is recorded, naming each path.
 - **Remote:** the worktree goes to `<root>/worktrees/<unit>` (and a copy to `<root>/base/<unit>` for collect); the brief gets a
   header naming the host-local test command `<root>/run/<unit>.lane '<cmd>'`, which runs the command through that host's
   pueue `jobs` lane with orch's admission and `MemoryMax`, waits and exits with its code. The key is sent from a detached

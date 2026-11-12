@@ -1670,6 +1670,11 @@ def cmd_launch(cfg, a):
         budget, bwhy = (a.budget, "--budget") if a.budget is not None else budget_for(cfg, mc, a.kind, a.tier)
         why_place += f"; budget ${budget:g} ({bwhy})"
     say(f"launch {name}: model={mname} host={hn} builds on {build} ({why_place}) cwd={cwd}")
+    btext = brief.read_text()
+    if not local:   # every path the brief names must reach the agent there (refused before anything is recorded)
+        btext, bcopy, bnotes = brief_plan(cfg, h, name, cwd, btext)
+        for n_ in bnotes: say(f"note: {n_}")
+        if bcopy or btext != brief.read_text(): say(f"brief for {hn}: {len(bcopy)} file(s) copied to {h['root']}/ctx/{name}, paths rewritten")
     if mc["kind"] == "api":
         read_secret(cfg.prov[mc["provider"]])   # the secret store answers before anything is reserved or recorded
         ok, w = model_ok(cfg, mname)
@@ -1707,7 +1712,8 @@ def cmd_launch(cfg, a):
             put_script(h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
             if not cfg.paths.get("board"): put_script(h, f"{root}/bin/board.sh", board_script(cfg).read_text())   # the shipped board there (outbox)
             if not DRY: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
-            put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["ORCH_REPORT"]) + brief.read_text(), "644")
+            ship_context(cfg, h, name, bcopy)
+            put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["ORCH_REPORT"]) + btext, "644")
             if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
                 put_script(h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
             else: X(h, f"[ -s {qp(env['ORCH_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['ORCH_REPORT'])}")
@@ -1793,6 +1799,59 @@ def cmd_launch(cfg, a):
     st = u.get("start_state", "running" if u["via"] == "herdr" else "unknown")
     say((f"launched {name} on {hn} via {u['via']}" if st in ("running", "queued", "finished") else f"queued {name} on {hn} via {u['via']}, NOT confirmed running ({st})")
         + (f" (task {u['task']}{', waiting for an agents slot' if st == 'queued' else ''})" if u.get("task") is not None else ""))
+
+# ---------------------------------------------------------------- briefs reach remote agents (orch-fixes10 item 4)
+PATH_RX = re.compile(r"(?<![\w.:/~$>)\]}*-])(/[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*)")
+
+def brief_paths(text):
+    """Every absolute path the brief names (trailing dots stripped), in order, once."""
+    return list(dict.fromkeys(m.group(1).rstrip(".") for m in PATH_RX.finditer(text) if len(m.group(1)) > 1))
+
+def brief_plan(cfg, h, name, cwd, text):
+    """(text for the remote agent, [(local path, path relative to the project root)] to copy, notes). A path in the unit's tree
+    becomes the same path in its copy there; a path under the project's root (reports, logs, briefs) that exists here is copied
+    to <root>/ctx/<unit>/ and rewritten to the copy (the root itself: that folder); a missing one under out/<unit> becomes the
+    host's out/<unit>; any other path must exist on the host. Raises Err naming every path the agent could not reach."""
+    root = h["root"]; ctx = f"{root}/ctx/{name}"; pr = cfg.root.resolve(); cw = Path(cwd).resolve()
+    rep, copy, ask, notes = {}, [], [], []
+    for p in brief_paths(text):
+        q = Path(p)
+        try: rq = q.resolve()
+        except OSError: rq = q
+        if p.startswith(str(root).rstrip("/") + "/") or p == root: continue   # already a path there
+        if rq == cw or cw in rq.parents: rep[p] = f"{root}/worktrees/{name}" + ("/" + str(rq.relative_to(cw)) if rq != cw else ""); continue
+        if rq == pr: rep[p] = ctx; notes.append(f"{p} is the project root: named as {ctx} (only the files the brief names are copied)"); continue
+        if pr in rq.parents:
+            rel = rq.relative_to(pr)
+            if q.exists(): rep[p] = f"{ctx}/{rel}"; copy.append((str(rq), str(rel))); continue
+            if rel.parts[:2] == ("out", name): rep[p] = f"{root}/{rel}"; continue
+            ask.append(p); continue
+        ask.append(p)
+    if pr in [Path(p).resolve() for p in rep if rep[p] == ctx]:   # the root is named (B = <root>): B/out/x.md and out/x.md files too
+        have = {r for _, r in copy}
+        for m in re.finditer(r"(?<![\w./~$-])([A-Za-z0-9._-]+(?:/[A-Za-z0-9._@+-]+)+)", text):
+            t = m.group(1).rstrip("."); parts = t.split("/")
+            for rel in ("/".join(parts), "/".join(parts[1:])):
+                f = pr / rel
+                if rel and rel not in have and f.is_file() and pr in f.resolve().parents and not f.resolve().is_relative_to(cw):
+                    have.add(rel); copy.append((str(f.resolve()), rel)); break
+    if ask:   # must exist on the host as named (a system path, a path of that host)
+        rc, o, e = hrun(h, "for p in " + " ".join(shlex.quote(x) for x in ask) + '; do [ -e "$p" ] || echo "$p"; done', timeout=30)
+        missing = [x for x in o.splitlines() if x.strip()] if rc == 0 else ask
+        if missing: raise Err(f"refused: the brief names path(s) the agent on that host cannot reach (not in its tree, not under the project root here, "
+                              f"not on the host): {', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}")
+    for p in sorted(rep, key=len, reverse=True): text = re.sub(r"(?<![\w.:/~$>)\]}*-])" + re.escape(p) + r"(?![A-Za-z0-9_@+/-]|\.[A-Za-z0-9_@+/-])", lambda m, r=rep[p]: r, text)
+    return text, copy, notes
+
+def ship_context(cfg, h, name, copy):
+    """Copy the brief's files under the project root to <root>/ctx/<unit>/ on the host (one rsync, relative paths kept)."""
+    if not copy: return
+    ctx = f"{h['root']}/ctx/{name}"
+    if DRY: say(f"+ copy to {h.get('ssh')}:{ctx}/: " + ", ".join(r for _, r in copy)); return
+    X(h, f"mkdir -p {qp(ctx)}")
+    lst = "".join(r + "\n" for _, r in copy)
+    rc, o, e = sh(["rsync", "-a", "-r", "--files-from=-", "-e", " ".join(SSH), f"{cfg.root.resolve()}/", f"{h['ssh']}:{ctx}/"], inp=lst, timeout=600)
+    if rc: raise Err(f"copying the brief's files to {h.get('ssh')} failed: {(e or o).strip()[-160:]}")
 
 def get_unit(cfg, name):
     bd = Beads(cfg); u = next((u for u in bd.units() if u["name"] == name), None)
