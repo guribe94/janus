@@ -137,6 +137,14 @@ class Autopilot(unittest.TestCase):
         self.assertEqual(len(ans), 1, ans); self.assertEqual(ans[0][1], "7"); self.assertIn("gates run on the build host", ans[0][2])
         self.assertIn("question:7", self.cfg.jget("acks.json"))
 
+    def test_a_question_merely_mentioning_a_memory_key_is_not_answered(self):
+        """Catches (panel-eng F7): a question that only mentions a memory key as a word ("may I skip the gate-host check?")
+        answered with that entry, so the agent proceeds on a non-answer."""
+        janus.memory_write(self.cfg, [("Decisions", "2026-11-11", "gate-host", "gates run on the build host", None)])
+        with mock.patch.object(janus, "board_questions", lambda c: [(9, "a3", "", "may I skip the gate-host check for docs?")]):
+            janus.tend_autopilot(self.cfg, {}, [], [], lambda m: None)
+        self.assertEqual([p for p in self.posts if p[0] == "answer"], [], "answered a question that did not ask for the entry")
+
 
 class OnceOnly(unittest.TestCase):
     def test_resume_and_wrapup_once_even_when_the_unit_record_save_fails(self):
