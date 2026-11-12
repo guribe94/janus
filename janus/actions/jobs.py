@@ -502,7 +502,11 @@ def cancel_job(cfg, ref, force=False, depth=0):
         except Err as e: out.append(f"{r}: {e}")
     return out
 
-def thrash_cfg(h): return (float(h.get("thrash_psi", 40)), float(h.get("thrash_min", 5)))
+def thrash_cfg(cfg, h):
+    """(threshold PSI, minutes over it) for a shared host: `thrash_psi` when set, else the host's admission pause threshold
+    (`psi_pause`) -- item 19: a fixed default of 40 was higher than the 10 that pauses admission, so a shared host whose
+    pressure paused admission (PSI ~20) never reached the thrash threshold and nothing stopped its job."""
+    return (float(h["thrash_psi"]) if "thrash_psi" in h else float(capv(cfg, h, "psi_pause")), float(h.get("thrash_min", 5)))
 
 def host_psi(p):
     v = p.get("cap_psi") or p.get("psi")
@@ -513,7 +517,7 @@ def thrash_track(cfg, hs):
     st = cfg.jget("thrash.json"); out = {}
     for n, h in cfg.hosts.items():
         if not h.get("shared") or not (hs.get(n) or {}).get("ok"): st.pop(n, None); continue
-        psi = host_psi(hs[n]); lim, _ = thrash_cfg(h)
+        psi = host_psi(hs[n]); lim, _ = thrash_cfg(cfg, h)
         if psi is None or psi <= lim: st.pop(n, None); out[n] = (psi, 0.0); continue
         st.setdefault(n, int(now())); out[n] = (psi, (now() - st[n]) / 60)
     cfg.jput("thrash.json", st)
@@ -542,7 +546,7 @@ def requeue_host(cfg, hs, units, n, spec):
     for m, h in cfg.hosts.items():
         p = hs.get(m) or {}
         if m == n or not p.get("ok") or (spec.get("lane") == "land" and not h.get("local")) or not host_meets(cfg, m, fs.get(m), needs)[0]: continue
-        if h.get("shared") and (host_psi(p) or 0) > thrash_cfg(h)[0]: continue
+        if h.get("shared") and (host_psi(p) or 0) > thrash_cfg(cfg, h)[0]: continue
         if host_cap(cfg, m, p, units)["free"] > 0 and not host_cap(cfg, m, p, units)["pause"]: return m
     return n
 
@@ -559,7 +563,7 @@ def tend_thrash(cfg, hs, units, log, dry=False):
     """Lines saying what was (or, dry, would be) done on each shared host over its thrash limit."""
     out = []
     for n, (psi, mins) in thrash_track(cfg, hs).items():
-        lim, need = thrash_cfg(cfg.hosts[n])
+        lim, need = thrash_cfg(cfg, cfg.hosts[n])
         if psi is None or psi <= lim or mins < need:
             if dry: out.append(f"{n}: memory PSI {psi if psi is not None else '-'} (limit {lim:g} for {need:g} min): {'over for ' + format(mins, '.0f') + ' min' if mins else 'fine'}")
             continue
