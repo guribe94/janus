@@ -659,14 +659,15 @@ class AdmitBound(unittest.TestCase):
                 return type("R", (), {"returncode": 0})()
             return real_run(cmd, **k)
         states = [{"status": {"Queued": {}}}, {"status": {"Done": {"result": "Success"}}}]
-        real = janus.task_status, janus.probe
+        real = janus.task_status, janus.probe, janus.hrun
         subprocess.run = fake_run
         janus.task_status = lambda h, tid: states.pop(0) if states else {"status": {"Done": {"result": "Success"}}}
         janus.probe = lambda n, h, **k: {"cap_admit": "disk", "cap_pause": "", "disk_gb": "9"}
+        janus.hrun = lambda h, script, **k: (0, "y\n", "")   # this job's own admission-wait file exists (finding 2, fix-install6)
         out = io.StringIO()
         try:
             with contextlib.redirect_stderr(out): rc = janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
-        finally: subprocess.run = real_run; janus.task_status, janus.probe = real
+        finally: subprocess.run = real_run; janus.task_status, janus.probe, janus.hrun = real
         self.assertEqual(rc, 0)
         self.assertIn("held by admission", out.getvalue()); self.assertIn("disk", out.getvalue())
 

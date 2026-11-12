@@ -191,11 +191,21 @@ def task_rc(t):
     if isinstance(r, dict) and "Failed" in r: return int(r["Failed"])
     return 137 if r == "Killed" else 1
 
+def admission_wait(cfg, h, jid):
+    """True while this job is waiting in janus's admission on its host: its own runs/<jid>.wait (jobs/land) or <jid>.gwait
+    (gates) file exists (templates.ADMIT writes it before the loop and removes it once admitted). Finding 2 (fix-install6): the
+    caller reports only a task admission really holds -- a task that started and runs normally has no wait file and is neither
+    probed nor reported."""
+    rd = runs_dir(cfg, h)
+    rc, o, e = hrun(h, f"ls {qp(f'{rd}/{jid}.wait')} {qp(f'{rd}/{jid}.gwait')} 2>/dev/null", timeout=30)
+    return bool(o.strip())
+
 def finish_job(cfg, hn, h, tid, jid, quiet=False):
     """Wait for the task, print its log, return its exit code. Each wait is bounded (WAIT_STEP s), so a task held by the host's
     admission is reported with the host's admission reason instead of waiting in silence (item 21). Finding 9: report only a task
-    the host's admission is really holding (the same rule as the check, hosts.py): a task that has merely not started, or one
-    running normally, is not reported (the old condition reported the former and stayed silent for the latter)."""
+    the host's admission is really holding (the same rule as the check, hosts.py). Finding 2 (fix-install6): the answer is this
+    job's OWN admission-wait file, not the host's `cap_admit` (the answer for ONE MORE job): a task that started and runs normally
+    is never probed or reported (the old condition reported it whenever a heavy job made admission say no)."""
     miss = 0; last = 0
     while True:
         try:
@@ -205,10 +215,11 @@ def finish_job(cfg, hn, h, tid, jid, quiet=False):
             t = task_status(h, tid)
             if task_rc(t) is not None: break
             if now() - last >= WAIT_STEP:
-                p = probe(hn, h, cfg=cfg); last = now()
-                adm = (p.get("cap_admit") or "").strip(); paused = (p.get("cap_pause") or "").strip()
-                if paused or (adm and adm != "yes"):   # only a task admission really holds, never one merely queued
-                    print(f"janus: {hn} task {tid} is held by admission after {WAIT_STEP}s ({paused or adm}): see janus queue {hn}", file=sys.stderr)
+                last = now()
+                if admission_wait(cfg, h, jid):   # only a task this job's own admission is holding, never one merely queued/running
+                    p = probe(hn, h, cfg=cfg)
+                    adm = (p.get("cap_admit") or "").strip(); paused = (p.get("cap_pause") or "").strip()
+                    print(f"janus: {hn} task {tid} is held by admission after {WAIT_STEP}s ({paused or adm or 'admission blocked'}): see janus queue {hn}", file=sys.stderr)
             continue
         t = task_status(h, tid)
         if task_rc(t) is not None: break
