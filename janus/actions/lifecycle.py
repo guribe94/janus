@@ -4,7 +4,7 @@ import os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import collect_job, job_of, job_state, runs_dir, save_task_log, task_rc, task_status, unit_jobs
 from janus.actions.launch import api_remote, confirm_started
-from janus.autopilot import record
+from janus.autopilot import forget, record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
 from janus.budgets import bset
@@ -350,18 +350,35 @@ def tend_parked(cfg, hs, units, log):
                     if card_fields(cfg, u["name"]).get("state") != "waiting": board(cfg, "post", u["name"], "waiting", " ".join(jobs))   # never SILENT/GONE
                 st = [job_state(hs, j)[0] for j in jobs]
                 if all(x in ("done", "gone") for x in st):
-                    try: log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs)))
-                    except Err as e:   # recorded on the unit: check reports it (review-fixes9 #2: the log was the only trace)
-                        if (u.get("resume_error") or {}).get("why") != str(e): u["resume_error"] = {"why": str(e), "at": int(now())}; bd.save(u)
-                        raise
-                    u.pop("resume_error", None)
-                    u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
-                    record(cfg, f"parked:{u['name']}", f"resume:{','.join(jobs)}", f"resumed: jobs {', '.join(jobs)} finished", u)
+                    # once only (panel-eng F1): the handled fact is recorded here before the resume and guards it; the unit
+                    # record (bd) is saved best-effort after, so a failed save cannot start a second run on the same session
+                    key, cause = f"parked:{u['name']}", f"resume:{','.join(jobs)}"
+                    if cfg.run.dry or record(cfg, key, cause, f"resumed: jobs {', '.join(jobs)} finished", u):
+                        try: log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs)))
+                        except Err as e:   # nothing started: recorded on the unit, check reports it; the next pass tries again
+                            if not cfg.run.dry: forget(cfg, key, cause, str(e))
+                            if (u.get("resume_error") or {}).get("why") != str(e): u["resume_error"] = {"why": str(e), "at": int(now())}; save_soft(bd, u, log)
+                            raise
+                        u.pop("resume_error", None)
+                    elif set(jobs) <= set(u.get("handled_jobs", [])): continue
+                    else: log(f"{u['name']}: already resumed for {', '.join(jobs)}; saving the unit record again")
+                    if cfg.run.dry: continue
+                    u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); save_soft(bd, u, log)
                 continue
             if wrap_due(cfg, u):
-                log(resume_unit(cfg, u, WRAPUP.format(report=report_path(cfg, u) if cfg.hosts[u["host"]].get("local") else f"{cfg.hosts[u['host']]['root']}/out/{u['name']}/REPORT.md"), wrapup=True))
-                bd.save(u); record(cfg, f"unit:{u['name']}", "wrapup", "ended at its budget cap without a verdict: resumed once to write its report", u, ack=f"unit:{u['name']}:limit")
+                if not cfg.run.dry and not record(cfg, f"unit:{u['name']}", "wrapup", "ended at its budget cap without a verdict: resumed once to write its report", u, ack=f"unit:{u['name']}:limit"):
+                    continue   # already wrapped up once (the unit record's save failed): never a second wrap-up run
+                try: log(resume_unit(cfg, u, WRAPUP.format(report=report_path(cfg, u) if cfg.hosts[u["host"]].get("local") else f"{cfg.hosts[u['host']]['root']}/out/{u['name']}/REPORT.md"), wrapup=True))
+                except Err as e:
+                    if not cfg.run.dry: forget(cfg, f"unit:{u['name']}", "wrapup", str(e), ack=f"unit:{u['name']}:limit")
+                    raise
+                save_soft(bd, u, log)
         except Err as e: log(f"{u['name']}: {e}")
+
+def save_soft(bd, u, log):
+    """Save the unit record best-effort: the once-only facts live in .janus/autopilot.json, so a busy bd only delays it."""
+    try: bd.save(u)
+    except Err as e: log(f"{u['name']}: saving the unit record failed ({e}); retried next pass")
 
 def wrap_due(cfg, u):
     """A run that ended at its budget cap without a final verdict, not yet wrapped up (item 2)."""
