@@ -313,6 +313,34 @@ class Probe(unittest.TestCase):
             self.assertEqual((p["cap_rj"], p["cap_rm"]), ("1", "700")); self.assertTrue(p["res"])
         finally: s.kill(); s.wait()
 
+class Park(unittest.TestCase):
+    """orch-fixes9 item 1: a WAITING line parks a unit on its jobs; PENDING is no verdict; a resume continues the session."""
+    def test_waiting_line_jobs_and_states(self):
+        d, cfg = project(); r = d / "out/u/REPORT.md"; r.parent.mkdir(parents=True)
+        r.write_text("VERDICT: PENDING\nstep 1 done\nWAITING here:7 here:8 nohost:9\n")
+        u = {"name": "u", "started": 0}
+        self.assertIsNone(orch.verdict(cfg, u))   # PENDING is not a verdict (close and park relied on that)
+        self.assertEqual(orch.waiting_line_jobs(cfg, u), ["here:7", "here:8"])   # unknown hosts ignored
+        u["handled_jobs"] = ["here:7"]; self.assertEqual(orch.waiting_line_jobs(cfg, u), ["here:8"])
+        hs = {"here": {"ok": True, "waitjob": ["wt-1"], "pueue": {"tasks": {
+            "7": {"status": {"Done": {"result": "Success"}}}, "8": {"status": {"Running": {}}, "command": "bash /x/runs/wt-1.sh", "label": "unit:u"},
+            "9": {"status": {"Queued": {}}, "label": "unit:u"}}}}}
+        self.assertEqual(orch.job_state(hs, "here:7"), ("done", 0))
+        self.assertEqual(orch.job_state(hs, "here:8")[0], "admission")   # running, but still in orch's admission wait
+        self.assertEqual(orch.job_state(hs, "here:9")[0], "queued")
+        self.assertEqual(orch.job_state(hs, "here:5")[0], "gone")
+        self.assertEqual(sorted(orch.unit_jobs(hs, "u")), ["here:8", "here:9"])
+        r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\n"); self.assertEqual(orch.verdict(cfg, u), "VERDICT: DONE")
+
+    def test_resume_argv_and_no_ack(self):
+        mc = {"api_id": "x"}
+        a = orch.api_argv({}, mc, 1, "go", "S1")
+        self.assertEqual(a[:5], ["claude", "--bare", "-p", "--resume", "S1"]); self.assertEqual(a[-1], "go")
+        self.assertEqual(orch.api_argv({"cmd": ["c", "{prompt}"], "resume_cmd": ["c", "resume", "{session}", "{prompt}"]}, mc, 1, "go", "S1"), ["c", "resume", "S1", "go"])
+        with self.assertRaises(orch.Err): orch.api_argv({"cmd": ["c", "{prompt}"]}, mc, 1, "go", "S1")   # cannot guess how to resume
+        d, cfg = project()
+        with self.assertRaises(orch.Err): orch.cmd_ack(cfg, type("A", (), {"problem": "waiting:u", "decision": "x"})())
+
 class Generic(unittest.TestCase):
     def test_no_project_details_in_code(self):
         import re

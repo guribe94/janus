@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """orch: thin glue over beads (bd), pueue, tmux, herdr, ssh, rsync and git. Python 3.11+, standard library only.
 Reads orch.toml from the current directory or a parent. See docs/PLAN.md and skill/SKILL.md."""
-import argparse, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, time, tomllib
+import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, time, tomllib
 from pathlib import Path
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -187,7 +187,8 @@ class Beads:
             out.append({**m, "id": i["id"], "name": t[5:]})
         return out
     def save(self, u):
-        meta = {k: v for k, v in u.items() if k not in ("id", "name")}
+        """The unit's record (beads notes). What check computes on the fly (state, verdict, keys starting with _) is never saved."""
+        meta = {k: v for k, v in u.items() if k not in ("id", "name", "state", "verdict", "status") and not k.startswith("_")}
         self.run("update", u["id"], "--notes", json.dumps(meta))
     def create(self, title, label, desc=""): 
         r = self.run("create", title, "-l", label, "-d", desc)
@@ -224,7 +225,7 @@ def probe_extra(h):
     rd = h["_rd"]
     # old_rule: waiting jobs whose script sources neither runs/cap.sh nor runs/admit.sh (queued before the measured rule; audit H5)
     w = (f'g=0; j=0; o=0; ol=; for f in {rd}/*.gwait {rd}/*.wait; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null || continue; '
-         f'case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
+         f'b=${{f##*/}}; echo "waitjob=${{b%.*}}"; case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
          f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"')
     # schedulers (orch.toml, per host): extended regexes for the command lines of other job-running processes (an old queue); each
     # running one prints sched=<pid> <command>. legacy_lanes (the Mac): pid-file folders of an old lane; a live pid is one too.
@@ -254,7 +255,7 @@ def pueue(h):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
     return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
-LIST_KEYS = ("res", "hist", "sched", "direct")   # probe lines that repeat: kept as lists
+LIST_KEYS = ("res", "hist", "sched", "direct", "waitjob")   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
 
 def probe(name, h, ro=True, cfg=None):
     """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,
@@ -500,7 +501,7 @@ def host_cap(cfg, n, p, units):
     qd = sum(1 for x in t if x.get("group") in ("jobs", "gates") and "Queued" in str(x.get("status")))
     qd += int(fl(p.get("wait_jobs"))) + int(fl(p.get("wait_gates")))
     here = [u for u in units if (u.get("build") or u.get("host")) == n and u.get("state") not in ("done", "failed", "gone", "idle")]
-    on = [u for u in units if u.get("host") == n and u.get("state") not in ("done", "failed", "gone", "idle")]
+    on = [u for u in units if u.get("host") == n and u.get("state") not in ("done", "failed", "gone", "idle", "parked")]
     agents_mb = max(ram, len(on) * amb)   # every open agent on the host holds the agent figure (reservation files of api agents at least)
     slots = max(1, min(c["cores"] // c["cpj"], (c["memcap"] - agents_mb) // max(jmb, 1)))
     pause = p.get("cap_pause", "")
@@ -739,7 +740,7 @@ def verdict(cfg, u):
     try: t = p.read_text().splitlines()
     except OSError: return None
     if u.get("resume") and (p.stat().st_mtime < u.get("started", 0) or (t and "PENDING" in t[0])): return None
-    return next((l for l in reversed(t) if l.startswith("VERDICT:")), None)
+    return next((l for l in reversed(t) if l.startswith("VERDICT:") and "PENDING" not in l), None)   # PENDING is not a verdict
 
 def herdr_agents(cfg):
     r = herdr("agent", "list")
@@ -992,7 +993,21 @@ def collect_findings(cfg, hs, units, ag, bd_err):
     for u in units:
         st = unit_state(u, hs, ag); v = verdict(cfg, u); u["state"] = st; u["verdict"] = v
         age = now() - u.get("started", now())
-        if st in ("working", "queued"): running += 1
+        # parked (orch-fixes9 item 1): recorded, or its turn ended with a WAITING line; no verdict yet
+        pk = [] if v else ((u.get("parked") or {}).get("jobs") or (waiting_line_jobs(cfg, u) if st in ENDED or u.get("via") == "tmux" else []))
+        if pk:
+            u["_park"] = pk; u["state"] = st = "parked"
+            js = {j: job_state(hs, j)[0] for j in pk}
+            if any(x in ("paused", "stashed", "locked") for x in js.values()):
+                F.append((f"parked:{u['name']}", f"{u['name']} is parked on {', '.join(f'{j} {x}' for j, x in js.items())}: a job that is not queued or running never resumes it"))
+        elif st == "working":   # alive while its own jobs wait for admission: it pays to wait (cannot be acked)
+            jw = [j for j in unit_jobs(hs, u["name"]) if job_state(hs, j)[0] in ("queued", "admission")]
+            if jw:
+                sp, how = unit_spend(cfg, u); hrs = max((now() - max(u.get("started", now()), u.get("resumed_at", 0))) / 3600, 1 / 60)
+                rate = f"about ${sp / hrs:.2f}/h ({how})" if sp is not None else f"cost per hour unknown ({how})"
+                F.append((f"waiting:{u['name']}", f"{u['name']} is alive while its job(s) {', '.join(jw[:4])} wait for admission, {rate}: "
+                          f"orch park {u['name']} (stops it; it resumes, same session, when its jobs finish)"))
+        if st in ("working", "queued", "parked"): running += 1
         if st == "blocked":
             r = herdr("agent", "read", u["name"], "--source", "detection") or {}
             F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}"))
@@ -1064,7 +1079,8 @@ def live_state(cfg, hs, units, F):
     L = ["## Live state (" + ts() + ")", "Hosts:"] + ["- " + cap_line(cfg, n, p, units) for n, p in hs.items()]
     L.append("Units:")
     for u in units:
-        L.append(f"- {u['name']} | {u.get('host')} | {u.get('model')} | {u.get('state', '?')} | {int((now() - u.get('started', now())) / 60)}m | {u.get('verdict') or 'no verdict'}")
+        L.append(f"- {u['name']} | {u.get('host')} | {u.get('model')} | {u.get('state', '?')}" + (f" on {' '.join(u['_park'][:4])}" if u.get("_park") else "")
+                 + f" | {int((now() - u.get('started', now())) / 60)}m | {u.get('verdict') or 'no verdict'}")
     if not units: L.append("- none")
     try: rd = ready_work(cfg); L.append("Queue: " + (", ".join(i.get("title", "")[:40] for i in rd[:8]) or "empty"))
     except Err as e: L.append(f"Queue: unavailable ({e})")
@@ -1098,7 +1114,7 @@ def run_check(cfg, cycle=True, writer=None):
     F = collect_findings(cfg, hs, units, ag, bd_err)
     if not cfg.ro: tune_pueue(cfg, hs, units)
     acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
-    F = [(k, t) for k, t in F if k not in acks]
+    F = [(k, t) for k, t in F if k not in acks or k.startswith(NO_ACK)]
     op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
     live = live_state(cfg, hs, units, F); write_handoff(cfg, live)
     if cycle: cfg.touch("last_cycle")
@@ -1135,6 +1151,7 @@ def cmd_board_close(cfg, a):
 
 def cmd_ack(cfg, a):
     k, d = a.problem, a.decision
+    if k.startswith(NO_ACK): raise Err(f"{k} cannot be acked: it costs money every hour; act on it (orch park {k.split(':', 1)[1]})")
     acks = live_acks(cfg); acks[k] = {"t": now()}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
     try:
         bd = Beads(cfg); m = re.match(r"unit:([^:]+)", k)
@@ -1187,9 +1204,12 @@ def pick_model(cfg, tier, kind, of_vendor, host=None):
         why.append(f"{m}: {w}")
     raise Err("no model available for " + tier + "/" + kind + " (" + "; ".join(why) + ")")
 
-def agent_prompt(cfg, unit, brief, hn):
+def agent_prompt(cfg, unit, brief, hn, report=None):
+    """The first prompt of a unit. It names the report path the unit must keep (row 26: a resumed unit continues its original
+    report, which orch reads; the agent must not guess it from the brief)."""
     rc, o, e = sh([str(cfg.p("board", "bin/board.sh")), "rule", unit, "mac" if cfg.hosts[hn].get("local") else hn])
-    return (f"Read {brief} and carry out every instruction exactly. Keep REPORT.md (path in the brief) current after every step (a run "
+    rp = f"your report {report}" if report else "REPORT.md (path in the brief)"
+    return (f"Read {brief} and carry out every instruction exactly. Keep {rp} current after every step (a run "
             f"stopped by its budget must leave its state written): line 1 'VERDICT: PENDING' "
             f"until done, then end with 'VERDICT: DONE' (or BLOCKED) and the real exit codes. {o.strip()}")
 
@@ -1215,8 +1235,15 @@ def deliver_key(h, fifo, key):
 API_CMD = ["claude", "--bare", "-p", "--model", "{api_id}", "--max-budget-usd", "{budget}", "--output-format", "json",
            "--dangerously-skip-permissions", "{prompt}"]   # [providers.<p>] cmd overrides; --bare: the key only, never a login
 
-def api_argv(pv, mc, budget, prompt):
-    return [x.format(api_id=mc.get("api_id", mc.get("model", "")), model=mc.get("model", ""), budget=budget, prompt=prompt) for x in pv.get("cmd", API_CMD)]
+def api_argv(pv, mc, budget, prompt, session=None):
+    """The agent's command line ([providers.<p>] cmd, default API_CMD). session: continue that session ([providers.<p>]
+    resume_cmd, e.g. ["codex", "exec", "resume", "{session}", "{prompt}"]; default: API_CMD with --resume {session})."""
+    t = pv.get("cmd", API_CMD)
+    if session:
+        if pv.get("resume_cmd"): t = pv["resume_cmd"]
+        elif "cmd" in pv: raise Err("the provider has its own cmd and no resume_cmd: set [providers.<p>] resume_cmd to resume a session")
+        else: t = [*API_CMD[:3], "--resume", "{session}", *API_CMD[3:]]
+    return [x.format(api_id=mc.get("api_id", mc.get("model", "")), model=mc.get("model", ""), budget=budget, prompt=prompt, session=session or "") for x in t]
 
 def put_script(h, path, text, mode="755"):
     """Write a script on host h by write-then-rename: a script that is running keeps reading its old file (orch-fixes7: a shell
@@ -1228,7 +1255,7 @@ def atomic_write(p, text, mode=0o644):
     p = Path(p); p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp"); tmp.write_text(text); tmp.chmod(mode); os.replace(tmp, p)
 
-def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env):
+def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, session=None, run=None):
     """Headless agent as a pueue task on host h. The key goes over ssh stdin into a fifo that only that task reads: never a file,
     argv or pueue's environment."""
     pv = cfg.prov[mc["provider"]]; var, key = read_secret(pv)
@@ -1241,7 +1268,8 @@ def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env):
            f"  ( t0=$(date +%s); pk=0; while kill -0 $$ 2>/dev/null; do v=$(tree_mb $$); [ \"${{v:-0}}\" -gt $pk ] && pk=$v; sleep 10; done\n"
            f"    cap_record agent $pk $(( $(date +%s) - t0 )) 0; rm -f $RD/agent-{name}.res ) </dev/null >/dev/null 2>&1 &\nfi\n")
     script = (f"{h.get('agent_env', 'export PATH=$HOME/.local/bin:$PATH')}\nexport PATH={root}/run/bin:$PATH\n{ex}read -r K < {fifo}; rm -f {fifo}; export {var}=$K; unset K\n"
-              f"cd {q(rcwd)} || exit 1\n{res}exec {sd}{shlex.join(api_argv(pv, mc, budget, prompt))} < /dev/null > {od}/api.json 2> {od}/api.err\n")
+              f"cd {q(rcwd)} || exit 1\n{res}{sd}{shlex.join(api_argv(pv, mc, budget, prompt, session))} < /dev/null > {od}/api.json 2> {od}/api.err; rc=$?\n"
+              + (f"cp {od}/api.json {od}/api-{run}.json 2>/dev/null\n" if run else "") + "exit $rc\n")
     if DRY: return X(h, f"mkfifo {fifo}; write {root}/run/{name}.sh; {pueue(h)} add -g agents -l {name} -w {rcwd} --print-task-id -- sh {root}/run/{name}.sh; key | ssh cat > {fifo}")
     rc, o, e = hrun(h, f"mkdir -p {root}/run/bin {od} && rm -f {fifo} && mkfifo -m 600 {fifo}")
     if rc: return rc, o, e
@@ -1271,8 +1299,9 @@ def cmd_api_run(cfg, a):
     shim = cfg.f("bin"); put_script({"local": True}, str(shim / "pueue"), clean_pueue_script({"local": True}))
     env = clean_env({"ORCH_ROLE": "agent", "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root), "ORCH_REPORT": a.report or str(od / "REPORT.md"), var: key})
     env["PATH"] = f"{shim}:{env['PATH']}"   # the agent's own `pueue add` never stores the key in pueue's state file
-    argv = api_argv(pv, mc, a.budget, agent_prompt(cfg, name, a.brief, hn))
-    say(f"orch api-run {name}: run {run}, model {mc.get('api_id', a.model)}, budget ${a.budget}, cwd {a.cwd}")
+    prompt = Path(a.prompt_file).read_text() if a.prompt_file else agent_prompt(cfg, name, a.brief, hn, a.report or str(od / "REPORT.md"))
+    argv = api_argv(pv, mc, a.budget, prompt, a.resume_session)
+    say(f"orch api-run {name}: run {run}, model {mc.get('api_id', a.model)}, budget ${a.budget}, cwd {a.cwd}" + (f", resuming session {a.resume_session}" if a.resume_session else ""))
     import signal
     with open(od / "api.json", "w") as fo, open(od / "api.err", "w") as fe:
         p = subprocess.Popen(argv, cwd=a.cwd, env=env, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe)
@@ -1291,9 +1320,18 @@ def cmd_api_run(cfg, a):
         except InterruptedError: continue
     resf.unlink(missing_ok=True)
     if peak: record_history(rd, "agent", peak, int(now() - t0), rc)
-    cost, reported = run_cost(od / "api.json", a.budget)
+    cost, reported = run_cost(od / "api.json", a.budget); how = ""
+    if reported:
+        try: atomic_write(od / f"api-{run}.json", (od / "api.json").read_text())   # every run's own json (orch report, resumes)
+        except OSError: pass
+    else:   # stopped before it wrote its cost (orch park, stop): its transcript since this run started, + 25 %, at most the budget
+        f = transcript_of(cfg, {"rcwd": a.cwd, "started": t0 - 5, "brief": a.brief}) if not a.resume_session else \
+            next(iter(sorted((Path.home() / ".claude/projects").glob(f"*/{a.resume_session}.jsonl"))), None)
+        est = transcript_cost(cfg, f, since=t0 - 5)[0] if f else None
+        if est is not None: cost, how = min(float(a.budget), round(est * 1.25, 4)), " (no cost reported: transcript estimate + 25 %)"
+        else: how = " (no cost reported: charged the whole budget)"
     ledger_done(cfg, pv, run, name, cost, rc)
-    say(f"orch api-run {name}: exit {rc}, cost ${cost:.4f}" + ("" if reported else " (no cost reported: charged the whole budget)"))
+    say(f"orch api-run {name}: exit {rc}, cost ${cost:.4f}{how}")
     return rc
 
 # A pueue that never stores the caller's environment: an agent holds ANTHROPIC_API_KEY in its own environment (claude passes
@@ -1317,25 +1355,37 @@ def clean_pueue_script(h):
 
 def lane_runner(cfg, hn, h, name, rcwd):
     """<root>/run/<unit>.lane on host h: `lane <command>` runs the command in the agent's tree through this host's pueue jobs lane,
-    with orch's admission (runs/cap.sh: reservations) and MemoryMax, waits, prints the log and exits with its code (M9; fixes5 item 2)."""
+    with orch's admission (runs/cap.sh: reservations) and MemoryMax, waits, prints the log and exits with its code (M9; fixes5 item 2).
+    `lane --detach <command>` queues it, prints <host>:<task> and returns at once (orch-fixes9: agents never wait)."""
     a = argparse.Namespace(lane="jobs", subdir=None, usb=False, wt=rcwd)
     rd = runs_dir(cfg, h); q = shlex.quote
     crd = in_container(h, rd)   # the runs dir as the job sees it
     js = job_script(cfg, hn, h, a, name, f"bash {crd}/__JID__.cmd", "__JID__", wd=rcwd, clsrc='"$(cat $R.cmd)"')
     return ("#!/bin/bash\n# orch lane runner for unit " + name + f" on {hn}: lane <command>\nRD={q(rd)}; mkdir -p $RD\n"
+            f"det=; [ \"$1\" = --detach ] && {{ det=1; shift; }}\n"
             f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=$RD/$jid\nprintf '%s\\n' \"$*\" > $R.cmd\n"
             f"cat > $R.sh <<'ORCH_JOB_EOF'\n{js}ORCH_JOB_EOF\nsed -i \"s/__JID__/$jid/g\" $R.sh\n"
             f"{pueue(h)} group add -p 1 jobs >/dev/null 2>&1\n"
             f"tid=$(env -i HOME=\"$HOME\" USER=\"$USER\" PATH=\"$PATH\" ${{XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"}} LANG=\"${{LANG:-C.UTF-8}}\" {pueue(h)} add -g jobs -l unit:{name} -w $RD --print-task-id -- bash $R.sh) || exit 125\n"
-            f"echo \"lane: queued {hn}:$tid ($jid)\" >&2\n{pueue(h)} wait -q $tid; cat $R.log; exit $(cat $R.rc 2>/dev/null || echo 255)\n")
+            f"echo \"lane: queued {hn}:$tid ($jid)\" >&2\n[ -n \"$det\" ] && {{ echo \"{hn}:$tid\"; exit 0; }}\n"
+            f"{pueue(h)} wait -q $tid; cat $R.log; exit $(cat $R.rc 2>/dev/null || echo 255)\n")
 
-def brief_header(cfg, hn, h, name, rcwd, local):
-    if local: return ""
+PARK_RULE = ("**Never wait for a build or test (orch rule).** Submit it with `{submit}`: it prints the job id (`<host>:<task>`) at once. "
+             "Then write a line `WAITING <job ids>` in your report ({report}) and end your turn. Do not poll, sleep or wait for a job: "
+             "orch resumes this same session with each job's exit code and log path when all of them have finished. A turn spent "
+             "waiting costs money and can end the run at its budget cap with nothing written.\n\n")
+
+def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None):
+    """The header every unit's brief gets: where it runs, how it submits builds and tests (detached, then WAITING), its report."""
+    if local:
+        b = build or hn
+        return (f"<!-- orch: unit {name} runs on {hn} -->\n" + PARK_RULE.format(
+            submit=f"orch run --detach --host {b} --wt {rcwd} -- '<command>'", report=report or "REPORT.md"))
     lane = f"{h['root']}/run/{name}.lane"
     return (f"<!-- orch: unit {name} runs on {hn} -->\n**Where you run (orch):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `orch collect` "
             f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
-            f"`{lane} '<command>'` (for example `{lane} 'cargo test -p <crate>'`). It waits for admission, runs, prints the log and exits "
-            f"with the command's code. Do not run builds, tests or other heavy commands directly.\n\n")
+            f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
+            f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=report or "REPORT.md"))
 
 def place(cfg, a, brief, mc, units, hs):
     """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
@@ -1487,13 +1537,17 @@ def cmd_launch(cfg, a):
             X(h, f"rm -rf {root}/base/{name} && cp -a {rcwd} {root}/base/{name}", timeout=300)
             put_script(h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
             if not DRY: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
-            put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local) + brief.read_text(), "644")
+            put_script(h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["ORCH_REPORT"]) + brief.read_text(), "644")
             if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
                 put_script(h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
             else: X(h, f"[ -s {root}/out/{name}/REPORT.md ] || echo 'VERDICT: PENDING' > {root}/out/{name}/REPORT.md")
         rep = outd / "REPORT.md"
         if not report and not rep.exists() and not DRY: rep.write_text("VERDICT: PENDING\n")
-        prompt = agent_prompt(cfg, name, rbrief, hn)
+        if local:   # the brief with orch's header (the park rule) as the agent reads it: out/<unit>/<brief name>
+            rbrief = str(outd / (brief.name if (outd / brief.name).resolve() != brief.resolve() else "orch-" + brief.name))
+            if not DRY: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["ORCH_REPORT"]) + brief.read_text())
+        u["rbrief"] = rbrief
+        prompt = agent_prompt(cfg, name, rbrief, hn, env["ORCH_REPORT"])
         u["rcwd"] = rcwd
         if mc["kind"] == "api":
             X(h, ensure_lanes(h, cfg))
@@ -1505,7 +1559,7 @@ def cmd_launch(cfg, a):
                                   "--brief", rbrief, "--cwd", rcwd, "--report", env["ORCH_REPORT"]])
                 rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(rcwd)} --print-task-id -- {cmd}", env=env)
             else:
-                rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env)
+                rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, run=run)
             if rc and not DRY: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
             if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
             u.update(via="pueue", task=int(o.strip() or 0))
@@ -1681,6 +1735,225 @@ def cmd_close(cfg, a):
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); cfg.touch("changed")
     say("closed")
 
+# ---------------------------------------------------------------- park and resume (orch-fixes9 items 1, 2)
+# Agents never pay to wait. An agent submits its builds and tests detached (`orch run --detach`, or its lane runner's
+# `--detach`), which prints each job id (<host>:<task>) at once, writes `WAITING <job ids>` in its report and ends its turn.
+# The unit is then parked on those jobs (or `orch park <unit>` parks a live agent: its turn is stopped, its jobs keep running).
+# When every job has finished, the watcher resumes the same session with each job's exit code and log path: API units get a
+# new run (`claude -p --resume <session id>`, or the provider's resume_cmd, e.g. `codex exec resume`) with its own ledger
+# rows and the rest of the unit's budget; interactive agents get a prompt (herdr) or the text typed in (tmux). A run that
+# ends at its budget cap without a final verdict is resumed once with [budget] wrapup_usd (default 0.5) to write its report.
+ENDED = ("done", "failed", "gone", "idle")
+WAIT_RX = re.compile(r"^[\s*>-]*WAITING\b\**:?\s*(.*)$", re.M)
+JOBREF = re.compile(r"(?<![\w/.-])([A-Za-z0-9][\w.-]*):(\d+)\b")
+NO_ACK = ("waiting:",)   # findings an ack cannot hide: they cost money every hour until acted on
+WRAPUP = ("Your budget is used up. Do no more work: write your report now ({report}): what is done, the state it is in, what is "
+          "left, the real exit codes of everything you ran, and the final line 'VERDICT: BLOCKED' (or DONE if it is done). Then stop.")
+
+def report_text(cfg, u):
+    try: return report_path(cfg, u).read_text()
+    except OSError: return ""
+
+def waiting_line_jobs(cfg, u):
+    """The jobs (<host>:<task>) named on the latest WAITING line of the unit's report that it has not been resumed for yet.
+    A resumed unit's report counts only once written after the unit started."""
+    try:
+        if u.get("resume") and report_path(cfg, u).stat().st_mtime < u.get("started", 0): return []
+    except OSError: return []
+    m = WAIT_RX.findall(report_text(cfg, u))
+    if not m: return []
+    done = set(u.get("handled_jobs", []))
+    return [j for j in dict.fromkeys(f"{h}:{t}" for h, t in JOBREF.findall(m[-1]) if h in cfg.hosts) if j not in done]
+
+def job_state(hs, ref):
+    """(state, exit code) of job <host>:<task> from the probes: queued | admission (running, waiting in orch's admission) |
+    running | done | gone (no such task any more) | unknown (host unreachable) | paused, stashed, locked."""
+    hn, _, tid = ref.partition(":"); p = hs.get(hn) or {}
+    if not p.get("ok"): return "unknown", None
+    t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid)
+    if not t: return "gone", None
+    rc = task_rc(t)
+    if rc is not None: return "done", rc
+    k = t["status"] if isinstance(t["status"], str) else next(iter(t["status"]), "")
+    if k == "Running": return ("admission" if job_of(t) in p.get("waitjob", []) else "running"), None
+    return k.lower(), None
+
+def unit_jobs(hs, name):
+    """The unit's own jobs that have not finished (pueue label unit:<name>, any host): ['<host>:<task>']."""
+    return [f"{hn}:{tid}" for hn, p in hs.items() for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items()
+            if t.get("label") == f"unit:{name}" and task_rc(t) is None]
+
+def unit_runs(u): return list(dict.fromkeys([*u.get("runs", []), *([u["run"]] if u.get("run") else [])]))
+
+def unit_spent(cfg, u, wrapup=False):
+    """Dollars the unit's runs have used (ledger: each run's done cost, its budget while it runs), over all its resumes; the
+    wrap-up run is outside the unit's budget and counted only with wrapup=True."""
+    pv = cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {})
+    if "ledger" not in pv: return 0.0
+    runs = ledger_read(cfg, pv)[0]
+    return sum((r["cost"] or 0.0) if r["done"] else (r["budget"] or 0.0) for k in unit_runs(u)
+               if (r := runs.get(k)) and (wrapup or k != u.get("wrapup")))
+
+def api_out(cfg, u):
+    try: return json.loads((cfg.p("out", "out") / u["name"] / "api.json").read_text())
+    except Exception: return {}
+
+def session_of(cfg, u):
+    """The agent's session id: its api.json (session_id; Codex: thread_id), else its newest transcript (a run stopped before
+    it wrote its json): here ~/.claude/projects/<cwd>, on a remote host the same under that host's agent_env HOME."""
+    d = api_out(cfg, u); sid = d.get("session_id") or d.get("thread_id")
+    if sid: return sid
+    h = cfg.hosts.get(u.get("host"), {})
+    if h.get("local"):
+        f = transcript_of(cfg, u); return f.stem if f else None
+    esc = re.sub(r"[^A-Za-z0-9-]", "-", u.get("rcwd") or "")
+    rc, o, e = hrun(h, f"{h.get('agent_env', '')}\nls -t \"$HOME/.claude/projects/{esc}\"/*.jsonl 2>/dev/null | head -1")
+    return Path(o.strip()).stem if rc == 0 and o.strip() else None
+
+def job_result(cfg, hs, ref, agent_host):
+    """(exit code or None, log path the agent can read) of a finished job. A remote job's files are copied here first when
+    the agent runs here (orch collect <host>:<task> does the same)."""
+    hn, _, tid = ref.partition(":"); h = cfg.hosts[hn]; p = hs.get(hn) or {}
+    t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid); jid = job_of(t); rc = task_rc(t); rd = runs_dir(cfg, h)
+    here = cfg.hosts.get(agent_host, {}).get("local")
+    if not jid:   # a task without a job script (a gate): its pueue log is the log
+        loc = cfg.f("runs") / f"task-{hn}-{tid}.log"; loc.parent.mkdir(exist_ok=True)
+        r = hrun(h, f"{pueue(h)} log {tid} --full", timeout=60)
+        if r[0] == 0 and not DRY: loc.write_text(r[1])
+        return rc, str(loc) if here or h.get("local") else f"{hn}: {pueue(h)} log {tid}"
+    if rc is None or t is None:
+        o = hrun(h, f"cat {rd}/{jid}.rc 2>/dev/null")[1].strip()
+        rc = int(o) if o.lstrip("-").isdigit() else rc
+    if hn == agent_host or (h.get("local") and here): return rc, f"{rd}/{jid}.log"
+    if here:
+        loc = cfg.f("runs"); loc.mkdir(exist_ok=True)
+        sh(["rsync", "-a", "-e", " ".join(SSH), f"{h['ssh']}:{rd}/{jid}.*", f"{loc}/"], timeout=300)
+        return rc, str(loc / f"{jid}.log")
+    return rc, f"{hn}:{rd}/{jid}.log"
+
+def resume_message(cfg, hs, u, jobs):
+    L = [f"Your jobs finished (orch resumed you; you used ${unit_spent(cfg, u):.2f} of ${u.get('budget') or 0:g} so far):"]
+    for j in jobs:
+        rc, log = job_result(cfg, hs, j, u.get("host"))
+        L.append(f"- {j}: exit {rc if rc is not None else 'unknown (the task is gone and left no exit code)'}; log {log}")
+    L.append("Read the logs you need, then continue the brief from where your report stands. Same rule as before: submit "
+             "builds and tests detached, write 'WAITING <job ids>' in the report and end your turn; keep the report current; "
+             "end with the VERDICT line and the real exit codes.")
+    return "\n".join(L)
+
+def resume_unit(cfg, u, msg, wrapup=False):
+    """Continue the unit's own agent session with msg (see above). The caller saves u. Returns a line saying what was done."""
+    name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); text = ORCH_MARK + msg
+    if via == "herdr":
+        if not DRY: herdr("agent", "prompt", name, text)
+        return f"{name}: prompted in its herdr pane"
+    if via == "tmux":
+        X(h, f"tmux send-keys -t orch-{name} -l {shlex.quote(text)} && tmux send-keys -t orch-{name} Enter")
+        return f"{name}: resumed in tmux orch-{name} on {u['host']}"
+    if via != "pueue" or mc.get("kind") != "api": raise Err(f"{name}: a unit run via {via} cannot be resumed")
+    pv = cfg.prov[mc["provider"]]; od = cfg.p("out", "out") / name
+    sid = session_of(cfg, u)
+    if not sid: raise Err(f"{name}: no session id (api.json or transcript) to resume")
+    if u.get("run"):   # the run before is closed first (idempotent): its reported cost, else its budget
+        cost, _ = run_cost(od / "api.json", (u.get("budget") or pv.get("budget_per_unit", 0)) if u.get("run") != u.get("wrapup") else bset(cfg, "wrapup_usd"))
+        ledger_done(cfg, pv, u["run"], name, cost, "resumed")
+    if wrapup: budget = bset(cfg, "wrapup_usd")
+    else:
+        budget = round((u.get("budget") or pv.get("budget_per_unit", 0)) - unit_spent(cfg, u), 2)
+        if budget < bset(cfg, "resume_min_usd"):
+            raise Err(f"{name}: ${budget:.2f} of its ${u.get('budget')} budget left (under [budget] resume_min_usd); resume it with orch launch --resume-of and a new budget")
+    k = len(unit_runs(u)) + 1; run = f"{name}.r{k}.{int(now())}"
+    run = reserve_budget(cfg, mc, name, budget, run)
+    local = h.get("local", False); old = u.get("task")
+    report = str(report_path(cfg, u)) if local else f"{h['root']}/out/{name}/REPORT.md"
+    env = {"ORCH_ROLE": "agent", "ORCH_REPORT": report, "ORCH_UNIT": name, "ORCH_ROOT": str(cfg.root)}
+    if local:
+        pf = od / f"resume-{k}.md"
+        if not DRY: atomic_write(pf, text)
+        cmd = shlex.join([sys.executable, str(ORCH_SELF), "api-run", name, "--run", run, "--model", u["model"], "--budget", str(budget),
+                          "--brief", u.get("rbrief") or u["brief"], "--cwd", u["rcwd"], "--report", report, "--resume-session", sid, "--prompt-file", str(pf)])
+        rc, o, e = X(h, f"{pueue(h)} add -g agents -l {name} -w {shlex.quote(u['rcwd'])} --print-task-id -- {cmd}", env=env)
+    else:
+        rc, o, e = api_remote(cfg, h, name, mc, u.get("rbrief") or f"{h['root']}/briefs/{name}.md", u["rcwd"], budget, text, env, session=sid, run=run)
+    if rc:
+        if not DRY: ledger_done(cfg, pv, run, name, 0, "resume-failed")
+        raise Err(f"{name}: resume failed: {(e or o).strip()[:120]}")
+    if DRY: return f"{name}: would resume session {sid} as run {run} (${budget:g})"
+    if old is not None: save_task_log(cfg, h, u, old, remove=True)   # the finished task's log is kept, then the task removed
+    u.update(task=int(o.strip() or 0), run=run, runs=[*unit_runs(u), run], resumes=u.get("resumes", 0) + 1, resumed_at=int(now()))
+    if wrapup: u["wrapup"] = run
+    return f"{name}: resumed session {sid[:8]} as run {run} (${budget:g}{', wrap-up' if wrapup else ''}), task {u['task']}"
+
+def save_task_log(cfg, h, u, tid, remove=False):
+    """Keep a pueue task's log under out/<unit>/task-<id>.log (the agent's stdout and stderr), then optionally remove the task."""
+    rc, o, e = hrun(h, f"{pueue(h)} log {tid} --full", timeout=60)
+    if rc == 0 and not DRY:
+        od = cfg.p("out", "out") / u["name"]; od.mkdir(parents=True, exist_ok=True); atomic_write(od / f"task-{tid}.log", o)
+        if remove: hrun(h, f"{pueue(h)} remove {tid} 2>/dev/null; true")
+    return rc == 0
+
+def cmd_park(cfg, a):
+    """Stop a live agent's turn while its jobs wait or run (the remedy for waiting:<unit>); the watcher resumes it, same session,
+    when they finish. API units: the run is ended (SIGTERM: its cost is still recorded); herdr and tmux agents: Escape."""
+    bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; n = u["name"]
+    hs = probe_all(cfg); jobs = unit_jobs(hs, n)
+    if not jobs: raise Err(f"{n} has no queued or running job of its own: nothing to wait for (orch stop {n} to stop it)")
+    say(f"park {n}: its jobs {', '.join(jobs)} keep running; it resumes when they finish")
+    if DRY: return
+    via = u.get("via")
+    if via == "pueue":
+        hrun(h, f"{pueue(h)} kill -s SIGTERM {u['task']} 2>/dev/null; true")
+        for _ in range(30):
+            if task_rc(task_status(h, u["task"])) is not None: break
+            time.sleep(2)
+        else: hrun(h, f"{pueue(h)} kill {u['task']} 2>/dev/null; true")
+        if h.get("local"): settle_run(cfg, u, "parked")
+    elif via == "herdr": herdr("pane", "send-keys", u["pane"], "Escape")
+    elif via == "tmux": X(h, f"tmux send-keys -t orch-{n} Escape")
+    u["parked"] = {"jobs": jobs, "since": int(now()), "by": "orch park"}; bd.save(u)
+    bd.comment(u["id"], f"{ts()} parked on {', '.join(jobs)}"); cfg.touch("changed"); say(f"parked {n}")
+
+def cmd_resume(cfg, a):
+    """Resume a unit's own session now: parked (its jobs' results, when they finished), or with --message."""
+    bd, u = get_unit(cfg, a.unit); hs = probe_all(cfg)
+    jobs = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
+    if a.message: msg = a.message
+    elif jobs:
+        left = [j for j in jobs if job_state(hs, j)[0] not in ("done", "gone")]
+        if left and not a.force: raise Err(f"{u['name']} waits on {', '.join(left)}, not finished (--force to resume now)")
+        msg = resume_message(cfg, hs, u, jobs)
+    else: raise Err(f"{u['name']} is not parked: give --message")
+    say(resume_unit(cfg, u, msg))
+    if DRY: return
+    u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
+    bd.comment(u["id"], f"{ts()} resumed"); cfg.touch("changed")
+
+def tend_parked(cfg, hs, units, log):
+    """The watcher's part: record parked units, resume those whose jobs all finished, wrap up capped runs (item 2)."""
+    bd = Beads(cfg)
+    for u in units:
+        try:
+            jobs = u.get("_park")
+            if jobs:
+                if (u.get("parked") or {}).get("jobs") != jobs:
+                    u["parked"] = {"jobs": jobs, "since": int(now()), "by": "report"}; bd.save(u); log(f"park {u['name']} on {', '.join(jobs)}")
+                st = [job_state(hs, j)[0] for j in jobs]
+                if all(x in ("done", "gone") for x in st):
+                    log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs)))
+                    u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
+                    bd.comment(u["id"], f"{ts()} resumed: jobs {', '.join(jobs)} finished")
+                continue
+            if wrap_due(cfg, u):
+                log(resume_unit(cfg, u, WRAPUP.format(report=report_path(cfg, u) if cfg.hosts[u["host"]].get("local") else f"{cfg.hosts[u['host']]['root']}/out/{u['name']}/REPORT.md"), wrapup=True))
+                bd.save(u); bd.comment(u["id"], f"{ts()} ended at its budget cap without a verdict: resumed once to write its report")
+        except Err as e: log(f"{u['name']}: {e}")
+
+def wrap_due(cfg, u):
+    """A run that ended at its budget cap without a final verdict, not yet wrapped up (item 2)."""
+    mc = cfg.models.get(u.get("model"), {})
+    return (u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("state") in ENDED and not u.get("verdict") and not u.get("wrapup")
+            and api_out(cfg, u).get("subtype") == "error_max_budget_usd" and not u.get("_park"))
+
 # ---------------------------------------------------------------- backlog and landing (orch-fixes7)
 # The backlog lives in beads: `orch backlog import` turns every unfinished item of the project's status checklist into a beads
 # issue labelled backlog and status:<its status>, keyed by external ref backlog:<item id> (idempotent: a re-import updates
@@ -1846,6 +2119,7 @@ def landing_findings(cfg, units, hs=None):
 # API unit's spend so far is estimated from its Claude Code transcript (tokens per model, priced at the rate learned from
 # finished runs' api.json), so check can say when a unit nears its budget with its report not updated.
 BUDGET_DEFAULTS = {"margin_pct": 30, "min_runs": 3, "min_usd": 0.5, "max_usd": None, "warn_pct": 80, "report_stale_min": 10,
+                   "wrapup_usd": 0.5, "resume_min_usd": 0.1,
                    "token_weights": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.1}}
 
 def bset(cfg, k): return cfg.c.get("budget", {}).get(k, BUDGET_DEFAULTS[k])
@@ -1921,7 +2195,7 @@ def transcript_of(cfg, u):
         try:
             with open(f) as fh: head = "".join(next(fh, "") for _ in range(8))
         except OSError: continue
-        if u.get("brief") and (u["brief"] in head or Path(u["brief"]).name in head): return f
+        if any(b and (b in head or Path(b).name in head) for b in (u.get("rbrief"), u.get("brief"))): return f
     return None
 
 def unit_spend(cfg, u):
@@ -1934,13 +2208,22 @@ def unit_spend(cfg, u):
     if not cfg.hosts.get(u.get("host"), {}).get("local"): return None, "remote"
     f = transcript_of(cfg, u)
     if not f: return None, "no transcript"
-    rates = learned_rates(cfg); w = bset(cfg, "token_weights"); seen = {}; model = None
+    return transcript_cost(cfg, f)
+
+def transcript_cost(cfg, f, since=0):
+    """(dollars, "transcript") of a Claude Code transcript's assistant messages (those after since, a time), priced at the
+    learned rate; (None, why) without a learned rate."""
+    rates = learned_rates(cfg); w = bset(cfg, "token_weights"); seen = {}
     for l in open(f, errors="replace"):
         if '"usage"' not in l: continue
         try: d = json.loads(l)
         except Exception: continue
         m = d.get("message") or {}
-        if d.get("type") == "assistant" and isinstance(m, dict) and m.get("usage"): seen[m.get("id") or len(seen)] = (m.get("model"), m["usage"]); model = m.get("model") or model
+        if since:
+            try:
+                if calendar.timegm(time.strptime(d.get("timestamp", "")[:19], "%Y-%m-%dT%H:%M:%S")) < since: continue   # UTC
+            except ValueError: pass
+        if d.get("type") == "assistant" and isinstance(m, dict) and m.get("usage"): seen[m.get("id") or len(seen)] = (m.get("model"), m["usage"])
     if not seen: return 0.0, "transcript"
     tot = 0.0
     for mdl, us in seen.values():
@@ -2960,6 +3243,7 @@ URGENT = ("unit:", "board:", "orphan:", "host:", "margin:", "stalled:", "spend:"
 def cmd_watch(cfg, a):
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
+    tend_parked(cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (orch-fixes9)
     # [fill] watcher = true (owner autonomy: "launch within capacity"): launch ready backlog units up to capacity, at most every
     # [fill] every_min (default 10) minutes, only when check found something that fits (idle-with-backlog)
     fc = cfg.c.get("fill", {})
@@ -3030,7 +3314,9 @@ def main():
         A("--report", help="a resumed unit: the report it continues (default out/<unit>/REPORT.md)"), A("--resume-of", help="a resumed unit: the unit whose report it continues"),
         A("--item", help="the backlog item this unit works on (orch backlog)"), dry=True)
     add("api-run", A("unit"), A("--run", required=True), A("--model", required=True), A("--budget", type=float, required=True), A("--brief", required=True),
-        A("--cwd", required=True), A("--report"))
+        A("--cwd", required=True), A("--report"), A("--resume-session", help="continue this agent session"), A("--prompt-file", help="the prompt (default: the brief's)"))
+    add("park", A("unit"), dry=True)
+    add("resume", A("unit"), A("--message", help="resume with this text instead of its jobs' results"), A("--force", action="store_true", help="resume although its jobs have not finished"), dry=True)
     add("ledger", A("action", choices=["check", "repair"]), A("--provider"), dry=True)
     add("doctor", A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", A("action", choices=["import", "list"]), dry=True)
@@ -3039,7 +3325,7 @@ def main():
     add("collect", A("unit", help="a unit, or <host>:<task id> for an orch run job"), dry=True)
     add("run", A("--host", required=True), A("--lane", choices=LANES, default="jobs"), A("--unit"), A("--wt", required=True),
         A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="a job that needs the host's USB devices (container.usb_args, usb_lock)"),
-        A("--priority", type=int, default=0), A("--no-wait", action="store_true", help="queue, print <host>:<task>, return"),
+        A("--priority", type=int, default=0), A("--detach", "--no-wait", dest="no_wait", action="store_true", help="queue, print <host>:<task>, return (agents: then write WAITING <ids> and end the turn)"),
         A("--allow-unmerged", action="store_true", help="run on a tree with a merge in progress, conflict markers or far behind the landing branch"),
         A("command", nargs=argparse.REMAINDER), dry=True)
     add("gate", A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $ORCH_UNIT)"), A("--priority", type=int, default=10),

@@ -117,6 +117,9 @@ key_keychain = "orch-api-key"   # macOS: security add-generic-password -s orch-a
 key_file = "~/.config/orch/anthropic.env"   # elsewhere: ANTHROPIC_API_KEY=... in a file only you can read (chmod 600)
 # cmd = ["claude", "--bare", "-p", "--model", "{api_id}", "--max-budget-usd", "{budget}", "--output-format", "json",
 #        "--dangerously-skip-permissions", "{prompt}"]   # the default; it must write JSON with total_cost_usd to stdout
+# resume_cmd: how a parked or capped run continues its own session ({session}: session_id, or Codex's thread_id, from its
+# JSON). Default with the default cmd: the same with --resume {session}. Needed when cmd is set, for example for Codex:
+# resume_cmd = ["codex", "exec", "resume", "{session}", "--json", "{prompt}"]
 [providers.codex]
 enabled = true
 
@@ -162,6 +165,8 @@ margin_pct = 30
 min_runs = 3             # fewer past runs: the provider's budget_per_unit
 warn_pct = 80            # check: budget80:<unit> at this share of its budget ...
 report_stale_min = 10    # ... while its report has not changed for this long
+wrapup_usd = 0.5         # a run that ends at its budget cap without a final verdict is resumed once with this, to write its report
+resume_min_usd = 0.1     # a parked unit is resumed (same session) only while this much of its budget is left
 
 [enforce]                # warn first (a board direction), stop after grace_min
 grace_min = 5
