@@ -5,10 +5,16 @@ may still override paths.board (section 9: board.sh stays a callable path); boar
 callers until the memory/actions split."""
 from orchkit.context import ORCH_SELF, sh, now, herdr, atomic_write, ORCH_MARK
 import hashlib, os, re, shlex, sys, time
+from pathlib import Path
 
 def board_script(cfg):
     """The message board script: paths.board (a project's own), else the board.sh shipped next to orch.py (orch-swarm item 6)."""
     return cfg.p("board") if cfg.paths.get("board") else ORCH_SELF.parent / "board.sh"
+
+def board_shipped(cfg):
+    """(name, text) of the shipped board sent into a remote unit's <root>/bin: the shell path every launcher names, and the
+    Python module it execs next to it. A project's own paths.board script is shipped by itself (no shim)."""
+    return [("board.sh", board_script(cfg).read_text()), ("msgboard.py", (Path(__file__).resolve().parent / "msgboard.py").read_text())]
 
 def board_dir(cfg): return cfg.root / cfg.paths.get("board_dir", "board")
 
@@ -85,4 +91,4 @@ def board_alerts(cfg, log):
     log(f"board alert: {msg[:600]}"); cfg.jput("alerted.json", {**{k: v for k, v in seen.items() if now() - v < 7 * 86400}, **{k: now() for k, _ in new}})
     return msg
 
-__all__ = ["board_script", "board_dir", "board", "board_rows", "board_questions", "learned_posts", "board_findings", "board_files", "board_alerts"]
+__all__ = ["board_script", "board_shipped", "board_dir", "board", "board_rows", "board_questions", "learned_posts", "board_findings", "board_files", "board_alerts"]

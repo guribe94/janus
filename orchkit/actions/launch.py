@@ -4,7 +4,7 @@ import argparse, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 from orchkit.actions.jobs import agent_res, ensure_lanes, in_container, job_script, runs_dir, task_rc, task_status, write_cap
 from orchkit.beads import Beads, UNIT_V
-from orchkit.board import board, board_dir, board_script
+from orchkit.board import board, board_dir, board_script, board_shipped
 from orchkit.budgets import budget_for, transcript_cost, waste_paused
 from orchkit.cap import build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
 from orchkit.context import EXCL, Err, ORCH_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, now, pq, qp, say, sh, ts
@@ -391,7 +391,8 @@ def cmd_launch(cfg, a):
             # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
             X(cfg, h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
             put_script(cfg, h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
-            if not cfg.paths.get("board"): put_script(cfg, h, f"{root}/bin/board.sh", board_script(cfg).read_text())   # the shipped board there (outbox)
+            if not cfg.paths.get("board"):
+                for n, t in board_shipped(cfg): put_script(cfg, h, f"{root}/bin/{n}", t)   # the shipped board there (outbox)
             if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
             ship_context(cfg, h, name, bcopy)
             put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["ORCH_REPORT"]) + btext, "644")
