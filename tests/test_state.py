@@ -44,5 +44,15 @@ class State(unittest.TestCase):
         self.assertEqual(json.loads(p.read_text()), {"a": 1}, "a crash mid-write left the state file truncated")
 
 
+class UnitRecord(unittest.TestCase):
+    def test_v1_record_migrates_to_v2(self):
+        """A v1 record (launch wrote only run; a resume added runs) reads as v2: every run id in runs, the current one last."""
+        r = lambda notes: orch.unit_record({"notes": json.dumps(notes) if isinstance(notes, dict) else notes})
+        self.assertEqual(r({"run": "u.1"}), {"run": "u.1", "runs": ["u.1"], "v": 2})
+        self.assertEqual(r({"run": "u.r2.9", "runs": ["u.1"]})["runs"], ["u.1", "u.r2.9"])
+        self.assertEqual(r({"v": 2, "run": "x", "runs": ["x"], "host": "h"}), {"v": 2, "run": "x", "runs": ["x"], "host": "h"})
+        self.assertEqual(r("not json"), {})
+
+
 if __name__ == "__main__":
     unittest.main()

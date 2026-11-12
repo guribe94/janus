@@ -3,13 +3,14 @@
 import argparse, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 from orchkit.actions.jobs import agent_res, ensure_lanes, in_container, job_script, runs_dir, task_rc, task_status, write_cap
-from orchkit.beads import Beads
+from orchkit.beads import Beads, UNIT_V
 from orchkit.board import board, board_dir, board_script
 from orchkit.budgets import budget_for, transcript_cost, waste_paused
 from orchkit.cap import build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
-from orchkit.context import EXCL, Err, ORCH_SELF, SSH, X, atomic_write, clean_env, findkey, herdr, hrun, now, pq, qp, say, sh, ts
+from orchkit.context import EXCL, Err, ORCH_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, now, pq, qp, say, sh, ts
 from orchkit.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
 from orchkit.memory import MEM_SECTIONS, mem_line, memory_read, mset
+from orchkit.platform import herdr
 from orchkit.probe import probe_all, pueue, room
 from orchkit.templates import CLEAN_PUEUE
 from orchkit.transcripts import transcript_of
@@ -366,7 +367,7 @@ def cmd_launch(cfg, a):
         t = report.read_text().split("\n", 1)
         if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not cfg.run.dry: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
-    u = {"host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
+    u = {"v": UNIT_V, "host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
     if report: u["report"] = str(report); u["resume"] = True
     item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
@@ -409,7 +410,7 @@ def cmd_launch(cfg, a):
             X(cfg, h, ensure_lanes(h, cfg))
             if local and not cfg.run.dry: write_cap(cfg, hn, h)
             # the budget is reserved (cap check and the run's running row, under the ledger's lock) before anything is queued
-            run = reserve_budget(cfg, mc, name, budget); u["run"] = run
+            run = reserve_budget(cfg, mc, name, budget); u.update(run=run, runs=[run])
             if local:
                 cmd = shlex.join([sys.executable, str(ORCH_SELF), "api-run", name, "--run", run, "--model", mname, "--budget", str(budget),
                                   "--brief", rbrief, "--cwd", rcwd, "--report", env["ORCH_REPORT"]])
