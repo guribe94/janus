@@ -23,7 +23,7 @@
 #   board.sh summary                      every open card grouped: needs answer, blocked, working, waiting, done; flags SILENT
 #                                         (> BOARD_SILENT_MIN, default 30 min, without a post) and GONE (process ended without done)
 #   board.sh digest [--since 1h]          for humans: landed, started, asked, answered, failed in that window
-#   board.sh close <agent>                archive a card and its directions
+#   board.sh close <agent>                archive a card and its directions; its open questions are withdrawn
 #   board.sh rule <agent> [host]          the board rule a launcher adds to an agent's prompt (one place)
 #   board.sh sync                         pull every host's outbox, then push the board copy to every host
 # Every write on the coordinating machine takes one flock (.lock); bash 3.2 compatible.
@@ -42,9 +42,11 @@ okkind() { case " $KINDS " in *" $1 "*) return 0;; esac; return 1; }
 oneline() { printf '%s' "$*" | tr '\n\r\t' '   '; }
 field() { sed -n "s/^- $2: //p" "$1" 2>/dev/null | head -1; }
 epoch_of() { date -j -f '%Y-%m-%d %H:%M' "$1" +%s 2>/dev/null || date -d "$1" +%s 2>/dev/null || echo 0; }
-locked() { local f=$1; shift; if [ -n "$FLOCK" ]; then ( "$FLOCK" 9 || exit 1; "$@" ) 9>>"$f"; else "$@"; fi; }
+# (the lock file is $_lk, not $f: shell locals are dynamic, and a function run under the lock reads its caller's $f)
+locked() { local _lk=$1; shift; if [ -n "$FLOCK" ]; then ( "$FLOCK" 9 || exit 1; "$@" ) 9>>"$_lk"; else "$@"; fi; }
 localname() { local n; n=$(head -1 "$BD/.master" 2>/dev/null); [ -n "$n" ] && echo "$n" || hostname -s 2>/dev/null || echo local; }
-notify() { [ -s "$BD/.notify" ] && { nohup sh -c "$(head -1 "$BD/.notify")" </dev/null >/dev/null 2>&1 & } ; true; }
+# the alert runs without the lock fds (8 sync, 9 board): it must never hold the board lock or block the next sync while it runs
+notify() { [ -s "$BD/.notify" ] && { nohup sh -c "$(head -1 "$BD/.notify")" </dev/null >/dev/null 2>&1 8>&- 9>&- & } ; true; }
 
 # Apply one post on the master board (caller holds the lock): log line, question record, card rewritten through temp + mv.
 apply() {
@@ -225,7 +227,11 @@ case $cmd in
     a=${1:-}; okname "$a"; [ -e "$BD/agents/$a.md" ] || die "no card for $a"
     mkdir -p "$BD/agents/archive" "$BD/to/archive"
     s=$(date +%Y%m%d-%H%M)
-    locked "$BD/.lock" sh -c 'mv "$1/agents/$2.md" "$1/agents/archive/$2.$3.md"; [ -e "$1/to/$2.md" ] && mv "$1/to/$2.md" "$1/to/archive/$2.$3.md"; true' _ "$BD" "$a" "$s" || die "close failed" ;;
+    locked "$BD/.lock" sh -c 'mv "$1/agents/$2.md" "$1/agents/archive/$2.$3.md"; [ -e "$1/to/$2.md" ] && mv "$1/to/$2.md" "$1/to/archive/$2.$3.md"
+      for q in "$1"/questions/q*.md; do   # its open questions go with it (they would stay "needs answer" for nobody)
+        [ -e "$q" ] && grep -qxF -- "- agent: $2" "$q" && grep -qxF -- "- state: open" "$q" || continue
+        sed "s/^- state: open\$/- state: withdrawn (card closed $3)/" "$q" > "$q.tmp.$$" && mv "$q.tmp.$$" "$q"
+      done; true' _ "$BD" "$a" "$s" || die "close failed" ;;
   rule)
     a=${1:-}; okname "$a"; h=${2:-}
     p=$self
@@ -272,5 +278,5 @@ case $cmd in
         $S "$ssh" "find $root/board -type f -perm -u+w -exec chmod a-w {} +" 2>/dev/null
       rsync -a -e 'ssh -o BatchMode=yes -o ConnectTimeout=8' "$self" "$ssh:$root/bin/board.sh" </dev/null 2>/dev/null
     done ;;
-  *) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,/^# Every write/p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
