@@ -399,6 +399,30 @@ def retire_old_orch(dry=False, retire=False, ps_text=None, root=None):
     else: out.append("-> not stopped (janus migrate --retire stops them, or stop them by hand)")
     return out
 
+def port_old_scripts(root, dry=False):
+    """Scripts of a migrated project that still call the retired `orch` CLI (soak 39): a shim (`exec orch "$@"` or `orch "$@"`)
+    is rewritten to `janus`; any other call (`orch run`, `orch gate`, ...) is listed so the owner ports it. A gate whose steps
+    call `orch` then exit 2 in 0 s (the retired CLI is gone), so migrate must never leave them silently."""
+    out, listed = [], 0
+    skip = {"worktrees", "node_modules", "target", "__pycache__", ".venv", ".mypy_cache", ".git", ".janus", ".orch"}
+    shim_rx = re.compile(r"^(?:exec\s+)?(?:\S*/)?orch(?:\.py)?\s*(?:\"?\$@\"?)?\s*$")
+    call_rx = re.compile(r"(?<![\w./-])(?:\./)?orch(?:\.py)?\s+[a-z][\w-]*\b")
+    for p in sorted(root.rglob("*")):
+        if not p.is_file() or (p.suffix.lower() not in (".sh", ".bash", ".py", ".mk", ".pl", ".rb") and p.name != "orch"): continue
+        try: rel = p.relative_to(root)
+        except ValueError: continue
+        if any(part in skip for part in rel.parts): continue
+        try: txt = p.read_text(errors="replace")
+        except OSError: continue
+        body = [l for l in txt.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        if len(body) == 1 and shim_rx.match(body[0].strip()):
+            if not dry: atomic_write(p, re.sub(r"(?<![\w./-])(\S*/)?orch(\.py)?", lambda m: (m.group(1) or "") + "janus", txt))
+            out.append(f"{rel}: a shim to the retired CLI -> janus"); continue
+        for i, l in enumerate(txt.splitlines(), 1):
+            if call_rx.search(l): out.append(f"{rel}:{i}: still calls the retired CLI: {l.strip()[:100]}"); listed += 1
+    if listed: out.append(f"{listed} line(s) still call `orch`: port them to `janus` (a gate step that calls the retired CLI exits 2 at once, not a test result)")
+    return out
+
 def migrate(project=None, dry=False, retire=False):
     """One-time, idempotent move from orch to janus: the project's orch.toml -> janus.toml and .orch/ -> .janus/, every config
     value that still names the old state folder or an old name (item 1), the hook commands a previous install wrote, the watcher,
@@ -426,6 +450,7 @@ def migrate(project=None, dry=False, retire=False):
     did += migrate_hooks(dry=dry) + migrate_watcher(dry=dry)
     if new_cfg.is_file() or (dry and old_cfg.is_file()): did += adopt_items(root, dry=dry, config=src)   # item 6
     did += retire_old_orch(dry=dry, retire=retire, root=root)   # item 14: the old orch's standing processes (finding 4)
+    did += port_old_scripts(root, dry=dry)   # soak 39: port shims / list scripts still calling the retired CLI
     for x in did: say(x)
     say("janus migrate: " + ("done" if did else "nothing to do (already migrated)") + (" [dry-run: nothing changed]" if dry else ""))
     return 0
@@ -619,6 +644,17 @@ def adopt_items(root, dry=False, config=None):
 
 def cmd_doctor(cfg, a): return doctor(cfg, a)
 
+def model_host_warnings(cfg):
+    """A warning per routed model whose [models.<m>] hosts is narrower than the configured hosts (decision 0004: agents run on
+    every host): 'model X: runs on 1 of 3 host(s)'. A model with no hosts key may run anywhere and is not warned."""
+    routed = {m for lst in cfg.route.values() for m in lst}
+    out = []
+    for m, c in cfg.models.items():
+        hs = c.get("hosts")
+        if hs and m in routed and set(hs) < set(cfg.hosts):
+            out.append(f"model {m}: runs on {len(hs)} of {len(cfg.hosts)} host(s) ({', '.join(hs)}): remove [models.{m}] hosts to allow every host")
+    return out
+
 def doctor(cfg, a):
     """Check a setup end to end and say what to fix: tools, the installed release, hooks, watcher, config, secret store,
     ledger, beads and hosts. Exit 1 when anything FAILs."""
@@ -664,6 +700,7 @@ def doctor(cfg, a):
     for tier, lst in cfg.route.items():
         for m in lst:
             if m not in cfg.models: r(False, f"routing {tier}: unknown model {m}", "fix [routing]")
+    for w in model_host_warnings(cfg): r(None, w, "drop [models.<m>] hosts to allow every host, or add the missing ones")
     for k, d in (("briefs", "briefs"), ("out", "out")):
         r(cfg.p(k, d).is_dir() or None, f"paths.{k} {cfg.p(k, d)}", f"mkdir {cfg.p(k, d)}")
     b = board_script(cfg)

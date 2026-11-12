@@ -95,6 +95,10 @@ for). Optional `[lanes.<lane>] age_min` overrides a lane's age limit. `example.j
 **`[caps]`** (optional, only when the owner wants them): `total = 6`, and `[caps.host] server = 2`. With no caps the limit
 is what each machine can safely hold.
 
+**`[janus]`**: `issues_file` (the skill's issue register that `janus issue` appends to and `janus check` writes a repeated
+finding to; unset by default) and `ack_issue_n` (default 3: the number of acks of one finding key at which it earns an issue
+row).
+
 **`[providers.<name>]`**: `enabled`, and optionally `cap_usd`, `ledger`, `budget_per_unit`, the secret store of the API key
 (`key_keychain`: a macOS keychain item; `key_file`: a `VAR=value` file that only you can read, mode 600; `key_env`: the
 variable, default `ANTHROPIC_API_KEY`) and `cmd` (the agent command; default `claude --bare -p --model {api_id}
@@ -124,7 +128,15 @@ Project launchers (an older `launcher` key) are no longer used; doctor says so.
 **`[models.<name>]`**: `provider`, `vendor`, `kind`. `kind = "api"` is an API agent run by janus (`api_id` is the model id
 the API takes).
 `claude`, `codex` and `opencode` are agents in a herdr pane (in tmux on remote hosts); `args` are extra command-line
-arguments. `hosts` limits where a model may run.
+arguments. `hosts` limits where a model may run. `qualified = false` marks a free or new model unqualified: routing skips it
+for normal work until `janus qualify <name> "<what it did>"` records a pass (`.janus/qualified.json`); a `qualify` unit may use
+it. Unset means qualified (inert).
+
+**`janus qualify <model> [--fail] "<what it did>"`**: record that a model passed (or failed) a small real task before it does
+real work. It clears the `qualified = false` skip for that model on a pass; `--fail` keeps it skipped. `janus report` shows each
+implementer model's first-review pass rate (`First review per implementer model`), the outcome data routing should read.
+`janus doctor` warns when a routed model's `hosts` is narrower than the configured hosts (decision 0004: agents run on every
+host).
 
 **`[routing]`**: ordered lists per tier: `critical`, `normal`, and `review`. The first model whose provider is enabled
 and within budget wins. A review skips models of the implementer's vendor.
@@ -159,7 +171,8 @@ $ janus check
 [gate:nightly@09:12:44] gate nightly FAILED at 09:12:44 (x y); re-queue or classify
 [board:u7:question] u7 is QUESTION on the board: which baseline? ...; answer with board.sh direct
 ```
-Options: `--brief` (at most 8 lines), `--escalate` (only problems open longer than `deadline_min`).
+Options: `--brief` (at most 8 lines), `--escalate` (only problems open longer than `deadline_min`), `--acked` (list the
+findings a live ack is hiding: key, the ack's decision, its age and its ttl).
 What it reports: per host and lane (`gates`, `jobs`, `land`), queued work with free slots or a paused group ("STALLED"),
 queued or admission-waiting work while the host has room for another job ("IDLE"), a host with free slots in a lane while
 another host has a backlog there, lane jobs older than their class age limit (enqueue to now: gates 240, jobs 120, land 240
@@ -275,11 +288,28 @@ acked unit:parser:finished
 
 **`janus status`**: prints the Live state (hosts, units, ready work, spend, problems) without counting as a cycle.
 
+**`janus issue "<text>" [--evidence <path|sha|job>] [--key <finding key>]`**: append one row to the skill's issue register
+(`[janus] issues_file`, a path under the project root or absolute; refused when unset). A row is generic: no project, host or
+person. `--key <k>` makes it idempotent (a row for that key is written once) and is what `check`'s `issue:<k>` finding points
+at; when the register is configured, `janus check` writes that row itself the first time a key has been acked `[janus]
+ack_issue_n` (3) times, so a rule that keeps coming back is tracked, not re-remembered.
+
 **`janus decide` / `janus decisions`**: the decision records (docs/DECISIONS.md). `janus decide "<title>" --by owner|orchestrator
 --decision "<one sentence>" [--why "<ruling>"] [--context ...] [--options "<option and trade-off>" ...] [--consequences ...]
 [--supersedes <n>] [--instruction <beads id>]` writes the next numbered record, marks the record it supersedes, and regenerates
 `.janus/decisions/INDEX.md`; `janus decisions [--grep <regex>]` lists the records, newest first. The index is injected at
 session start, so the record chain is in front of the orchestrator before it decides anything those records touch.
+
+**`janus introduce <a> <b> --why <text> [--topic <regex>]`**: record that two units' work meets and tell both (the `--why`
+goes to both agents as a `RELATED:` pointer; `--topic` is the regex each reads in the other's transcript, default a path named
+in `--why`). `check` raises `related:<a>:<b>` while both run and their work meets (same file or module, branch, gate area or a
+learned post).
+
+**`janus migrate [<project>] [--retire]`**: move a project still on the old `orch.toml`/`.orch` layout to `janus.toml`/`.janus`
+(projects, state and config are rewritten). `--retire` also stops the old orch's standing processes on this machine. An
+extracted release of the toolkit ships alongside it so a migrated project's own scripts keep working. It also ports a shim
+calling the retired `orch` CLI to `janus` and lists any other script that still calls it (soak 39): a gate step that calls the
+retired CLI exits 2 at once, and `janus check` raises `gate-setup:<name>` for a gate whose steps all fail that way at once.
 
 **Notes.** After each decision, update the *Orchestrator notes* part of `.janus/HANDOFF.md` (see section 5).
 
@@ -413,6 +443,77 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
   jobs go to whichever host has room. `janus launch` places agents by test host and measured room, and `janus check` reports
   hosts idle while work waits and lanes free on one host while another has a backlog: act on those lines.
 
+## 4b. Finding families
+
+Every `janus check` line has a family (the key up to `:`): the findings registry `janus/findings/__init__.py` declares each,
+whether the watcher treats it as urgent (an idle orchestrator is prompted for it) and how long an ack hides it (0: it cannot be
+acked). A key of an unregistered family is refused in code, so a new key can never silently become non-urgent or ackable. This
+table is the plain-language list of the families the reference must name; the recipes are in section 4a.
+
+| family | what it means |
+|---|---|
+| `age` | a lane job queued or running over its class age limit (`[lanes] age`) |
+| `backlog` | the checklist is not imported, or changed since the last import |
+| `beads` | `bd` is unavailable: units cannot be read |
+| `board` | a board card is blocked, has a question, is gone or is silent |
+| `budget80` | a unit spent over `[budget] warn_pct` of its budget and its report is stale |
+| `burner` | a CPU burner an agent started (or orphaned) outside the lanes on this machine |
+| `cap` | more agents than the owner's total or per-host cap |
+| `decision-missing` | an owner instruction classified as a decision has no decision record |
+| `direct` | an agent runs a build or test directly on a remote host, outside its lane |
+| `context` | the orchestrator's context is over `[project] reset_tokens` and no reset was asked |
+| `disk` | a host is over its disk budget (tidy's last pass) |
+| `gate` | a gate failed in the last 12 h (its latest result) |
+| `gate-common` | the same failure appears in two or more gates: suspect the test or fixture |
+| `gate-setup` | every step of a gate failed at once: a setup problem, not the tests |
+| `git` | the project's repository is dirty, unpushed or has no upstream |
+| `handoff` | the orchestrator notes are stale or too long, or the state folder has no `HANDOFF.md` |
+| `host` | a host is unreachable |
+| `idle` | a host or lane has room while work waits |
+| `idle-backlog` | ready backlog items without briefs while hosts have room, or held by budget |
+| `idle-with-backlog` | ready backlog units with briefs would fit now (`janus fill`) |
+| `instructions` | unclassified owner instructions in beads |
+| `issue` | a finding key acked 3+ times with no issue row logged (every oddity is logged) |
+| `known-failure` | a known failure with no open unit fixing it, or one that passes now |
+| `landing` | a finished DONE unit has no gate, or passed its gates and is not landed |
+| `learned` | an agent's learned post awaits remember or reject |
+| `ledger` | a provider ledger is malformed, implausible or holds unreconciled runs |
+| `localtest` | a test or build runs on this machine outside the lanes |
+| `machine` | a job or tmux session on a shared host with no project id (listed, never acted on) |
+| `margin` | a host is over its disk or memory-pressure margins |
+| `memory-long` | `MEMORY.md` holds more entries than `[memory] cap_lines` |
+| `memory-review` | a memory entry is older than `[memory] review_days` |
+| `memory-source` | a memory entry cites a path that is gone |
+| `memory-subject` | two memory entries share one subject |
+| `note` | an agent left a shared-file note on another agent's card |
+| `old-rule` | jobs still wait under the old cap rule |
+| `orchestrator` | the registered orchestrator's kind differs from janus.toml, or one the watcher started never registered |
+| `orphan` | a job, tmux session or agent pane with no open unit |
+| `overlap` | two running units change the same file |
+| `overrun` | a running job is far over its expected run time (its class's history on that host) |
+| `owner-question` | a question for the owner waits in `.janus/owner-queue.md` |
+| `parked` | a parked unit's job can never finish, or its resume failed |
+| `pressure` | a host's admission is paused by back-pressure |
+| `provider` | a unit runs on a disabled provider |
+| `question` | an open board question |
+| `quality` | a finished unit changed test files but named no failure each test catches (report.json) |
+| `related` | two units whose work meets (same file or module, branch, gate area or a learned post) |
+| `report-due` | a status report to the owner is due |
+| `review` | a critical unit finished DONE with no review of its final code |
+| `rule-subject` | two standing rules (beads memories) share one subject |
+| `scheduler` | job-running work outside a host's janus lanes |
+| `script` | a running script's file was changed after it started |
+| `spend` | a provider's committed spend is at its cap or over 80/90 % of it, or an API process janus did not start |
+| `stalled` | queued work with free slots, or an old queue that does not drain |
+| `test-signal` | a long gate/test step that has not failed in N runs: scope or trim it |
+| `thrash` | the watcher stopped and re-queued a job on a thrashing shared host |
+| `tidy` | what `janus tidy` can reclaim |
+| `unit` | a unit is blocked, finished, or stopped by a limit without a verdict |
+| `waiting` | a live agent waits for its jobs' admission and pays for it |
+| `waste` | a run ended at its budget cap without a verdict |
+| `waste-pause` | launch and fill are paused by the waste limit |
+| `watcher` | the watcher is not running |
+
 ## 5. Handoff, instructions, rules, memory and the board
 
 **Handoff.** `.janus/HANDOFF.md` is the orchestrator's working memory, in two parts:
@@ -438,6 +539,10 @@ start through `bd prime`, so the owner never has to repeat them.
 
 A rule that changes an older one replaces it: `bd remember "<rule>" --key <subject>`, reusing the old rule's key (`bd memories
 <word>` finds it). `check` raises `rule-subject:<subject>` when two rules share a subject.
+
+A deferral (`first-collection-means-working`): an open instruction labelled `deferral` makes `janus launch` refuse a new
+implement unit whose name or `ITEM:` id the instruction names, so work the owner put off until a milestone is not started
+silently.
 
 ### Memory
 
@@ -634,6 +739,10 @@ janus runs `tests.sh` itself and appends `<date> <time> <name> EXIT_tests=<rc> R
 hosts' `gates` lanes. `--unit` (default `$JANUS_UNIT`) records the gate on the unit for the landing check. `--wait` prints the
 RESULT line, exit 0 on PASS. **`janus cancel <host>:<task>`** kills and removes a janus job that outlived its intent.
 **`janus queue [host] [--log N]`** prints each host's pueue status (or a task's log), read-only.
+**`janus gate-log <name> [--task <host>:<id>]`** reads a failed gate's per-step summary and first error line: the RESULT line and
+the failing/passing test ids, then the gate's own output (the pueue task it was queued as, recorded in `out/<name>/task.txt`;
+`--task` overrides it; else a saved `out/<name>/log`), showing `EXIT_<step>=<rc>` per step and the first error-looking line.
+Exit 0 on a PASS result. This is the janus way to see why a gate failed (soak 40) without ssh-ing or reading panes.
 **`janus busy <wt>`** exits 0 (and says why) while the tree is in use: a janus job queued or running on it (any host; a host
 that does not answer counts as busy), an open unit's own job when the unit's cwd is that tree, or a local process matching
 `[busy] patterns` (default: mutation testing, which edits sources in place) that runs in or names it; 1 when it is free. A
@@ -671,8 +780,17 @@ It also covers the rest of the mess orchestration makes, each by a safe rule:
 - test roots (`/tmp/janus-test-fixture-*`, and older `janus-test-*` / `janus-rem-*`) over a day old;
 - `[hosts.X] disk_budget_gb`: the host's janus root plus its `cache_dirs` (build targets, compiler caches); over budget, the
   oldest top-level entries of the cache dirs go until it fits.
+- `janus tidy hold <target> [--why <text>]` records a hold so tidy never removes that item (a worktree path, a `host:name`, a
+  test root; a hold matches a target equal to it, under it or containing it); `janus tidy holds` lists them, `janus tidy unhold
+  <target>` clears one. It is how one clean worktree an open unit still depends on (not as its cwd) is kept while the rest is
+  tidied, instead of skipping the whole pass.
+- `[tidy] auto = true` lets the watcher remove the safe kinds itself — a clean landed worktree and a landed branch — each
+  `every_min`, so `tidy:<n>` does not keep firing for bookkeeping nobody does; every other kind still needs `janus tidy`.
+- `[tidy] artifacts = ["target", ...]`: globs of rebuildable output removed inside a CLOSED unit's own worktree (an open unit's
+  tree is never touched); inert unless set. It keeps a worktree that stays around from pinning build output.
 The watcher refreshes the list every `[tidy] every_min` (60); `janus check` raises `disk:<host>` over a budget and `tidy:<n>`
-with what is reclaimable.
+with what is reclaimable. `janus tidy` prints the disk free before and after from `df` (the real measure; on APFS `du`
+over-counts clone-shared trees), so the space actually freed is visible.
 
 **Gate policy (targeted gates, known failures, time limits).**
 - `janus gate-scope <unit> [--name land-<unit>] [--dry-run]` runs the project's affected-scope hook (`[landing] scope_cmd`,
@@ -686,6 +804,10 @@ with what is reclaimable.
   runner's FAIL is re-judged the same way). A non-zero gate that names no failing test fails. `janus check` raises
   `known-failure:<id>` for an entry whose unit is missing or not open (failures on main are fixed at their root cause) and
   `known-failure:<id>:passes` for an entry a gate ran and passed in the last 24 h (remove it).
+- **Gate baseline (decision 0002).** `janus gate <name> --baseline <base>` records that a run of the landing branch and the
+  same host is this gate's baseline (`out/<name>/baseline.txt`; `--baseline none` clears it). `gate-judge` then treats a test
+  the baseline also failed as the branch's, not the unit's: only failures the baseline did not see (and that are not
+  `known_failures`) block. The RESULT line names the baseline and its failure count (`BASE=<base>(<n>)`).
 - `[landing] gate_timeout_min` (or `janus gate --timeout-min`): the gate's process group is stopped at the limit and a
   `EXIT_timeout=124 RESULT: FAIL` line is written. Every gate runs under `janus gate-exec`, which records its length.
 - `[landing] quick_gate_min`: a gate expected (median of its own last runs, else of its family `land-*-<suffix>`) under this
@@ -740,6 +862,10 @@ for the reload plus `[budget] resume_min_usd` (0.1) is refused and the unit reco
   unit until the review passes or `janus quality review <unit> --override '<reason>'` accepts its findings.
 - `janus check` raises `test-signal:<gate>` for a gate that takes over `[quality] signal_min_min` (20) minutes and has not failed
   in its last `signal_runs` (5) recorded runs: scope or trim it (deleting a step is the owner's call).
+- `janus check` raises `review:<unit>` for a tier **critical** unit that finished DONE with no later review of it: launch a review
+  with `--of <unit>` (the strongest model, different vendor) that starts after the unit's last commit, or re-review after any
+  change. `[landing] hold_h` (hours; unset by default) refuses a NEW implement unit when a gated DONE unit has waited that long
+  and a provider is under 25 % of its cap — "land first" (S1 finish-and-land, S3 land-first-lean).
 - **`janus soak [--minutes N] [--live]`** exercises janus's read-only paths on a live project and prints one pass/fail line per
   step: the watcher's wake decision, a check, peers, the reports index, a brief header (with the session memory), a transcript,
   each ledger, and the decision log. Read-only by default; `--live` also runs one watcher pass. `--minutes 0` is one pass.

@@ -18,6 +18,32 @@ from janus.templates import CLEAN_PUEUE
 from janus.transcripts import predecessor_name, related_pointers, transcript_of
 from janus.units import herdr_agents, main_checkout, report_path, unit_state, ws_id
 
+def model_qualified(cfg, m):
+    """Whether a model may do normal work: [models.<m>] qualified = false marks a free or new model unqualified until
+    `janus qualify <m>` records a pass (.janus/qualified.json). Unset means qualified (inert for a one-machine setup)."""
+    c = cfg.models.get(m, {}); q = cfg.jget("qualified.json").get(m, {})
+    return True if q.get("pass") else c.get("qualified", True) is not False
+
+def cmd_qualify(cfg, a):
+    """janus qualify <model> [--fail] "<what it did>": record that a model passed (or failed) a small real task before it is used
+    for real work. A model with [models.<m>] qualified = false is skipped by routing for normal work until this records a pass."""
+    if a.model not in cfg.models: raise Err(f"unknown model {a.model}")
+    q = cfg.jget("qualified.json"); q[a.model] = {"pass": not a.fail, "at": ts(), "note": a.note or ""}; cfg.jput("qualified.json", q)
+    return 0, [f"{a.model}: qualification {'failed' if a.fail else 'passed'} ({a.note or 'no note'})"]
+
+def deferred_block(cfg, name, item=None):
+    """Why a launch of this unit is refused (None when it is not): an open owner instruction labelled `deferral` names the unit
+    or its backlog item. The owner deferred that work (S3 first-collection-means-working: a deferral is not silently started), so
+    ask before starting it."""
+    try: ins = Beads(cfg).issues("instruction")
+    except Exception: return None   # beads unavailable (or a test double): no deferral to enforce
+    for i in ins:
+        if "deferral" not in (i.get("labels") or []): continue
+        t = (i.get("title") or "")
+        if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", t) or (item and re.search(rf"(?<![\w-]){re.escape(str(item))}(?![\w-])", t)):
+            return f"deferred by the owner: {t.strip()[:160]} (finish what it waits on, or ask the owner to lift it)"
+    return None
+
 def pick_model(cfg, tier, kind, of_vendor, host=None):
     lst = cfg.route.get("review" if kind == "review" else tier, [])
     why = []
@@ -25,6 +51,7 @@ def pick_model(cfg, tier, kind, of_vendor, host=None):
         c = cfg.models.get(m, {})
         if host and host not in c.get("hosts", list(cfg.hosts)): why.append(f"{m}: not allowed on {host}"); continue
         if kind == "review" and of_vendor and c.get("vendor") == of_vendor: why.append(f"{m}: same vendor as implementer"); continue
+        if not model_qualified(cfg, m) and kind != "qualify": why.append(f"{m}: not qualified (janus qualify {m})"); continue
         ok, w = model_ok(cfg, m)
         if ok: return m
         why.append(f"{m}: {w}")
@@ -265,7 +292,9 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
             + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
     return (head + f"**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
-            f"brings back a patch of your changes, your REPORT and logs). Run every build and test through this host's pueue lane: "
+            f"brings back a patch of your changes, your REPORT and logs). **No git here (janus):** your copy has no `.git` and no "
+            f"remote, so do not run git commands; write the code, and list every file you changed in your report (janus collects a "
+            f"patch of your changes). Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
             f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=rep)
             + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
@@ -289,6 +318,27 @@ def place(cfg, a, brief, mc, units, hs):
     if want and want in allowed: return [want], f"tests run on {want}", want
     if want and want not in cfg.hosts: want = None
     return allowed, ("tests run on " + want + ", but " + a.unit + "'s model is not allowed there; " if want else "") + "most room", want
+
+def land_first_block(cfg, units, hs):
+    """Why a NEW implement unit is refused (None when it is not): [landing] hold_h is set, a capped provider has under 25 % of its
+    cap left, and a finished DONE unit's gates passed over hold_h hours ago but it is not landed. Then the work that is done is
+    landed before more is started (S1 finish-and-land, S3 land-first-lean). Inert unless [landing] hold_h is set."""
+    h = cfg.c.get("landing", {}).get("hold_h")
+    if not h: return None
+    from janus.findings.work import landing_findings
+    from janus.ledger import committed
+    if not any("cap_usd" in pv and committed(cfg, pv) >= 0.75 * pv["cap_usd"] for pv in cfg.prov.values()): return None
+    stuck = []
+    for k, why in landing_findings(cfg, units, hs):
+        if not k.endswith(":unlanded"): continue
+        n = k.split(":")[1]; u = next((x for x in units if x["name"] == n), None)
+        if not u: continue
+        try: age = (now() - report_path(cfg, u).stat().st_mtime) / 3600
+        except OSError: continue
+        if age >= h: stuck.append(f"{n} ({age:.0f} h)")
+    if not stuck: return None
+    return ("land first: " + ", ".join(stuck[:6]) + ("..." if len(stuck) > 6 else "") + f" passed their gates over {h} h ago and are not "
+            f"landed, while a provider is under 25 % of its cap: land them (janus land <unit>), then start more work")
 
 def choose(cfg, a, brief, mc, units, hs):
     """(agent host, build host, why) for a new unit, or Err saying why not and when to expect room. The agent host has room for
@@ -368,6 +418,10 @@ def cmd_launch(cfg, a):
     if wp: raise Err(f"refused (waste pause): {wp}")
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
+    if a.kind == "implement":   # a deferred item is not started without asking (S3 first-collection-means-working)
+        _it = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
+        db = deferred_block(cfg, name, _it)
+        if db: raise Err(f"refused: {db}")
     of = next((u for u in units if u["name"] == (a.of or name)), None)
     if a.model:   # an explicit model passes the same enabled and budget checks as a routed one (M1)
         if a.model not in cfg.models: raise Err(f"unknown model {a.model}")
@@ -378,6 +432,9 @@ def cmd_launch(cfg, a):
     hs = getattr(a, "probes", None) or probe_all(cfg)
     ag = herdr_agents(cfg) if not getattr(a, "probes", None) else {}
     for x in units: x.setdefault("state", unit_state(x, hs, ag))   # finished units hold no build position
+    if a.kind == "implement":   # land the done work before starting more (S1 finish-and-land, S3 land-first-lean; inert unless configured)
+        lb = land_first_block(cfg, units, hs)
+        if lb: raise Err(f"refused: {lb}")
     hn, build, why_place = choose(cfg, a, brief, mc, units, hs)
     h = cfg.hosts[hn]; local = h.get("local", False)
     if getattr(a, "new_worktree", None) and a.cwd:   # finding 12: --new-worktree makes its own tree
@@ -436,6 +493,7 @@ def cmd_launch(cfg, a):
     pred = predecessor_name(cfg, name, a.resume_of)   # RELATED: names and the predecessor reach the brief (imp-awareness)
     u = {"v": UNIT_V, "host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
+    if a.of: u["of"] = a.of   # the unit a review checks (review:<unit> for a critical unit needs a later review of it)
     if report: u["report"] = str(report); u["resume"] = True
     item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
     if item: u["item"] = item
