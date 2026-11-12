@@ -23,7 +23,8 @@ def board(cfg, *args, env=None, timeout=25):
     The shipped board's files (.master, .hosts, .notify) exist from the first call: posts never land in an outbox here, and a
     remote unit's rule names <root>/bin/board.sh (not this machine's path)."""
     if not cfg.paths.get("board") and not cfg.run.dry: board_files(cfg)   # .master, and .hosts before a remote unit's rule is written
-    return sh([str(board_script(cfg)), *args], env={"BOARD_DIR": str(board_dir(cfg)), **(env or {})}, timeout=timeout)
+    from janus.project import project_id   # a card janus creates carries the project's id (cross-project safety)
+    return sh([str(board_script(cfg)), *args], env={"BOARD_DIR": str(board_dir(cfg)), "BOARD_PROJECT": project_id(cfg), **(env or {})}, timeout=timeout)
 
 def board_rows(cfg):
     """Every open card on the board: {name: {"state", "silent", "gone", "text"}} (audit H8: all cards, not only janus's units)."""

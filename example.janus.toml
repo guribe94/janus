@@ -4,6 +4,8 @@
 
 [project]
 name = "myproject"
+# id = "myproject"        # the project id every job, tmux session and card janus creates carries (default: name); on a machine
+                         # shared by several janus projects each sees and acts on its own items only. Unique per machine.
 beads = "."              # directory holding .beads/ (units, instructions, rules, backlog); `bd init` there once
 state = ".janus"          # HANDOFF.md, history.md and janus's bookkeeping
 cycle_min = 15           # a check/ack cycle is overdue after this
@@ -194,6 +196,7 @@ margin_pct = 30
 min_runs = 3             # fewer past runs: the provider's budget_per_unit
 warn_pct = 80            # check: budget80:<unit> at this share of its budget ...
 report_stale_min = 10    # ... while its report has not changed for this long
+overshoot_pct = 20       # each run holds its budget plus this in the ledger (runs overshoot their cap; worst seen 18 %)
 wrapup_usd = 0.5         # a run that ends at its budget cap without a final verdict is resumed once with this, to write its report
 resume_min_usd = 0.1     # a parked unit is resumed (same session) only while this much of its budget is left
 
@@ -222,6 +225,7 @@ backup_min = 30          # stop and close refuse while a remote copy has work ja
 grace_min = 5
 stop_burners = true      # a CPU burner's process group (never a group that holds the agent)
 stop_direct = false      # a build or test an agent runs outside the lanes on a remote host (flagged and warned either way)
+stop_api = true          # a Claude/Anthropic API process janus did not start, on any host (spend:proc:<host>:<pid>)
 
 # [landing] final_gate_host = "<host>"; final_gate = "<command>"   # janus land gates the merged tree there before it squash-lands
 

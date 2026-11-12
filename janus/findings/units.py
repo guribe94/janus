@@ -6,8 +6,9 @@ from janus.actions.jobs import job_state, unit_jobs
 from janus.board import board_dir, board_questions, board_rows
 from janus.budgets import bset, last_checkpoint, unit_spend, waste_paused, work_written
 from janus.context import DIFF_X, atomic_write, fl, hrun, now, qp, sh, ts
-from janus.ledger import committed, ledger_read, spend
+from janus.ledger import ledger_read, spend
 from janus.platform import herdr
+from janus.project import project_id
 from janus.transcripts import card_fields, transcript_where
 from janus.units import ENDED, all_units, api_out, own_tree, report_path, unit_runs, unit_state, verdict, waiting_line_jobs
 
@@ -102,7 +103,7 @@ def peer_rows(cfg, units, hs):
     for u, (br, fs) in zip(live, ch):
         c = card_fields(cfg, u["name"])
         rows.append({"name": u["name"], "host": u.get("host"), "model": u.get("model"), "branch": br, "files": fs, "state": u.get("state"),
-                     "step": c.get("step") or c.get("state") or "-", "jobs": u.get("_park") or unit_jobs(hs, u["name"]),
+                     "step": c.get("step") or c.get("state") or "-", "jobs": u.get("_park") or unit_jobs(cfg, hs, u["name"]),
                      "report": str(report_path(cfg, u)) if cfg.hosts.get(u.get("host"), {}).get("local") else f"{u['host']}:{cfg.hosts[u['host']].get('root')}/out/{u['name']}/REPORT.md",
                      "transcript": transcript_where(cfg, u)})
     return rows
@@ -131,7 +132,10 @@ def peer_findings(cfg, units, hs):
 def card_findings(cfg, names):
     """board:<card>:blocked|question|gone|silent for every card on the board, including other launchers' (marked not a unit)."""
     F = []; qids = board_questions(cfg) is not None
+    me = project_id(cfg)
     for card, r in board_rows(cfg).items():   # every card, including those other launchers posted (marked "not a unit")
+        pid = card_fields(cfg, card).get("project")
+        if pid and pid != me: continue   # another project's card (a shared board): not shown
         tag = "" if card in names else " (not a unit)"
         if r["state"] == "blocked" or (r["state"] == "question" and not qids):
             F.append((f"board:{card}:{r['state']}", f"{card}{tag} is {r['state'].upper()} on the board: {r['text']}; answer with board.sh direct"))
@@ -153,7 +157,7 @@ def unit_findings(cfg, hs, units, ag):
             u["_park"] = pk; u["state"] = st = "parked"
             F += parked_findings(cfg, hs, u, pk)
         elif st == "working":   # alive while its own jobs wait for admission: it pays to wait (cannot be acked)
-            jw = [j for j in unit_jobs(hs, u["name"]) if job_state(hs, j)[0] in ("queued", "admission")]
+            jw = [j for j in unit_jobs(cfg, hs, u["name"]) if job_state(hs, j)[0] in ("queued", "admission")]
             if jw:
                 sp, how = unit_spend(cfg, u); hrs = max((now() - max(u.get("started", now()), u.get("resumed_at", 0))) / 3600, 1 / 60)
                 rate = f"about ${sp / hrs:.2f}/h ({how})" if sp is not None else f"cost per hour unknown ({how})"
@@ -193,14 +197,22 @@ def ledger_findings(cfg, units):
             if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
                 F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
                           + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": janus ledger check"))
-            ur = unreconciled(cfg, pv, units)
-            if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (${sum(x[2] for x in ur):.2f} held as running: "
+            ur = unreconciled(cfg, pv, units)   # each check: the done spend against the committed, and runs held for agents that are gone
+            done = sum(r["cost"] or 0.0 for r in runs.values() if r["done"])
+            if ur: F.append((f"ledger:{n}:unreconciled", f"{len(ur)} {n} run(s) whose agent is gone have no done row (done ${done:.2f} vs committed ${spend(runs):.2f}; ${sum(x[2] for x in ur):.2f} held as running: "
                              + ", ".join(f"{x[0]} {x[3]}" for x in ur[:3])[:240] + "): janus ledger reconcile"))
     return F
 
 def spend_findings(cfg):
-    """spend:<provider>: a provider's committed spend is at its cap."""
+    """spend:<provider>: a provider's committed spend is at its cap; spend:<provider>:90 and :80 when it passed 90 or 80 % of it
+    (the highest only). Committed counts running runs at their reservation (budget plus overshoot margin)."""
     F = []
     for n, pv in cfg.prov.items():
-        if "cap_usd" in pv and committed(cfg, pv) >= pv["cap_usd"]: F.append((f"spend:{n}", f"{n} spend at its ${pv['cap_usd']} cap: launch on another provider, or ask the owner to raise the cap"))
+        if "cap_usd" not in pv or not pv["cap_usd"]: continue
+        runs = ledger_read(cfg, pv)[0]; c = spend(runs); done = sum(r["cost"] or 0.0 for r in runs.values() if r["done"]); cap = pv["cap_usd"]
+        if c >= cap: F.append((f"spend:{n}", f"{n} spend at its ${cap} cap: launch on another provider, or ask the owner to raise the cap"))
+        else:
+            pct = next((p for p in (90, 80) if c >= cap * p / 100), None)
+            if pct: F.append((f"spend:{n}:{pct}", f"{n} committed ${c:.2f} is over {pct} % of its ${cap} cap (${done:.2f} spent in finished runs, "
+                               f"${c - done:.2f} held by running ones): tell the owner; launch only what matters most"))
     return F

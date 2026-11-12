@@ -8,6 +8,7 @@ from janus.context import Err, LE, handoff_path, handoff_stale, now, sh
 from janus.gates import gate_ids, gate_results, kf_active, known_failures, landed
 from janus.platform import watcher_loaded, watcher_service
 from janus.probe import room
+from janus.project import own_label
 from janus.units import report_path
 
 def gate_findings(cfg, hs=None):
@@ -15,8 +16,8 @@ def gate_findings(cfg, hs=None):
     running (a superseded failure never comes back after its ack expires)."""
     try: lines = cfg.p("gate_log").read_text().splitlines()[-200:]
     except OSError: return []
-    busy = {(t.get("label") or "")[5:] for p in (hs or {}).values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values()
-            if (t.get("label") or "").startswith("gate:") and any(k in str(t.get("status")) for k in ("Queued", "Running"))}
+    busy = {(own_label(cfg, t) or "")[5:] for p in (hs or {}).values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values()
+            if (own_label(cfg, t) or "").startswith("gate:") and any(k in str(t.get("status")) for k in ("Queued", "Running"))}
     latest = {}
     for l in lines:
         if "RESULT:" in l and len(l) > 20: latest[l[20:].split()[0]] = l
@@ -93,7 +94,7 @@ def landing_findings(cfg, units, hs=None):
     res = gate_results(cfg); queued = set()
     for p in (hs or {}).values():
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
-            lab = t.get("label") or ""
+            lab = own_label(cfg, t) or ""
             if lab.startswith("gate:") and any(k in str(t.get("status")) for k in ("Queued", "Running")): queued.add(lab[5:])
     F = []
     for u in units:
@@ -132,9 +133,16 @@ def known_failure_findings(cfg, names):
                 seen.add(i); F.append((f"known-failure:{i}:passes", f"known failure {i} passed in gate {n}: remove it from {cfg.c['landing']['known_failures']}"))
     return F
 
+ORCH_WAIT = 3   # watcher passes an unregistered orchestrator (pane present without an agent, or session pending) is tolerated
+
 def orchestrator_findings(cfg):
-    """orchestrator:kind: the registered orchestrator's kind differs from janus.toml [orchestrator] kind."""
+    """orchestrator:kind: the registered orchestrator's kind differs from janus.toml [orchestrator] kind; orchestrator:unregistered:
+    the watcher has not seen the orchestrator it started (or the recorded pane's agent) for ORCH_WAIT passes and starts none."""
     F = []
+    w = cfg.jget("orch_wait.json")
+    if w.get("passes", 0) >= ORCH_WAIT:
+        F.append(("orchestrator:unregistered", f"no orchestrator seen for {w['passes']} watcher passes ({w.get('why')}); the watcher starts no other while it "
+                  "may be starting: look at its pane, then run janus register in it, or close the pane (herdr pane close) so the watcher starts a new one"))
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but janus.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))

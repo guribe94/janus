@@ -7,6 +7,8 @@ from janus.beads import Beads
 from janus.board import board, board_rows
 from janus.context import FIXTURE_MARK, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
 from janus.gates import landed, landing_branch
+from janus.project import own_card
+from janus.transcripts import card_fields
 from janus.units import all_units, herdr_agents, ws_id
 
 def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
@@ -32,11 +34,11 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
         P.append(("worktree", str(d), f"clean, contained in the landing branch{', branch ' + br + ' kept' if br else ''}, no open unit"))
     au = all_units(cfg); ws = ws_id(cfg)
     for k, a in (ag if ag is not None else herdr_agents(cfg)).items():
-        if ws and a.get("workspace_id") != ws: continue
+        if not ws or a.get("workspace_id") != ws: continue   # only panes in this project's workspace (cross-project safety)
         if k in names or k == "orchestrator" or au.get(k, {}).get("status") != "closed": continue
         P.append(("pane", a["pane_id"], f"herdr agent {k}: its unit is closed ({a.get('agent_status')})"))
     for card, r in (rows if rows is not None else board_rows(cfg)).items():
-        if r.get("gone") and card not in names: P.append(("card", card, "its process is gone and it belongs to no open unit"))
+        if r.get("gone") and card not in names and own_card(cfg, card_fields(cfg, card)): P.append(("card", card, "its process is gone and it belongs to no open unit"))
     return P
 
 # The whole mess orchestration makes (owner core rule, janus-fixes10 item 5b), each by a safe rule. [tidy] in janus.toml:

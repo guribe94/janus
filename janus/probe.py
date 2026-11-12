@@ -5,7 +5,7 @@ pueue(), margins/room/cap_line. Unreachable hosts degrade to a finding with the 
 from janus.context import hrun, qp, fl, sh, now, FIXTURE_MARK
 from janus.cap import cap_lib, capv, host_cap, FACTS
 from janus.platform import HOST_FACTS, parse_facts
-from janus.templates import PROBE, DIRECT_PROBE
+from janus.templates import API_PROBE, PROBE, DIRECT_PROBE
 import concurrent.futures as cf, json, shlex
 
 # Remote lane enforcement (issue 22): processes on a Linux host whose environment carries JANUS_UNIT (an agent and what it starts),
@@ -26,6 +26,7 @@ def probe_extra(h):
     for s in h.get("legacy_lanes", "").split():
         w += f'\no=$(cat {shlex.quote(s)}/pid 2>/dev/null); [ -n "$o" ] && kill -0 "$o" 2>/dev/null && echo "sched=$o old lane {s}"'
     if not h.get("local"): w += "\n" + DIRECT_PROBE % {"rx": shlex.quote(BUILD_ERE)}
+    w += "\n" + API_PROBE   # every host: Claude/Anthropic API processes janus did not start (spend safety)
     # legacy_probe (janus.toml, per host): shell that prints legacy_wait=<n> and legacy_run=<n> for a project's older job queue
     # while it drains, so a jammed old queue shows in janus check
     return w + "\n" + h.get("legacy_probe", "")
@@ -36,7 +37,7 @@ def pueue(h):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
     return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
-LIST_KEYS = ("res", "hist", "sched", "direct", "waitjob")   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
+LIST_KEYS = ("res", "hist", "sched", "direct", "waitjob", "apiproc")   # apiproc: API processes janus did not start   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
 
 def probe(name, h, ro=True, cfg=None):
     """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,

@@ -36,6 +36,16 @@ DIRECT_PROBE = r'''if [ -d /proc/1 ]; then
  rm -f /tmp/.janus-units.$$
 fi'''
 
+# Claude/Anthropic API processes janus did not start (spend safety): an API key in the environment and no JANUS_UNIT (every
+# agent janus starts has one), command claude or anthropic. Prints apiproc=<pid> <pgid> <etime> <command>; never the environment.
+API_PROBE = r'''if [ -d /proc/1 ]; then
+ for f in /proc/[0-9]*/environ; do e=$(tr '\0' '\n' < "$f" 2>/dev/null); case "$e" in *ANTHROPIC_API_KEY=*) case "$e" in *JANUS_UNIT=*) ;; *) p=${f#/proc/}; echo "${p%/environ}";; esac;; esac; done 2>/dev/null > /tmp/.janus-api.$$
+else
+ ps -Eww -A -o pid=,command= 2>/dev/null | awk '/ANTHROPIC_API_KEY=/ && !/JANUS_UNIT=/ {print $1}' > /tmp/.janus-api.$$
+fi
+ps -A -o pid=,pgid=,etime=,command= | awk 'NR == FNR {k[$1] = 1; next} ($1 in k) {c = $0; sub(/^ *[0-9]+ +[0-9]+ +[^ ]+ +/, "", c); if (c ~ /(^|\/)claude( |$)|node .*claude|anthropic/) print "apiproc=" $1, $2, $3, substr(c, 1, 100)}' /tmp/.janus-api.$$ - 2>/dev/null
+rm -f /tmp/.janus-api.$$'''
+
 CAP_LIB = r'''# janus capacity library for host %(name)s (written by janus, see cap_lib in janus.py; do not edit: the next janus run rewrites it).
 # Sourced by every waiting job each poll and sent inline with every probe. Needs RD (the runs dir).
 CORES=%(cores)d CPJ=%(cpj)d MEMCAP=%(memcap)d CAPMB=%(capmb)d AGMB=%(agmb)d PSIP=%(psip)s LOADX=%(loadx)s HOLD=%(hold)d DISK=%(disk)d HN=%(hn)d MARGIN=%(margin)d
@@ -172,8 +182,8 @@ fi'''
 CLEAN_PUEUE = r'''#!/bin/sh
 # pueue with an allow-listed environment (written by janus): a task never stores the caller's ANTHROPIC_API_KEY or tokens
 real=%(real)s
-# an agent's own `pueue add` gets its unit's label, so janus check never calls it an orphan (issue 24)
-if [ "$1" = add ] && [ -n "$JANUS_UNIT" ]; then case " $* " in *" -l "*|*" --label "*|*" --label="*) ;; *) shift; set -- add -l "unit:$JANUS_UNIT" "$@";; esac; fi
+# an agent's own `pueue add` gets its unit's label and the project's id, so janus check never calls it an orphan (issue 24)
+if [ "$1" = add ] && [ -n "$JANUS_UNIT" ]; then case " $* " in *" -l "*|*" --label "*|*" --label="*) ;; *) shift; set -- add -l "unit:$JANUS_UNIT${JANUS_PROJECT:+@$JANUS_PROJECT}" "$@";; esac; fi
 exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" PATH="$PATH" LANG="${LANG:-C.UTF-8}" SHELL="${SHELL:-/bin/sh}" \
   TMPDIR="${TMPDIR:-/tmp}" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} ${XDG_CONFIG_HOME:+XDG_CONFIG_HOME="$XDG_CONFIG_HOME"} ${JANUS_UNIT:+JANUS_UNIT="$JANUS_UNIT"} ${JANUS_ROLE:+JANUS_ROLE="$JANUS_ROLE"} "$real" "$@"
 '''
