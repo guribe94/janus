@@ -1930,11 +1930,39 @@ def cmd_resume(cfg, a):
     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); bd.save(u)
     bd.comment(u["id"], f"{ts()} resumed"); cfg.touch("changed")
 
+def save_output(cfg, u):
+    """Bring a remote unit's output folder here (out/<unit>/: REPORT.md, api.json and each run's api-<run>.json, logs; never the
+    key fifo) and keep its pueue task's log; a resumed unit's report also goes back to its original path. True when done."""
+    h = cfg.hosts[u["host"]]; n = u["name"]; od = cfg.p("out", "out") / n
+    cmd = ["rsync", "-a", "--exclude", "*.key", "-e", " ".join(SSH), f"{h['ssh']}:{h['root']}/out/{n}/", str(od) + "/"]
+    if DRY: say("+ " + shlex.join(cmd)); return True
+    od.mkdir(parents=True, exist_ok=True)
+    if sh(cmd, timeout=600)[0]: return False
+    if u.get("via") == "pueue" and u.get("task") is not None: save_task_log(cfg, h, u, u["task"])
+    if u.get("report") and (od / "REPORT.md").is_file(): atomic_write(Path(u["report"]), (od / "REPORT.md").read_text())
+    return True
+
+def refresh_remote(cfg, u, bd, log):
+    """A remote unit's output is read here: saved once when its agent's turn ended (then its verdict, WAITING line and api.json
+    are judged here), and every [collect] backup_min while it runs (item 4)."""
+    if cfg.hosts[u["host"]].get("local") or u.get("via") in ("failed", "starting"): return
+    fin = u.get("state") in ENDED
+    if not ((fin and u.get("saved") != u.get("task")) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60): return
+    if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed"); return
+    u["saved_at"] = int(now())
+    if fin: u["saved"] = u.get("task")
+    bd.save(u)
+    u["verdict"] = v = verdict(cfg, u)
+    if not v and not u.get("_park") and (fin or u.get("via") == "tmux"):
+        pk = waiting_line_jobs(cfg, u)
+        if pk: u["_park"] = pk; u["state"] = "parked"
+
 def tend_parked(cfg, hs, units, log):
     """The watcher's part: record parked units, resume those whose jobs all finished, wrap up capped runs (item 2)."""
     bd = Beads(cfg)
     for u in units:
         try:
+            refresh_remote(cfg, u, bd, log)
             jobs = u.get("_park")
             if jobs:
                 if (u.get("parked") or {}).get("jobs") != jobs:
