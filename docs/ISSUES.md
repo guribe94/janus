@@ -1,8 +1,31 @@
 # Issue register
 
-Every problem met with the orchestrating skill, fixed at its root cause in the skill (generic, shareable). Kept current per
-round. Status: **fixed (round)** = fixed in code, with the proof named; **verify** = believed fixed, still to be seen working
-live; **open** = not fixed yet, with the reason. First filled 2026-11-11 (orch-fixes7) from the owner's register.
+Every problem met with the orchestrating skill, fixed at its root cause in the skill (generic, shareable). The live part is
+the open-risks table below; everything fixed is kept as history in the changelog at the end, so a maintainer can tell a known
+risk from a closed one. Status: **fixed (round)** = fixed in code, with the proof named; **verify** = believed fixed, still to
+be seen working live; **open** = not fixed yet, with the reason. First filled 2026-11-11 (orch-fixes7) from the owner's
+register.
+
+## Open risks
+
+| # | Risk | Why it is still open |
+|---|---|---|
+| 1 | Agents run with the owner's full identity: no sandbox, `--dangerously-*` permissions, the API key in their environment | an isolation decision (separate user or container) is the owner's; the key-injection proxy and the agent-side hook policy are not built |
+| 2 | `check` and the watcher both mutate state with no writer lock; `jput`/`touch` are not atomic | a kill during a state write silently resets acks, open problems, the Stop counter and learned posts; `tests/test_state.py` pins the atomic fix as an expected failure |
+| 3 | An interactive agent cannot park: its Stop hook demands a verdict where parking needs a `WAITING` line and no verdict | the park-aware Stop predicate is not built; API agents escape only because `--bare` skips hooks |
+| 4 | `orch close` does not refuse while the unit's jobs still run | closing deletes the tree under a queued job; results land in a removed tree |
+| 5 | Abandoned runs pin budget until `orch ledger reconcile` is run | no automatic age/no-live-task settle; the live project held ~$24 of a $255 cap |
+| 6 | Gates are unmodeled: no per-step timing, retry budget or full affected-scope selection | `gate-scope`, `known_failures` and `gate_timeout_min` landed; the model does not |
+| 7 | The orchestrator is the throughput ceiling (60 ready items with no brief) | no brief-writer loop; a cheap model writing briefs from the checklist is not built |
+| 8 | CPU is reserved by a per-host scalar, never measured or bound (`-j`/`CARGO_BUILD_JOBS` not set, no CPU-seconds) | memory is learned per class; CPU is guessed |
+| 9 | No utilisation or queue-wait metrics | "use every machine" is unprovable; `orch report` reports dollars, not cores or waits |
+| 10 | `orch land` blocks the caller for the length of a gate and never pushes the landing branch | a Bash timeout strands a half-landed branch; a landing can sit only on the Mac with every check silent |
+| 11 | The hooks do not stop hand-run builds/tests (only destructive operations) | the role's core rule is detected after the fact; nothing denies `cargo test` by hand |
+| 12 | Board posts and `learned` proposals flow into `MEMORY.md` and every brief with no provenance | an unauthenticated channel into all future agents; no "treat as data" framing |
+
+## Fixed history (changelog)
+
+Rows quoted with their original names; the tool was later renamed (see `docs/PLAN-history.md`).
 
 | # | Issue seen | Root cause | Status |
 |---|---|---|---|
@@ -82,4 +105,4 @@ live; **open** = not fixed yet, with the reason. First filled 2026-11-11 (orch-f
 | 74 | Running the test suite beside a live project raised findings there (a test's in-place-edited script, test/build fixtures) | live checks could not tell fixtures from real work | fixed (fixes10 item 6): fixtures live under a temp root named `orch-test-fixture-*`; live checks skip processes whose argv holds the mark (proc, script, scheduler and direct probes) unless `ORCH_IN_TESTS` is set (the suite). test Fixtures |
 | 75 | Branches, run files, caches, remote copies, test roots and containers piled up; disks filled | no rule removed them | fixed (fixes10 item 5b, owner core rule): `orch tidy` covers landed branches (local + remote, `[tidy] branches`), run files beyond `keep_days`, our stopped `orch-run-*` containers, remote copies of closed units with nothing uncollected, test roots over a day old, cache entries over `disk_budget_gb`; watcher refresh, findings `disk:<host>`, `tidy:<n>`. Dangling images are not removed (they carry no name of ours). test TidyAll; live dry-run |
 | 76 | Runs whose agent was gone kept their running row for days; spend and reports could not tell finished from running | nothing closed a run when its agent vanished without a done row | fixed (fixes10 item 7): `orch ledger reconcile [--dry-run]` writes `done unknown` with the budget as the upper bound; `orch report` shows them as reconciled; `ledger:<provider>:unreconciled` until done. test Reconcile; live dry-run (4 runs) |
-| 77 | 4324 lines in one file, 32 subcommands, 31 finding families and 9 embedded templates; duplicated policy kept in sync by hand; no way to test the finding set or a launch decision | everything in one namespace with module-level globals (`DRY`, `cfg.ro`, `cfg._*`) | in progress (refactor round, section 7): split into `orchkit/` with `orch.py` as the entry point. Moved: `context`, `templates`, `beads`, `cap`, `probe`, `ledger`, `units`, `board`; `install` copies the package; `tools/check_all.sh` adds `sh -n` template tests and an atomic-state test (expected failure until seam 2). Remaining groups need the item-2 seams first (the section graph has a 17-group cycle). See `out/ds-refactor/REPORT.md` |
+| 77 | 4324 lines in one file, 32 subcommands, 31 finding families and 9 embedded templates; duplicated policy kept in sync by hand; no way to test the finding set or a launch decision | everything in one namespace with module-level globals (`DRY`, `cfg.ro`, `cfg._*`) | fixed (refactor round, section 7): split by seam into `orchkit/` with `orch.py` a seven-line entry point. The seams landed first (`Finding` registry + `orch check --json`, the `Run` object replacing `DRY`/`cfg.ro`/`cfg._*`, actions returning `(rc, lines)`, a golden-findings test); then every section moved verbatim; the board contract moved to `orchkit/msgboard.py` with `board.sh` a thin shim; unit record v2 with a migration; `./check` discovers every `tests/test_*.py`; `install` copies the package and its release smoke imports it. `docs/DESIGN.md` carries the module map and the seams. Dead aliases deleted (`SECRET_ENV`, `cfg.unreach`, `fleet_log`, `run_handoff`, the `launcher`-key set) |
