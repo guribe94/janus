@@ -508,6 +508,10 @@ start through `bd prime`, so the owner never has to repeat them.
 A rule that changes an older one replaces it: `bd remember "<rule>" --key <subject>`, reusing the old rule's key (`bd memories
 <word>` finds it). `check` raises `rule-subject:<subject>` when two rules share a subject.
 
+A deferral (`first-collection-means-working`): an open instruction labelled `deferral` makes `janus launch` refuse a new
+implement unit whose name or `ITEM:` id the instruction names, so work the owner put off until a milestone is not started
+silently.
+
 ### Memory
 
 `.janus/MEMORY.md` is the session's curated memory: three sections (Decisions, Facts, Pitfalls), one dated line per entry. The
