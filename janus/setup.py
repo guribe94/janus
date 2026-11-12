@@ -1,13 +1,16 @@
 """janus init, doctor, queue, register and install-host: a shareable project setup, new machines, and the one registered
 orchestrator session."""
-import concurrent.futures as cf, json, os, re, shlex, sys
+import argparse, concurrent.futures as cf, json, os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import remote_wt
+from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
+from janus.actions.launch import new_tab, wait_shell
 from janus.board import board_dir, board_script
-from janus.context import (Err, JANUS_SELF, SSH, atomic_write, clean_env, herdr, hrun, now, projects, qp, record_session_proc, say,
-    session_alive, sh, slug, ts)
+from janus.context import (Err, JANUS_MARK, JANUS_SELF, SSH, WAKE, atomic_write, clean_env, herdr, hrun, now, projects, qp,
+    record_session_proc, say, session_alive, sh, slug, ts)
+from janus.hooks import session_start_text
 from janus.ledger import ledger_read, read_secret, spend
-from janus.platform import run, watcher_loaded, watcher_service
+from janus.platform import pane_tool, run, watcher_loaded, watcher_service
 from janus.probe import discover, probe, pueue
 from janus.units import ws_id
 
@@ -38,6 +41,156 @@ def cmd_register(cfg, a):
             if lab in have: continue
             r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root), "--no-focus")
             if r: herdr("pane", "run", r["root_pane"]["pane_id"], cmd)
+
+# janus resume (imp-resume): continue the orchestration in a Claude or Codex session with nothing lost.
+#
+# The owner's ask (bd janus-resume): `janus resume [--runtime claude|codex] [--here]` — safe takeover of the registered
+# orchestrator, the state committed and pushed (pulled first when this machine is behind), running agents and jobs untouched,
+# the new session given the handoff, the standing rules and the decisions index, and the runtime's hooks checked.
+TAKEOVER_MSG = "janus resume is taking over: stop now, do not start new work, and end your turn."
+CODEX_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop")
+
+def _orch_state(pane):
+    """The registered pane's herdr agent status ("working", "idle", ...), or None when herdr does not answer or the pane has no
+    agent. The watcher judges the orchestrator the same way (janus/watch.py)."""
+    ag = herdr("agent", "get", pane) if pane else None
+    return ((ag or {}).get("agent") or {}).get("agent_status")
+
+def state_repo(cfg):
+    """The git repo that holds the state: the project root when the state folder is inside a repo (its usual place, committed by
+    janus commit-state), else the state folder itself when that is a repo of its own. None when no repo holds it."""
+    rc, o, _ = sh(["git", "-C", str(cfg.state), "rev-parse", "--show-toplevel"])
+    if rc == 0 and Path(o.strip()).resolve() == cfg.state.resolve(): return cfg.state
+    if sh(["git", "-C", str(cfg.root), "rev-parse", "--is-inside-work-tree"])[0] == 0: return cfg.root
+    return None
+
+def sync_state(cfg):
+    """Nothing lost (item 3): pull the state first when this machine is behind its remote, then commit and push it, so another
+    machine that resumes next sees the same state. Refuses on diverged histories (a hand merge, never a silent one). Running
+    agents and jobs are untouched (they belong to their hosts' queues); a parked unit keeps its jobs."""
+    repo = state_repo(cfg)
+    if repo is None: say("state: no git repo holds the state folder: nothing to pull or push"); return
+    if not sh(["git", "-C", str(repo), "remote"])[1].split(): say("state: no git remote: nothing to pull or push"); return
+    if cfg.run.dry: say(f"+ [{repo}] git fetch; git pull --ff-only when behind; commit and push the state"); return
+    rc, o, e = sh(["git", "-C", str(repo), "fetch", "--quiet"], timeout=120)
+    if rc: say(f"state: fetch failed ({(e or o).strip()[:80]}); syncing locally")
+    elif sh(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "@{u}"])[0] == 0:
+        behind = sh(["git", "-C", str(repo), "rev-list", "--count", "HEAD..@{u}"])[1].strip()
+        if behind and behind != "0":
+            rc, o, e = sh(["git", "-C", str(repo), "pull", "--ff-only", "--quiet"], timeout=180)
+            if rc: raise Err(f"state is {behind} commit(s) behind its remote and cannot fast-forward (diverged): resolve it by hand, then janus resume")
+            say(f"state pulled from its remote ({behind} commit(s))")
+    if repo == cfg.root: cmd_commit_state(cfg, argparse.Namespace(message="janus: state"))
+    else:   # the state folder is a repo of its own: the same steps, staged under it (a secret is never committed)
+        sh(["git", "-C", str(repo), "add", "-A"], timeout=120)
+        paths = [x for x in sh(["git", "-C", str(repo), "diff", "--cached", "--name-only", "-z"])[1].split("\0") if x]
+        hit = [sp for sp in paths for r in SECRETS if (cfg.state / sp).is_file() and r.search((cfg.state / sp).read_bytes())]
+        if hit: sh(["git", "-C", str(repo), "reset", "-q"]); raise Err("refused (unstaged again), possible secrets in the state: " + ", ".join(hit))
+        if not paths: say("state: nothing to commit"); return
+        for cmd in (["git", "-C", str(repo), "commit", "-m", "janus: state"], push_cmd(repo, cfg)):
+            rc, o, e = sh(cmd, cwd=str(repo), timeout=120)
+            if rc: raise Err(f"{' '.join(cmd[:3])} failed: {(e or o).strip()[-160:]}")
+        say(f"state committed and pushed ({len(paths)} path(s))")
+
+def takeover(cfg):
+    """Safe takeover (item 1): a registered orchestrator that is alive is asked, through its pane, to stop, and waited for a
+    bounded time ([orchestrator] takeover_wait_s, default 60). Never two at once: when it is still working after the wait, or
+    its process is alive but its pane cannot be reached, refuse and start nothing. The registration switch that follows makes
+    the old session inert (its hooks then match no project), and the whole resume holds the state writer lock (imp/autopilot)."""
+    pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
+    if not pane:
+        if session_alive(cfg): say("takeover: a registered session is alive but no pane was recorded, so it cannot be asked to stop")
+        return
+    pl = herdr("pane", "list")
+    if pl is None: raise Err("takeover: herdr did not answer, so the registered orchestrator's state cannot be confirmed; nothing started")
+    present = pane in {p.get("pane_id") for p in pl.get("panes", [])}
+    st = _orch_state(pane) if present else None
+    # A session was just started (session = pending:<ts>) and has not claimed the registration yet: never start a second one
+    # beside it (the panel's second-orchestrator hole; the claim window is 10 min, hooks.py). After it, the pending claim is
+    # stale and a fresh start is correct.
+    sess = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
+    if present and sess.startswith("pending:") and now() - float(sess.split(":", 2)[1] or 0) < 600:
+        raise Err(f"takeover: a session was started {int(now() - float(sess.split(':', 2)[1] or 0))} s ago (pending, pane {pane}) and has not "
+                  "registered yet: nothing started (two orchestrators must not run)")
+    if not present and session_alive(cfg) is not True:
+        say(f"takeover: the registered orchestrator is gone (pane {pane} absent, its process ended)"); return
+    if session_alive(cfg) is True and st is None:
+        raise Err(f"takeover: the registered session's process is still running, but its pane {pane} cannot be reached to ask it to stop: "
+                  "stop it, then janus resume")
+    if present and st is not None:
+        say(f"takeover: asking the registered orchestrator (pane {pane}) to stop")
+        if not cfg.run.dry: herdr("agent", "prompt", pane, JANUS_MARK + TAKEOVER_MSG)
+    if st == "working":
+        wait = float(cfg.c.get("orchestrator", {}).get("takeover_wait_s", 60)); step = min(5.0, max(0.05, wait)); t0 = now()
+        while now() - t0 < wait:
+            time.sleep(step)
+            if _orch_state(pane) != "working": st = None; break
+        if st: raise Err(f"takeover: the registered orchestrator (pane {pane}) is still working after {wait:g} s: nothing started "
+                         "(two orchestrators must not run); stop it, then janus resume")
+    say("takeover: the registered orchestrator has ended its turn")
+
+def start_orchestrator(cfg, kind):
+    """Start a new orchestrator session in the requested runtime (item 2), like the watcher's restart path: its own tab in the
+    project's herdr workspace, else a tmux session (platform.pane_tool). The registration is left to be claimed by the session's
+    first hook event, or by the `janus register` it is told to run. Its SessionStart gives it the handoff, the standing rules and
+    the decisions index, and the prompt makes its first act a fresh `janus check` (item 4)."""
+    if pane_tool() is None: raise Err("neither herdr nor tmux is installed, so no new session can be started: run janus register in a Claude or Codex session and resume with --here")
+    oc = cfg.c.get("orchestrator", {}); args = oc.get("args", []) if oc.get("kind", "claude") == kind else []
+    prompt = JANUS_MARK + "You are the orchestrator. Run janus register, then " + WAKE
+    if cfg.run.dry:
+        say(f"+ start a {kind} orchestrator in " + ("a herdr tab" if pane_tool() == "herdr" else "tmux") + f" and prompt it: {WAKE}"); return
+    atomic_write(cfg.f("session"), f"pending:{int(now())}"); atomic_write(cfg.f("session_kind"), kind + "\n")
+    if pane_tool() == "herdr":
+        pane, tab = new_tab(cfg, "orchestrator", cfg.root); wait_shell(pane, "orchestrator")
+        rc, o, e = sh(["herdr", "agent", "start", "orchestrator", "--kind", kind, "--pane", pane, "--timeout", "90000", "--", *args], timeout=100)
+        if rc: raise Err(f"herdr agent start failed: {(e or o).strip()[:160]}")
+        atomic_write(cfg.f("pane"), pane)
+        herdr("agent", "prompt", "orchestrator", prompt)
+        say(f"started a {kind} orchestrator in a new herdr tab (pane {pane}); its first hook event claims the registration")
+    else:
+        sess = "janus-orchestrator"
+        rc, o, e = sh(["tmux", "new", "-d", "-s", sess, "-c", str(cfg.root), shlex.join([kind, *args])], timeout=30)
+        if rc: raise Err("tmux new failed: " + (e or o).strip()[:120])
+        atomic_write(cfg.f("pane"), "")   # no herdr pane: the watcher judges this session by its process and transcript
+        time.sleep(2)
+        if sh(["tmux", "has-session", "-t", sess])[0]: raise Err(f"the {kind} session ended at once; nothing is running")
+        sh(["tmux", "send-keys", "-t", sess, "-l", prompt]); sh(["tmux", "send-keys", "-t", sess, "Enter"])
+        say(f"started a {kind} orchestrator in tmux session {sess}; its first hook event claims the registration")
+
+def register_here(cfg):
+    """--here: make this Claude or Codex session the registered orchestrator (janus register) and hand it the context a
+    SessionStart gives (item 4), so an in-place resume loses nothing."""
+    if cfg.run.dry: say("+ register this session as the orchestrator and print the handoff, the standing rules and the decisions index"); return
+    cmd_register(cfg, argparse.Namespace(session=None))
+    say(session_start_text(cfg))
+
+def codex_hooks_check(cfg):
+    """Item 5: under Codex the janus hooks must be installed and trusted. janus reads Codex's hook file to confirm they are
+    installed; Codex keeps hook trust in a private store janus does not read, so it names the one step (/hooks). Inert when
+    Codex's hook file does not exist."""
+    p = Path.home() / ".codex/hooks.json"
+    if not p.exists(): return
+    try: hk = json.loads(p.read_text()).get("hooks", {})
+    except Exception: hk = {}
+    miss = [ev for ev in CODEX_HOOK_EVENTS if not any("janus hook " + ev in h.get("command", "") for e in hk.get(ev, []) for h in e.get("hooks", []))]
+    if miss: say(f"Codex: janus hooks are missing ({', '.join(miss)}): run ./install, then trust them once with /hooks")
+    else: say("Codex: janus hooks installed; trust them once with /hooks (Codex keeps its own trust store, which janus does not read)")
+
+def cmd_resume_orch(cfg, a):
+    """janus resume [--runtime claude|codex] [--here]: continue the orchestration in a new session with nothing lost. The state
+    is committed and pushed first (pulled first when this machine is behind), the registered orchestration is taken over safely,
+    then this session is registered (--here) or a new one is started in the requested runtime and given the context a
+    SessionStart gives. Under Codex the hook check names the one step (item 5)."""
+    if os.environ.get("JANUS_ROLE") == "agent": raise Err("refused: an agent cannot resume the orchestration (issue 2)")
+    here = "codex" if os.environ.get("CODEX_THREAD_ID") and not os.environ.get("CLAUDECODE") else "claude"
+    kind = here if a.here else (a.runtime or (cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else "")
+                                or cfg.c.get("orchestrator", {}).get("kind", "claude"))
+    say(f"janus resume: runtime {kind}, " + ("this session (--here)" if a.here else "a new session"))
+    sync_state(cfg)   # item 3 first: the state is saved (and pulled) before anything changes
+    takeover(cfg)     # item 1: never two orchestrators
+    if a.here: register_here(cfg)
+    else: start_orchestrator(cfg, kind)
+    if kind == "codex": codex_hooks_check(cfg)   # item 5
 
 def init_project(root, a):
     """A new project: write a commented starter janus.toml (from example.janus.toml next to janus.py), create the state, briefs and
