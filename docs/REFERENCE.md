@@ -292,7 +292,8 @@ OpenRouter, OpenAI (`sk-proj-`), hex `sk-` keys, AWS access key ids, GitHub and 
 private-key blocks. A bare prefix mention passes. On a hit it unstages again, refuses and lists the paths, never the values.
 Otherwise it commits and pushes.
 
-**`janus ack <key> "<decision>"`**: acknowledges a problem for 4 hours (margin problems 30 min), until the problem clears
+**`janus ack <key> "<decision>"`**: acknowledges a problem for 4 hours (margin problems 30 min, `idle-backlog` 1 h; `waiting`
+and `instructions` cannot be acked: park the unit; close or remember each instruction), until the problem clears
 (a cleared problem's ack is dropped, so it comes back if it recurs), and records the decision as a beads comment (on the
 unit's issue for `unit:<name>:...` keys, otherwise on a `janus: decisions` issue).
 ```
@@ -407,8 +408,9 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
   add a second rule beside it; `check` raises `rule-subject:<subject>` when two rules share a subject (keep one key,
   `bd forget` the rest). A ruling that is a decision gets a record at once (`janus decide ... --instruction <id>` links and
   labels it); a decision-labelled instruction cannot be closed without one (`check` raises `decision-missing:<id>`).
-- **Keep the backlog in beads** (`janus backlog import` after the checklist changes). On `idle-backlog`, write briefs for the
-  listed items and launch them with `--item <id>`. On `landing:<unit>`, gate the finished unit (`janus gate-scope <unit>`
+- **Keep the backlog in beads** (`janus backlog import` after the checklist changes). On `idle-backlog:nobrief` (it names the count, the hosts'
+  room and the top items), run `janus brief draft <item>...` (below), read each draft and `janus brief accept <item>`; `janus fill`
+  then launches it (or write the brief yourself with an `ITEM: <id>` line). On `landing:<unit>`, gate the finished unit (`janus gate-scope <unit>`
   writes a targeted gate from the project's scope hook, then `janus gate <name> --unit <unit>`) or land it once its gates
   passed. A gate with only known failures (`[landing] known_failures`) passes; on `known-failure:<id>` launch the unit that
   fixes it at the root (or remove the entry); on `known-failure:<id>:passes` remove the entry.
@@ -488,7 +490,7 @@ table is the plain-language list of the families the reference must name; the re
 | `idle` | a host or lane has room while work waits |
 | `idle-backlog` | ready backlog items without briefs while hosts have room, or held by budget |
 | `idle-with-backlog` | ready backlog units with briefs would fit now (`janus fill`) |
-| `instructions` | unclassified owner instructions in beads |
+| `instructions` | unclassified owner instructions in beads (an ack cannot clear it: close or remember each) |
 | `issue` | a finding key acked 3+ times with no issue row logged (every oddity is logged) |
 | `known-failure` | a known failure with no open unit fixing it, or one that passes now |
 | `landing` | a finished DONE unit has no gate, or passed its gates and is not landed |
@@ -642,6 +644,13 @@ pane left without an agent for 20 minutes is closed first (section 2). A live se
   reservation or a queue position (one queued job per running job) is free there.
 - **Fill.** `janus fill --dry-run` lists what fits now and why it stops; `janus fill` launches it, and so does the
   watcher (`[fill] watcher`: unset follows `[autopilot] enabled`, so off by default). `check` reports `idle-with-backlog`.
+- **Briefs for ready items: `janus brief draft <item>... [--model m]`** writes a drafting brief and launches ONE normal-tier
+  unit (kind audit, in the project root) on the cheapest routed model: the first available model of `[routing] draft` (list the
+  project's cheapest models there), else of the normal route. It writes one brief per item (TIER, SCOPE, REPORT, DONE-WHEN, from
+  the checklist line and the reports it links; `HOLD: <why>` when the item needs the owner) into `<briefs>/drafts/<item>.md`.
+  **`janus brief accept <item> [--as <unit>]`** is the orchestrator's yes after reading it: the draft moves to
+  `<briefs>/<unit>.md` (the unit name of its first line) with an `ITEM: <item>` line; a draft on HOLD is refused. Nothing
+  launches a draft: `janus fill` reads only `<briefs>/*.md`.
 - **Autopilot (`[autopilot] enabled = true` turns it on; unset or false is off, and `check` then says `unattended:off` while
   units are open).** The watcher applies the ending policy's fixed rules
   itself (docs/DESIGN.md, "Keeping work moving"): collect finished remote units; resume a unit stopped by its budget in its own
@@ -716,7 +725,16 @@ job). `--dry-run` prints each host's verdict. A job given `--host` stays there (
 **`--broad <reason>`**: a jobs-lane run that matches `[capacity] broad_patterns` or whose class takes `broad_min` minutes is
 refused without it; with it, the run gets nice 19, pueue priority -5 and goes after shorter jobs.
 
-**`janus run --host <h> --lane gates|jobs|land [--unit <u>] --wt <worktree> [--subdir <d>] [--usb] [--priority N] [--detach] -- <cmd>`**
+**`janus run --host <h> --lane gates|jobs|land [--unit <u>] --wt <worktree> [--subdir <d>] [--usb] [--priority N] [--detach] [--inputs <path>... [--no-cache]] -- <cmd>`**
+- **Result cache (`--inputs`, optional).** A job (a gate step is one) may declare the paths its result depends on, relative to the
+  worktree. Its key is the host's OS and architecture, the toolchain stamp (`[cache] toolchain = "<text>"` and the output of
+  `[cache] toolchain_cmd` run on that host, e.g. `rustc -V; uv --version`), the command with its `--subdir`, and git's hash of
+  each input at the tree (`git rev-parse HEAD:<path>` for a clean path; the files' contents for a dirty one). A key that already
+  PASSED is not run: the command prints `CACHED PASS <key> from <host>:<task> <date>` and exits 0 (with `--detach` too: there is
+  no job to wait for; `janus queue --log <host>:<task>` shows the run it stands for). A failure is never kept; `--no-cache` forces
+  a run. With `--needs`, a pass on any host that meets the needs counts. The store is `<state>/cache/` (one small file per key,
+  at most `[cache] max`, default 2000); a tree that is not a git checkout caches nothing. Declare every input (lock files,
+  toolchain files, fixtures): an undeclared one is not seen.
 - refuses a worktree with a merge in progress, unmerged files or conflict markers; in the gates and land lanes (and `janus
   gate`) also one more than `[landing] max_behind` (default 10) commits behind the landing branch, never an agent's own jobs
   lane work (`--allow-unmerged` overrides).
@@ -760,6 +778,9 @@ whose task is gone prints its run log instead.
 **`janus gate-log <name> [--task <host>:<id>]`** reads a failed gate's per-step summary and first error line: the RESULT line and
 the failing/passing test ids, then the gate's own output (the pueue task it was queued as, recorded in `out/<name>/task.txt`;
 `--task` overrides it; else a saved `out/<name>/log`), showing `EXIT_<step>=<rc>` per step and the first error-looking line.
+Where the gate script writes each step's output to `out/<name>/steps/<step>.log`, every failing step gets its failing test
+ids (cargo test, nextest, pytest, unittest) and its first error line from that log, and a step the result cache answered its
+`CACHED PASS` line.
 Exit 0 on a PASS result. This is the janus way to see why a gate failed (soak 40) without ssh-ing or reading panes.
 **`janus busy <wt>`** exits 0 (and says why) while the tree is in use: a janus job queued or running on it (any host; a host
 that does not answer counts as busy), an open unit's own job when the unit's cwd is that tree, or a local process matching
