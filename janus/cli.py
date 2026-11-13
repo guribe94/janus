@@ -70,6 +70,8 @@ def main():
         A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="a job that needs the host's USB devices (container.usb_args, usb_lock)"),
         A("--priority", type=int, default=0), A("--detach", "--no-wait", dest="no_wait", action="store_true", help="queue, print <host>:<task>, return (agents: then write WAITING <ids> and end the turn)"),
         A("--allow-unmerged", action="store_true", help="run on a tree with a merge in progress, conflict markers or far behind the landing branch"),
+        A("--inputs", nargs="+", action="extend", metavar="PATH", help="the paths (relative to the worktree) the result depends on: a job whose command, host kind, toolchain and inputs already passed is not run again (CACHED PASS, exit 0); end the list with --"),
+        A("--no-cache", action="store_true", help="run although the same inputs already passed"),
         A("command", nargs=argparse.REMAINDER), dry=True)
     add("gate", cmd_gate, A("name"), A("--host", help="test host for the whole gate (passed in paths.gate_host_env)"), A("--unit", help="the unit this gate checks (default $JANUS_UNIT)"), A("--priority", type=int, default=10),
         A("--baseline", help="name of a recorded run of the landing branch on the same host: its failures are main's, not the unit's (decision 0002); 'none' clears it"),

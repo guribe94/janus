@@ -6,6 +6,7 @@ import argparse, calendar, concurrent.futures as cf, json, os, re, shlex, subpro
 from pathlib import Path
 from janus.beads import Beads
 from janus.board import board
+from janus.cache import cache_key, input_hashes, lookup as cache_lookup, record as cache_record, settle as cache_settle
 from janus.cap import cap_lib, cap_nums, capv, class_mb, class_secs, class_usage, host_cap
 from janus.context import Err, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
 from janus.platform import ARCH, MAXRSS_PY
@@ -380,7 +381,8 @@ def queue_placement(cfg, a, src, cmd, jid, label):
     argv = [sys.executable, str(JANUS_SELF), "run", "--needs", ",".join(a.needs), "--lane", a.lane, "--wt", src, "--place-wait"]
     argv += [x for k, v in (("--unit", a.unit), ("--subdir", a.subdir), ("--priority", a.priority or None), ("--broad", getattr(a, "broad", None))) if v for x in (k, str(v))]
     argv = ["env", f"JANUS_TQ={int(now())}", *argv]   # the job's queue wait counts from now
-    argv += ["--usb"] * bool(a.usb) + ["--allow-unmerged"] * bool(a.allow_unmerged) + ["--", cmd]
+    argv += ["--usb"] * bool(a.usb) + ["--allow-unmerged"] * bool(a.allow_unmerged) + ["--no-cache"] * bool(getattr(a, "no_cache", False))
+    argv += (["--inputs", *a.inputs] if getattr(a, "inputs", None) else []) + ["--", cmd]
     if cfg.run.dry: say(f"+ [{ln}] pueue add -g place -l {label} -- env JANUS_WRAP={tok} {shlex.join(argv[2:])}"); return
     rc, o, e = hrun(h, f"{ensure_lanes(h, cfg)}; {pueue(h)} add -g place -l {shlex.quote(label)} -w {qp(str(cfg.root))} --print-task-id -- "
                        + pq(f"env JANUS_WRAP={tok} {shlex.join(argv)}"))
@@ -404,6 +406,16 @@ def cmd_run(cfg, a):
     why = tree_guard(cfg, src, behind=a.lane in ("gates", "land"))   # behind main matters for gates and landing only (item 5)
     if why and not a.allow_unmerged: raise Err(f"refused: {src} {why} (--allow-unmerged to run anyway)")
     jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
+    keys = {}   # --inputs: the result cache (janus/cache.py); a key that already passed on a host this job may run on is not run again
+    if getattr(a, "inputs", None) and not cfg.run.dry:
+        hh = input_hashes(Path(src), a.inputs); facts = host_facts(cfg, refresh="stale")
+        if hh is None: print(f"janus: --inputs ignored: {src} is not a git checkout (nothing is cached)", file=sys.stderr)
+        for n in ([a.host] if a.host else [n for n in cfg.hosts if host_meets(cfg, n, facts.get(n), needs)[0]]) if hh is not None else []:
+            k = cache_key(cfg, n, facts.get(n), cmd, a.subdir, hh)
+            if k: keys[n] = k
+        for k in dict.fromkeys(keys.values()) if not getattr(a, "no_cache", False) else []:
+            r = cache_lookup(cfg, k)
+            if r: say(f"CACHED PASS {k} from {r['host']}:{r['task']} {ts(r['t'])}"); return 0
     label = tag(cfg, f"unit:{unit}" if unit else f"run:{name}")   # unit:<name>@<project>: check reports it once that unit is closed (M3)
     if a.host and needs:
         ok, why = host_meets(cfg, a.host, host_facts(cfg, refresh="stale").get(a.host), needs)
@@ -442,8 +454,11 @@ def cmd_run(cfg, a):
         wd = cfg.f("runs") / "wrap"; wd.mkdir(parents=True, exist_ok=True)
         with open(wd / wrap, "a") as f: f.write(f"{hn}:{tid} {jid}\n")
     print(f"janus: queued {hn}:{tid} ({a.lane}, {label}) job {jid}; collect with: janus collect {hn}:{tid}", file=sys.stderr)
+    if keys.get(hn): cache_record(cfg, keys[hn], hn, tid, jid, cmd)
     if a.no_wait: say(f"{hn}:{tid}"); return
-    return finish_job(cfg, hn, h, tid, jid)
+    rc = finish_job(cfg, hn, h, tid, jid)
+    if keys.get(hn): cache_settle(cfg, keys[hn], rc)
+    return rc
 
 def tree_guard(cfg, wt, behind=True, head=False):
     """Why a tree must not be built or gated (issues 33, 41): a merge in progress, conflict markers in changed files, or (behind:
