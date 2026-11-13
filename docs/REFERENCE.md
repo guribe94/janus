@@ -665,6 +665,9 @@ pane left without an agent for 20 minutes is closed first (section 2). A live se
   reservation or a queue position (one queued job per running job) is free there.
 - **Fill.** `janus fill --dry-run` lists what fits now and why it stops; `janus fill` launches it, and so does the
   watcher (`[fill] watcher`: unset follows `[autopilot] enabled`, so off by default). `check` reports `idle-with-backlog`.
+  Each unit fill launches gets a new worktree `<worktrees>/<unit>`, as `janus launch --new-worktree <repo>` makes it (an
+  existing `<worktrees>/<unit>` is used as it is): the repository is the brief's `REPO: <path>` line, else `[fill] repo`, else
+  the repository that holds the project root; the branch starts from `[fill] from`, else `[landing] branch`, else `main`.
 - **Briefs for ready items: `janus brief draft <item>... [--model m]`** writes a drafting brief and launches ONE normal-tier
   unit (kind audit, in the project root) on the cheapest routed model: the first available model of `[routing] draft` (list the
   project's cheapest models there), else of the normal route. It writes one brief per item (TIER, SCOPE, REPORT, DONE-WHEN, from
