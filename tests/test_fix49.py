@@ -26,5 +26,24 @@ class LandGateJobFindsTheRoot(unittest.TestCase):
         self.assertIn(str(d.resolve() / "out" / "land-u" / "tests.sh"), out, "the gate did not look in the project that queued it")   # no such gate here: its own error
 
 
+    def test_a_dispatcher_gate_is_not_held_by_the_coordinators_admission_but_other_work_is(self):
+        """Catches the Linux final gate waiting on the Mac: land's `janus gate` dispatcher (landing.gate_is_dispatcher) was admitted
+        as a build on the coordinator, so a coordinator under its disk floor held a gate whose steps run on other hosts (exit 121
+        never admitted). Real work stays refused there, and a plain gate command is no dispatcher."""
+        from janus.actions import landing
+        d, cfg = project("\n[capacity]\nmin_disk_gb = 100000000\n")   # the coordinator is below its disk floor
+        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h); wt = tempfile.mkdtemp(prefix="janus-wt-")
+        env = {**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"}
+        def run(lane, cmd, **k):
+            ra = argparse.Namespace(host="here", lane=lane, unit="u", wt=wt, subdir=None, usb=False, priority=10, no_wait=False, allow_unmerged=False, command=[cmd], **k)
+            p = subprocess.run(["bash"], input=janus.job_script(cfg, "here", h, ra, "u", cmd, "u-" + lane), capture_output=True, text=True, timeout=60, env=env)
+            return p.returncode, p.stdout + p.stderr
+        rc, out = run("gates", "echo GATE-STEP-REACHED", dispatcher=landing.gate_is_dispatcher("janus gate land-u --wait"))
+        self.assertEqual(rc, 0, out); self.assertIn("GATE-STEP-REACHED", out)
+        self.assertEqual(run("gates", "echo X", dispatcher=landing.gate_is_dispatcher("cargo test"))[0], 121, "a plain gate command was exempted")
+        rc, out = run("jobs", "echo X"); self.assertEqual(rc, 121, out); self.assertNotIn("X\n", out.replace("echo X", ""))   # real work still blocked
+        self.assertEqual(run("jobs", "echo X", dispatcher=True)[0], 121, "the dispatcher flag exempted a non-gate lane")
+
+
 if __name__ == "__main__":
     unittest.main()
