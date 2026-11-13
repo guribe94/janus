@@ -1,7 +1,7 @@
 """Findings about work in flight: failed gates, known failures, finished units not gated or not landed, idle backlog,
 and the project's own git state."""
 import re, time
-from janus.actions.backlog import fill_candidates, fill_plan
+from janus.actions.backlog import brief_index, fill_candidates, fill_plan
 from janus.backlog import backlog_cfg, backlog_issues, item_actors, unit_items
 from janus.beads import Beads
 from janus.context import Err, LE, handoff_path, handoff_stale, now, sh
@@ -95,7 +95,19 @@ def backlog_findings(cfg, hs, units):
     if held:   # skill-fix52: briefed units the plan cannot place were counted by no finding; named with fill's own reasons
         F.append(("backlog:held", f"{len(held)} ready backlog unit(s) with briefs do not launch now ({', '.join(held[:6])}{'...' if len(held) > 6 else ''}): "
                   + "; ".join(stops)[:300] + "; janus fill --dry-run shows each"))
-    nob = [(i, t) for i, t in todo if i not in briefed]; nobrief_seen(cfg, len(nob))
+    # skill-fix56 item 6: an item whose ITEM: brief already ran (its unit was launched, or has an out/ folder) is no fill
+    # candidate, so it counted as "has no brief": the nobrief count could not drop (A108 with briefs/a108-finish.md, its unit
+    # closed DONE) and `janus brief draft` was advised for an item that has a brief. Such an item is briefed; what it lacks is
+    # its checklist status or a next brief, said by backlog:spent.
+    linked = {}
+    for _f, name, keys, _h in brief_index(cfg):
+        if keys.get("ITEM"): linked.setdefault(keys["ITEM"].lower(), []).append(name)
+    spent = [(i, linked[i.lower()]) for i, _ in todo if i not in briefed and i.lower() in linked]
+    if spent:
+        F.append(("backlog:spent", f"{len(spent)} ready backlog item(s) are still open though their brief already ran ("
+                  + ", ".join(f"{i}: {' '.join(ns[:3])}" for i, ns in spent[:6]) + ("..." if len(spent) > 6 else "") + "): read the unit's report; when the item is "
+                  f"finished set its status in {b['file']} (janus backlog import closes it), else write its next brief under a new unit name with ITEM: <id>"))
+    nob = [(i, t) for i, t in todo if i not in briefed and i.lower() not in linked]; nobrief_seen(cfg, len(nob))
     if nob and not plan and any("budget" in s for s in stops):
         F.append(("idle-backlog:budget", f"budget-limited: {'; '.join(s for s in stops if 'budget' in s)[:160]}; {len(nob)} ready item(s) wait"))
     if nob:   # skill-fix52: never hidden by the budget finding (it was an elif), nor dropped when no host has room

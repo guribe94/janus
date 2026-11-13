@@ -488,7 +488,7 @@ reference must name; the recipes are in section 4a.
 | family | what it means |
 |---|---|
 | `age` | a lane job queued or running over its class age limit (`[lanes] age`) |
-| `backlog` | the checklist is not imported, or changed since the last import; `backlog:held`: briefed units fill cannot place now (with fill's reasons); `backlog:unbriefed`: ready items without briefs while no host has room |
+| `backlog` | the checklist is not imported, or changed since the last import; `backlog:held`: briefed units fill cannot place now (with fill's reasons); `backlog:unbriefed`: ready items without briefs while no host has room; `backlog:spent`: ready items still open though their `ITEM:` brief already ran (they are briefed, not counted by `idle-backlog:nobrief`: set the item's status in the checklist, or write its next brief) |
 | `beads` | `bd` is unavailable: units cannot be read |
 | `blocked` | a host's jobs wait in an admission that says no or is paused; the line names the cause (disk, memory, PSI) |
 | `board` | a board card is blocked, has a question, is gone or is silent; `board:stale-sync`: posts have waited over 3 min in a host's outbox (the watcher's board sync is not running: run `board.sh sync`, then read `watch.log`) |

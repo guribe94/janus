@@ -23,7 +23,7 @@ class Family(NamedTuple):
 
 FAMILIES = {
     "age": Family("a lane job queued or running over its class age limit ([lanes] age)"),
-    "backlog": Family("the checklist is not imported or changed since the import; ready items held: briefed units fill cannot place, items without briefs while no host has room"),
+    "backlog": Family("the checklist is not imported or changed since the import; ready items held: briefed units fill cannot place, items without briefs while no host has room, items still open after their brief ran (backlog:spent)"),
     "beads": Family("bd is unavailable: units cannot be read", urgent=True),
     "blocked": Family("a host's jobs wait in an admission that says no or is paused (the cause is named)", urgent=True, recurs=True),
     "board": Family("a board card is blocked, has a question (a project's own board), is gone or silent; a host's posts wait unsynced over 3 min (board:stale-sync)", urgent=True),
