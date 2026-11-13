@@ -192,6 +192,14 @@ class ReadyItemsWithoutBriefs(unittest.TestCase):
             F = dict(janus.backlog_findings(cfg, {"here": {"ok": True}}, []))
         t = F.get("idle-backlog:nobrief", "")
         self.assertIn("2 ready backlog item(s)", t); self.assertIn("janus brief draft A1 B2", t); self.assertIn("first thing", t)
+        # skill-fix56 item 6. Catches: an item whose ITEM: brief already ran (a108-finish, unit closed DONE) still counted as
+        # briefless, so the count never dropped and a draft was advised for an item that has a brief.
+        (d / "briefs/a1-done.md").write_text("# Brief: a1-done\nITEM: A1\n"); (d / "out/a1-done").mkdir()
+        with mock.patch.object(janus, "backlog_issues", lambda cfg: self.ISS), mock.patch.object(janus, "room", lambda *a, **k: (3, "")), \
+             mock.patch.object(janus, "all_units", lambda cfg: {}):
+            F = dict(janus.backlog_findings(cfg, {"here": {"ok": True}}, []))
+        self.assertIn("1 ready backlog item(s)", F["idle-backlog:nobrief"]); self.assertNotIn("A1", F["idle-backlog:nobrief"])
+        self.assertIn("A1: a1-done", F["backlog:spent"])
         self.assertLessEqual(janus.ack_ttl("idle-backlog:nobrief"), 3600)
 
     def test_a_second_ack_needs_fewer_items_without_a_brief(self):
