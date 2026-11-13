@@ -511,6 +511,13 @@ class Capacity(unittest.TestCase):
             out = self.sh(fake + 'admit_ok cargo_test && echo ADMIT || echo WAIT; echo "P=$PAUSE"', {"T_PSI": "12.5"})
             self.assertIn("WAIT", out); self.assertIn("memory PSI", out)       # back-pressure pauses admission ...
             self.assertTrue(holder.poll() is None)                             # ... and kills nothing
+            darwin = 'uname() { echo Darwin; }\nsysctl() { case "$*" in *pressure*) echo $T_LVL;; *) echo "{ 0.5 0.5 0.5 }";; esac; }\n'   # the Mac branch, any host
+            out = self.sh(darwin + 'admit_ok cargo_test && echo ADMIT || echo WAIT; echo "P=$PAUSE"', {"T_LVL": "2"})
+            self.assertIn("WAIT", out); self.assertIn("memory PSI avg10 50 over", out)   # a real warn level still pauses (the simulated signal) ...
+            self.assertIn("ADMIT", self.sh(darwin + 'admit_ok cargo_test && echo ADMIT || echo WAIT', {"T_LVL": "1"}))   # ... a normal level admits
+            mac = 'uname() { echo Darwin; }\n'   # the suite's own calm sysctl (janusload) answers: a Mac's live level must not decide these tests
+            self.assertIn("ADMIT", self.sh(mac + 'admit_ok cargo_test && echo ADMIT || echo WAIT'))
+            self.assertIn("WAIT", self.sh(mac + 'admit_ok cargo_test && echo ADMIT || echo WAIT', {"JANUS_TEST_PRESSURE": "2"}))
             out = self.sh(fake + 'HOLD=0; admit_ok cargo_test && echo ADMIT || echo WAIT; echo "P=$PAUSE"', {"T_LOAD": "11"})
             self.assertIn("load 11 over 1.25 x 8", out)
             out = self.sh(fake + 'HOLD=60; CAP_RO=; admit_ok x && echo ADMIT || echo WAIT', {"T_LOAD": "11"})   # load must be held HOLD s
