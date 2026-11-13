@@ -16,7 +16,7 @@ from janus.probe import probe_all, pueue, room
 from janus.quality import qset
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import predecessor_name, related_pointers, transcript_of
-from janus.units import herdr_agents, main_checkout, report_path, unit_state, ws_id
+from janus.units import TAB_SEP, herdr_agents, main_checkout, report_path, unit_state, ws_id
 
 def model_qualified(cfg, m):
     """Whether a model may do normal work: [models.<m>] qualified = false marks a free or new model unqualified until
@@ -82,6 +82,16 @@ def new_tab(cfg, label, cwd):
     r = herdr("tab", "create", "--workspace", ws, "--label", label, "--cwd", str(cwd))
     if not r: raise Err("herdr tab create failed")
     return r["root_pane"]["pane_id"], r["tab"].get("tab_id")
+
+def close_tab(cfg, u):
+    """Close the tab janus opened for unit u (the one on its record: new_tab made it) and forget it there, so tabs do not pile
+    up after a unit parks, stops or closes (issue 267). True when the record named one; the caller saves the record."""
+    t, p = u.pop("tab", None), u.pop("pane", None)
+    if not (t or p): return False
+    if cfg.run.dry: say(f"+ herdr {'tab' if t else 'pane'} close {t or p}")
+    elif t: herdr("tab", "close", t)
+    else: herdr("pane", "close", p)
+    return True
 
 def deliver_key(h, fifo, key):
     """Send the key into the task's fifo from a detached ssh with no time limit, so a full agents group queues the task instead
@@ -418,7 +428,7 @@ def past_dialogs(name, pane):
 def unit_tab(cfg, u, mname, hn, h):
     """One labelled tab per running unit (<unit> · <model> · <host>) that follows its pueue log (fixes5 item 3)."""
     if u.get("via") != "pueue" or cfg.run.dry: return
-    try: pane, tab = new_tab(cfg, f"{u['name']} · {mname} · {hn}", cfg.root)
+    try: pane, tab = new_tab(cfg, TAB_SEP.join((u['name'], mname, hn)), cfg.root)
     except Err: return
     f = f"{pueue(h)} follow {int(u['task'])}"
     herdr("pane", "run", pane, f if h.get("local") else f"ssh -t {shlex.quote(h['ssh'])} {shlex.quote(f)}"); u.update(pane=pane, tab=tab)
@@ -597,7 +607,7 @@ def cmd_launch(cfg, a):
                                             "" if st == "running" else f": not confirmed running (pueue {hn}:{u['task']} is {st})"))
             unit_tab(cfg, u, mname, hn, h)
         elif local:
-            pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd) if not cfg.run.dry else ("pane", "tab")
+            pane, tab = new_tab(cfg, TAB_SEP.join((name, mname, hn)), cwd) if not cfg.run.dry else ("pane", "tab")
             u.update(pane=pane, tab=tab)
             if not cfg.run.dry:
                 wait_shell(pane, name)
@@ -632,7 +642,7 @@ def cmd_launch(cfg, a):
                 u["start_state"] = "running"
             if not cfg.run.dry: agent_res(cfg, hn, h, name, u["pid"])
             if not cfg.run.dry:
-                pane, tab = new_tab(cfg, f"{name} · {mname} · {hn}", cwd)
+                pane, tab = new_tab(cfg, TAB_SEP.join((name, mname, hn)), cwd)
                 herdr("pane", "run", pane, f"ssh -t {shlex.quote(h['ssh'])} tmux attach -t {shlex.quote(tm)}"); u.update(pane=pane, tab=tab)
     except Err as ex:
         if not cfg.run.dry:

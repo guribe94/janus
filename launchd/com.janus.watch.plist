@@ -6,7 +6,7 @@
     <string>/bin/sh</string><string>-c</string>
     <string>[ -f "$HOME/.config/janus/projects" ] || exit 0; while read -r p; do [ -d "$p" ] &amp;&amp; (cd "$p" &amp;&amp; "$HOME/.local/bin/janus" watch); done &lt; "$HOME/.config/janus/projects"</string>
   </array>
-  <key>StartInterval</key><integer>300</integer>
+  <key>StartInterval</key><integer>120</integer>
   <key>RunAtLoad</key><true/>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
   <key>StandardErrorPath</key><string>__HOME__/.config/janus/watch.err</string>

@@ -75,6 +75,20 @@ def ws_id(cfg, create=False):
         r = herdr("workspace", "create", "--label", lab, "--no-focus") or {}
         return r.get("workspace", {}).get("workspace_id")
 
+TAB_SEP = " · "   # a unit's tab is labelled <unit> · <model> · <host>: the only tabs janus closes or flags (issue 267)
+
+def orphan_tabs(cfg, names):
+    """[(tab_id, unit, label)]: tabs janus opened for units (their label, in this project's workspace, the host one of this
+    project's) whose unit is closed. Never another tab: a label that is not exactly janus's, or a unit not recorded as closed,
+    is left alone. names: the open units."""
+    ws = ws_id(cfg); out = []; au = None
+    for t in ((herdr("tab", "list", "--workspace", ws) or {}).get("tabs", []) if ws else []):
+        f = (t.get("label") or "").split(TAB_SEP)
+        if len(f) != 3 or f[2] not in cfg.hosts or f[0] in names or not t.get("tab_id"): continue
+        au = all_units(cfg) if au is None else au
+        if au.get(f[0], {}).get("status") == "closed": out.append((t["tab_id"], f[0], t["label"]))
+    return out
+
 def report_path(cfg, u):
     """The report janus reads for the unit: out/<unit>/REPORT.md; a local unit launched with --report writes that file instead.
     A remote unit's is always its own folder's (soak 43b): its agent writes <root>/out/<unit>/REPORT.md there and collect
@@ -225,4 +239,4 @@ def unit_any(cfg, name):
     except Err: u = None
     return u or all_units(cfg).get(name)
 
-__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
+__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]

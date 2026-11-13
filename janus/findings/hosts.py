@@ -6,13 +6,14 @@ from janus.actions.jobs import LANES, job_of, lane_age, lane_stall, lane_wait, o
 from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
 from janus.backlog import ready_work
 from janus.beads import Beads
-from janus.board import board
+from janus.board import board, board_script
+from janus.msgboard import STALE_MIN
 from janus.cap import capv, host_cap
 from janus.context import AGENT_RX, Err, FIXTURE_MARK, ancestors, fl, hrun, now, projects, sh, ts
 from janus.platform import env_janus, secs
 from janus.probe import margins, room
 from janus.templates import STOP_GROUP
-from janus.units import all_units, ws_id
+from janus.units import all_units, orphan_tabs, ws_id
 
 # Test fixtures never trip live findings (janus-fixes10 item 6): the test suite runs every process fixture under a temporary root
 # whose name holds FIXTURE_MARK (and sets JANUS_IN_TESTS for itself); the live checks skip a process whose command line holds the
@@ -453,6 +454,21 @@ def pane_findings(cfg, units, ag):
         if k in names or a.get("pane_id") in pane_units or a.get("pane_id") == janus_pane or k == "orchestrator": continue
         F.append((f"orphan:pane:{a['pane_id']}", f"orphan agent {k} in pane {a['pane_id']} ({a.get('agent_status')}) has no open unit: janus tidy closes panes of closed units; otherwise register it as a unit or close it"))
     return F
+
+def tab_findings(cfg, units):
+    """tab:<unit>:orphan: a tab janus opened for a unit is still open although the unit is closed (close, park and stop close
+    it; this one was left by an older janus or a failed close). Only tabs with janus's own label (units.orphan_tabs)."""
+    return [(f"tab:{n}:orphan", f"tab {t} ({lab}) is still open but unit {n} is closed: janus tidy closes it")
+            for t, n, lab in orphan_tabs(cfg, {u["name"] for u in units})]
+
+def sync_findings(cfg, hs):
+    """board:stale-sync: posts wait in a host's outbox for over STALE_MIN minutes (the host's probe asks its board.sh outbox):
+    the watcher is not merging the board, so questions and blocks from that host are not seen here."""
+    late = {n: int(p["outbox_min"]) for n, p in hs.items() if str(p.get("outbox_min", "")).isdigit() and int(p["outbox_min"]) > STALE_MIN}
+    if not late or cfg.paths.get("board"): return []
+    return [("board:stale-sync", "board posts wait unsynced on " + ", ".join(f"{n} ({m} min)" for n, m in sorted(late.items()))
+             + f": the watcher's board sync is not running (it syncs every minute of a pass); run {board_script(cfg)} sync now, then see "
+             + f"{cfg.f('watch.log')} (pass skipped or failed) and janus doctor (watcher not loaded: run install)")]
 
 def orphan_job_findings(cfg, hs, units, seen):
     """orphan:job:<host>:<task> for a job whose owner is gone (orphan_jobs; the watcher cancels it), unless already reported."""
