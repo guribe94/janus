@@ -4,12 +4,23 @@ An intent is a beads issue labelled `intent` whose notes hold its record: what, 
 owner instruction it answers) and units (the units that work on it), with t, the time it last moved. Every check prints the
 open ones in the Live state of HANDOFF.md, so the session after a context clear sees them without reading notes, and raises
 intent:<id>:stale when no linked unit runs and nothing moved for [intents] stale_h hours (default 2)."""
-import json
+import calendar, json, time
 from janus.beads import Beads
 from janus.context import Err, now
 
 LABEL = "intent"
 RESTING = ("done", "failed", "gone", "idle")   # a unit in one of these states is not working on anything
+
+def moved_at(i, rec):
+    """When an intent last moved (epoch seconds): the t of its record (janus intent add sets it on create and on every update),
+    else the issue's own updated_at, else created_at, else now. ISSUES row 94: an intent made by `bd create -l intent`, or whose
+    notes were edited by hand, has no t; it counted from epoch 0 and check said 'has not moved for 498494 h'."""
+    t = rec.get("t")
+    if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0: return t
+    for k in ("updated_at", "created_at"):
+        try: return calendar.timegm(time.strptime(str(i.get(k) or "")[:19], "%Y-%m-%dT%H:%M:%S"))   # bd writes UTC (...Z)
+        except ValueError: pass
+    return now()
 
 def intents(cfg):
     """The open intents: [{id, what, why, done, instruction, units, t}], oldest first."""
@@ -17,7 +28,8 @@ def intents(cfg):
     for i in Beads(cfg).issues(LABEL, "open,in_progress"):
         try: rec = json.loads(i.get("notes") or "{}")
         except ValueError: rec = {}
-        out.append({"what": str(i.get("title", "")).removeprefix("intent: "), "units": [], "t": 0, **(rec if isinstance(rec, dict) else {}), "id": i["id"]})
+        if not isinstance(rec, dict): rec = {}
+        out.append({"what": str(i.get("title", "")).removeprefix("intent: "), "units": [], **rec, "t": moved_at(i, rec), "id": i["id"]})
     return sorted(out, key=lambda x: x["t"])
 
 def intent_stale(cfg, it, units):
