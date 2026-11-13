@@ -199,5 +199,17 @@ class Guard(Case):
         self.assertEqual(self.build()[0], 0); self.assertEqual(self.patch.read_bytes(), b"")
 
 
+class ToolCachesLeftOut(Case):
+    def test_tool_caches_and_ignored_new_files_are_not_in_the_patch(self):
+        """Catches row 251: a unit that only ran tests came back with a changes.patch of `.pytest_cache`/`.ruff_cache` files, which
+        looked like work to land. Cache folders and NEW files the tree's own .gitignore ignores are left out; a file that was
+        sent (in the base) is carried even when an ignore rule matches it."""
+        base = {"a": b"1\n", ".gitignore": b"build/\n*.log\n", "kept.log": b"old\n"}
+        self.trees(base, {**base, "a": b"2\n", "kept.log": b"new\n", ".pytest_cache/v/cache/lastfailed": b"{}", "sub/.ruff_cache/0.1/x": b"c",
+                          "build/o.bin": b"\0\1", "run.log": b"l\n"})
+        r = self.build(); self.assertEqual(r[0], 0, r[2])
+        self.assertEqual([l for l in self.patch.read_text().splitlines() if l.startswith("diff --git ")], ["diff --git a/a b/a", "diff --git a/kept.log b/kept.log"])
+
+
 if __name__ == "__main__":
     unittest.main()

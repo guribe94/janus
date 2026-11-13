@@ -82,8 +82,12 @@ def agent_res(cfg, hn, h, name, pid):
 
 def ensure_lanes(h, cfg=None):
     p = pueue(h); n = slots(h, cfg)
-    g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n)} | ({"land": 1, "gates-quick": 1, "place": 16} if h.get("local") else {})
-    return "; ".join(f"{p} group add -p {int(k)} {g_} >/dev/null 2>&1" for g_, k in g.items()) + "; true"
+    g = {"agents": 1, "jobs": n, "gates": h.get("gate_slots", n), "land": 1} | ({"gates-quick": 1, "place": 16} if h.get("local") else {})
+    if h.get("local") and cfg:   # row 245: a gate whose steps run on another host waits in that host's own group here, never in `gates`
+        g |= {gate_group(r): x.get("gate_slots", slots(x, cfg)) for r, x in cfg.hosts.items() if not x.get("local")}
+    return "; ".join(f"{p} group add -p {int(k)} {shlex.quote(g_)} >/dev/null 2>&1" for g_, k in g.items()) + "; true"
+
+def gate_group(host): return f"gates-{host}"   # the coordinator's pueue group for the gates of one other host
 
 def runs_dir(cfg, h): return h["_rd"]
 
@@ -146,7 +150,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
                    "waitmax": int(lane_wait(cfg, a.lane) * 60)}   # item 21: give up after the lane's wait limit
     if h.get("local"):
         pre = ""
-        if a.lane == "land":   # the local landing lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
+        if a.lane == "land":   # on the coordinator the land lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
             ck = h.get("admit_check", ""); base = h.get("legacy_lanes", ""); ce = h.get("admit_check_env", "")
             lfloor = land_disk_floor(cfg, h); lmax = int(lane_wait(cfg, "land") * 60)
             pre = (f"start=$(date +%s); last=0\nwhile :; do d=$(df -Pk {q(str(cfg.root))} | awk 'NR==2{{print int($4/1048576)}}'); busy=\n"
@@ -313,7 +317,6 @@ def place_job(cfg, lane, needs):
     free reservations exceed the jobs already waiting there; among those, the most room left."""
     fs = host_facts(cfg, refresh="stale"); lines, cands = [], []
     for n, h in cfg.hosts.items():
-        if lane == "land" and not h.get("local"): continue
         ok, why = host_meets(cfg, n, fs.get(n), needs)
         if ok: cands.append(n)
         else: lines.append(f"{n}: does not meet the needs ({why})")
@@ -440,7 +443,6 @@ def cmd_run(cfg, a):
         if best is None: return queue_placement(cfg, a, src, cmd, jid, label)
         a.host = best; print(f"janus: placed on {best} (" + "; ".join(lines) + ")", file=sys.stderr)
     hn = a.host; h = cfg.hosts[hn]
-    if a.lane == "land" and not h.get("local"): raise Err("the land lane is the coordinator's")
     broad = getattr(a, "broad", None)
     if a.lane == "jobs" and not broad and os.environ.get("JANUS_LANE") != "gates":   # a gate's own steps are exempt
         why = broad_why(cfg, hn, h, cmd)
@@ -660,13 +662,12 @@ def own_admitted_jobs(cfg, hs, n):
     return sorted(r, key=lambda x: x[3], reverse=True)
 
 def requeue_host(cfg, hs, units, n, spec):
-    """Another host where the job may run now (reachable, not thrashing, room by admission, meets the job's --needs; the land lane
-    stays local), else n. A job pinned with --host stays on n."""
+    """Another host where the job may run now (reachable, not thrashing, room by admission, meets the job's --needs), else n. A job pinned with --host stays on n."""
     if spec.get("pinned"): return n
     needs = parse_needs(spec.get("needs")); fs = host_facts(cfg) if needs else {}
     for m, h in cfg.hosts.items():
         p = hs.get(m) or {}
-        if m == n or not p.get("ok") or (spec.get("lane") == "land" and not h.get("local")) or not host_meets(cfg, m, fs.get(m), needs)[0]: continue
+        if m == n or not p.get("ok") or not host_meets(cfg, m, fs.get(m), needs)[0]: continue
         if h.get("shared") and (host_psi(p) or 0) > thrash_cfg(cfg, h)[0]: continue
         if host_cap(cfg, m, p, units)["free"] > 0 and not host_cap(cfg, m, p, units)["pause"]: return m
     return n

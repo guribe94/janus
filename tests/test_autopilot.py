@@ -1,6 +1,6 @@
 """imp-autopilot: notes stale only on real events, the context reset at a safe boundary, the autopilot's fixed-rule actions.
 Standard library only; no network, no API spend."""
-import json, os, time, unittest
+import json, os, subprocess, time, unittest
 from unittest import mock
 
 from test_janus import janus, project
@@ -132,15 +132,24 @@ class Autopilot(unittest.TestCase):
         janus.tend_autopilot(self.cfg, {}, [u2], [], log.append); self.assertEqual(len(self.launched), 1, "acted on a held unit")
         self.assertIsNone(janus.ending(self.cfg, self.unit(verdict="VERDICT: DONE")))
 
-    def test_a_crashed_remote_unit_is_not_relaunched_and_the_finding_names_its_patch(self):
+    def test_a_crashed_remote_unit_is_relaunched_only_with_its_collected_patch_applied(self):
         """Catches (panel-eng F4): a crashed remote unit relaunched from this machine's tree, without the code it wrote (kept
-        only in its remote tree and out/<unit>/changes.patch), and the orchestrator not told where that code is."""
+        only in its remote tree and out/<unit>/changes.patch), and the orchestrator not told where that code is. And row 249: a
+        remote unit whose collected patch applies to its worktree here stayed dead, where a local one is relaunched."""
         d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/tmp/x"\n[autopilot]\nenabled = true\n')
         u = self.unit(host="far", collected_at=time.time() + 60)
         janus.tend_autopilot(cfg, {}, [u], [], lambda m: None)
         self.assertEqual(self.launched, [], "a remote unit was relaunched from this machine's tree")
         F = dict(janus.autopilot_findings(cfg, [u]))
         self.assertIn("out/u1/changes.patch", F.get("unit:u1:relaunch", ""), F)
+        g = lambda c, *a: subprocess.run(["git", "-C", str(c), "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True, text=True).stdout
+        r = d / "repo"; r.mkdir(); wt = d / "wt"; g(r, "init", "-q", "-b", "main"); (r / "a").write_text("1\n"); g(r, "add", "a"); g(r, "commit", "-qm", "base")
+        g(r, "worktree", "add", "-q", "-b", "wk/u", str(wt)); (wt / "a").write_text("2\n")
+        (d / "out/u1").mkdir(parents=True, exist_ok=True); (d / "out/u1/changes.patch").write_text(g(wt, "diff")); g(wt, "checkout", "-q", "a")
+        u = self.unit(host="far", collected_at=time.time() + 60, cwd=str(wt), run="u1.2")
+        self.assertEqual(janus.autopilot_findings(cfg, [u]), [], "a remote unit whose patch can be carried is still left to the orchestrator")
+        janus.tend_autopilot(cfg, {}, [u], [], lambda m: None)
+        self.assertEqual([a.unit for a in self.launched], ["u1-r1"]); self.assertEqual((wt / "a").read_text(), "2\n", "relaunched without the code it wrote")
 
     def test_off_by_default_and_question_answered_only_from_an_exact_memory_subject(self):
         """Catches: the autopilot acting without the owner's opt-in in a project with no spending cap (with a cap it is on by

@@ -37,12 +37,16 @@ def landed(cfg, u):
     if rc != 1: return True if rc == 0 else None
     return contained(c, br)
 
+CACHE_DIRS = {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".hypothesis", ".tox"}   # tool caches: never a unit's work (PATCH_PY's SKIP too)
+
 def unapplied_patch(cfg, u):
     """The unit's collected patch (out/<unit>/changes.patch: janus collect of a unit that ran on a host without the repository)
     when it still applies cleanly to the unit's worktree, so its changes are not there; else None. Row 239: such a unit's
     branch equals the landing branch, land said 'already landed ... janus close', and a close would have dropped the work."""
     p = cfg.p("out", "out") / str(u.get("name")) / "changes.patch"; c = Path(u.get("cwd", "/"))
     if not c.is_dir() or c.resolve() == cfg.root.resolve() or not p.is_file() or not p.stat().st_size: return None
+    heads = re.findall(rb"^diff --git (.*)$", p.read_bytes(), re.M)   # row 251: a patch of tool caches only holds no change to apply
+    if heads and all(h.startswith(b"a/") and CACHE_DIRS & set(h[2:].split(b" b/")[0].decode(errors="replace").split("/")[:-1]) for h in heads): return None
     return p if sh(["git", "-C", str(c), "apply", "--check", str(p.resolve())])[0] == 0 else None
 
 def landing_branch(cfg, c):

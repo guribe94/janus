@@ -230,6 +230,7 @@ stop_api = false         # a Claude/Anthropic API process janus did not start, i
                          # reported either way; another project's processes and the owner's terminal sessions are never flagged
 
 # [landing] final_gate_host = "<host>"; final_gate = "<command>"   # janus land gates the merged tree there before it squash-lands
+# [landing] gate_gen = "bin/gate-gen.sh {unit} {worktree}"   # optional: janus land runs it when out/land-<unit>/tests.sh is missing or older than the merge
 
 # [busy]                   # janus busy <wt>: exit 0 while a janus job, an open unit's own job or one of these processes uses the tree
 # patterns = ["mutants"]   # substrings of local command lines that edit a tree in place while they run (default: mutation testing)

@@ -7,6 +7,7 @@ so capacity, budget, caps and the waste pause apply exactly as for the orchestra
 The always-on parts (resume parked units, wrap up a capped run, cancel orphan jobs) live in tend_parked and the watcher;
 they record their actions here too."""
 import argparse, contextlib, io
+from pathlib import Path
 from janus.beads import Beads
 from janus.board import board, board_dir, board_questions
 from janus.context import Err, now, ts
@@ -143,18 +144,32 @@ def ending(cfg, u):
     if api_out(cfg, u).get("subtype") == "error_max_budget_usd": return None   # wrap_due: tend_parked wraps it up first
     return "crashed"
 
+def carry_patch(cfg, u, apply=False):
+    """Why a remote unit that ended cannot be relaunched like a local one, or None when it can (row 249). A relaunch starts from
+    this machine's tree, so the code the unit wrote (out/<unit>/changes.patch, written by janus collect) must be in its worktree
+    here: an empty patch (it changed nothing) and a patch already applied are fine; one that applies cleanly is applied when
+    apply is set; anything else is left to the orchestrator, with the reason."""
+    from janus.context import sh
+    p = cfg.p("out", "out") / u["name"] / "changes.patch"; c = Path(u.get("cwd") or "/")
+    if not p.is_file(): return f"no collected patch (janus collect {u['name']} writes it)"
+    if not p.stat().st_size: return None
+    if not c.is_dir() or c.resolve() == cfg.root.resolve(): return f"{c} is not a worktree of its own"
+    ap = lambda *x: sh(["git", "-C", str(c), "apply", *x, str(p.resolve())])[0] == 0
+    if ap("--check"): return None if not apply or ap() else f"git apply of {p} in {c} failed"
+    return None if ap("--check", "-R") else f"its patch does not apply to {c}"
+
 def autopilot_findings(cfg, units):
-    """unit:<n>:relaunch: with the autopilot on, a remote unit that crashed or was capped is not relaunched automatically (a
-    relaunch would start from this machine's tree, without its code): the finding names the patch its changes are kept in."""
+    """unit:<n>:relaunch: with the autopilot on, a crashed or capped unit of another host whose collected patch cannot be put into
+    its worktree here is not relaunched (a relaunch would start without its code): the finding names the patch and the reason."""
     if not apc(cfg, "enabled"): return []
     F = []
     for u in units:
         if cfg.hosts.get(u.get("host"), {}).get("local") or held(cfg, u["name"]): continue
-        why = ending(cfg, u)
-        if why:
-            n = u["name"]; p = cfg.p("out", "out") / n / "changes.patch"; get = "" if p.is_file() else f" (janus collect {n} writes it)"
-            F.append((f"unit:{n}:relaunch", f"{n} {why} on {u.get('host')}; the autopilot relaunches only local units. Its changes are kept in "
-                      f"{p}{get}: relaunch it with that patch applied first (git apply --3way in the new unit's tree), or close it"))
+        why = ending(cfg, u); blk = carry_patch(cfg, u) if why else None
+        if blk:
+            n = u["name"]; p = cfg.p("out", "out") / n / "changes.patch"
+            F.append((f"unit:{n}:relaunch", f"{n} {why} on {u.get('host')}; the autopilot did not relaunch it: {blk}. Its changes are kept in "
+                      f"{p}: relaunch it with that patch applied first (git apply --3way in the new unit's tree), or close it"))
     return F
 
 def answer_from_memory(cfg, log):
@@ -262,9 +277,12 @@ def tend_autopilot(cfg, hs, units, F, log):
                 out = quiet(cmd_collect, cfg, argparse.Namespace(unit=u["name"]))
                 u["collected_at"] = int(now()); record(cfg, f"unit:{u['name']}", f"collect:{u.get('run')}", out, u); log(f"autopilot: collected {u['name']}")
             why = ending(cfg, u)
-            if why and remote:   # its code lives only in its remote tree and changes.patch: the orchestrator decides (F4)
-                if record(cfg, f"unit:{u['name']}", f"remote-left:{u.get('run')}", f"{why} on {u.get('host')}: not relaunched (remote); see the unit:{u['name']}:relaunch finding", u):
-                    log(f"autopilot: {u['name']} {why} on {u.get('host')}: left to the orchestrator (remote unit)")
+            # row 249: a unit of another host is relaunched like a local one once its collected patch is in its worktree here;
+            # only when the patch cannot be carried does the orchestrator decide (F4: never a relaunch without its code)
+            blk = carry_patch(cfg, u, apply=True) if why and remote and not u.get("relaunched") else None
+            if blk:
+                if record(cfg, f"unit:{u['name']}", f"remote-left:{u.get('run')}", f"{why} on {u.get('host')}: not relaunched ({blk}); see the unit:{u['name']}:relaunch finding", u):
+                    log(f"autopilot: {u['name']} {why} on {u.get('host')}: left to the orchestrator ({blk})")
             elif why: relaunch(cfg, u, why, log, hs)
         except Err as e: log(f"autopilot: {u['name']}: {e}")
     for step in (lambda: answer_from_memory(cfg, log), lambda: requeue_stuck(cfg, hs, units, F, log),
