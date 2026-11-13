@@ -465,14 +465,16 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
 
 Every `janus check` line has a family (the key up to `:`): the findings registry `janus/findings/__init__.py` declares each,
 whether the watcher treats it as urgent (an idle orchestrator is prompted for it) and how long an ack hides it (0: it cannot be
-acked). A key of an unregistered family is refused in code, so a new key can never silently become non-urgent or ackable. This
-table is the plain-language list of the families the reference must name; the recipes are in section 4a.
+acked). A key of an unregistered family is reported as an urgent `unregistered:<key>` finding, so a new key can never
+silently become non-urgent and one bad key cannot end the check. This table is the plain-language list of the families the
+reference must name; the recipes are in section 4a.
 
 | family | what it means |
 |---|---|
 | `age` | a lane job queued or running over its class age limit (`[lanes] age`) |
 | `backlog` | the checklist is not imported, or changed since the last import |
 | `beads` | `bd` is unavailable: units cannot be read |
+| `blocked` | a host's jobs wait in an admission that says no or is paused; the line names the cause (disk, memory, PSI) |
 | `board` | a board card is blocked, has a question, is gone or is silent |
 | `budget80` | a unit spent over `[budget] warn_pct` of its budget and its report is stale |
 | `burner` | a CPU burner an agent started (or orphaned) outside the lanes on this machine |
@@ -527,6 +529,7 @@ table is the plain-language list of the families the reference must name; the re
 | `thrash` | the watcher stopped and re-queued a job on a thrashing shared host |
 | `tidy` | what `janus tidy` can reclaim |
 | `unit` | a unit is blocked, finished, or stopped by a limit without a verdict |
+| `unregistered` | a finding whose family the registry does not hold: a janus bug (register the family); the original key and line follow |
 | `waiting` | a live agent waits for its jobs' admission and pays for it |
 | `waste` | a run ended at its budget cap without a verdict |
 | `waste-pause` | launch and fill are paused by the waste limit |
