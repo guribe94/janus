@@ -13,7 +13,8 @@ from janus.context import Err, now, ts
 from janus.memory import memory_read
 from janus.project import own_card, own_label
 from janus.transcripts import card_fields
-from janus.units import agent_ended, api_out, report_path
+from janus.probe import probe
+from janus.units import agent_ended, api_out, herdr_agents, park_jobs, report_path, report_text, unit_state
 
 AP = {"enabled": False, "relaunch_max": 2, "host_down_min": 20}
 
@@ -76,11 +77,32 @@ def quiet(fn, *a):
     with contextlib.redirect_stdout(buf): fn(*a)
     return " | ".join(l.strip() for l in buf.getvalue().splitlines() if l.strip())[:300]
 
-def relaunch(cfg, u, cause, log):
-    """Relaunch a unit from its report (a new unit continuing the same report, same brief and tree), bounded by relaunch_max."""
+def live(cfg, u, hs):
+    """Why the unit must not be relaunched now, or None (soak 43). Its state in this watcher pass is the one probed when the
+    pass began: a resume started later in the pass (tend_parked, tend_resumable) or by `janus resume` runs under a new task, and
+    the unit was judged crashed and duplicated while its own session ran. So the unit record as saved now and its host as it is
+    now are asked; a host that cannot say counts as live. A unit whose report or record parks it on a job that has not finished
+    (hs, this pass's probes) waits for that job."""
+    from janus.actions.jobs import job_state
+    try: cur = next((x for x in Beads(cfg).units() if x.get("id") == u.get("id")), None) or u
+    except Err: cur = u
+    ps = {u["host"]: probe(u["host"], cfg.hosts[u["host"]])}; ag = herdr_agents(cfg) if "herdr" in (u.get("via"), cur.get("via")) else {}
+    for x in (u, cur):
+        st = unit_state(x, ps, ag)
+        if st in ("working", "queued", "blocked", "unknown") or (x.get("via") == "herdr" and st != "gone"):
+            return f"its own session is {st} now" + (f" (task {x['task']})" if x.get("task") is not None else "")
+    jobs = dict.fromkeys([*((cur.get("parked") or {}).get("jobs") or []), *park_jobs(cfg, report_text(cfg, cur) or "")[1]])
+    busy = [j for j in jobs if job_state(hs, j)[0] not in ("done", "gone")]
+    return f"it is parked on {', '.join(busy)}, not finished" if busy else None
+
+def relaunch(cfg, u, cause, log, hs=None):
+    """Relaunch a unit from its report (a new unit that starts from a copy of that report in its own out folder, same brief and
+    tree), bounded by relaunch_max. Never while the unit's own session, a resume of it or a job it is parked on is live."""
     from janus.actions.launch import cmd_launch
     base = u.get("relaunch_of") or u["name"]; k = u.get("relaunches", 0)
     if u.get("relaunched"): return
+    why = live(cfg, u, hs)
+    if why: log(f"autopilot: {u['name']} looked {cause}, but {why}: not relaunched"); return
     if k >= apc(cfg, "relaunch_max"):
         if record(cfg, f"unit:{u['name']}", "relaunch-limit", f"{cause}, but already relaunched {k} times ([autopilot] relaunch_max): left to the orchestrator", u):
             log(f"autopilot: {u['name']} {cause}: relaunch limit reached")
@@ -88,7 +110,7 @@ def relaunch(cfg, u, cause, log):
     new = f"{base[:28]}-r{k + 1}"
     a = argparse.Namespace(unit=new, kind=u.get("kind") or "implement", tier=u.get("tier") or "normal", host=None, model=u.get("model"),
                            brief=u.get("brief"), cwd=u.get("cwd"), budget=None, test_host=None, allow_main=False, of=None,
-                           report=str(report_path(cfg, u)), resume_of=None, item=u.get("item"), share_with=u["name"])
+                           report=None, seed_report=str(report_path(cfg, u)), resume_of=None, item=u.get("item"), share_with=u["name"])
     # once only (panel-eng F1): recorded before the launch, the unit record saved best-effort after
     if not record(cfg, f"unit:{u['name']}", "relaunch", f"{cause}: relaunching from its report as {new}", u, ack=f"unit:{u['name']}:finished"): return
     try: out = quiet(cmd_launch, cfg, a)
@@ -232,7 +254,7 @@ def tend_autopilot(cfg, hs, units, F, log):
             if why and remote:   # its code lives only in its remote tree and changes.patch: the orchestrator decides (F4)
                 if record(cfg, f"unit:{u['name']}", f"remote-left:{u.get('run')}", f"{why} on {u.get('host')}: not relaunched (remote); see the unit:{u['name']}:relaunch finding", u):
                     log(f"autopilot: {u['name']} {why} on {u.get('host')}: left to the orchestrator (remote unit)")
-            elif why: relaunch(cfg, u, why, log)
+            elif why: relaunch(cfg, u, why, log, hs)
         except Err as e: log(f"autopilot: {u['name']}: {e}")
     for step in (lambda: answer_from_memory(cfg, log), lambda: requeue_stuck(cfg, hs, units, F, log),
                  lambda: move_off_down_hosts(cfg, hs, units, log), lambda: archive_cards(cfg, units, log)):

@@ -95,7 +95,8 @@ def main():
     add("report", cmd_report, A("--brief", action="store_true", help="summary lines only"), A("--sent", action="store_true", help="record that the report was sent (clears report-due)"))
     add("land", cmd_land, A("unit"), A("--no-gate", action="store_true", help="skip the final gate (it is still refused mid-merge)"),
         A("--no-dispatch", action="store_true", help="on a conflict, only say what merge unit to dispatch"), dry=True)
-    add("close", cmd_close, A("unit"), A("--force", action="store_true"), A("--reason"), dry=True)
+    add("close", cmd_close, A("unit"), A("--force", action="store_true"), A("--reason"),
+        A("--duplicate-of", metavar="UNIT", help="close a stopped relaunch that duplicated this open unit: no verdict needed, never --force"), dry=True)
     add("commit-state", cmd_commit_state, A("-m", "--message", default="janus: state"), dry=True)
     add("ack", cmd_ack, A("problem"), A("decision"), A("--decision-class", action="store_true", help="a decision the notes must record (routine keys do not make them stale)"))
     m = add("remember", cmd_remember, A("text"), A("--source", help="where it can be checked: a path, a commit sha or a job (a fact needs one)"),

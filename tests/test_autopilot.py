@@ -106,7 +106,8 @@ class Autopilot(unittest.TestCase):
         def launch(cfg, a): self.launched.append(a); FakeBeads.units_.append({"name": a.unit}); print(f"launched {a.unit}")
         self.p = [mock.patch.object(janus, "Beads", FakeBeads), mock.patch.object(janus, "cmd_launch", launch),
                   mock.patch.object(janus, "board", lambda c, *a, **k: self.posts.append(a) or (0, "", "")),
-                  mock.patch.object(janus, "board_questions", lambda c: [])]
+                  mock.patch.object(janus, "board_questions", lambda c: []),
+                  mock.patch.object(janus, "probe", lambda *a, **k: {"name": "here", "ok": True, "pueue": {"tasks": {}}})]   # the relaunch asks the unit's host now: its task is gone
         for x in self.p: x.start()
     def tearDown(self):
         for x in self.p: x.stop()
@@ -120,7 +121,7 @@ class Autopilot(unittest.TestCase):
         log = []; u = self.unit()
         janus.tend_autopilot(self.cfg, {}, [u], [], log.append)
         self.assertEqual([a.unit for a in self.launched], ["u1-r1"])
-        a = self.launched[0]; self.assertEqual((a.report, a.share_with, a.brief), (str(janus.report_path(self.cfg, u)), "u1", "b.md"))
+        a = self.launched[0]; self.assertEqual((a.report, a.seed_report, a.share_with, a.brief), (None, str(janus.report_path(self.cfg, u)), "u1", "b.md"))
         self.assertIn("u1-r1", self.cfg.jget("acks.json")["unit:u1:finished"]["d"]); self.assertIn("relaunch:crashed", self.cfg.f("autopilot.log").read_text())
         janus.tend_autopilot(self.cfg, {}, [u], [], log.append); self.assertEqual(len(self.launched), 1, "relaunched twice for one cause")
         r1 = self.unit(name="u1-r1", relaunch_of="u1", relaunches=1, wrapup="u1-r1.r2", run="u1-r1.r2", verdict="VERDICT: BLOCKED")

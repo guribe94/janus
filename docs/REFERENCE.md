@@ -207,9 +207,12 @@ launched parser on laptop via herdr
 A `cleanup` unit frees disk and load, so neither `min_disk_gb` nor the load limit refuses it; memory and caps still apply.
 - **Model:** from `[routing]`, or `--model`, which passes the same checks (provider enabled, budget left). Every API launch
   checks `committed + budget <= cap_usd` and reserves the run's "running" row under the ledger's lock before anything is
-  queued. A resumed unit continues its original report: `--resume-of <unit>` (its `out/<unit>/REPORT.md`) or `--report
-  <path>`, never a path read from the brief's prose; check, close, collect and the Stop hook read that report, and a verdict
-  written before the resume started does not count. Every value janus puts in a shell command is quoted, and launch waits a few
+  queued. A unit that continues another's work starts from that unit's report: `--resume-of <unit>` copies its
+  `out/<unit>/REPORT.md` into the new unit's own `out/<new unit>/REPORT.md` (line 1 PENDING) and the new unit writes only its
+  own copy, so two units never write one report; `--report <path>` names the file a local unit writes instead (never a path
+  read from the brief's prose). A remote unit's report is always its own folder's. A verdict or WAITING line from before the
+  launch does not count. Without `--cwd`, `--new-worktree` or an existing `<worktrees>/<unit>`, launch makes no worktree: the
+  unit runs in the project root and launch says so (`note: no worktree made for <unit>`). Every value janus puts in a shell command is quoted, and launch waits a few
   seconds to confirm the run started (or is queued for a slot): a run that dies at once fails the launch with its exit code
   and log, and nothing is reported as launched. `--item <id>` (or an `ITEM: <id>` line) ties the unit to a backlog item.
 - **Host:** `--host`; else where the unit's builds and tests run (`--test-host`, a `TEST-HOST: <h>` line in the brief, the
@@ -258,9 +261,12 @@ keep refusing; a fifo, socket or device, which no patch can carry, is named and 
 local checkout; apply the patch in the unit's worktree with `git apply --3way` (the patch carries git's blob ids, so a
 checkout that has moved on is merged). Local units: nothing to collect.
 
-**`janus close <unit> [--force] [--reason text]`**: for a unit with a worktree of its own, refuses on uncommitted or unpushed
-work (unless `--force`). A unit without one (cwd is the project root, or shared with another open unit) skips the git checks
-and needs a final VERDICT line in its REPORT instead; `--force` is refused there. Then it closes the unit's tab, removes the
+**`janus close <unit> [--force] [--reason text] [--duplicate-of <unit>]`**: for a unit with a worktree of its own, refuses on
+uncommitted or unpushed work (unless `--force`). A unit without one (cwd is the project root, or shared with another open
+unit) skips the git checks and needs a final VERDICT line in its REPORT instead; `--force` is refused there. A relaunch that
+duplicated a unit still at work has neither: `janus close <unit>-r<k> --duplicate-of <unit> --reason <why>` closes it without
+a verdict and without `--force`, only when janus recorded it as a relaunch of that open unit and its agent is stopped (`janus
+stop` first); the original, its tree and its out folder are not touched. Then it closes the unit's tab, removes the
 remote copy unless another open unit on that host uses it, removes only its own pueue task, and closes the board card and
 the beads issue.
 
@@ -634,7 +640,7 @@ pane left without an agent for 20 minutes is closed first (section 2). A live se
 - **Autopilot (`[autopilot] enabled`: on by default when a provider has a `cap_usd` and a ledger, the cap being what bounds
   it; `enabled = false` turns it off, `check` then says `unattended:off`).** The watcher applies the ending policy's fixed rules
   itself (docs/DESIGN.md, "Keeping work moving"): collect finished remote units; resume a unit stopped by its budget in its own
-  session when the cap has room (before any new unit); relaunch a crashed unit from its report as `<unit>-r<k>` (same brief, tree and report, through `janus launch`: capacity, budget and
+  session when the cap has room (before any new unit); relaunch a crashed unit from its report as `<unit>-r<k>` (same brief and tree, a copy of the report in its own out folder; never while the unit's own session, a resume of it or a job it is parked on is live: its host is asked just before; through `janus launch`: capacity, budget and
   the waste pause apply; at most `relaunch_max`, default 2); answer a board question that names a MEMORY.md subject exactly;
   cancel a job past its age limit and re-queue it once on a host with room; re-queue the unstarted jobs of a host down over
   `host_down_min` (20) elsewhere (the old copies are cancelled when it is back); archive finished cards. Always on: resume
@@ -786,7 +792,8 @@ It also covers the rest of the mess orchestration makes, each by a safe rule:
 - `[hosts.X] disk_budget_gb`: the host's janus root plus its `cache_dirs` (build targets, compiler caches); over budget, the
   oldest top-level entries of the cache dirs go until it fits.
 - `janus tidy hold <target> [--why <text>]` records a hold so tidy never removes that item (a worktree path, a `host:name`, a
-  test root; a hold matches a target equal to it, under it or containing it); `janus tidy holds` lists them, `janus tidy unhold
+  test root; a hold matches a target equal to it, under it or containing it; paths are compared resolved, so a hold by the real
+  path keeps a worktree tidy names through `..` or a symlink); `janus tidy holds` lists them, `janus tidy unhold
   <target>` clears one. It is how one clean worktree an open unit still depends on (not as its cwd) is kept while the rest is
   tidied, instead of skipping the whole pass.
 - `[tidy] auto = true` lets the watcher remove the safe kinds itself — a clean landed worktree and a landed branch — each
