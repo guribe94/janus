@@ -62,7 +62,7 @@ class Item11Verdict(unittest.TestCase):
         self.assertEqual(u["_park"], ["far:9"]); self.assertEqual(u["state"], "parked")
         self.assertNotIn("orphan:job:far:9", [k for k, _ in janus.orphan_job_findings(cfg, hs, [u], set())])
         import inspect
-        self.assertIn("sync_remote_outputs(cfg, units, bd)", inspect.getsource(janus.collect_findings))
+        self.assertIn("sync_remote_outputs(cfg, units, bd, fetched)", inspect.getsource(janus.collect_findings))
 
 
 class Item7WastePause(unittest.TestCase):

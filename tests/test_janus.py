@@ -373,7 +373,7 @@ class LaunchQuoting(unittest.TestCase):
         saved = {}
         class FakeBeads:   # no beads database in a temp project
             def __init__(self, cfg): pass
-            def units(self): return []
+            def units(self): return [dict(u) for u in saved.values()]   # launch re-reads its own record (settle_launch)
             def create(self, title, *a): return title
             def run(self, *a): return []
             def save(self, u): saved[u["name"]] = dict(u)

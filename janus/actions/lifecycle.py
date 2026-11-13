@@ -9,14 +9,14 @@ from janus.autopilot import apc, ending, forget, held, record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
 from janus.budgets import bset, budget_for, budget_note, finish_refusal, fits_cap, reload_usd, run_spend, session_usage
-from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
+from janus.context import (DIFF_X, Err, LockLost, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
     sh, ts)
 from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, run_cost, settle_run
 from janus.project import project_id, tag, unit_tmux
 from janus.probe import probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
-from janus.units import (ENDED, api_out, get_unit, herdr_agents, own_tree, report_path, unit_runs, unit_spent, unit_state,
+from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, api_out, get_unit, herdr_agents, own_tree, report_path, unit_runs, unit_spent, unit_state,
     verdict, waiting_line_jobs)
 
 # Agents never pay to wait. An agent submits its builds and tests detached (`janus run --detach`, or its lane runner's
@@ -202,7 +202,7 @@ def uncollected(cfg, u):
     """Why removing or stopping a remote unit now would lose work (None when nothing would): its copy has changes or output
     that differ from what janus collect last brought here, or its host cannot be asked."""
     h = cfg.hosts.get(u.get("host"), {})
-    if h.get("local") or u.get("via") in ("failed", "starting"): return None
+    if h.get("local") or no_remote_copy(u): return None
     kv = fingerprint(cfg, u)
     if kv is None: return f"cannot read its copy on {u['host']} (unreachable?), so cannot tell whether work would be lost"
     if kv.get("fp") == u.get("collected"): return None
@@ -212,9 +212,11 @@ def uncollected(cfg, u):
             + f": janus collect {u['name']} first, or --force")
 
 def cmd_collect(cfg, a):
-    if ":" in a.unit: return collect_job(cfg, a.unit)
+    if ":" in a.unit:
+        with cfg.command_writer(): return collect_job(cfg, a.unit)
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]
     if h.get("local"): say("local unit: nothing to collect"); return
+    if no_remote_copy(u) and u.get("closing"): raise Err(f"{u['name']} is being closed: its copy on {u['host']} is being removed (janus close {u['name']} finishes it)")
     root = h["root"]; n = u["name"]; od = cfg.p("out", "out") / n
     # The agent's changes come back as a patch against the tree it was sent (base/<unit>), never as an rsync over the Mac
     # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree (the patch
@@ -231,11 +233,17 @@ def cmd_collect(cfg, a):
     if not cfg.run.dry and not save_transcript(cfg, u): say(f"note: no transcript of {n} saved (none found on {u['host']})")   # out/<unit>/transcript.md
     st = task_status(h, u["task"]) if u.get("via") == "pueue" and u.get("task") is not None and not cfg.run.dry else None
     if not (st and task_rc(st) is None): X(cfg, h, f"rm -f {qp(f'{root}/run/{n}.key')}")   # the key fifo, once no task can still read it (row 52)
-    mc = cfg.models.get(u.get("model"), {})
+    kv = fingerprint(cfg, u) if not cfg.run.dry else None   # the last remote read; the lock is taken only now, for the state below
+    with cfg.command_writer():
+        bd, u = get_unit(cfg, a.unit)   # the record as it is now: a unit another command changed or closed meanwhile is not overwritten
+        collect_state(cfg, bd, u, h, kv, p)
+
+def collect_state(cfg, bd, u, h, kv, p):
+    """The state half of cmd_collect, under the writer lock: the run's cost into the ledger, the fingerprint on the unit record."""
+    n = u["name"]; od = cfg.p("out", "out") / n; mc = cfg.models.get(u.get("model"), {})
     if not cfg.run.dry and u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("run"):
         cost, reported = run_cost(od / "api.json", None, u["run"])
         if reported: keep_run_json(cfg, od, u["run"]); ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], n, cost, "collected")   # idempotent: once per run id
-    kv = fingerprint(cfg, u) if not cfg.run.dry else None
     if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
     if not cfg.run.dry: bd.comment(u["id"], f"{ts()} collected from {u['host']}")
     say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
@@ -275,6 +283,8 @@ def duplicate_check(cfg, u, units, orig):
 def cmd_close(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
     handover = bool(getattr(a, "handover", False)); dup = getattr(a, "duplicate_of", None)
+    redo = bool(u.get("closing")) and bool(busy_dead(u))   # a close that was interrupted: its checks passed then, the remote cleanup is repeated
+    if u.get("busy") and not busy_dead(u): raise Err(f"{u['name']}: a {u['busy']['op']} of it is running (pid {u['busy'].get('pid')}); wait for it")
     if dup and a.force: raise Err("--duplicate-of with --force: --duplicate-of is the close without --force")
     mine = own_tree(cfg, u, units) or handover   # item 13: a successor took its tree, so --force is right
     if a.force and not mine: raise Err(f"--force refused: {u['cwd']} is shared (project root or another open unit's cwd)")
@@ -288,26 +298,34 @@ def cmd_close(cfg, a):
         raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
     # A handover is never a reason to skip the uncollected guard (finding 3): a remote predecessor's dirty tree is its copy on
     # the host, so removing it without collect loses work. Only a plain --force skips the guard.
-    why = None if (a.force and not handover) or cfg.run.dry else uncollected(cfg, u)
+    with cfg.unlocked():   # the fingerprint and the probe ask the unit's host: an ack must not wait for them
+        why = None if (a.force and not handover) or cfg.run.dry or redo else uncollected(cfg, u)
+        st = unit_state(u, probe_all(cfg), herdr_agents(cfg)) if handover and not cfg.run.dry else None
     if why: raise Err(f"refused: {u['name']}: {why}")
     if handover and not cfg.run.dry:   # never close a predecessor whose agent is still running (finding 3; finding 5: unknown too)
-        st = unit_state(u, probe_all(cfg), herdr_agents(cfg))
         if st in ("working", "queued", "blocked", "unknown"):
             what = f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)"
             raise Err(f"{u['name']}: cannot hand over its tree: its agent is {what}; stop it first (janus stop {u['name']}), then hand its tree over")
+    if not cfg.run.dry:   # the record as it is now; marked closing before the remote cleanup, which runs without the lock
+        u = get_unit(cfg, a.unit)[1]
+        if u.get("busy") and not busy_dead(u): raise Err(f"{u['name']}: a {u['busy']['op']} of it is running (pid {u['busy'].get('pid')}); wait for it")
+        u["closing"] = True; u["busy"] = busy_mark("close"); bd.save(u)
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
-    close_tab(cfg, u)
-    if not h.get("local"):
-        root = h["root"]; n = u["name"]
-        others = [x["name"] for x in units if x["id"] != u["id"] and x.get("host") == u["host"] and x.get("rcwd") == u.get("rcwd")]
-        if others: say(f"keeping {u.get('rcwd')} on {u['host']}: open unit(s) {', '.join(others)} use it")
-        else: X(cfg, h, f"cd {qp(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
-    if u.get("via") == "pueue":   # the task's log is kept under out/<unit>/ before the task is removed
-        if not cfg.run.dry: save_task_log(cfg, h, u, u["task"])
-        X(cfg, h, f"{pueue(h)} remove {int(u['task'])} 2>/dev/null; true")
-    X(cfg, {"local": True}, f"BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} close {u['name']} 2>/dev/null; true")
+    with cfg.unlocked():   # the host's cleanup, its probe and the task log take as long as the host does: the unit is recorded closing, busy
+        close_tab(cfg, u)
+        if not h.get("local"):
+            root = h["root"]; n = u["name"]
+            others = [x["name"] for x in units if x["id"] != u["id"] and x.get("host") == u["host"] and x.get("rcwd") == u.get("rcwd")]
+            if others: say(f"keeping {u.get('rcwd')} on {u['host']}: open unit(s) {', '.join(others)} use it")
+            else: X(cfg, h, f"cd {qp(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
+        if u.get("via") == "pueue":   # the task's log is kept under out/<unit>/ before the task is removed
+            if not cfg.run.dry: save_task_log(cfg, h, u, u["task"])
+            X(cfg, h, f"{pueue(h)} remove {int(u['task'])} 2>/dev/null; true")
+        X(cfg, {"local": True}, f"BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} close {u['name']} 2>/dev/null; true")
+        ended = bool(u.get("run")) and not cfg.run.dry and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown")
     if cfg.run.dry: return
-    if u.get("run") and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"): settle_run(cfg, u, "closed")
+    u = next((x for x in bd.units() if x["id"] == u["id"]), u)   # as it is now: the run is settled and the issue closed on the current record
+    if ended: settle_run(cfg, u, "closed")
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); note_event(cfg, "close")
     say("closed")
     if not dup: note_collected(cfg, u["name"], "close"); say(present_line(u["name"]))   # a duplicate relaunch has no result of its own
@@ -540,15 +558,29 @@ def saved_marker(u):
     finding 5, so `saved == task` is never None == None)."""
     return u.get("task") if u.get("task") is not None else "tmux"
 
-def refresh_remote(cfg, u, bd, log):
+def refresh_due(cfg, u):
+    """True when refresh_remote brings a remote unit's output here now: its agent ended and it is unsaved, or its last backup is
+    older than [collect] backup_min."""
+    if cfg.hosts[u["host"]].get("local") or no_remote_copy(u): return False
+    return (u.get("state") in ENDED and u.get("saved") != saved_marker(u)) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60
+
+def fetch_unit(cfg, u):
+    """One unit's remote read phase, writing no state: (backup patch rc, its stderr, whether the output folder was saved)."""
+    prc, _, perr = remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch") or (0, "", "")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
+    return prc, perr, bool(save_output(cfg, u))
+
+def refresh_remote(cfg, u, bd, log, fetched=None):
     """A remote unit's output is read here: saved once when its agent's turn ended (then its verdict, WAITING line and api.json
-    are judged here), and every [collect] backup_min while it runs (item 4)."""
-    if cfg.hosts[u["host"]].get("local") or u.get("via") in ("failed", "starting"): return
+    are judged here), and every [collect] backup_min while it runs (item 4). fetched: what fetch_remote_outputs brought before the
+    writer lock was taken (the watcher); a unit that became due since is left to the next pass, never copied under the lock."""
+    if not refresh_due(cfg, u): return
     fin = u.get("state") in ENDED
-    if not ((fin and u.get("saved") != saved_marker(u)) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60): return
-    prc, _, perr = remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
+    if fetched is None: got = fetch_unit(cfg, u)
+    elif u["name"] in fetched: got = fetched[u["name"]]
+    else: return
+    prc, perr, ok = got
     if prc: log(f"{u['name']}: no backup patch could be made on {u['host']} (exit {prc}; the earlier one is kept): {(perr or '').strip()[-300:]}")
-    if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed ({u.get('_sync_error')})"); return
+    if not ok: log(f"{u['name']}: saving its output from {u['host']} failed ({u.get('_sync_error')})"); return
     u["saved_at"] = int(now())
     if fin: u["saved"] = saved_marker(u); settle_remote(cfg, u)   # its run is closed when it ends, not at collect
     bd.save(u)
@@ -557,31 +589,43 @@ def refresh_remote(cfg, u, bd, log):
         pk = waiting_line_jobs(cfg, u)
         if pk: u["_park"] = pk; u["state"] = "parked"
 
-def sync_remote_outputs(cfg, units, bd):
+def remote_to_sync(cfg, units):
+    """The units whose remote output check brings here: a remote unit whose agent ended and whose output is not saved yet."""
+    return [u for u in units if not cfg.hosts.get(u.get("host"), {}).get("local") and not no_remote_copy(u)
+            and u.get("state") in ENDED and u.get("saved") != saved_marker(u)]
+
+def fetch_remote_outputs(cfg, units):
+    """The read phase of sync_remote_outputs and refresh_remote (ssh and rsync, no state written; it runs outside the writer
+    lock): {unit name: fetch_unit's result} for each unit one of them will bring here."""
+    got = {}
+    if cfg.run.ro: return got
+    for u in units:
+        if refresh_due(cfg, u):
+            try: got[u["name"]] = fetch_unit(cfg, u)
+            except Err: got[u["name"]] = (1, "", False)
+    return got
+
+def sync_remote_outputs(cfg, units, bd, fetched=None):
     """Item 11 addendum (finding 5): before check judges a remote unit parked vs orphan, bring its report and the end-of-turn
     backup patch here once its agent ended (the local report has no WAITING line until janus collect, so its jobs looked
     orphaned). Remote tmux units (no pueue task) are synced too, and a failed sync fails closed: the unit is marked so its jobs
-    are never cancelled on the stale local report."""
+    are never cancelled on the stale local report. fetched: what fetch_remote_outputs brought before the writer lock was taken; the
+    record is judged again here, so a unit another command saved or ended meanwhile is not overwritten, and one that ended after
+    the fetch is marked failed (its report was not brought)."""
     if cfg.run.ro: return
-    for u in units:
-        if cfg.hosts.get(u.get("host"), {}).get("local") or u.get("via") in ("failed", "starting"): continue
-        if u.get("state") not in ENDED or u.get("saved") == saved_marker(u): continue
-        try:
-            remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")
-            if not save_output(cfg, u):
-                u["_sync_failed"] = True; continue
-        except Err:
-            u["_sync_failed"] = True; continue
+    if fetched is None: fetched = fetch_remote_outputs(cfg, units)
+    for u in remote_to_sync(cfg, units):
+        if not (fetched.get(u["name"]) or (0, "", False))[2]: u["_sync_failed"] = True; continue
         u["saved"] = saved_marker(u); u["saved_at"] = int(now())
         try: settle_remote(cfg, u); bd.save(u)
         except Err: pass
 
-def tend_parked(cfg, hs, units, log):
+def tend_parked(cfg, hs, units, log, fetched=None):
     """The watcher's part: record parked units, resume those whose jobs all finished, wrap up capped runs (item 2)."""
     bd = Beads(cfg)
     for u in units:
         try:
-            refresh_remote(cfg, u, bd, log)
+            refresh_remote(cfg, u, bd, log, fetched)
             jobs = u.get("_park")
             if jobs:
                 if (u.get("parked") or {}).get("jobs") != jobs:

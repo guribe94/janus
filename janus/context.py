@@ -39,6 +39,9 @@ class Run:
 
 class Err(Exception): pass
 
+class LockLost(Err):
+    """The writer lock could not be taken again after a command let it go for its remote part: the work is done, its state is not written."""
+
 def now(): return time.time()
 
 def ts(t=None): return time.strftime("%Y-%m-%d %H:%M", time.localtime(t or now()))
@@ -81,6 +84,13 @@ class Cfg:
         orchestrator's state-changing commands hold it, so two never interleave read-modify-write of acks, open problems or
         unit records. Readers do not take it. Re-entrant within a process (the watcher's pass runs the check)."""
         return writer_lock(self.f("write.lock"), wait)
+    def unlocked(self):
+        """The writer lock let go for the body (a command's slow remote part) and taken again after it, whatever depth the process
+        holds it at; a no-op where it is not held. The caller records what it is doing on the unit record first (busy)."""
+        return writer_unlocked(self.f("write.lock"))
+    def command_writer(self):
+        """The lock a state-changing command takes: none for a dry run or an agent's call (the orchestrator's commands only)."""
+        return self.writer() if not self.run.dry and os.environ.get("JANUS_ROLE") != "agent" else contextlib.nullcontext()
     def touch(self, n):
         if not self.run.ro: self.f(n).touch()
     def mtime(self, n):
@@ -247,6 +257,25 @@ def writer_lock(path, wait=300):
             if s >= LOCK_SLOW:   # skill-fix57: who held the lock for long, in .janus/lock.log (short writers waited behind it)
                 with contextlib.suppress(OSError), open(Path(k).parent / "lock.log", "a") as lf: lf.write(f"{ts()} {Path(k).name} held {s:.0f} s by janus {' '.join(sys.argv[1:3])} (pid {os.getpid()})\n")
             _HELD.pop(k, None); held[0].close()
+
+@contextlib.contextmanager
+def writer_unlocked(path, wait=300):
+    """Let go of this process's hold on the writer lock for the body (the same entry stays, so the outer exits are unchanged),
+    then wait up to wait seconds for it again (Err: the caller's work is done but its state not yet written)."""
+    import fcntl
+    k = str(path); held = _HELD.get(k)
+    if not held: yield; return
+    fcntl.flock(held[0], fcntl.LOCK_UN); held[0].close()
+    try: yield
+    finally:
+        f = open(k, "a"); t0 = time.time()
+        while True:
+            try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+            except BlockingIOError:
+                if time.time() - t0 >= wait: f.close(); raise LockLost(f"another janus writer ({lock_owner(k) or 'the watcher or a command'}) holds {Path(k).name} for over {wait:g} s; the command's remote part is done but its state is not written (check: unit:<n>:interrupted)")
+                time.sleep(0.2)
+        held[0] = f; held[2] = time.time()
+        with contextlib.suppress(OSError): Path(k + ".owner").write_text(f"{os.getpid()} {int(held[2])} janus {' '.join(sys.argv[1:3])}")
 
 LOCK_SLOW = 30   # seconds a writer may hold the lock before its hold is logged
 

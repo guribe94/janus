@@ -136,7 +136,8 @@ def cmd_fill(cfg, a):
     """Launch ready backlog units that have briefs, highest priority first, until every host's reservations or the budget are
     used, and no further. --dry-run lists what it would launch now and why it stops there."""
     if cfg.run.dry: cfg.run.ro = True   # a dry run changes nothing anywhere (the probe leaves the hosts' reservation files alone)
-    hs = probe_all(cfg); units = Beads(cfg).units(); ag = herdr_agents(cfg)
+    with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers take as long as the slowest host: not under the writer lock (the watcher's pass holds it)
+    units = Beads(cfg).units(); ag = herdr_agents(cfg)
     for u in units: u["state"] = unit_state(u, hs, ag)
     wp = waste_block(cfg)
     if wp: say(f"fill: PAUSED: {wp}"); return 1

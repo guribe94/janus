@@ -171,6 +171,7 @@ auditor, a shell), `check`, `status` and `capacity` only read: no file is writte
 ```
 $ janus check
 [unit:parser:finished] parser finished (done; VERDICT: DONE); collect/close or relaunch
+[unit:parser:interrupted] parser: its close (pid 4242) stopped before it finished; run janus close parser again (launch and close hand the writer lock back during their remote part and mark the unit starting or closing, busy; a dead busy mark is this finding)
 [gate:nightly@09:12:44] gate nightly FAILED at 09:12:44 (x y); re-queue or classify
 [board:u7:question] u7 is QUESTION on the board: which baseline? ...; answer with board.sh direct
 ```

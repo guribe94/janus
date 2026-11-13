@@ -7,7 +7,7 @@ from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_script, board_shipped
 from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost, waste_block
 from janus.cap import FACTS, build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
-from janus.context import EXCL, Err, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, note_event, now, pq, qp, say, sh, ts
+from janus.context import EXCL, Err, LockLost, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, note_event, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
 from janus.memory import MEM_SECTIONS, mem_line, memory_read, mset
 from janus.platform import herdr
@@ -16,7 +16,7 @@ from janus.probe import probe_all, pueue, room
 from janus.quality import qset
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import predecessor_name, related_pointers, transcript_of
-from janus.units import TAB_SEP, herdr_agents, main_checkout, report_path, unit_state, ws_id
+from janus.units import TAB_SEP, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
 
 def model_qualified(cfg, m):
     """Whether a model may do normal work: [models.<m>] qualified = false marks a free or new model unqualified until
@@ -472,6 +472,13 @@ def new_worktree(repo, cwd, name, ref="main"):
     if rc: raise Err(f"git worktree add -b {name} {cwd} {ref} in {repo} failed: {(e or o).strip()[-160:]}")
     return cwd.resolve()
 
+def settle_launch(bd, u, snap):
+    """The unit's record as it is now (the lock was let go during the launch's remote part) with what the launch set on it since
+    it was recorded starting: another command's change to it is kept, never written over."""
+    cur = next((x for x in bd.units() if x["id"] == u["id"]), None)
+    if cur is None: raise Err(f"{u['name']}: its record was closed while it started; nothing recorded (stop its agent: janus cancel {u['name']})")
+    return {**cur, **{k: v for k, v in u.items() if snap.get(k) != v}}
+
 def cmd_launch(cfg, a):
     name = a.unit
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
@@ -492,7 +499,11 @@ def cmd_launch(cfg, a):
         if not ok: raise Err(f"model {a.model}: {w}")
     mname = a.model or pick_model(cfg, a.tier, a.kind, of.get("vendor") if of else None, a.host)
     mc = cfg.models[mname]
-    hs = getattr(a, "probes", None) or probe_all(cfg)
+    hs = getattr(a, "probes", None)
+    if not hs:
+        with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers: not under the writer lock; the units are read again after it (another launch may have taken the name or the room)
+        units = bd.units(); prev = next((u for u in units if u["name"] == name), None); of = next((u for u in units if u["name"] == (a.of or name)), None)
+        if prev and a.kind != "review": raise Err(f"{name} already launched on {prev.get('host')}")
     ag = herdr_agents(cfg) if not getattr(a, "probes", None) else {}
     for x in units: x.setdefault("state", unit_state(x, hs, ag))   # finished units hold no build position
     if a.kind == "implement":   # land the done work before starting more (S1 finish-and-land, S3 land-first-lean; inert unless configured)
@@ -553,6 +564,7 @@ def cmd_launch(cfg, a):
     pred = predecessor_name(cfg, name, a.resume_of)   # RELATED: names and the predecessor reach the brief (imp-awareness)
     u = {"v": UNIT_V, "host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
+    if not cfg.run.dry: u["busy"] = busy_mark("launch")   # the remote part below runs without the writer lock: this says so (check: unit:<n>:interrupted)
     if a.of: u["of"] = a.of   # the unit a review checks (review:<unit> for a critical unit needs a later review of it)
     if report: u["report"] = str(report); u["resume"] = True
     elif seed: u["resume"] = True   # its own out/<unit>/REPORT.md, seeded below
@@ -566,105 +578,109 @@ def cmd_launch(cfg, a):
     start = report if report and report.exists() else outd / "REPORT.md" if seed and not cfg.run.dry else None   # the report it starts from
     env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root),
            **({"BOARD_DIR": str(board_dir(cfg))} if local else {})}   # remote: <root>/bin/board.sh finds <root>/board itself
+    snap = dict(u)
     try:
-        if not local:
-            root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
-            env["JANUS_REPORT"] = f"{root}/out/{name}/REPORT.md"
-            rc_, o_, _ = X(cfg, h, "mkdir -p " + " ".join(qp(x) for x in (rcwd, f"{root}/briefs", f"{root}/out/{name}", f"{root}/run", f"{root}/base"))
-                           + f" && cd {qp(rcwd)} && pwd -P")
-            if rc_ == 0 and o_.strip().startswith("/"): u["rcwd_abs"] = o_.strip().splitlines()[-1]   # the transcript folder's name (#4)
-            cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
-            if cfg.run.dry: say("+ " + shlex.join(cmd))
+        with cfg.unlocked():   # the copy, the queueing and the start take minutes on a slow host: an ack must not wait for them (the unit is recorded starting, busy)
+            if not local:
+                root = h["root"]; rcwd = f"{root}/worktrees/{name}"; rbrief = f"{root}/briefs/{name}.md"
+                env["JANUS_REPORT"] = f"{root}/out/{name}/REPORT.md"
+                rc_, o_, _ = X(cfg, h, "mkdir -p " + " ".join(qp(x) for x in (rcwd, f"{root}/briefs", f"{root}/out/{name}", f"{root}/run", f"{root}/base"))
+                               + f" && cd {qp(rcwd)} && pwd -P")
+                if rc_ == 0 and o_.strip().startswith("/"): u["rcwd_abs"] = o_.strip().splitlines()[-1]   # the transcript folder's name (#4)
+                cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
+                if cfg.run.dry: say("+ " + shlex.join(cmd))
+                else:
+                    rc, o, e = sh(cmd, timeout=900)
+                    if rc: raise Err(f"rsync to {hn} failed (exit {rc}): {(e or o).strip()[-160:]}")
+                # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
+                X(cfg, h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
+                put_script(cfg, h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
+                if not cfg.paths.get("board"):
+                    for n, t in board_shipped(cfg): put_script(cfg, h, f"{root}/bin/{n}", t)   # the shipped board there (outbox)
+                if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
+                ship_context(cfg, h, name, bcopy)
+                put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + btext, "644")
+                if start:   # a resumed unit starts from the report it continues; there it writes <root>/out/<unit>/REPORT.md, its own
+                    put_script(cfg, h, f"{root}/out/{name}/REPORT.md", start.read_text(), "644")
+                else: X(cfg, h, f"[ -s {qp(env['JANUS_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['JANUS_REPORT'])}")
+            rep = outd / "REPORT.md"
+            if not report and not rep.exists() and not cfg.run.dry: rep.write_text("VERDICT: PENDING\n")
+            if local:   # the brief with janus's header (the park rule) as the agent reads it: out/<unit>/<brief name>
+                rbrief = str(outd / (brief.name if (outd / brief.name).resolve() != brief.resolve() else "janus-" + brief.name))
+                if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + brief.read_text())
+            u["rbrief"] = rbrief
+            prompt = agent_prompt(cfg, name, rbrief, hn, env["JANUS_REPORT"], budget=budget)
+            u["rcwd"] = rcwd
+            if mc["kind"] == "api":
+                X(cfg, h, ensure_lanes(h, cfg))
+                if local and not cfg.run.dry: write_cap(cfg, hn, h)
+                # the budget is reserved (cap check and the run's running row, under the ledger's lock) before anything is queued
+                run = reserve_budget(cfg, mc, name, budget); u.update(run=run, runs=[run])
+                if local:
+                    cmd = shlex.join([sys.executable, str(JANUS_SELF), "api-run", name, "--run", run, "--model", mname, "--budget", str(budget),
+                                      "--brief", rbrief, "--cwd", rcwd, "--report", env["JANUS_REPORT"]])
+                    rc, o, e = X(cfg, h, f"{pueue(h)} add -g agents -l {tag(cfg, name)} -w {shlex.quote(rcwd)} --print-task-id -- {pq(cmd)}", env=env)
+                else:
+                    rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, run=run)
+                if rc and not cfg.run.dry: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
+                if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
+                u.update(via="pueue", task=int(o.strip() or 0))
+                if not cfg.run.dry:   # launched means started (or queued for a slot, or already done), never a run that died at once
+                    st, why = confirm_started(cfg, h, u["task"])
+                    if st == "died":
+                        ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "died-at-start")
+                        raise Err(f"the run died at once ({why}); nothing is running")
+                    u["start_state"] = st
+                    say(f"{name}: run {st}" + (" (waiting for an agents slot)" if st == "queued" else " (exit 0)" if st == "finished" else
+                                                "" if st == "running" else f": not confirmed running (pueue {hn}:{u['task']} is {st})"))
+                unit_tab(cfg, u, mname, hn, h)
+            elif local:
+                pane, tab = new_tab(cfg, TAB_SEP.join((name, mname, hn)), cwd) if not cfg.run.dry else ("pane", "tab")
+                u.update(pane=pane, tab=tab)
+                if not cfg.run.dry:
+                    wait_shell(pane, name)
+                    envs = {**env, **({"OPENCODE_CONFIG_CONTENT": json.dumps({"model": mc["model"]})} if mc["kind"] == "opencode" else {})}
+                    # the pane's shell inherited herdr's environment: drop what must not reach an agent, then set the unit's own
+                    herdr("pane", "run", pane, "unset ANTHROPIC_API_KEY CLAUDE_CODE_MESSAGING_TOKEN HERDR_PANE_ID CLAUDE_CODE_SESSION_ID; "
+                          + "; ".join(f"export {k}={shlex.quote(v)}" for k, v in envs.items()) + f"; echo env-'{name}'")
+                    sh(["herdr", "pane", "wait-output", pane, "--match", f"env-{name}", "--timeout", "10000"], timeout=15)
+                    r = sh(["herdr", "agent", "start", name, "--kind", mc["kind"], "--pane", pane, "--timeout", "90000", "--", *mc.get("args", [])], timeout=100)
+                    d = past_dialogs(name, pane)
+                    if r[0] and d: raise Err("herdr agent start failed: " + (r[2] or d)[:160])
+                    if d: raise Err(f"{name}: {d}")
+                    herdr("agent", "prompt", name, prompt)
+                    u.update(via="herdr", pid=findkey(herdr("pane", "process-info", "--pane", pane), "pid"))
+                    agent_res(cfg, hn, h, name, u.get("pid"))
+                else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
             else:
-                rc, o, e = sh(cmd, timeout=900)
-                if rc: raise Err(f"rsync to {hn} failed (exit {rc}): {(e or o).strip()[-160:]}")
-            # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
-            X(cfg, h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
-            put_script(cfg, h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
-            if not cfg.paths.get("board"):
-                for n, t in board_shipped(cfg): put_script(cfg, h, f"{root}/bin/{n}", t)   # the shipped board there (outbox)
-            if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
-            ship_context(cfg, h, name, bcopy)
-            put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + btext, "644")
-            if start:   # a resumed unit starts from the report it continues; there it writes <root>/out/<unit>/REPORT.md, its own
-                put_script(cfg, h, f"{root}/out/{name}/REPORT.md", start.read_text(), "644")
-            else: X(cfg, h, f"[ -s {qp(env['JANUS_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['JANUS_REPORT'])}")
-        rep = outd / "REPORT.md"
-        if not report and not rep.exists() and not cfg.run.dry: rep.write_text("VERDICT: PENDING\n")
-        if local:   # the brief with janus's header (the park rule) as the agent reads it: out/<unit>/<brief name>
-            rbrief = str(outd / (brief.name if (outd / brief.name).resolve() != brief.resolve() else "janus-" + brief.name))
-            if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + brief.read_text())
-        u["rbrief"] = rbrief
-        prompt = agent_prompt(cfg, name, rbrief, hn, env["JANUS_REPORT"], budget=budget)
-        u["rcwd"] = rcwd
-        if mc["kind"] == "api":
-            X(cfg, h, ensure_lanes(h, cfg))
-            if local and not cfg.run.dry: write_cap(cfg, hn, h)
-            # the budget is reserved (cap check and the run's running row, under the ledger's lock) before anything is queued
-            run = reserve_budget(cfg, mc, name, budget); u.update(run=run, runs=[run])
-            if local:
-                cmd = shlex.join([sys.executable, str(JANUS_SELF), "api-run", name, "--run", run, "--model", mname, "--budget", str(budget),
-                                  "--brief", rbrief, "--cwd", rcwd, "--report", env["JANUS_REPORT"]])
-                rc, o, e = X(cfg, h, f"{pueue(h)} add -g agents -l {tag(cfg, name)} -w {shlex.quote(rcwd)} --print-task-id -- {pq(cmd)}", env=env)
-            else:
-                rc, o, e = api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, run=run)
-            if rc and not cfg.run.dry: ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "launch-failed")
-            if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
-            u.update(via="pueue", task=int(o.strip() or 0))
-            if not cfg.run.dry:   # launched means started (or queued for a slot, or already done), never a run that died at once
-                st, why = confirm_started(cfg, h, u["task"])
-                if st == "died":
-                    ledger_done(cfg, cfg.prov[mc["provider"]], run, name, 0, "died-at-start")
-                    raise Err(f"the run died at once ({why}); nothing is running")
-                u["start_state"] = st
-                say(f"{name}: run {st}" + (" (waiting for an agents slot)" if st == "queued" else " (exit 0)" if st == "finished" else
-                                            "" if st == "running" else f": not confirmed running (pueue {hn}:{u['task']} is {st})"))
-            unit_tab(cfg, u, mname, hn, h)
-        elif local:
-            pane, tab = new_tab(cfg, TAB_SEP.join((name, mname, hn)), cwd) if not cfg.run.dry else ("pane", "tab")
-            u.update(pane=pane, tab=tab)
-            if not cfg.run.dry:
-                wait_shell(pane, name)
-                envs = {**env, **({"OPENCODE_CONFIG_CONTENT": json.dumps({"model": mc["model"]})} if mc["kind"] == "opencode" else {})}
-                # the pane's shell inherited herdr's environment: drop what must not reach an agent, then set the unit's own
-                herdr("pane", "run", pane, "unset ANTHROPIC_API_KEY CLAUDE_CODE_MESSAGING_TOKEN HERDR_PANE_ID CLAUDE_CODE_SESSION_ID; "
-                      + "; ".join(f"export {k}={shlex.quote(v)}" for k, v in envs.items()) + f"; echo env-'{name}'")
-                sh(["herdr", "pane", "wait-output", pane, "--match", f"env-{name}", "--timeout", "10000"], timeout=15)
-                r = sh(["herdr", "agent", "start", name, "--kind", mc["kind"], "--pane", pane, "--timeout", "90000", "--", *mc.get("args", [])], timeout=100)
-                d = past_dialogs(name, pane)
-                if r[0] and d: raise Err("herdr agent start failed: " + (r[2] or d)[:160])
-                if d: raise Err(f"{name}: {d}")
-                herdr("agent", "prompt", name, prompt)
-                u.update(via="herdr", pid=findkey(herdr("pane", "process-info", "--pane", pane), "pid"))
-                agent_res(cfg, hn, h, name, u.get("pid"))
-            else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
-        else:
-            cli = {"claude": "claude", "codex": "codex", "opencode": "opencode run"}[mc["kind"]]
-            e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-            if mc["kind"] == "opencode": e += " OPENCODE_CONFIG_CONTENT=" + shlex.quote(json.dumps({"model": mc["model"]}))
-            mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -- " if mm else ""   # fixes5 item 7
-            inner = f"cd {qp(rcwd)} && exec env {e} {sd}{cli} {shlex.join(mc.get('args', []))} {shlex.quote(prompt)}"
-            pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
-            tm = tmux_name(cfg, name)
-            rc, o, er = X(cfg, h, pre + f"tmux new -d -s {shlex.quote(tm)} {shlex.quote(inner)} && tmux display -p -t {shlex.quote(tm)} '#{{pane_pid}}'")
-            if rc: raise Err("tmux start failed: " + er.strip()[:100])
-            u.update(via="tmux", tmux=tm, pid=int(o.strip() or 0))
-            if not cfg.run.dry:   # launched means the agent's session is alive a moment later (a broken command line ends it at once)
-                time.sleep(3)
-                if hrun(h, pre + f"tmux has-session -t {shlex.quote(tm)}")[0] or not u["pid"]:
-                    raise Err(f"the agent's tmux session {tm} ended at once; nothing is running")
-                u["start_state"] = "running"
-            if not cfg.run.dry: agent_res(cfg, hn, h, name, u["pid"])
-            if not cfg.run.dry:
-                pane, tab = new_tab(cfg, TAB_SEP.join((name, mname, hn)), cwd)
-                herdr("pane", "run", pane, f"ssh -t {shlex.quote(h['ssh'])} tmux attach -t {shlex.quote(tm)}"); u.update(pane=pane, tab=tab)
+                cli = {"claude": "claude", "codex": "codex", "opencode": "opencode run"}[mc["kind"]]
+                e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+                if mc["kind"] == "opencode": e += " OPENCODE_CONFIG_CONTENT=" + shlex.quote(json.dumps({"model": mc["model"]}))
+                mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -- " if mm else ""   # fixes5 item 7
+                inner = f"cd {qp(rcwd)} && exec env {e} {sd}{cli} {shlex.join(mc.get('args', []))} {shlex.quote(prompt)}"
+                pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
+                tm = tmux_name(cfg, name)
+                rc, o, er = X(cfg, h, pre + f"tmux new -d -s {shlex.quote(tm)} {shlex.quote(inner)} && tmux display -p -t {shlex.quote(tm)} '#{{pane_pid}}'")
+                if rc: raise Err("tmux start failed: " + er.strip()[:100])
+                u.update(via="tmux", tmux=tm, pid=int(o.strip() or 0))
+                if not cfg.run.dry:   # launched means the agent's session is alive a moment later (a broken command line ends it at once)
+                    time.sleep(3)
+                    if hrun(h, pre + f"tmux has-session -t {shlex.quote(tm)}")[0] or not u["pid"]:
+                        raise Err(f"the agent's tmux session {tm} ended at once; nothing is running")
+                    u["start_state"] = "running"
+                if not cfg.run.dry: agent_res(cfg, hn, h, name, u["pid"])
+                if not cfg.run.dry:
+                    pane, tab = new_tab(cfg, TAB_SEP.join((name, mname, hn)), cwd)
+                    herdr("pane", "run", pane, f"ssh -t {shlex.quote(h['ssh'])} tmux attach -t {shlex.quote(tm)}"); u.update(pane=pane, tab=tab)
     except Err as ex:
+        if isinstance(ex, LockLost): raise   # the launch is done, the record stays starting + busy: check names it interrupted
         if not cfg.run.dry:
-            u["via"] = "failed"; bd.save(u); bd.comment(u["id"], f"{ts()} launch failed: {ex}")
+            u = settle_launch(bd, u, snap); u["via"] = "failed"; u.pop("busy", None); bd.save(u); bd.comment(u["id"], f"{ts()} launch failed: {ex}")
             bd.run("close", u["id"], "--reason", "launch failed")
             if u.get("tab"): herdr("tab", "close", u["tab"])
         raise
     if cfg.run.dry: return
+    u = settle_launch(bd, u, snap); u.pop("busy", None)
     bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); note_event(cfg, "launch")
     chk = f"herdr {name}" if u["via"] == "herdr" else f"pueue {hn}:{u['task']}" if u["via"] == "pueue" else f"tmux {hn}:janus-{name}"
     board(cfg, "post", name, "status", f"launched ({mname}, {hn})",

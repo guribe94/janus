@@ -501,7 +501,7 @@ class Item8Unattended(unittest.TestCase):
         """One watcher pass with every step stubbed (`more` replaces some); returns the names of the steps that ran."""
         ran = []
         stubs = {n: (lambda *a, _n=n, **k: ran.append(_n) or []) for n in self.STEPS + ("orphan_jobs", "cmd_fill")}
-        stubs.update(run_check=lambda cfg, cycle=False, writer=True: ([janus.finding(k, "t") for k in F], None, {}, []), herdr=lambda *a: None, **more)
+        stubs.update(run_check=lambda cfg, cycle=False, writer=True, pre=None: ([janus.finding(k, "t") for k in F], None, {}, []), herdr=lambda *a: None, **more)
         with mock.patch.multiple(sys.modules["janus.watch"], **stubs): janus.watch_pass(cfg, self.log.append)
         return ran
 
@@ -553,7 +553,7 @@ class Item8Unattended(unittest.TestCase):
         """Catches (item 8): an unexpected error in a pass (not a janus refusal) ended the watcher command with a traceback and
         nothing in watch.log, so nobody could see why no pass had acted."""
         d, cfg = project()
-        def dies(cfg, log): raise ValueError("bad state file")
+        def dies(cfg, log, pre=None): raise ValueError("bad state file")
         with mock.patch.object(sys.modules["janus.watch"], "watch_pass", dies): janus.cmd_watch(cfg, ns())
         self.assertIn("ValueError: bad state file", cfg.f("watch.log").read_text())
         self.assertEqual([k for k, _ in janus.watch_step_findings(cfg)], [], "one failed pass is not yet a finding")

@@ -15,7 +15,7 @@ class SecondOrchestrator(unittest.TestCase):
         cfg.touch("last_wake"); os.utime(cfg.f("last_wake"), (time.time() - 700,) * 2)
         started = []
         herdr = lambda *a: {"panes": [{"pane_id": "P2"}]} if a[:2] == ("pane", "list") else ({"agent": None} if a[:2] == ("agent", "get") else {})
-        stubs = {"run_check": lambda cfg, cycle=False, writer=True: ([janus.finding("unit:x:finished", "t")], None, {}, []),
+        stubs = {"run_check": lambda cfg, cycle=False, writer=True, pre=None: ([janus.finding("unit:x:finished", "t")], None, {}, []),
                  "herdr": herdr, "new_tab": lambda cfg, n, root: (started.append(n), ("P3", None))[1], "wait_shell": lambda *a: None,
                  "sh": lambda *a, **k: (0, "", "")}
         stubs.update({n: (lambda *a, **k: []) for n in ("heartbeat_beat", "board_alerts", "tend_parked", "tend_autopilot", "tend_thrash", "tend_tidy", "orphan_jobs")})
@@ -39,7 +39,7 @@ class Restart(unittest.TestCase):
             if a[:2] == ("pane", "list"): return {"panes": [{"pane_id": p} for p in panes]}
             if a[:2] == ("pane", "close"): self.closed.append(a[2]); return {}
             return {"agent": None} if a[:2] == ("agent", "get") else {}
-        stubs = {"run_check": lambda cfg, cycle=False, writer=True: ([janus.finding("unit:x:finished", "t")], None, {}, []), "herdr": herdr,
+        stubs = {"run_check": lambda cfg, cycle=False, writer=True, pre=None: ([janus.finding("unit:x:finished", "t")], None, {}, []), "herdr": herdr,
                  "new_tab": lambda cfg, n, root: (self.started.append(n), ("P3", None))[1], "wait_shell": lambda *a: None, "sh": lambda *a, **k: (0, "", "")}
         stubs.update({k: (lambda *a, **kw: []) for k in ("heartbeat_beat", "board_alerts", "tend_parked", "tend_autopilot", "tend_thrash", "tend_tidy", "orphan_jobs")})
         with mock.patch.multiple(sys.modules["janus.watch"], **stubs):

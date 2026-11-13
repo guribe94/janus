@@ -5,8 +5,9 @@ a verdict written after the resume started; PENDING is not a verdict), report_pa
 ws_id (the workspace agents run in); get_unit/unit_any/all_units (open units, the latest record of any unit), unit_runs/unit_spent,
 api_out, the WAITING line of its report (waiting_line_jobs), agent_ended, and whether its tree is its own (own_tree,
 main_checkout)."""
+import os
 from janus.beads import Beads, unit_record
-from janus.context import Err, sh
+from janus.context import Err, now, sh
 from janus.ledger import budget_of, ledger_read
 from janus.platform import herdr
 from janus.project import unit_tmux
@@ -240,3 +241,20 @@ def unit_any(cfg, name):
     return u or all_units(cfg).get(name)
 
 __all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
+
+
+def no_remote_copy(u):
+    """A unit whose remote output check must not copy: it failed or is still being started, or a close is removing its copy."""
+    return u.get("via") in ("failed", "starting") or bool(u.get("closing"))
+
+def busy_mark(op):
+    """What a launch or close records on the unit's record before its remote part runs without the writer lock."""
+    return {"op": op, "pid": os.getpid(), "at": int(now())}
+
+def busy_dead(u):
+    """The busy mark of a launch or close whose process is gone, else None. Age alone never makes it dead: a slow live operation is not."""
+    b = u.get("busy")
+    if not b: return None
+    try: os.kill(int(b.get("pid", 0)), 0); alive = True
+    except (OSError, ValueError, TypeError): alive = False
+    return None if alive else b

@@ -23,6 +23,7 @@ from janus.setup import cmd_doctor, cmd_init, cmd_install_host, cmd_queue, cmd_r
 from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
+LOCKS_LATE = {"collect"}   # writers that take the lock themselves, once their remote reads are done
 WRITERS = {"ack", "launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
            "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue", "qualify", "brief", "intent"}
 
@@ -171,9 +172,9 @@ def main():
     except (tomllib.TOMLDecodeError, OSError) as e: print(f"janus: {root / 'janus.toml'}: {e}", file=sys.stderr); return 2
     # the orchestrator's state-changing commands hold the writer lock (context.Cfg.writer); long ones (land, run, gate, api-run)
     # and agents' calls do not, so a gate never blocks the watcher; check takes it itself when it is a writer
-    lock = a.cmd in WRITERS and not cfg.run.dry and os.environ.get("JANUS_ROLE") != "agent"
+    # collect takes the lock itself, after its ssh and rsync (lifecycle.cmd_collect)
     try:
-        with cfg.writer() if lock else contextlib.nullcontext(): r = a.fn(cfg, a)
+        with cfg.command_writer() if a.cmd in WRITERS and a.cmd not in LOCKS_LATE else contextlib.nullcontext(): r = a.fn(cfg, a)
     except Err as e: print(f"janus: {e}", file=sys.stderr); return 1
     rc, lines = r if isinstance(r, tuple) else (r if isinstance(r, int) else 0, [])   # a read-only command returns its lines
     for l in lines: say(l)
