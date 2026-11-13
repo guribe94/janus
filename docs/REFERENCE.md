@@ -168,6 +168,9 @@ session (its session id, or its process among the caller's ancestors), it rewrit
 saves acks and open problems, sets the pueue limits and stamps the cycle (`last_cycle`). Run by anyone else (an agent, an
 auditor, a shell), `check`, `status` and `capacity` only read: no file is written, no pueue limit changes, no cycle stamp, and
 `check` ends with a "(read-only: ...)" line. The watcher is the other writer.
+On a machine that runs other janus projects, `check` also lists machine state that carries no project id (queues, panes,
+hosts) under a separate "machine state (no project id; not this project's, never acted on)" heading: it is shown, never
+acted on.
 ```
 $ janus check
 [unit:parser:finished] parser finished (done; VERDICT: DONE); collect/close or relaunch
