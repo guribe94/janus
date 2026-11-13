@@ -63,9 +63,13 @@ def smoke(d):
         r = subprocess.run(py + args, input=inp, capture_output=True, text=True)
         if r.returncode: return f"janus.py {' '.join(args)} failed: {r.stderr.strip()[-300:]}"
     if not A.skip_tests and (d / "tests").is_dir():   # every tests/test_*.py, against the copy (tests/janusload.py loads its janus)
+        # like ./check: the calling session's own janus variables stay out (an agent's JANUS_ROLE made 24 tests fail here, none in ./check)
+        env = {k: v for k, v in os.environ.items() if k not in ("JANUS_ROOT", "JANUS_UNIT", "JANUS_ROLE", "JANUS_REPORT")}
         r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-q", "-s", "tests", "-p", "test_*.py"], cwd=d, capture_output=True, text=True,
-                           env={**os.environ, "JANUS_PY": str(d / "janus.py"), "PYTHONDONTWRITEBYTECODE": "1"})
-        if r.returncode: return "tests failed:\n" + (r.stderr or r.stdout)[-1500:]
+                           env={**env, "JANUS_PY": str(d / "janus.py"), "PYTHONDONTWRITEBYTECODE": "1"})
+        if r.returncode:   # the whole output is kept: the 1500 characters below showed one of seven failures
+            log = SHARE / "release-check-failed.log"; log.write_text(r.stdout + r.stderr)
+            return f"tests failed (every failure: {log}):\n" + (r.stderr or r.stdout)[-1500:]
     return None
 
 def release():

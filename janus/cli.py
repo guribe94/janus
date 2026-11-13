@@ -144,7 +144,11 @@ def main():
     add("board-close", cmd_board_close, A("agent", help="a board card that is not an open unit"), dry=True)
     add("register", cmd_register, A("session", nargs="?"), dry=True)
     add("hook", cmd_hook, A("event", choices=["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"]))
-    a = ap.parse_args()
+    # gate-exec's command is everything after the first "--", cut off here: argparse before Python 3.12.7 gives the "*" its (empty)
+    # value together with <name>, before --timeout-min, and then refuses the command ("unrecognized arguments: -- <cmd>", exit 2)
+    argv = sys.argv[1:]; cut = argv.index("--") if argv[:1] == ["gate-exec"] and "--" in argv else None
+    a = ap.parse_args(argv if cut is None else argv[:cut])
+    if cut is not None: a.command = argv[cut + 1:]
     if a.cmd == "hook":
         try: cmd_hook(a.event)
         except Exception as e: print(f"janus hook: {e}", file=sys.stderr)

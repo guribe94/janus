@@ -121,7 +121,8 @@ class Flow(unittest.TestCase):
         d, cfg = project(); cfg.f("session").write_text("old"); cfg.f("pane").write_text("")
         cfg.run.dry = True
         out = io.StringIO()
-        with contextlib.redirect_stdout(out), mock.patch.object(janus, "herdr", lambda *a, **k: {}):
+        with contextlib.redirect_stdout(out), mock.patch.object(janus, "herdr", lambda *a, **k: {}), \
+             mock.patch.object(janus, "pane_tool", lambda: "tmux"):   # the test host's own tools must not decide (a container has neither)
             janus.cmd_resume_orch(cfg, args())
         self.assertEqual(cfg.f("session").read_text().strip(), "old")
         self.assertIn("+ start a claude orchestrator", out.getvalue())
