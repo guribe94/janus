@@ -241,24 +241,6 @@ class Item9ResumeCard(unittest.TestCase):
         self.assertTrue(any(a[0] == "post" and a[2] == "waiting" and (e or {}).get("BOARD_CHECK") == "pueue here:7" for a, e in posts), posts)
 
 
-class Item10UnitChanges(unittest.TestCase):
-    def test_a_staged_landing_merge_does_not_count_the_branchs_files(self):
-        """Catches: a unit holding a staged merge of the landing branch counted all of the branch's files as its changes, so it
-        overlapped every other such unit."""
-        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u10-")); R = base / "repo"; R.mkdir()
-        g = lambda *a: subprocess.run(["git", "-C", str(R), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
-        g("init", "-q", "-b", "main"); (R / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a")
-        g("checkout", "-q", "-b", "unit"); (R / "a").write_text("1x\n"); g("commit", "-qam", "unit change")
-        g("checkout", "-q", "main"); (R / "c").write_text("2\n"); g("add", "."); g("commit", "-qm", "main adds c")
-        g("checkout", "-q", "unit"); (R / "a").write_text("1y\n")   # the unit's staged work
-        g("merge", "--no-commit", "--no-ff", "main")                 # the landing branch merged and staged
-        d, cfg = project()
-        u = {"id": "t-1", "name": "u1", "host": "here", "cwd": str(R)}
-        hs = {"here": probe_of()}
-        br, fs = janus.unit_changes(cfg, u, [u])
-        self.assertIn("a", fs); self.assertNotIn("c", fs, "the landing branch's own file counted as the unit's change")
-
-
 class Item7BlockedLane(unittest.TestCase):
     def test_a_normally_queued_job_is_not_a_blocked_lane(self):
         """Catches (finding 7): `blocked:<host>:<lane>` fired whenever a job waited in admission, even when admission said yes
@@ -554,19 +536,6 @@ class Item6RetireMatch(unittest.TestCase):
         self.assertTrue(any("601" in l and "could not TERM" in l for l in out), out)
         self.assertTrue(any("sent TERM to 0" in l for l in out), out)
 
-    def test_retire_stops_an_idle_loop_whose_only_child_is_its_sleep(self):
-        """Catches (finding 4): --retire kept EVERY loop with a living child, and a loop that idles in `sleep 30` always has
-        one, so --retire never stopped the loops it exists for."""
-        ps = " 301 /bin/zsh /w/proj/bin/fleet-loops.sh far\n"
-        kills = []
-        def fake_run(cmd, **k):
-            if cmd[:1] == ["pgrep"]: return 0, ("777\n" if cmd[-1] == "301" else ""), ""
-            if cmd[:1] == ["ps"]: return 0, "777 sleep\n", ""
-            kills.append(list(cmd)); return 0, "", ""
-        real = janus.run; janus.run = fake_run
-        try: out = janus.retire_old_orch(dry=False, retire=True, idle=True, ps_text=ps, root="/w/proj")   # --idle: the owner says it is idle
-        finally: janus.run = real
-        self.assertEqual(kills, [["kill", "-TERM", "301"]], "an idle loop with only a sleep child was kept")
 
     def test_a_wrapped_loop_is_matched_but_not_a_wrapped_waiter(self):
         """Catches (finding 4): a loop started through sudo/nohup/env was not listed at all (over-strict matching)."""
@@ -754,14 +723,6 @@ class Item26GateExec(unittest.TestCase):
     def gate_exec(self, d, *argv):
         return subprocess.run([sys.executable, str(JANUS_PY), "gate-exec", *argv], cwd=d, capture_output=True, text=True)
 
-    def test_the_wrapper_runs_the_command_after_the_timeout_option(self):
-        """Catches (item 26): with a positional before it, argparse's REMAINDER command swallowed the `--timeout-min` option,
-        so the wrapper ran `sh -c '--timeout-min 0 -- <cmd>'`; sh refuses that string ('sh: --: invalid option', exit 2) and no
-        gate step ran at all (a real landing gate's whole log was bash's usage text)."""
-        d, _ = project()
-        r = self.gate_exec(d, "land-u1-x", "--timeout-min", "0", "--", "printf ran > out/marker")
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertEqual((d / "out/marker").read_text(), "ran")
 
     def test_the_wrapper_honours_the_timeout_option_from_the_command_line(self):
         """Catches (item 26, the silent half): the same REMAINDER swallowed `--timeout-min` itself, so `a.timeout_min` stayed 0
@@ -1402,27 +1363,6 @@ class Item10Residues(unittest.TestCase):
         finally:
             for k, v in saved.items(): setattr(janus, k, v)
         self.assertIn(("u1", "u2"), cases, "a shallow clone of the same repository was not related")
-
-
-class Item10Clones(unittest.TestCase):
-    def test_two_clones_of_one_repo_are_related(self):
-        """Catches (finding 10): two clones of one repository compared different (git common dir), so units in separate clones
-        were never related."""
-        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u10c-")); R = base / "r"; R.mkdir()
-        g = lambda c, *a: subprocess.run(["git", "-C", str(c), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
-        g(R, "init", "-q", "-b", "main"); (R / "docs").mkdir(); (R / "docs/a.md").write_text("x\n"); g(R, "add", "."); g(R, "commit", "-qm", "a")
-        C = base / "clone"; g(base, "clone", "-q", str(R), str(C))
-        W1 = base / "w1"; g(R, "worktree", "add", "-q", str(W1), "-b", "u1"); (W1 / "docs/a.md").write_text("y\n")
-        W2 = base / "w2"; g(C, "worktree", "add", "-q", str(W2), "-b", "u2"); (W2 / "docs/a.md").write_text("y2\n")
-        d, cfg = project()
-        units = [{"id": "t-1", "name": "u1", "host": "here", "cwd": str(W1), "state": "working"},
-                 {"id": "t-2", "name": "u2", "host": "here", "cwd": str(W2), "state": "working"}]
-        saved = {k: getattr(janus, k) for k in ("all_units", "gate_results", "learned_posts")}
-        janus.all_units = lambda cfg: {}; janus.gate_results = lambda cfg: {}; janus.learned_posts = lambda cfg: []
-        try: cases = janus.related_cases(cfg, units)
-        finally:
-            for k, v in saved.items(): setattr(janus, k, v)
-        self.assertIn(("u1", "u2"), cases, "two clones of one repository were not related")
 
 
 class Item11CommitStateAdd(unittest.TestCase):

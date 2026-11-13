@@ -150,9 +150,12 @@ class CancelStopsARunnerInItsOwnGroup(unittest.TestCase):
         d, cfg = project(); (d / "runner.py").write_text(self.RUNNER)
         p = subprocess.Popen([sys.executable, str(janusload.JANUS_PY), "gate-exec", "g", "--", f"{sys.executable} {d / 'runner.py'} {d / 'child'}"],
                              cwd=d, env={**os.environ, "JANUS_ROOT": str(d), "JANUS_WRAP": "gate-g-1"}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        child = self.child_pid(d / "child")
-        p.send_signal(signal.SIGTERM); p.wait(timeout=40)
+        child = self.child_pid(d / "child"); pgid = Path(cfg.hosts["here"]["_rd"]) / "gate-g-1.pgid"; t0 = time.time()
+        while not pgid.is_file() and time.time() - t0 < 10: time.sleep(0.1)
+        self.assertTrue(pgid.is_file(), "no group id for janus cancel to stop")   # row 219: what cancel reads
+        p.send_signal(signal.SIGTERM); self.assertEqual(p.wait(timeout=40), 128 + signal.SIGTERM)
         self.assertFalse(alive(child), "the runner's child in its own process group outlived the wrapper's stop")
+        self.assertFalse((d / "out/gates.log").exists(), "a cancelled gate wrote a result")   # row 219
 
 
 class RepeatAcks(unittest.TestCase):
