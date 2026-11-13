@@ -708,6 +708,10 @@ def doctor(cfg, a):
         r(cfg.p(k, d).is_dir() or None, f"paths.{k} {cfg.p(k, d)}", f"mkdir {cfg.p(k, d)}")
     b = board_script(cfg)
     r(os.access(b, os.X_OK) or None, f"message board {b}", "optional: agents post progress through it (paths.board)")
+    from janus.issue import issue_path, iset
+    from janus.autopilot import unattended_state
+    r(True, f"issue register {issue_path(cfg)}" + ("" if iset(cfg, "issues_file") else " (the default: [janus] issues_file is unset; janus issue writes there)"))   # row 224
+    r(True, unattended_state(cfg))   # row 225: say whether the unattended loop is on, and why
     rc, o, e = sh(["bd", "list", "-n", "1", "--json"], cwd=cfg.beads)
     r(rc == 0, f"beads in {cfg.beads}", f"run bd init in {cfg.beads} ({(e or o).strip()[:80]})")
     for n, pv in cfg.prov.items():

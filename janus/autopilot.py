@@ -21,15 +21,23 @@ AP = {"enabled": False, "relaunch_max": 2, "host_down_min": 20}
 def has_cap(cfg): return any(pv.get("cap_usd") and "ledger" in pv for pv in cfg.prov.values())   # a cap janus enforces
 
 def apc(cfg, k):
-    """An [autopilot] setting. `enabled` left unset is on when a provider has a cap (budget-follow item 8: the cap bounds what
-    the unattended loop can spend, so a project with one keeps its work moving without being configured)."""
+    """An [autopilot] setting. `enabled` left unset is OFF (row 225: it was on whenever a provider had a cap, so a project that
+    never asked for it had the watcher relaunch and resume its agents); the owner turns the unattended loop on by name."""
     v = cfg.c.get("autopilot", {}).get(k)
-    return v if v is not None else has_cap(cfg) if k == "enabled" else AP[k]
+    return v if v is not None else AP[k]
 
 def fill_watcher(cfg):
-    """Whether the watcher launches ready backlog units ([fill] watcher; unset: on with a cap, like the autopilot)."""
+    """Whether the watcher launches ready backlog units ([fill] watcher; unset: as [autopilot] enabled, so off with no setting)."""
     v = cfg.c.get("fill", {}).get("watcher")
-    return has_cap(cfg) if v is None else bool(v)
+    return bool(apc(cfg, "enabled")) if v is None else bool(v)
+
+def unattended_state(cfg):
+    """One line for doctor: whether the unattended loop is on, and the setting that says so."""
+    ap, fw = bool(apc(cfg, "enabled")), fill_watcher(cfg)
+    src = "janus.toml sets it" if cfg.c.get("autopilot", {}).get("enabled") is not None else "no [autopilot] enabled in janus.toml, and unset is off"
+    return (f"unattended loop: autopilot {'on' if ap else 'off'}, watcher fill {'on' if fw else 'off'} ({src}): "
+            + ("the watcher relaunches a crashed unit and resumes one stopped by its budget" if ap else "nothing relaunches or resumes a unit while no "
+               "orchestrator is at work; set [autopilot] enabled = true to turn it on"))
 
 def unattended_findings(cfg, units):
     """unattended:off: a part of the unattended loop is off while there is work it would keep moving (open units; ready backlog
@@ -38,9 +46,11 @@ def unattended_findings(cfg, units):
     off = [k for k, on in (("[autopilot] enabled", apc(cfg, "enabled") or not units), ("[fill] watcher", fill_watcher(cfg) or not backlog)) if not on]
     if not off: return []
     acts = [a for k, a in (("[autopilot] enabled", "relaunch a unit that crashed or resume one stopped by its budget"), ("[fill] watcher", "launch ready backlog units")) if k in off]
-    why = "janus.toml turns it off" if has_cap(cfg) else "it is on by default only when a provider has a cap_usd and a ledger, and none has"
+    unset = cfg.c.get("autopilot", {}).get("enabled") is None and ("[autopilot] enabled" in off or cfg.c.get("fill", {}).get("watcher") is None)
+    why = "janus.toml has no [autopilot] enabled, and unset is off" if unset else "janus.toml turns it off"
+    if cfg.c.get("fill", {}).get("watcher") is None: off = list(dict.fromkeys("[autopilot] enabled" if k == "[fill] watcher" else k for k in off))   # an unset fill follows the autopilot
     return [("unattended:off", f"the unattended loop is off ({why}): while no orchestrator is at work the watcher will not {' or '.join(acts)}. To turn it on set "
-             f"{' = true and '.join(off)} = true in janus.toml{'' if has_cap(cfg) else ', or give the provider a cap_usd'}; if the owner wants it off, "
+             f"{' = true and '.join(off)} = true in janus.toml; if the owner wants it off, "
              "ack this with the reason (janus ack unattended:off <reason>)")]
 
 def record(cfg, key, cause, reason, unit=None, ack=None):
