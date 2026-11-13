@@ -15,6 +15,8 @@ A message from the owner (any prompt without `[janus]`) is answered before anyth
 0. If the owner still waits for an answer, answer first (above).
 1. `janus check` (silent when all is well). Each line is `[key] problem: action`; take the action.
 2. `janus ack <key> "<what you did>"` for each line.
+2a. Collected means presented: when you `janus collect` or `janus close` a unit, tell the owner in chat in the same turn what it proved or built, what is left and what you ask of them; then `janus report --presented <unit> --summary "<what you said>"`. Files are not a presentation; `present:<unit>` cannot be acked.
+2b. Nothing everything waits on may stall: on `land:<unit>:stalled` run the command the line names (`janus land <unit> --host <h> --restart`); on `install:blocked-by-blocker` install now, then restart the land.
 3. Update *Orchestrator notes* in `.janus/HANDOFF.md` (goal; per unit why and done-means; decisions latest first; next steps). Never edit the Live state part. Under 150 lines; old notes go to `.janus/history.md`.
 Work you mean to do but cannot finish now: `janus intent add "<what>" --why .. --done-means .. [--instruction <id>] [--unit <u>]` (shown in the Live state, so it survives a context clear; `janus intent done <id>` when finished).
 Stop is blocked while a finding is unacked past its deadline or the notes are stale. Register once per session: `janus register`.

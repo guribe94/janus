@@ -10,6 +10,7 @@ from janus.actions.tidy import tend_tidy
 from janus.board import board, board_alerts, board_dir, board_files
 from janus.autopilot import fill_watcher, record, tend_autopilot
 from janus.check import run_check
+from janus.findings.stall import tend_stalled_lands
 from janus.reset import orch_tokens, reset_now
 from janus.context import CLAIM_WINDOW, Err, JANUS_MARK, atomic_write, handoff_stale, herdr, now, pending_age, session_alive, sh, ts, wake, wake_clear
 from janus.setup import heartbeat_beat
@@ -21,7 +22,13 @@ def cmd_watch(cfg, a):
     watch_step(cfg, log, "sync", board_sync, cfg)   # first, before the writer lock: the hosts' posts are merged (their questions alert at once through .notify) before the check
     stop = sync_ticker(cfg, log)
     try:
-        with cfg.writer(wait=120): return watch_pass(cfg, log)   # the whole pass is one writer (panel problem 2)
+        with cfg.writer(wait=120):   # the whole pass is one writer (panel problem 2)
+            t0 = now(); STEP_S.clear()
+            try: return watch_pass(cfg, log)
+            finally:   # skill-fix57: how long the pass held the writer lock and on what (check: watcher:lock)
+                slow = dict(sorted(((n, round(s)) for n, s in STEP_S.items() if s >= 5), key=lambda x: -x[1])[:4])
+                if not cfg.run.dry: cfg.jput("watch_lock.json", {"t": int(now()), "held": round(now() - t0), "slow": slow})
+                if now() - t0 >= 60: log(f"pass held the writer lock {now() - t0:.0f} s; slowest: " + (", ".join(f"{n} {s} s" for n, s in slow.items()) or "none over 5 s"))
     except Err as e: log(f"pass skipped: {e}")
     except Exception as e:   # never a silent death (budget-follow item 8): the cause is in watch.log, and the next pass runs
         log(f"pass failed: {type(e).__name__}: {e} | " + " | ".join(traceback.format_exc().strip().splitlines()[-3:-1])[:400])
@@ -50,27 +57,33 @@ def sync_ticker(cfg, log, every=SYNC_EVERY):
     threading.Thread(target=loop, daemon=True).start()
     return stop
 
+STEP_S = {}   # seconds each step of this pass took (cmd_watch reports the slow ones)
+
 def watch_step(cfg, log, name, fn, *a):
     """Run one step of the pass. Any failure is logged and counted in .janus/watch_steps.json (check: watcher:step:<name> after
     three passes in a row), and the pass goes on: one bad unit record or host cannot stop the resumes, the relaunches, the fill
     or the orchestrator's wake (budget-follow item 8)."""
+    t0 = now()
     try: r = fn(*a)
     except Exception as e:
+        STEP_S[name] = STEP_S.get(name, 0) + now() - t0
         err = f"{type(e).__name__}: {e}"[:300]
         if not cfg.run.dry:
             rec = cfg.jget("watch_steps.json"); rec[name] = {"n": (rec.get(name) or {}).get("n", 0) + 1, "err": err, "t": int(now())}; cfg.jput("watch_steps.json", rec)
         log(f"step {name} failed, the pass goes on: {err}"); return None
+    STEP_S[name] = STEP_S.get(name, 0) + now() - t0
     rec = cfg.jget("watch_steps.json")
     if name in rec and not cfg.run.dry: rec.pop(name); cfg.jput("watch_steps.json", rec); log(f"step {name} works again")
     return r
 
 def watch_pass(cfg, log):
     step = lambda name, fn, *a: watch_step(cfg, log, name, fn, *a)
-    F, live, hs, units = run_check(cfg, cycle=False, writer=True)
+    t0 = now(); F, live, hs, units = run_check(cfg, cycle=False, writer=True); STEP_S["check"] = now() - t0
     F = [f for f in F if f.family != "machine"]   # machine state (no project id) never wakes or starts an orchestrator
     step("heartbeat_beat", heartbeat_beat, cfg)   # the watchdog host sees this pass (inert until heartbeat/ ships and [heartbeat] watchdog is set)
     step("board_alerts", board_alerts, cfg, log)
     step("tend_parked", tend_parked, cfg, hs, units, log)   # park, resume when the jobs finished, wrap up capped runs (janus-fixes9)
+    step("tend_stalled_lands", tend_stalled_lands, cfg, hs, units, log)   # a land starved on a paused host while a landing host is free: restarted there when provably safe (skill-fix57)
     step("tend_checkpoint", tend_checkpoint, cfg, hs, units, log)   # a run near its budget is ordered once to commit, report and park (budget-follow item 6)
     step("tend_resumable", tend_resumable, cfg, hs, units, log)   # units stopped by their budget: recorded, and resumed first when the cap has room (item 7)
     step("tend_autopilot", tend_autopilot, cfg, hs, units, F, log)   # [autopilot] enabled: the ending policy's fixed-rule actions (janus/autopilot.py)

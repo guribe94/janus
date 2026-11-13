@@ -2,6 +2,7 @@
 transcript; the watcher's tend_parked (resume a parked unit when its jobs finished, wrap up a capped run)."""
 import os, re, shlex, sys, time
 from pathlib import Path
+from janus.findings.stall import note_collected, present_line
 from janus.actions.jobs import collect_job, job_of, job_state, recorded_jid, runs_dir, save_task_log, task_rc, task_status, unit_jobs
 from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken
 from janus.autopilot import apc, ending, forget, held, record
@@ -238,6 +239,7 @@ def cmd_collect(cfg, a):
     if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
     if not cfg.run.dry: bd.comment(u["id"], f"{ts()} collected from {u['host']}")
     say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
+    if not cfg.run.dry: note_collected(cfg, n, "collect"); say(present_line(n))   # collected means presented (skill-fix57)
 
 def unit_dirty(cfg, cwd):
     """(uncommitted paths the unit owns, whether its tree lies in the project's own repo). Only the unit's cwd subtree counts,
@@ -308,6 +310,7 @@ def cmd_close(cfg, a):
     if u.get("run") and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"): settle_run(cfg, u, "closed")
     bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); note_event(cfg, "close")
     say("closed")
+    if not dup: note_collected(cfg, u["name"], "close"); say(present_line(u["name"]))   # a duplicate relaunch has no result of its own
 
 WRAPUP = ("Your budget is spent; this short run is only for your report. Do not run, submit or wait for anything. Write {report} "
           "now: what is done, its state, what is left, the real exit codes of everything you ran (say \"not run\" where none), then "

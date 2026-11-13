@@ -352,6 +352,18 @@ retired CLI exits 2 at once, and `janus check` raises `gate-setup:<name>` for a 
   Budget); `janus resume <u> --budget <usd>` by hand.
 - *Finished with a verdict*: `janus collect <u>` for a remote unit, then `janus close <u>`.
 - *Done but not landed* (`landing:<u>:unlanded`): `janus gate <name>`, then `janus land <u>`.
+- *A land that stalls* (`land:<u>:stalled`, skill-fix57): a land waiting for its final gate over `[landing] stall_min` (default
+  180 min), or whose gate jobs wait `[landing] starve_min` (default 20) on a host whose admission is paused or says no while a
+  host with a landing lane has a free gates lane. The line names the jobs, the cause, what the paused host's lanes hold and
+  the one command: `janus land <u> --host <h> --restart` (stops the waiting land and its gate jobs, merges again, gates
+  there). The watcher runs it itself when it is provably safe (the land is starved, still at its gate, its worktree holds
+  the merge as a commit with no open change, at most once in 6 h; `[landing] auto_recover = false` turns it off) and says
+  so (`land:<u>:recovered`, log `.janus/runs/land-<u>.recover.log`); otherwise the line says why not.
+- *The install that waits for the blocker* (`install:blocked-by-blocker`): janus commits that change the code a stalled land
+  runs are not installed. A running janus keeps its own release folder, so install now (`./install --release-only`), then
+  `janus land <u> --restart`.
+- *Collected means presented* (`present:<u>`): `janus collect` and `janus close` end with `PRESENT NOW`; tell the owner in
+  chat what the unit proved or built, what is left and what you ask, then `janus report --presented <u> --summary ".."`.
 - *Parked, not failed* (a `WAITING <jobs>` line, no final verdict): its jobs are still running; the watcher resumes it when they
   finish (`janus resume <u>` resumes it by hand). `VERDICT: WAITING` and `VERDICT: PENDING` are never a final verdict (item 11),
   and a recorded park wins over one.
@@ -509,9 +521,11 @@ reference must name; the recipes are in section 4a.
 | `idle-backlog` | ready backlog items without briefs while hosts have room, or held by budget |
 | `idle-with-backlog` | ready backlog units with briefs would fit now (`janus fill`) |
 | `instructions` | unclassified owner instructions in beads (an ack cannot clear it: close or remember each; one an open intent tracks is in progress and not listed) |
+| `install` | janus commits that change the code a stalled step runs are not installed, and the install waits for that step |
 | `intent` | `intent:<id>:stale`: an open intent (`janus intent`) no linked unit works on and nothing moved for `[intents] stale_h` hours (default 2) |
 | `issue` | a finding key acked 3+ times with no issue row logged (every oddity is logged) |
 | `known-failure` | a known failure with no open unit fixing it, or one that passes now |
+| `land` | a `janus land` is stalled at its final gate (over `[landing] stall_min`, or starved on a paused host while a landing host is free), or the watcher restarted one |
 | `landing` | a finished DONE unit has no gate, or passed its gates and is not landed |
 | `learned` | an agent's learned post awaits remember or reject |
 | `ledger` | a provider ledger is malformed, implausible or holds unreconciled runs |
@@ -530,7 +544,8 @@ reference must name; the recipes are in section 4a.
 | `overrun` | a running job is far over its expected run time (its class's history on that host) |
 | `owner-question` | a question for the owner waits in `.janus/owner-queue.md` |
 | `parked` | a parked unit's job can never finish, or its resume failed |
-| `pressure` | a host's admission is paused by back-pressure |
+| `present` | a collected or closed unit whose result was never presented to the owner in chat (`janus report --presented <unit> --summary ".."`); cannot be acked |
+| `pressure` | a host's admission is paused by back-pressure (the line lists what its lanes hold) |
 | `provider` | a unit runs on a disabled provider |
 | `question` | an open board question |
 | `quality` | a finished unit changed test files but named no failure each test catches (report.json) |
