@@ -523,6 +523,15 @@ class Capacity(unittest.TestCase):
             out = self.sh(fake + 'HOLD=60; CAP_RO=; admit_ok x && echo ADMIT || echo WAIT', {"T_LOAD": "11"})   # load must be held HOLD s
             self.assertIn("ADMIT", out)
         finally: holder.kill(); holder.wait()
+    def test_the_calm_sysctl_stub_falls_back_to_the_real_one_when_path_is_prefixed(self):
+        """Catches (Mac release 3870850): the stub stripped only a leading stub dir from PATH; a probe that put its own dirs ahead
+        made it re-exec itself for every other key (sysctl hw.ncpu hung: 'sh: timeout', hosts missing from discovery)."""
+        import janusload
+        real = self.d / "realbin"; real.mkdir(); (real / "sysctl").write_text('#!/bin/sh\necho REAL "$@"\n'); (real / "sysctl").chmod(0o755)
+        env = {**os.environ, "PATH": f"/usr/bin:/bin:{janusload._STUB}:{real}"}
+        r = lambda *k: subprocess.run(["sysctl", *k], capture_output=True, text=True, env=env, timeout=10).stdout.strip()
+        self.assertEqual(r("-n", "hw.ncpu"), "REAL -n hw.ncpu")                     # falls through to the real one, once
+        self.assertEqual(r("-n", "kern.memorystatus_vm_pressure_level"), "1")        # the calm answer is kept
     def test_job_script_admits_runs_records(self):
         """A Mac (local) jobs-lane job (register item 5): waits for admission, holds its reservation, records its peak. The job
         allocates only after 4 s and then ends, between two 5 s samples: the sampler alone recorded no peak (the flake under
