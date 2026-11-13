@@ -150,7 +150,10 @@ def cmd_status(cfg, a):
 
 def cmd_ack(cfg, a):
     k, d = a.problem, a.decision
-    if not ackable(k): raise Err(f"{k} cannot be acked: it costs money every hour; act on it (janus park {k.split(':', 1)[1]})")
+    if not ackable(k):   # row 229: an ack of the instructions finding classified nothing and hid it; only closing or remembering clears it
+        if k.split(":", 1)[0] == "instructions":
+            raise Err("instructions cannot be acked: classify each instruction instead: bd close <id> once it is done, or bd remember --key <subject> for a standing rule (janus decide --instruction <id> for a decision)")
+        raise Err(f"{k} cannot be acked: it costs money every hour; act on it (janus park {k.split(':', 1)[-1]})")
     if k.split(":", 1)[0] in ("idle", "landing") and re.match(r"(?i)^\s*(?:i |we )?(?:will|'ll|am going to|are going to|going to|plan|intend|shall)\b", d or ""):
         raise Err(f"ack {k} with what was DONE, not what you will do (a plan is not a decision): run it, then ack")
     acks = live_acks(cfg); acks[k] = {"t": now(), "d": d}; cfg.jput("acks.json", acks); cfg.touch("last_ack")

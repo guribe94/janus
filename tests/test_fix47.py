@@ -83,5 +83,82 @@ class ResultCache(unittest.TestCase):
         self.assertIsNone(janus.input_hashes(d, ["x"]), "a tree that is no git checkout must cache nothing")
 
 
+class GateLogStepLogs(unittest.TestCase):
+    def test_a_failing_steps_test_ids_and_first_error_come_from_its_step_log(self):
+        """Catches (row 228): gate-log printing the step exits and 'no error-looking line' for a gate whose steps write their
+        output to out/<gate>/steps/<step>.log: no failing test id, no error, although both are in the step log."""
+        d, cfg = project(); o = d / "out/g"; (o / "steps").mkdir(parents=True)
+        (o / "log").write_text("rc_unit=101\nEXIT_unit=1\nEXIT_py=1\nEXIT_lint=0\ngate duration: 5 s\n")
+        (o / "steps/unit.log").write_text("test a::a_failed_start_keeps_frames ... ok\ntest a::paces_the_next_pulse ... FAILED\n\nfailures:\n"
+                                          "thread 'a::paces_the_next_pulse' panicked at src/a.rs:9:5:\nassertion `left == right` failed\n"
+                                          "test result: FAILED. 1 passed; 1 failed\n")
+        (o / "steps/py.log").write_text("PASSED tests/t.py::test_failed_read_is_ok\nE   AssertionError: 3 != 4\n"
+                                        "FAILED tests/t.py::test_sum - AssertionError: 3 != 4\n")
+        (o / "steps/lint.log").write_text("CACHED PASS 0123456789abcdef from here:4 2026-01-01 00:00\n")
+        (d / "out/gates.log").write_text("2026-01-01 00:00:00 g EXIT_unit=1 EXIT_py=1 RESULT: FAIL\n")
+        rc, L = janus.cmd_gate_log(cfg, type("A", (), {"name": "g", "task": None})()); t = "\n".join(L)
+        self.assertEqual(rc, 1)
+        self.assertIn("step unit: failed test(s) (1): a::paces_the_next_pulse", t)
+        self.assertIn("panicked at src/a.rs:9:5", t)
+        self.assertIn("step py: failed test(s) (1): tests/t.py::test_sum", t)
+        self.assertIn("AssertionError: 3 != 4", t)
+        self.assertNotIn("a_failed_start_keeps_frames", t, "a passing test whose name holds 'failed' was shown as the error")
+        self.assertNotIn("no error-looking line", t)
+        self.assertIn("step lint: CACHED PASS 0123456789abcdef from here:4", t)
+
+
+class InstructionsAck(unittest.TestCase):
+    def test_an_ack_cannot_clear_the_instructions_finding(self):
+        """Catches (row 229): `janus ack instructions ...` hid the unclassified owner instructions (13 acks in one evening)
+        instead of each being closed or remembered; an old ack in acks.json must not hide the finding either."""
+        d, cfg = project()
+        with self.assertRaises(janus.Err) as e: janus.cmd_ack(cfg, argparse.Namespace(problem="instructions", decision="seen", decision_class=False))
+        self.assertIn("bd close", str(e.exception)); self.assertIn("bd remember", str(e.exception))
+        cfg.jput("acks.json", {"instructions": {"t": janus.now(), "d": "seen"}})
+        self.assertEqual(janus.live_acks(cfg, {"instructions"}), {})
+
+
+class ReadyItemsWithoutBriefs(unittest.TestCase):
+    ISS = {"backlog:A1": {"id": "b1", "title": "backlog: A1 first thing", "status": "open", "labels": ["backlog", "backlog-ready"], "priority": 1},
+           "backlog:B2": {"id": "b2", "title": "backlog: B2 second thing", "status": "open", "labels": ["backlog", "backlog-ready"], "priority": 2}}
+
+    def proj(self):
+        d, cfg = project("\n[backlog]\nfile = \"LIST.md\"\n"); (d / "briefs").mkdir(exist_ok=True); (d / "LIST.md").write_text("x\n")
+        cfg.touch("backlog_imported")
+        return d, cfg
+
+    def test_the_finding_names_the_count_the_items_and_the_drafting_command(self):
+        """Catches (row 227): hosts with room and ready items without briefs, and check naming neither the item ids nor a way
+        to get briefs (so the fleet idled); and an ack of it lasting 4 h (the evening's silence came from one)."""
+        d, cfg = self.proj()
+        with mock.patch.object(janus, "backlog_issues", lambda cfg: self.ISS), mock.patch.object(janus, "room", lambda *a, **k: (3, "")), \
+             mock.patch.object(janus, "all_units", lambda cfg: {}):
+            F = dict(janus.backlog_findings(cfg, {"here": {"ok": True}}, []))
+        t = F.get("idle-backlog:nobrief", "")
+        self.assertIn("2 ready backlog item(s)", t); self.assertIn("janus brief draft A1 B2", t); self.assertIn("first thing", t)
+        self.assertLessEqual(janus.ack_ttl("idle-backlog:nobrief"), 3600)
+
+    def test_a_draft_launches_one_cheap_unit_and_only_an_accepted_draft_can_be_filled(self):
+        """Catches: a drafted brief launched unaccepted (fill reading briefs/drafts), a draft unit started on the critical
+        route, and an accepted brief that fill cannot match to its item (no ITEM: line)."""
+        d, cfg = self.proj(); cfg.route["draft"] = ["m"]; launched = []
+        with mock.patch.object(janus, "backlog_issues", lambda cfg: self.ISS), mock.patch.object(janus, "all_units", lambda cfg: {}), \
+             mock.patch.object(janus, "cmd_launch", lambda cfg, a: launched.append(a)), mock.patch.object(janus, "model_ok", lambda cfg, m: (True, "")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(janus.Err): janus.cmd_brief(cfg, argparse.Namespace(action="draft", items=["ZZ"], as_name=None, model=None))
+            janus.cmd_brief(cfg, argparse.Namespace(action="draft", items=["A1", "B2"], as_name=None, model=None))
+            self.assertEqual(len(launched), 1); a = launched[0]
+            self.assertEqual((a.tier, a.model), ("normal", "m"))
+            bt = Path(a.brief).read_text(); self.assertIn("A1: first thing", bt); self.assertIn("B2: second thing", bt)
+            self.assertIn(str(d / "briefs/drafts"), bt)
+            dr = d / "briefs/drafts"; dr.mkdir(); (dr / "A1.md").write_text("# Brief: first-thing: do the first thing\nTIER: NORMAL\n\nSCOPE: x\n")
+            (dr / "B2.md").write_text("HOLD: needs the owner\n")
+            self.assertEqual([x[2] for x in janus.fill_candidates(cfg, []) if x[2] in ("A1", "B2")], [], "a draft was a fill candidate before it was accepted")
+            with self.assertRaises(janus.Err): janus.cmd_brief(cfg, argparse.Namespace(action="accept", items=["B2"], as_name=None, model=None))
+            janus.cmd_brief(cfg, argparse.Namespace(action="accept", items=["A1"], as_name=None, model=None))
+            self.assertFalse((dr / "A1.md").exists()); self.assertIn("ITEM: A1", (d / "briefs/first-thing.md").read_text().splitlines()[:3])
+            self.assertEqual([(x[2], x[4]) for x in janus.fill_candidates(cfg, [])], [("A1", "first-thing")])
+
+
 if __name__ == "__main__":
     unittest.main()
