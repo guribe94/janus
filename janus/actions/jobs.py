@@ -50,13 +50,21 @@ def save_task_log(cfg, h, u, tid, remove=False):
 
 LANES = ("gates", "jobs", "land", "gates-quick", "place")   # gates-quick: one slot kept for gates under [landing] quick_gate_min; place: jobs waiting for a host (--needs)
 
-AGE_MIN = {"gates": 240, "jobs": 120, "land": 240, "gates-quick": 60, "place": 240}   # class age limits (minutes from enqueue); janus.toml [lanes.<lane>] age_min overrides
+# Class age limits: minutes a job has RUN (from its start, never from enqueue: row 214). A running job over its limit is stuck
+# only after STALL_MIN minutes without progress (no output, no CPU); a job still waiting (queued, or held by admission) has the
+# lane's wait limit instead. janus.toml [lanes.<lane>] age_min, stall_min and wait_min override them.
+AGE_MIN = {"gates": 240, "jobs": 120, "land": 240, "gates-quick": 60, "place": 240}
+STALL_MIN = 30
 
 LSSH = [*SSH, "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
 
 WAIT_STEP = 300   # item 21: the longest a caller waits on one pueue wait before reporting the host's admission reason
 
 def lane_age(cfg, lane): return cfg.c.get("lanes", {}).get(lane, {}).get("age_min", AGE_MIN.get(lane, 120))
+
+def lane_wait(cfg, lane): return cfg.c.get("lanes", {}).get(lane, {}).get("wait_min", AGE_MIN.get(lane, 120))
+
+def lane_stall(cfg, lane): return cfg.c.get("lanes", {}).get(lane, {}).get("stall_min", STALL_MIN)
 
 def slots(h, cfg=None):
     """pueue parallel limit of a host's jobs lane: the jobs its cores hold (cores // cores_per_job). Pueue only orders the
@@ -132,12 +140,12 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     broad = bool(getattr(a, "broad", None)); nice = 19 if broad else 10   # a broad run (--broad) runs at the lowest CPU priority
     setup = guarded_setup(h); log = h.get("job_log", "/dev/null")
     adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
-                   "waitmax": int(lane_age(cfg, a.lane) * 60)}   # item 21: give up after the lane's age limit
+                   "waitmax": int(lane_wait(cfg, a.lane) * 60)}   # item 21: give up after the lane's wait limit
     if h.get("local"):
         pre = ""
         if a.lane == "land":   # the local landing lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy
             ck = h.get("admit_check", ""); base = h.get("legacy_lanes", ""); ce = h.get("admit_check_env", "")
-            lfloor = land_disk_floor(cfg, h); lmax = int(lane_age(cfg, "land") * 60)
+            lfloor = land_disk_floor(cfg, h); lmax = int(lane_wait(cfg, "land") * 60)
             pre = (f"start=$(date +%s); last=0\nwhile :; do d=$(df -Pk {q(str(cfg.root))} | awk 'NR==2{{print int($4/1048576)}}'); busy=\n"
                    f"  for s in {base}; do o=$(cat $s/pid 2>/dev/null); [ -n \"$o\" ] && kill -0 $o 2>/dev/null && busy=$s; done\n"
                    f"  [ \"$d\" -ge {lfloor} ] && {{ [ -z {q(ck)} ] || {ce + ' ' if ce else ''}sh {q(ck)} >/dev/null 2>&1; }} && [ -z \"$busy\" ] && break\n"
@@ -427,7 +435,8 @@ def cmd_run(cfg, a):
     if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
     tid = o.strip()
     record_job(cfg, f"{hn}:{tid}", jid, src, {"lane": a.lane, "unit": unit, "wt": src, "cmd": cmd, "subdir": a.subdir, "usb": bool(a.usb),
-                                              "priority": a.priority, "needs": getattr(a, "needs", None), "pinned": not needs, "broad": broad})
+                                              "priority": a.priority, "needs": getattr(a, "needs", None), "pinned": not needs, "broad": broad,
+                                              "requeued": getattr(a, "requeued", None)})   # row 215: the job this one replaces (re-queued once only)
     wrap = os.environ.get("JANUS_WRAP")   # queued from inside another janus job or gate (a wrapper): record it, so cancel follows (row 49)
     if wrap and re.fullmatch(r"[\w.-]+", wrap):
         wd = cfg.f("runs") / "wrap"; wd.mkdir(parents=True, exist_ok=True)
@@ -436,7 +445,7 @@ def cmd_run(cfg, a):
     if a.no_wait: say(f"{hn}:{tid}"); return
     return finish_job(cfg, hn, h, tid, jid)
 
-def tree_guard(cfg, wt, behind=True):
+def tree_guard(cfg, wt, behind=True, head=False):
     """Why a tree must not be built or gated (issues 33, 41): a merge in progress, conflict markers in changed files, or (behind:
     the gates and land lanes and janus gate only, never an agent's own jobs; janus-fixes9 item 5) more than [landing] max_behind
     (default 10) commits behind the landing branch. None when fine or not a git tree."""
@@ -449,6 +458,10 @@ def tree_guard(cfg, wt, behind=True):
     if rc == 0 and o.strip(): return f"has conflict markers ({o.splitlines()[0][:80]})"
     if not behind: return None
     br = cfg.c.get("landing", {}).get("branch") or "main"; mx = cfg.c.get("landing", {}).get("max_behind", 10)
+    for ref in (br, f"origin/{br}") if head else ():   # row 220: a landing gate's tree holds the landing branch's head, here and as last fetched
+        rc, o, e = g("rev-list", "--count", f"HEAD..{ref}")
+        if rc == 0 and o.strip().isdigit() and int(o) > 0:
+            return f"does not contain the head of {ref} ({o.strip()} commit(s) behind): merge {ref} first, so the gate judges the tree that lands"
     rc, o, e = g("rev-list", "--count", f"HEAD..{br}")
     if rc == 0 and o.strip().isdigit() and int(o) > mx: return f"is {o.strip()} commits behind {br} (max {mx}): merge {br} first"
     return None
@@ -526,6 +539,14 @@ def wrapped_records(cfg, tok):
 
 def wrapped_jobs(cfg, tok): return [r for r, _ in wrapped_records(cfg, tok)]
 
+def wrapper_busy(cfg, hs, tok):
+    """Whether a wrapper (a gate, or a job that queued jobs itself) still has a job of its own queued or running: it waits for
+    that job, which is judged on its own. A host that does not answer counts as busy."""
+    for r, jid in wrapped_records(cfg, tok) if tok else []:
+        hn, _, tid = r.partition(":"); p = hs.get(hn) or {}; t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid)
+        if not p.get("ok") or (t and same_job(t, jid) and task_rc(t) is None): return True
+    return False
+
 def same_job(t, jid):
     """Whether live task t is the job a wrapper recorded under jid: pueue reuses task ids, so an id alone can name another job
     (even of the same project) by now; the job's script path in its command carries its job id. An old record without one: yes."""
@@ -539,7 +560,8 @@ def stop_job_cmd(h, jid):
 
 def cancel_job(cfg, ref, force=False, depth=0):
     """Cancel job <host>:<task>: its files are saved here first (runs/<jid>.*; refused when that fails, unless force: nothing is
-    removed before it is collected), then pueue kill and remove, then its container or scope is stopped by name, and every job
+    removed before it is collected), then pueue kill and remove, then its container or scope is stopped by name (a gate: its
+    command's own process group, runs/<token>.pgid, row 219), and every job
     it queued itself (a wrapper: a gate or a job whose script ran janus run; row 49) is cancelled the same way."""
     hn, _, tid = ref.partition(":")
     if hn not in cfg.hosts or not tid.isdigit(): raise Err("expected <host>:<task id>")
@@ -559,7 +581,10 @@ def cancel_job(cfg, ref, force=False, depth=0):
             r = sh(["rsync", "-a", "-e", " ".join(SSH), f"{h['ssh']}:{runs_dir(cfg, h)}/{jid}.*", f"{loc}/"], timeout=300)
             if r[0] and not force: raise Err(f"refused: {hn}:{tid}'s files could not be saved here ({r[2].strip()[-80:]}); --force cancels anyway")
         elif not jid: save_task_log(cfg, h, {"name": f"_cancelled/{hn}-{tid}"}, tid)
-        hrun(h, f"{pueue(h)} kill {tid} 2>/dev/null; {stop_job_cmd(h, jid)}sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true", timeout=60)
+        gf = qp(f"{runs_dir(cfg, h)}/{tok}.pgid") if tok and not jid else ""   # a gate's command runs in a process group of its own
+        grp = (f"g=$(cat {gf} 2>/dev/null); case $g in ''|*[!0-9]*) ;; *) kill -TERM -- -$g 2>/dev/null; sleep 3; kill -KILL -- -$g 2>/dev/null;; esac; "
+               f"rm -f {gf} {qp(f'{runs_dir(cfg, h)}/{tok}.live')}; ") if gf else ""
+        hrun(h, f"{pueue(h)} kill {tid} 2>/dev/null; {stop_job_cmd(h, jid)}{grp}sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true", timeout=60)
         out.append(f"cancelled {hn}:{tid} ({t.get('label')}); its files are in {cfg.f('runs') if jid and not h.get('local') else runs_dir(cfg, h) if jid else cfg.p('out', 'out') / '_cancelled'}")
     for r, rj in recs:
         if depth > 3: break
@@ -620,7 +645,7 @@ def requeue_host(cfg, hs, units, n, spec):
 def requeue(cfg, spec, to):
     """Queue a recorded job (.janus/runs/jobs/<jid>.json) again on host to; returns what janus run printed last (its new id)."""
     args = argparse.Namespace(host=to, needs=spec.get("needs"), broad=spec.get("broad"), lane=spec.get("lane", "jobs"), unit=spec.get("unit"), wt=spec["wt"], subdir=spec.get("subdir"),
-                              usb=spec.get("usb", False), priority=spec.get("priority") or 0, no_wait=True, allow_unmerged=True, command=[spec["cmd"]])
+                              usb=spec.get("usb", False), priority=spec.get("priority") or 0, no_wait=True, allow_unmerged=True, command=[spec["cmd"]], requeued=spec.get("requeued"))
     import io, contextlib
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf): cmd_run(cfg, args)
@@ -680,15 +705,17 @@ def orphan_jobs(cfg, hs, units):
     """Jobs whose owner is gone (item 3): [(ref, why)]. A lane job of a closed unit, or of an open unit whose agent ended and is
     not parked; a job a wrapper queued (row 49) whose wrapper is no longer queued or running here."""
     names = {u["name"]: u for u in units}; out = []
+    live = {wrap_token(t) for p in hs.values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values() if task_rc(t) is None}
+    wrapped = {(r, jid) for tok in live - {None} for r, jid in wrapped_records(cfg, tok)}   # row 216: a live gate's steps are the gate's
     for hn, p in hs.items():
         for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items():
             lab = own_label(cfg, t) or ""   # only this project's jobs (another project's, or none's, are never cancelled)
             if task_rc(t) is not None or not lab.startswith("unit:"): continue
+            if any(r == f"{hn}:{tid}" and same_job(t, jid) for r, jid in wrapped): continue
             u = names.get(lab[5:])
             if not u: out.append((f"{hn}:{tid}", f"its unit {lab[5:]} is closed"))
             elif agent_ended(u) and not u.get("_park") and not u.get("parked") and not u.get("_sync_failed"):
                 out.append((f"{hn}:{tid}", f"its unit {u['name']}'s agent ended ({u['state']}) and is not parked"))
-    live = {wrap_token(t) for p in hs.values() for t in ((p.get("pueue") or {}).get("tasks") or {}).values() if task_rc(t) is None}
     try: recs = list((cfg.f("runs") / "wrap").iterdir())
     except OSError: recs = []
     for f in recs:
@@ -700,6 +727,33 @@ def orphan_jobs(cfg, hs, units):
             if st in ("queued", "admission", "running") and r not in {x for x, _ in out}: out.append((r, f"its wrapper {f.name} has ended"))
             # records of wrappers that ended long ago and whose jobs are done are cleared by the watcher
     return out
+
+def recorded_jid(cfg, hn, tid):
+    """The job id janus run recorded for <host>:<task> (.janus/runs/jobs; the newest record, pueue reuses ids), or None."""
+    best = (-1, None); jd = cfg.f("runs") / "jobs"
+    for f in jd.glob("*.json") if jd.is_dir() else []:
+        try: s = json.loads(f.read_text())
+        except ValueError: continue
+        if s.get("host") == hn and str(s.get("task")) == str(tid) and s.get("at", 0) > best[0]: best = (s.get("at", 0), f.stem)
+    return best[1]
+
+def task_output(cfg, hn, tid, full=False):
+    """(exit code, text) of task <host>:<tid>'s output: its pueue log. Row 223: when the task was a janus job and its pueue log
+    is empty or the task is gone (cancelled and removed), the job's own run log (runs/<job>.log: this host's, the copy saved
+    here, else the remote host's), named in the first line."""
+    h = cfg.hosts[hn]; rc, o, e = hrun(h, f"{pueue(h)} log {int(tid)}" + (" --full" if full else ""), timeout=60)
+    t = task_status(h, tid); jid = job_of(t) if t else recorded_jid(cfg, hn, tid)
+    if not jid: return rc, o if rc == 0 else (e or o)
+    if rc == 0 and t:
+        try: body = (json.loads(hrun(h, f"{pueue(h)} log {int(tid)} --json", timeout=60)[1]).get(str(tid)) or {}).get("output")
+        except ValueError: body = "?"
+        if body: return rc, o
+    for f in ([Path(runs_dir(cfg, h)) / f"{jid}.log"] if h.get("local") else []) + [cfg.f("runs") / f"{jid}.log"]:
+        if f.is_file() and f.stat().st_size: return 0, f"(pueue has no output for {hn}:{tid}: the job's run log {f})\n" + f.read_text(errors="replace")
+    if not h.get("local"):
+        r = hrun(h, f"cat {qp(f'{runs_dir(cfg, h)}/{jid}.log')} 2>/dev/null", timeout=60)
+        if r[1].strip(): return 0, f"(pueue has no output for {hn}:{tid}: the job's run log on {hn}, runs/{jid}.log)\n" + r[1]
+    return rc, o if rc == 0 else (e or o)
 
 def job_of(t):
     m = re.search(r"/runs/([^/ ]+)\.sh", (t or {}).get("command", ""))

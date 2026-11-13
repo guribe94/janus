@@ -18,7 +18,9 @@ def probe_extra(h):
     # old_rule: waiting jobs whose script sources neither runs/cap.sh nor runs/admit.sh (queued before the measured rule; audit H5)
     w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && kill -0 "$(cut -d' ' -f1 "$f")" 2>/dev/null || continue; '
          f'b=${{f##*/}}; echo "waitjob=${{b%.*}}"; case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
-         f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"')
+         f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"; '
+         # row 214: seconds since each running job last showed progress (its own mark, written by the job script or the gate wrapper)
+         f'nowt=$(date +%s); for f in {qp(rd)}/*.live; do [ -e "$f" ] || continue; b=${{f##*/}}; echo "live=${{b%.live}} $((nowt - $(cat "$f" 2>/dev/null || echo $nowt)))"; done')
     # schedulers (janus.toml, per host): extended regexes for the command lines of other job-running processes (an old queue); each
     # running one prints sched=<pid> <command>. legacy_lanes (the Mac): pid-file folders of an old lane; a live pid is one too.
     for rx in h.get("schedulers", []):
@@ -37,7 +39,7 @@ def pueue(h):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
     return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
-LIST_KEYS = ("res", "hist", "sched", "direct", "waitjob", "apiproc", "apiinfo")   # apiproc/apiinfo: API processes janus did not start, and whose they are   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
+LIST_KEYS = ("res", "hist", "sched", "direct", "waitjob", "apiproc", "apiinfo", "live")   # apiproc/apiinfo: API processes janus did not start, and whose they are   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
 
 def probe(name, h, ro=True, cfg=None):
     """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,

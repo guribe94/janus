@@ -2,7 +2,7 @@
 transcript; the watcher's tend_parked (resume a parked unit when its jobs finished, wrap up a capped run)."""
 import os, re, shlex, sys, time
 from pathlib import Path
-from janus.actions.jobs import collect_job, job_of, job_state, runs_dir, save_task_log, task_rc, task_status, unit_jobs
+from janus.actions.jobs import collect_job, job_of, job_state, recorded_jid, runs_dir, save_task_log, task_rc, task_status, unit_jobs
 from janus.actions.launch import api_remote, confirm_started, cwd_taken
 from janus.autopilot import apc, ending, forget, held, record
 from janus.beads import Beads
@@ -311,7 +311,8 @@ def job_result(cfg, hs, ref, agent_host):
     """(exit code or None, log path the agent can read) of a finished job. A remote job's files are copied here first when
     the agent runs here (janus collect <host>:<task> does the same)."""
     hn, _, tid = ref.partition(":"); h = cfg.hosts[hn]; p = hs.get(hn) or {}
-    t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid); jid = job_of(t); rc = task_rc(t); rd = runs_dir(cfg, h)
+    t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid); rc = task_rc(t); rd = runs_dir(cfg, h)
+    jid = job_of(t) or (recorded_jid(cfg, hn, tid) if t is None and p.get("ok") else None)   # row 223: cancelled and removed, it is still that job
     here = cfg.hosts.get(agent_host, {}).get("local")
     if not jid:   # a task without a job script (a gate): its pueue log is the log
         loc = cfg.f("runs") / f"task-{hn}-{tid}.log"; loc.parent.mkdir(exist_ok=True)

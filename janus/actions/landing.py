@@ -1,13 +1,14 @@
 """janus gate (and its gate-exec, gate-judge and gate-scope helpers), janus land and janus commit-state."""
-import argparse, os, re, shlex, signal, subprocess, sys, time, unicodedata
+import argparse, fnmatch, json, os, re, shlex, signal, subprocess, sys, time, unicodedata
 from pathlib import Path
-from janus.actions.jobs import cmd_run, ensure_lanes, tree_guard
+from janus.actions.jobs import cmd_run, ensure_lanes, task_output, task_rc, tree_guard
 from janus.actions.launch import cmd_launch
 from janus.actions.swarm import write_index
 from janus.beads import Beads
 from janus.context import Err, JANUS_SELF, X, atomic_write, hrun, note_event, now, pq, say, sh, ts
 from janus.gates import GATE_DEFAULT, GATE_LINE, baseline_failures, gate_baseline, gate_ids, judge_gate, landed
-from janus.project import tag
+from janus.platform import group_cpu_s
+from janus.project import own_label, tag
 from janus.probe import pueue
 from janus.quality import land_review
 from janus.units import all_units, get_unit, own_tree
@@ -45,7 +46,7 @@ def cmd_gate_log(cfg, a):
     if ref:
         hn, _, tid = ref.partition(":"); h = cfg.hosts.get(hn)
         if h and tid.strip().isdigit():
-            rc, o, e = hrun(h, f"{pueue(h)} log {int(tid)}", timeout=30)
+            rc, o = task_output(cfg, hn, tid.strip())
             if rc == 0: log = o
     if log is None:
         for f in (out / name / "log", out / name / "gate.log"):
@@ -77,13 +78,40 @@ def cmd_gate_exec(cfg, a):
     t0 = now(); lim = (a.timeout_min or 0) * 60 or None
     c = a.command[1:] if a.command[:1] == ["--"] else a.command
     p = subprocess.Popen(["sh", "-c", "--", c[0] if len(c) == 1 else shlex.join(c)], start_new_session=True)
-    try: rc = p.wait(timeout=lim)
-    except subprocess.TimeoutExpired:
+    def stop_group():
         try: os.killpg(p.pid, signal.SIGTERM); p.wait(timeout=20)
         except (subprocess.TimeoutExpired, ProcessLookupError):
             try: os.killpg(p.pid, signal.SIGKILL)
             except ProcessLookupError: pass
-        rc = 124
+    # Row 219: the command runs in its own process group, so a cancel (pueue kill) that stops only this wrapper left the gate's
+    # runner and tests.sh running: they queued later steps and wrote a RESULT line after the cancel. A signal here stops the whole
+    # group and writes no RESULT; the group id is also kept in runs/<token>.pgid, so janus cancel stops the group even when this
+    # wrapper is killed outright. Row 214: runs/<token>.live is the gate's progress mark (its group used CPU), like a job's.
+    tok = os.environ.get("JANUS_WRAP", ""); rd = Path(next(h for h in cfg.hosts.values() if h.get("local"))["_rd"])
+    marks = [rd / f"{tok}.pgid", rd / f"{tok}.live"] if re.fullmatch(r"[\w.-]+", tok) else []
+    if marks: rd.mkdir(parents=True, exist_ok=True); marks[0].write_text(f"{p.pid}\n"); marks[1].write_text(f"{int(now())}\n")
+    class Cancelled(Exception): pass
+    def on_signal(sig, frame): raise Cancelled(sig)
+    for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(sg, on_signal)
+    rc = None; last = None
+    try:
+        while rc is None:
+            left = lim - (now() - t0) if lim else 60
+            if left <= 0: break
+            try: rc = p.wait(timeout=min(60, left))
+            except subprocess.TimeoutExpired:
+                cpu = group_cpu_s(p.pid)
+                if marks and cpu is not None and (last is None or abs(cpu - last) >= 2): marks[1].write_text(f"{int(now())}\n")
+                last = cpu if cpu is not None else last
+    except Cancelled as e:
+        for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(sg, signal.SIG_IGN)
+        stop_group()
+        for m in marks: m.unlink(missing_ok=True)
+        say(f"gate {a.name} cancelled (signal {e.args[0]}): its process group is stopped and no RESULT line is written")
+        return 128 + int(e.args[0])
+    for m in marks: m.unlink(missing_ok=True)
+    if rc is None:
+        stop_group(); rc = 124
         with open(cfg.p("gate_log", "out/gates.log"), "a") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {a.name} EXIT_timeout=124 RESULT: FAIL\n")
         say(f"gate {a.name} stopped at its {a.timeout_min} min limit")
@@ -129,6 +157,14 @@ def cmd_gate_scope(cfg, a):
     say(f"wrote {t}: {len(steps)} step(s) ({', '.join(n + ('@' + h if h else '') for h, n, _ in steps)})"
         + (f"; expected {est:g} min" if est is not None else "") + f"; queue it: janus gate {name} --unit {a.unit}")
 
+def gate_unit(cfg, name):
+    """The open unit a landing gate's name carries when no --unit is given (land-<unit> or land-<unit>-<suffix>, and the
+    [landing] gate_names patterns that start with land-; the longest unit name wins), or None."""
+    pats = [x for x in cfg.c.get("landing", {}).get("gate_names", []) if x.startswith("land-")] or ["land-{unit}", "land-{unit}-*"]
+    try: names = [u["name"] for u in Beads(cfg).units()]
+    except Err: return None
+    return max((n for n in names if any(fnmatch.fnmatch(name, x.replace("{unit}", n)) for x in pats)), key=len, default=None)
+
 def cmd_gate(cfg, a):
     """Run out/<name>/tests.sh as a gates-lane task on this machine. paths.gate_runner (a project script called with <name>)
     runs it when set; otherwise janus runs tests.sh itself and appends '<date> <time> <name> EXIT_tests=<rc> RESULT: PASS|FAIL'
@@ -136,6 +172,13 @@ def cmd_gate(cfg, a):
     --unit (default $JANUS_UNIT) records the gate on that unit, for the landing check."""
     out = cfg.p("out", "out"); t = out / a.name / "tests.sh"
     if not t.is_file(): raise Err(f"{t} not found")
+    ln, h = next((n, x) for n, x in cfg.hosts.items() if x.get("local"))
+    # Row 217: a gate that is already queued or running is not queued again (the duplicate failed at once and task.txt then named it)
+    try: tasks = (json.loads(hrun(h, f"{pueue(h)} status --json", timeout=30)[1]).get("tasks") or {})
+    except ValueError: tasks = {}
+    dup = next((i for i, x in tasks.items() if own_label(cfg, x) == f"gate:{a.name}" and task_rc(x) is None), None)
+    if dup is not None:
+        raise Err(f"refused: gate {a.name} is already queued or running as {ln}:{dup}: wait for it (janus gate-log {a.name}), or janus cancel {ln}:{dup} first")
     # Baseline (decision 0002): --baseline <name> records a run of the landing branch on the same host whose failures are main's,
     # not the unit's; --baseline none clears it. The gate script's gate-judge reads out/<name>/baseline.txt.
     bl = getattr(a, "baseline", None)
@@ -145,8 +188,9 @@ def cmd_gate(cfg, a):
             raise Err(f"--baseline {bl}: no recorded gate out/{bl} (a run of the landing branch on the same host); run it first")
         (out / a.name).mkdir(parents=True, exist_ok=True); atomic_write(out / a.name / "baseline.txt", bl + "\n")
         say(f"gate {a.name}: baseline {bl} (its failures are treated as the branch's, not the unit's)")
-    h = cfg.hosts[next(n for n, x in cfg.hosts.items() if x.get("local"))]
-    env = {"JANUS_LANE": "gates", "JANUS_ROOT": str(cfg.root)} | ({cfg.paths.get("gate_host_env", "JANUS_TEST_HOST"): a.host} if a.host else {})
+    unit = a.unit or os.environ.get("JANUS_UNIT") or gate_unit(cfg, a.name)
+    # Row 216: the gate's task carries its unit, so the steps it queues (janus run reads JANUS_UNIT) are recorded on that unit
+    env = {"JANUS_LANE": "gates", "JANUS_ROOT": str(cfg.root)} | ({cfg.paths.get("gate_host_env", "JANUS_TEST_HOST"): a.host} if a.host else {}) | ({"JANUS_UNIT": unit} if unit else {})
     pre = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     rh = cfg.paths.get("gate_runner", "")
     run = (shlex.quote(str(cfg.root / rh)) + " " + shlex.quote(a.name)) if rh else \
@@ -155,11 +199,10 @@ def cmd_gate(cfg, a):
     run = shlex.join([sys.executable, str(JANUS_SELF), "gate-exec", a.name, "--timeout-min", str(lim or 0), "--", run])
     est = gate_estimate(cfg, a.name); qm = ld.get("quick_gate_min")
     group = "gates-quick" if qm and (a.quick or (est is not None and est < qm)) else "gates"   # short gates never wait behind long ones
-    unit = a.unit or os.environ.get("JANUS_UNIT")
     if unit:   # a gate refuses its unit's tree mid-merge, with conflict markers, or too far behind the landing branch (item 41)
-        try:
+        try:       # row 220: a landing gate (land-*) judges the tree that lands, so it must hold the landing branch's head
             bd0, u0 = get_unit(cfg, unit)
-            why = tree_guard(cfg, u0["cwd"]) if own_tree(cfg, u0, bd0.units()) else None
+            why = tree_guard(cfg, u0["cwd"], head=a.name.startswith("land-")) if own_tree(cfg, u0, bd0.units()) else None
             if why and not a.allow_unmerged: raise Err(f"refused: {unit}'s tree {u0['cwd']} {why} (--allow-unmerged to gate anyway)")
         except Err as e:
             if str(e).startswith("refused"): raise
@@ -173,9 +216,9 @@ def cmd_gate(cfg, a):
     rc, o, e = X(cfg, h, f"env {pre} {pueue(h)} add -g {group} -l {shlex.quote(tag(cfg, 'gate:' + a.name))} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env JANUS_WRAP={tok} {run}')}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
     if cfg.run.dry: return
-    tid = o.strip(); say(f"queued gate {a.name} as {next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid} in {group}"
+    tid = o.strip(); say(f"queued gate {a.name} as {ln}:{tid} in {group}" + (f" for unit {unit}" if unit else "")
                          + (f" (expected {est:g} min)" if est is not None else "") + (f", limit {lim} min" if lim else ""))
-    atomic_write(out / a.name / "task.txt", f"{next(n for n, x in cfg.hosts.items() if x.get('local'))}:{tid}\n")   # janus gate-log reads its output
+    atomic_write(out / a.name / "task.txt", f"{ln}:{tid}\n")   # janus gate-log reads its output
     if not a.wait: return
     subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {tid}"])
     lines = [l for l in cfg.p("gate_log").read_text().splitlines() if (m := GATE_LINE.match(l)) and m.group(1) == a.name]

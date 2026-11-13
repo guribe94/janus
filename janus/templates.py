@@ -172,6 +172,9 @@ job_mb() {  # $1 pid, $2 job id: the job's resident memory now, in MB (empty whe
 %(sample)s
   echo "$v"
 }
+tree_cpu() {  # CPU seconds used so far by process $1 and its living descendants (ps time: [d-]h:m:s or m:s.cc)
+  ps -A -o pid=,ppid=,time= | awk -v r="$1" '{pp[$1] = $2; n = split($3, a, /[-:]/); s = 0; for (i = 1; i <= n; i++) s = s * ((n == 4 && i == 2) ? 24 : 60) + a[i]; tm[$1] = s} END {q[r] = 1; do {ch = 0; for (x in pp) if (!(x in q) && (pp[x] in q)) {q[x] = 1; ch = 1}} while (ch); for (x in q) s2 += tm[x]; print int(s2)}'
+}
 tree_mb() {  # resident memory of process $1 and all its descendants, MB
   ps -A -o pid=,ppid=,rss= | awk -v r="$1" '{pp[$1] = $2; rs[$1] = $3} END {q[r] = 1; do {ch = 0; for (x in pp) if (!(x in q) && (pp[x] in q)) {q[x] = 1; ch = 1}} while (ch); for (x in q) s += rs[x]; print int(s / 1024)}'
 }
@@ -285,12 +288,20 @@ run_sampled() {  # run "$@", sample its memory (and a cgroup's CPU) every 5 s, t
   # CPU seconds (the waited-for children's, from the shell's times; a container's from its cgroup) and queue wait in history.tsv.
   # The peak is also the kernel's high-water mark of its largest process (platform.MAXRSS_PY), so a job that ends between two
   # samples, or before its first sample sees it allocate (a slow start under load), still records its real peak.
-  t0=$(date +%%s); pf="$R.maxrss"; rm -f "$pf"; times > "$R.t0"
+  # Progress (row 214): about once a minute, when the job's log grew or its processes used 2 s of CPU or more since the last look,
+  # the time is written to $R.live; the check calls a job stuck only when that mark is older than the lane's stall limit.
+  t0=$(date +%%s); pf="$R.maxrss"; rm -f "$pf"; times > "$R.t0"; LN=0; LB=; LC=0
   if command -v python3 >/dev/null 2>&1; then python3 -c %(maxrss)s "$pf" "$@" & else "$@" & fi; pid=$!; peak=0; cpu=0
   while kill -0 $pid 2>/dev/null; do
     v=$(job_mb $pid %(jid)s); [ "${v:-0}" -gt "$peak" ] 2>/dev/null && peak=$v
-    v=$(job_cpu %(jid)s); [ "${v:-0}" -gt "$cpu" ] 2>/dev/null && cpu=$v; sleep 5
+    v=$(job_cpu %(jid)s); [ "${v:-0}" -gt "$cpu" ] 2>/dev/null && cpu=$v
+    if [ $((LN %% ${JANUS_LIVE_N:-12})) -eq 0 ]; then
+      lb=$(wc -c < "$R.log" 2>/dev/null | tr -d ' '); lc=${v:-$(tree_cpu $pid)}; lc=${lc%%.*}; ld=$(( ${lc:-0} - LC )); [ "$ld" -lt 0 ] && ld=$(( -ld ))
+      { [ "${lb:-0}" != "$LB" ] || [ "$ld" -ge 2 ]; } && date +%%s > "$R.live"; LB=${lb:-0}; LC=${lc:-0}
+    fi
+    LN=$((LN + 1)); sleep 5
   done
+  rm -f "$R.live"
   wait $pid; rc=$?; times > "$R.t1"; k=$(cat "$pf" 2>/dev/null); rm -f "$pf"; [ "${k:-0}" -gt "$peak" ] 2>/dev/null && peak=$k
   v=$(awk -v a="$(cpu_s "$R.t0")" -v b="$(cpu_s "$R.t1")" 'BEGIN {print int(b - a + 0.5)}'); rm -f "$R.t0" "$R.t1"
   [ "${v:-0}" -gt "$cpu" ] 2>/dev/null && cpu=$v
