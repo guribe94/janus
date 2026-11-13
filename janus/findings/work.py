@@ -5,7 +5,7 @@ from janus.actions.backlog import fill_candidates, fill_plan
 from janus.backlog import backlog_cfg, backlog_issues, item_actors, unit_items
 from janus.beads import Beads
 from janus.context import Err, LE, handoff_path, handoff_stale, now, sh
-from janus.gates import gate_ids, gate_results, kf_active, known_failures, landed
+from janus.gates import gate_ids, gate_results, kf_active, known_failures, landed, unapplied_patch
 from janus.platform import watcher_loaded, watcher_service
 from janus.probe import room
 from janus.project import own_label
@@ -115,6 +115,10 @@ def landing_findings(cfg, units, hs=None):
     F = []
     for u in units:
         v = u.get("verdict") or ""
+        up = unapplied_patch(cfg, u) if u.get("state") in ("done", "failed", "gone", "idle") else None
+        if up:   # row 239: the work of a unit that ran without the repository exists only in its collected patch
+            F.append((f"landing:{u['name']}:patch", f"{u['name']}'s collected patch {up} is not applied in {u.get('cwd')}: git -C {u.get('cwd')} apply --3way {up}, "
+                      f"commit, then gate and land it; do not close it before (its work exists only in that patch)"))
         if u.get("state") not in ("done", "failed", "gone", "idle") or "DONE" not in v or u.get("kind", "implement") not in ld.get("kinds", ["implement"]): continue
         try: fin = report_path(cfg, u).stat().st_mtime
         except OSError: continue

@@ -10,6 +10,7 @@ so a rule that keeps coming back is not forgotten. The acked-findings view (`jan
 import re
 from pathlib import Path
 from janus.context import Err, say, ts, atomic_write
+from janus.findings import repeat_is_issue
 
 ISSUE_DEFAULTS = {"issues_file": None, "ack_issue_n": 3}
 
@@ -53,14 +54,14 @@ def repeated_issue_findings(cfg):
     it earns an issue row): name the key and `janus issue --key <key>`."""
     n0 = int(iset(cfg, "ack_issue_n")); c = cfg.jget("ack-counts.json")
     return [(f"issue:{k}", f"{k} has been acked {n} times (>= {n0}): open an issue row for it once (janus issue --key {k} \"<what "
-             f"keeps happening and why>\"), so a recurring failure is tracked, not re-remembered") for k, n in sorted(c.items()) if n >= n0]
+             f"keeps happening and why>\"), so a recurring failure is tracked, not re-remembered") for k, n in sorted(c.items()) if n >= n0 and repeat_is_issue(k)]
 
 def auto_log_issues(cfg):
     """Append an issue row for each over-acked key not yet logged (once per key).
     Called by janus check as a writer, so a rule that keeps coming back is written down where the skill keeps its register."""
     done = cfg.jget("issued.json")
     for k, n in cfg.jget("ack-counts.json").items():
-        if n < int(iset(cfg, "ack_issue_n")) or k in done: continue
+        if n < int(iset(cfg, "ack_issue_n")) or k in done or not repeat_is_issue(k): continue
         rc, _ = append_issue(cfg, f"a finding key keeps coming back ([{k}] acked {n} times): fix the root cause or make the "
                                   f"condition impossible", f"janus check; ack-counts {n}", key=k)
         if rc: done[k] = ts()

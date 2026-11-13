@@ -16,6 +16,7 @@ class Family(NamedTuple):
     doc: str
     urgent: bool = False
     ack_ttl: int = 4 * H
+    recurs: bool = False   # the condition returns by nature (a host's load, new work in the repository): repeat acks earn no issue row
 
 
 FAMILIES = {
@@ -33,8 +34,8 @@ FAMILIES = {
     "gate": Family("a gate failed in the last 12 h (its latest result)"),
     "gate-common": Family("the same failure in two or more gates: suspect the test or fixture"),
     "gate-setup": Family("every step of a gate failed at once: a setup problem, not the tests"),
-    "git": Family("the project's repository is dirty, unpushed or has no upstream"),
-    "handoff": Family("the orchestrator notes are stale or too long, or the state folder has no HANDOFF.md"),
+    "git": Family("the project's repository is dirty, unpushed or has no upstream", recurs=True),
+    "handoff": Family("the orchestrator notes are stale or too long, or the state folder has no HANDOFF.md; cannot be acked: write the notes", ack_ttl=0),
     "host": Family("a host is unreachable", urgent=True),
     "idle": Family("a host or lane has room while work waits"),
     "idle-backlog": Family("ready backlog items without briefs while hosts have room, or held by budget", urgent=True, ack_ttl=H),
@@ -47,7 +48,7 @@ FAMILIES = {
     "ledger": Family("a provider ledger is malformed, implausible or holds unreconciled runs", urgent=True),
     "localtest": Family("a test or build runs on this machine outside the lanes"),
     "machine": Family("a job or tmux session on a shared host with no project id (made before ids, or by hand): listed, never acted on"),
-    "margin": Family("a host is over its disk or memory-pressure margins", urgent=True, ack_ttl=H // 2),
+    "margin": Family("a host is over its disk or memory-pressure margins", urgent=True, ack_ttl=H // 2, recurs=True),
     "memory-long": Family("MEMORY.md holds more entries than [memory] cap_lines"),
     "memory-review": Family("a memory entry is older than [memory] review_days"),
     "memory-source": Family("a memory entry cites a path that is gone"),
@@ -60,7 +61,7 @@ FAMILIES = {
     "owner-question": Family("a question for the owner waits in .janus/owner-queue.md", urgent=True),
     "parked": Family("a parked unit's job can never finish, or its resume failed", urgent=True),
     "overrun": Family("a running job is far over its expected run time (its class's history on that host)"),
-    "pressure": Family("a host's admission is paused by back-pressure", urgent=True),
+    "pressure": Family("a host's admission is paused by back-pressure", urgent=True, recurs=True),
     "provider": Family("a unit runs on a disabled provider"),
     "question": Family("an open board question", urgent=True),
     "quality": Family("a finished unit changed test files but named no failure each test catches (report.json)"),
@@ -119,10 +120,17 @@ def ack_ttl(key):
 def ackable(key): return ack_ttl(key) > 0
 
 
+def repeat_is_issue(key):
+    """True when repeated acks of key are a sign of something to fix. Not for a family whose condition returns by nature
+    (recurs), nor for one that cannot be acked (rows 5, 6, 9, 10, 12 of a project's register: memory pressure on a host, a
+    repository that new work dirties again, notes that only writing clears)."""
+    f = FAMILIES.get(key.split(":", 1)[0], Family("")); return f.ack_ttl > 0 and not f.recurs
+
+
 def live_acks(cfg, keys=None):
     """Acks still in force. keys: the findings seen now; an ack whose finding is gone is dropped (only a writer saves that)."""
     acks = {k: (v if isinstance(v, dict) else {"t": v}) for k, v in cfg.jget("acks.json").items()}
     return {k: v for k, v in acks.items() if now() - v["t"] < ack_ttl(k) and (keys is None or k in keys)}
 
 
-__all__ = ["Family", "FAMILIES", "Finding", "family", "finding", "ack_ttl", "ackable", "live_acks"]
+__all__ = ["Family", "FAMILIES", "Finding", "family", "finding", "ack_ttl", "ackable", "repeat_is_issue", "live_acks"]

@@ -108,7 +108,7 @@ class Golden(unittest.TestCase):
         self.assertEqual(sorted(f.key for f in F), want)
         self.assertEqual([f.key for f in F if f.urgent], [f.key for f in F if f.key.startswith(URGENT_BEFORE)])
         self.assertEqual([f for f, x in janus.FAMILIES.items() if x.urgent], [f for f in janus.FAMILIES if (f + ":").startswith(URGENT_BEFORE)])
-        self.assertEqual([f for f in janus.FAMILIES if not janus.ackable(f + ":x")], ["instructions", "waiting"])
+        self.assertEqual([f for f in janus.FAMILIES if not janus.ackable(f + ":x")], ["handoff", "instructions", "waiting"])
 
 
 if __name__ == "__main__":

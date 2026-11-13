@@ -2,7 +2,7 @@
 
 probe/probe_all (the PROBE script, margins, room, host_cap), probe_extra (old queues, other schedulers, direct builds),
 pueue(), margins/room/cap_line. Unreachable hosts degrade to a finding with the units they held (section 9: keep)."""
-from janus.context import hrun, qp, fl, sh, now, FIXTURE_MARK
+from janus.context import hrun, qp, fl, sh, now, FIXTURE_MARK, SSH
 from janus.cap import cap_lib, capv, host_cap, FACTS
 from janus.platform import HOST_FACTS, parse_facts
 from janus.templates import API_PROBE, PROBE, DIRECT_PROBE
@@ -15,8 +15,9 @@ def probe_extra(h):
     """Running janus jobs still waiting in their admission (per lane), the old scripts' queue, other job schedulers on the host
     (one scheduler per host, janus-fixes8), and on remote hosts builds or tests an agent runs outside the lanes (issue 22)."""
     rd = h["_rd"]
+    # a .wait/.gwait file holds '<pid> <since>'; its job waits while that pid lives (row 231: the pid is read by the shell's own read)
     # old_rule: waiting jobs whose script sources neither runs/cap.sh nor runs/admit.sh (queued before the measured rule; audit H5)
-    w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && kill -0 "$(cut -d' ' -f1 "$f")" 2>/dev/null || continue; '
+    w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && read p _ < "$f" && kill -0 "$p" 2>/dev/null || continue; '
          f'b=${{f##*/}}; echo "waitjob=${{b%.*}}"; case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
          f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"; '
          # row 214: seconds since each running job last showed progress (its own mark, written by the job script or the gate wrapper)
@@ -45,8 +46,12 @@ def probe(name, h, ro=True, cfg=None):
     """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,
     history), other schedulers, direct builds, pueue status and tmux sessions. ro: the overload tracker is only read."""
     lib = cap_lib(cfg, name, h) if cfg else ""
-    rc, o, e = hrun(h, PROBE % {"bin": h.get("bin", ""), "root": qp(h.get("root", "/")), "pueue": pueue(h), "extra": probe_extra(h),
-                                "rd": qp(h["_rd"]), "ro": "1" if ro else "", "cap": lib or "cap_report() { :; }"}, timeout=25)
+    script = PROBE % {"bin": h.get("bin", ""), "root": qp(h.get("root", "/")), "pueue": pueue(h), "extra": probe_extra(h),
+                                "rd": qp(h["_rd"]), "ro": "1" if ro else "", "cap": lib or "cap_report() { :; }"}
+    rc, o, e = hrun(h, script, timeout=25)
+    # Row 234: ssh's own failure (255) may be the shared master connection's (mux_client_request_session: send fds failed) while
+    # the host answers a fresh connection: ask once more without the master before calling the host unreachable.
+    if rc == 255 and not h.get("local"): rc, o, e = sh([*SSH, "-o", "ControlPath=none", h["ssh"], script], timeout=25)
     if rc: return {"name": name, "ok": False, "err": (e or o).strip().splitlines()[-1][:80] if (e or o).strip() else f"rc {rc}"}
     head, _, rest = o.partition("--pueue\n"); pj, _, tm = rest.partition("--tmux\n")
     p = {"name": name, "ok": True, "tmux": tm.split(), **{k: [] for k in LIST_KEYS}}

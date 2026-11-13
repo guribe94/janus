@@ -37,6 +37,14 @@ def landed(cfg, u):
     if rc != 1: return True if rc == 0 else None
     return contained(c, br)
 
+def unapplied_patch(cfg, u):
+    """The unit's collected patch (out/<unit>/changes.patch: janus collect of a unit that ran on a host without the repository)
+    when it still applies cleanly to the unit's worktree, so its changes are not there; else None. Row 239: such a unit's
+    branch equals the landing branch, land said 'already landed ... janus close', and a close would have dropped the work."""
+    p = cfg.p("out", "out") / str(u.get("name")) / "changes.patch"; c = Path(u.get("cwd", "/"))
+    if not c.is_dir() or c.resolve() == cfg.root.resolve() or not p.is_file() or not p.stat().st_size: return None
+    return p if sh(["git", "-C", str(c), "apply", "--check", str(p.resolve())])[0] == 0 else None
+
 def landing_branch(cfg, c):
     br = cfg.c.get("landing", {}).get("branch")
     if br: return br

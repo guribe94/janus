@@ -6,8 +6,8 @@ from janus.actions.launch import cmd_launch
 from janus.actions.swarm import write_index
 from janus.beads import Beads
 from janus.context import Err, JANUS_SELF, X, atomic_write, hrun, note_event, now, pq, say, sh, ts
-from janus.gates import GATE_DEFAULT, GATE_LINE, baseline_failures, gate_baseline, gate_ids, judge_gate, landed
-from janus.platform import group_cpu_s
+from janus.gates import GATE_DEFAULT, GATE_LINE, baseline_failures, gate_baseline, gate_ids, judge_gate, landed, unapplied_patch
+from janus.platform import group_cpu_s, tree_groups_sh
 from janus.project import own_label, tag
 from janus.probe import pueue
 from janus.quality import land_review
@@ -109,11 +109,15 @@ def cmd_gate_exec(cfg, a):
     t0 = now(); lim = (a.timeout_min or 0) * 60 or None
     c = a.command[1:] if a.command[:1] == ["--"] else a.command
     p = subprocess.Popen(["sh", "-c", "--", c[0] if len(c) == 1 else shlex.join(c)], start_new_session=True)
-    def stop_group():
-        try: os.killpg(p.pid, signal.SIGTERM); p.wait(timeout=20)
-        except (subprocess.TimeoutExpired, ProcessLookupError):
-            try: os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError: pass
+    def stop_group():   # row 237: every group of the command's process tree (a runner that started its own group outlived the cancel)
+        gs = {p.pid} | {int(x) for x in sh(["sh", "-c", tree_groups_sh(p.pid)])[1].split() if x.isdigit()}
+        for sg, grace in ((signal.SIGTERM, 20), (signal.SIGKILL, 5)):
+            for g in gs:
+                try: os.killpg(g, sg)
+                except (ProcessLookupError, PermissionError): pass
+            try: p.wait(timeout=grace)
+            except subprocess.TimeoutExpired: pass
+            if sg == signal.SIGTERM and len(gs) > 1: time.sleep(1)   # the other groups get a moment to end on TERM
     # Row 219: the command runs in its own process group, so a cancel (pueue kill) that stops only this wrapper left the gate's
     # runner and tests.sh running: they queued later steps and wrote a RESULT line after the cancel. A signal here stops the whole
     # group and writes no RESULT; the group id is also kept in runs/<token>.pgid, so janus cancel stops the group even when this
@@ -391,10 +395,21 @@ def cmd_land(cfg, a):
     # the gate's command is built (and the branch name judged) before anything is merged or dispatched, and only when a gate
     # will run: a refusal after the merge left a merge commit behind for a land that could never go on (review finding F2)
     gh, gc = ld.get("final_gate_host"), None if a.no_gate else final_gate_cmd_checked(ld, a.unit, wt, branch)
+    up = unapplied_patch(cfg, u)   # row 239
+    if up: raise Err(f"{a.unit}'s collected patch {up} is not applied in {wt} (the unit ran on a host without the repository): "
+                     f"git -C {wt} apply --3way {up}, commit, then janus land {a.unit} again; do not close it before (its work exists only in that patch)")
     if git(wt, "status", "--porcelain", "--untracked-files=no")[1].strip(): raise Err(f"{wt} has uncommitted changes: commit them first")
     if git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")[0] == 0: raise Err(f"{wt} has a merge in progress (MERGE_HEAD): finish or abort it")
     base = git(wt, "rev-parse", br)[1].strip()
     if not base: raise Err(f"no branch {br}")
+    # Row 240: the landing branch here may be behind its upstream (a commit already pushed that this checkout lacks). "Ahead of
+    # <branch>" then counted that pushed commit as the unit's, and the squash rewrote it on the old base. Fetch, compare, refuse.
+    rcu, ups, _ = git(wt, "rev-parse", "--abbrev-ref", f"{br}@{{upstream}}"); ups = ups.strip()
+    if rcu == 0 and "/" in ups:
+        if not cfg.run.dry and git(wt, "fetch", "-q", ups.split("/", 1)[0], timeout=120)[0]: say(f"note: git fetch {ups.split('/', 1)[0]} failed; comparing with {ups} as last fetched")
+        lag = int(git(wt, "rev-list", "--count", f"{br}..{ups}")[1].strip() or 0)
+        if lag: raise Err(f"{br} here is {lag} commit(s) behind {ups} (already pushed): landing on it would rewrite them. Fast-forward {br} first "
+                          f"(in its checkout: git merge --ff-only {ups}), then janus land {a.unit} again")
     ahead = int(git(wt, "rev-list", "--count", f"{br}..HEAD")[1].strip() or 0); behind = int(git(wt, "rev-list", "--count", f"HEAD..{br}")[1].strip() or 0)
     if not ahead: raise Err(f"{branch} has no commits over {br}: nothing to land")
     if landed(cfg, u): raise Err(f"{a.unit} is already landed: {br} holds its tree ({branch} has no change since): janus close {a.unit}")
@@ -434,7 +449,9 @@ def cmd_land(cfg, a):
         ra = argparse.Namespace(host=gh, lane="gates", unit=a.unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False, allow_unmerged=False, command=[gc])
         if cfg.run.dry: say(f"+ janus run --host {gh} --lane gates --unit {a.unit} --wt {wt} -- {gc}"); 
         else:
-            grc = cmd_run(cfg, ra)
+            mark = cfg.f("runs") / f"land-{a.unit}.pid"; mark.parent.mkdir(parents=True, exist_ok=True); mark.write_text(str(os.getpid()))
+            try: grc = cmd_run(cfg, ra)   # row 241: while the mark's process lives, this gate is land's own, not an orphan (landing_now)
+            finally: mark.unlink(missing_ok=True)
             if grc: raise Err(f"final gate on {gh} failed (exit {grc}): not landed; the merge stays committed in {wt}")
             say(f"final gate on {gh}: PASS")
     # 3. squash-land: tree of the gated HEAD, parent = the landing tip that was merged

@@ -24,8 +24,9 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
         if not (d / ".git").is_file() or d.resolve() in used or d.resolve() == cfg.root.resolve(): continue
         keep = (lambda why: kept.append((str(d), why))) if kept is not None else (lambda why: None)
         br = sh(["git", "-C", str(d), "symbolic-ref", "-q", "--short", "HEAD"])[1].strip()
-        own = next((n for n in (d.name, br) if n in names), None)
-        if own: keep(f"open unit {own}'s worktree (its folder or branch has the unit's name)"); continue
+        # row 235: a tree an open unit made for its own jobs (<unit>-proof) is that unit's too
+        own = next((u for n in (d.name, br) for u in sorted(names) if n == u or n.startswith(u + "-")), None)
+        if own: keep(f"open unit {own}'s worktree (its folder or branch has, or starts with, the unit's name)"); continue
         rc, o, e = sh(["git", "-C", str(d), "status", "--porcelain", "--ignore-submodules=none"])
         if rc or o.strip(): keep(f"{len(o.splitlines())} uncommitted change(s)" if not rc else "git status failed"); continue
         if br and any(l.startswith((f"WIP on {br}:", f"On {br}:")) for l in sh(["git", "-C", str(d), "stash", "list", "--format=%gs"])[1].splitlines()):

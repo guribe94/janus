@@ -293,7 +293,7 @@ private-key blocks. A bare prefix mention passes. On a hit it unstages again, re
 Otherwise it commits and pushes.
 
 **`janus ack <key> "<decision>"`**: acknowledges a problem for 4 hours (margin problems 30 min, `idle-backlog` 1 h; `waiting`
-and `instructions` cannot be acked: park the unit; close or remember each instruction), until the problem clears
+`instructions` and `handoff` cannot be acked: park the unit; close or remember each instruction; write the notes), until the problem clears
 (a cleared problem's ack is dropped, so it comes back if it recurs), and records the decision as a beads comment (on the
 unit's issue for `unit:<name>:...` keys, otherwise on a `janus: decisions` issue).
 ```
