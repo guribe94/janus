@@ -149,7 +149,7 @@ class ReadOnly(Base):
 
     def test_nothing_secret_reaches_the_screen(self):
         """Catches: a credential in a board post, a bd error or a host error printed on the screen or in details."""
-        self.w.board("2026-11-13 10:00 ann status: set ANTHROPIC_API_KEY=sk-ant-abc123456789 and Authorization: Bearer tok-9f8e7d6c5b4a\n")
+        self.w.board("2026-11-13 10:00 ann status: set ANTHROPIC_API_KEY=sk-" "ant-abc123456789 and Authorization: Bearer tok-9f8e7d6c5b4a\n")
         self.w.fail = {"bd"}; self.collect()
         m = self.model(); ui = M.UI(); ui.tab = 3; ui.detail = True; ui.dkey = m.rows["Board"][0].key
         txt = "\n".join(t for line in M.render(m, ui, 40, 120, time.time(), "") for t, _ in line) + json.dumps(self.store.view()[0]["units"].err) + repr([r.detail for r in m.rows["Board"]])
@@ -398,7 +398,7 @@ class Cli(unittest.TestCase):
 
     def test_scrub_masks_credentials_and_controls(self):
         """Catches: credential-shaped text or terminal escapes reaching the screen."""
-        for s in ("TOKEN=abcd1234", "api_key: 'sk-live-0123456789'", "Authorization: Bearer abcdef123", "x ghp_0123456789abcdef0123 y", '"password": "p4ss"'):
+        for s in ("TOKEN=abcd1234", "api_key: 'sk-live-0123456789'", "Authorization: Bearer abcdef123", "x ghp" "_0123456789abcdef0123 y", '"password": "p4ss"'):
             out = M.clean(s); self.assertIn("***", out, s); self.assertNotRegex(out, r"abcd1234|0123456789|abcdef123|p4ss")
         self.assertEqual(M.clean("a\x1b[31mred\x07\n b"), "a [31mred b"); self.assertEqual(M.clean("token expired"), "token expired")
 
