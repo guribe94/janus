@@ -8,7 +8,7 @@ from janus.budgets import OUTCOMES, first_review_pass, rset, run_outcomes, waste
 from janus.context import Err, Locked, NUM, atomic_write, note_event, now, refuse_agent, say, slug, ts
 from janus.findings.awareness import introduced_recently, related_cases
 from janus.findings.units import peer_rows, peers_text, unreconciled
-from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, committed, recost, recost_plan, run_cost, spend
+from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, committed, left_cost, recost, recost_plan, reconciled_plan, spend
 from janus.memory import MEM_SECTIONS, learned_mark, mem_line, memory_history, memory_path, memory_read, memory_write
 from janus.probe import probe_all
 from janus.transcripts import pointer_text, read_transcript
@@ -26,11 +26,14 @@ def cmd_ledger(cfg, a):
         if not cfg.run.dry: refuse_agent("janus ledger recost")
         for n, pv in pvs:
             plan = recost_plan(cfg, pv); over = sum(c - own for _, _, c, own in plan)
-            if not plan: say(f"{n}: nothing to correct"); continue
+            found = reconciled_plan(cfg, pv); bound = sum(c - own for _, _, c, own, _ in found)   # row 222: agent-gone runs booked at their budget
+            if not plan and not found: say(f"{n}: nothing to correct"); continue
             for k, un, c, own in plan: say(f"{'would correct' if cfg.run.dry else 'corrected'} {k} ({un}): ${c:.2f} (its session's total) -> ${own:.2f} (its own cost)")
-            if cfg.run.dry: say(f"{n}: {len(plan)} row(s), ${over:.2f} charged twice; committed ${committed(cfg, pv):.2f} -> ${committed(cfg, pv) - over:.2f} [dry-run: nothing changed]"); continue
-            bak = recost(cfg, pv, plan)
-            say(f"{n}: corrected {len(plan)} row(s), ${over:.2f} less; committed now ${committed(cfg, pv):.2f}; backup {bak}")
+            for k, un, c, own, src in found: say(f"{'would correct' if cfg.run.dry else 'corrected'} {k} ({un}): ${c:.2f} (its budget, counted as the upper bound) -> ${own:.2f} (the cost its {src} reports)")
+            parts = ", ".join(x for x in (f"${over:.2f} charged twice" if plan else "", f"${bound:.2f} counted at the bound and not spent" if found else "") if x)
+            if cfg.run.dry: say(f"{n}: {len(plan) + len(found)} row(s), {parts}; committed ${committed(cfg, pv):.2f} -> ${committed(cfg, pv) - over - bound:.2f} [dry-run: nothing changed]"); continue
+            bak = recost(cfg, pv, plan, found)
+            say(f"{n}: corrected {len(plan) + len(found)} row(s), ${over + bound:.2f} less; committed now ${committed(cfg, pv):.2f}; backup {bak}")
         return 0
     if a.action == "reconcile":   # runs whose agent is gone and that have no done row: done unknown, budget as the upper bound
         if not cfg.run.dry: refuse_agent("janus ledger reconcile")
@@ -40,8 +43,7 @@ def cmd_ledger(cfg, a):
             rs = unreconciled(cfg, pv, units)
             if not rs: say(f"{n}: nothing to reconcile"); continue
             for k, un, b, why in rs:
-                od = cfg.p("out", "out") / un; cost, rep = run_cost(od / f"api-{k}.json", b, k)   # what the run itself reported, when its json is here
-                if not rep and next((u.get("run") for u in units if u["name"] == un), None) == k: cost, rep = run_cost(od / "api.json", b, k)
+                cost, rep = left_cost(cfg, ledger_read(cfg, pv)[0], k)   # what the run itself reported, when its json is here (a closed unit's api.json too: row 222)
                 if rep:
                     if cfg.run.dry: say(f"would close {k} ({un}) at ${cost:.2f} (the cost its json reports): {why}"); continue
                     ok = ledger_done(cfg, pv, k, un, cost, "reconciled")
