@@ -528,8 +528,9 @@ class Capacity(unittest.TestCase):
         made it re-exec itself for every other key (sysctl hw.ncpu hung: 'sh: timeout', hosts missing from discovery)."""
         import janusload
         real = self.d / "realbin"; real.mkdir(); (real / "sysctl").write_text('#!/bin/sh\necho REAL "$@"\n'); (real / "sysctl").chmod(0o755)
-        env = {**os.environ, "PATH": f"/usr/bin:/bin:{janusload._STUB}:{real}"}
-        r = lambda *k: subprocess.run(["sysctl", *k], capture_output=True, text=True, env=env, timeout=10).stdout.strip()
+        pre = self.d / "probebin"; pre.mkdir()                                       # a probe's own dir ahead of the stub (no sysctl in it)
+        env = {**os.environ, "PATH": f"{pre}:{janusload._STUB}:{real}"}              # no system dir: a host's own sysctl must not decide
+        r = lambda *k: subprocess.run([str(janusload._STUB / "sysctl"), *k], capture_output=True, text=True, env=env, timeout=10).stdout.strip()
         self.assertEqual(r("-n", "hw.ncpu"), "REAL -n hw.ncpu")                     # falls through to the real one, once
         self.assertEqual(r("-n", "kern.memorystatus_vm_pressure_level"), "1")        # the calm answer is kept
     def test_job_script_admits_runs_records(self):
