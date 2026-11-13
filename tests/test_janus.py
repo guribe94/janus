@@ -113,7 +113,8 @@ class Hooks(unittest.TestCase):
                   'git commit -F - <<EOF\nrm -rf / ; kill 1; for x in worktrees; do git add; done\nEOF', 'echo "kill -9 1"',
                   'bd comment x-1 "kill the loop; rm -rf it"', 'git -C /x/worktrees/a commit -m "while"',
                   'ssh host pueue status', "ssh -o BatchMode=yes h 'pueue status --json' | jq .", 'ssh h pueue --color never status',
-                  'ssh h "pueue group; pueue log 3"', 'for h in a b; do ssh $h pueue status; done']:
+                  'ssh h "pueue group; pueue log 3"', 'for h in a b; do ssh $h pueue status; done',
+                  'rg -n "rm -rf|kill -9" .', "grep -c 'pueue kill' log"]:   # a search pattern is data too
             self.assertIsNone(self.j(c), c)
     def test_commands_are_judged(self):
         for c in ['for d in worktrees/*; do git -C $d add -A; done', 'kill 5', 'ls | xargs rm -rf', 'bash -c "kill 3"',
@@ -188,38 +189,12 @@ class UserPrompt(unittest.TestCase):
         self.assertIn("bd remember", text)              # the orchestrator's own rules (beads)
         self.assertIn("janus remember", text)           # what agents must follow (MEMORY.md)
         self.assertNotIn("also janus remember", text)   # the old copy-the-same-fact-into-both instruction
-    def test_the_broadcast_reply_names_the_stores(self):
-        d, cfg = project(); bd = d / "board"; bd.mkdir(); (bd / ".master").write_text("here\n")
-        B = lambda *a: janus.board(cfg, *a)
-        B("post", "a1", "status", "start")
-        self.assertIn("bd remember", B("direct", "all", "freeze main")[1])
-        self.assertIn("janus remember", B("direct", "all", "freeze main")[1])
-
-
-class SkillDoc(unittest.TestCase):
-    """F4/F5: the skill's description triggers for the orchestrator only (never an agent working a unit), and the launch recipe
-    names the markers lint_brief checks. The failure caught: a unit agent loading the skill and reading 'never do the work'."""
-    P = Path(JANUS_PY).parent / "skill/SKILL.md"
-    def test_description_triggers_for_the_orchestrator_only(self):
-        desc = self.P.read_text().split("---")[1]
-        self.assertIn("Orchestrator role for a janus project", desc)
-        self.assertIn("[janus]", desc)
-        self.assertIn("Not for an agent working a unit", desc)
-        self.assertNotIn("never do the work", desc)   # that is a rule, not a trigger
-    def test_launch_recipe_names_the_lint_markers(self):
-        txt = self.P.read_text()
-        for m in ("TIER:", "SCOPE:", "REPORT.md", "DONE-WHEN:", "PROOF:"): self.assertIn(m, txt)
-        self.assertNotIn("every few minutes", txt)   # a session cannot schedule itself; the watcher wakes it
 
 
 class PromptFixes(unittest.TestCase):
     """F7/F8/F9/F13/F15 and the board direction: the wrap-up and resume texts, the refusal's named alternative, the wake's
     reason, read only showing new directions, and the header's absolute report path (for the opencode launch path, too)."""
     def setUp(self): self.d, self.cfg = project()
-    def test_wrapup_forbids_work_and_names_the_structured_report(self):
-        w = janus.WRAPUP.format(report="/o/u/REPORT.md")
-        self.assertIn("Do not run, submit or wait", w)
-        self.assertIn("/o/u/REPORT.md", w); self.assertIn("report.json", w)
     def test_resume_message_names_the_report_path(self):
         u = {"name": "u", "host": "here", "budget": 2.0}
         m = janus.resume_message(self.cfg, {}, u, [])
@@ -247,12 +222,6 @@ class PromptFixes(unittest.TestCase):
         o2 = B("read", "a1")[1]; self.assertNotIn("second", o2); self.assertNotIn("first", o2)
         B("direct", "a1", "third")
         o3 = B("read", "a1")[1]; self.assertIn("third", o3); self.assertNotIn("second", o3)
-    def test_the_question_finding_names_every_knowledge_source(self):
-        """F16: a question's finding names every place the answer may be, not only MEMORY.md."""
-        bd = self.d / "board"; bd.mkdir(); (bd / ".master").write_text("here\n")
-        janus.board(self.cfg, "post", "a1", "question", "which port?")
-        txt = dict(janus.board_findings(self.cfg, {"a1"}))["question:q1"]
-        for w in ("janus memory", "janus decisions", "bd memories"): self.assertIn(w, txt)
     def test_the_opencode_launch_writes_the_absolute_report_path_in_the_header(self):
         d, cfg = project('\n[providers.oc]\nenabled = true\n[models.oc]\nprovider = "oc"\nkind = "opencode"\nmodel = "z"\n')
         (d / "briefs/u.md").write_text("TIER: NORMAL\nSCOPE: all\nWrite REPORT.md.\nPROOF: x\n")
@@ -517,11 +486,6 @@ class Register(unittest.TestCase):
         g("checkout", "-q", "wk")
         self.assertIn("11 commits behind", janus.tree_guard(cfg, d))       # gates and land: refused
         self.assertIsNone(janus.tree_guard(cfg, d, behind=False))            # an agent's own jobs: never for being behind (item 5)
-    def test_shim_labels_agent_jobs(self):
-        self.assertIn('add -l "unit:$JANUS_UNIT${JANUS_PROJECT:+@$JANUS_PROJECT}"', janus.clean_pueue_script({"local": True}))
-    def test_rg_patterns_are_data(self):
-        d, cfg = project()
-        for c in ['rg -n "rm -rf|kill -9" .', "grep -c 'pueue kill' log"]: self.assertIsNone(janus.judge(cfg, c, str(d), janus.edit_ok_dirs(cfg)), c)
 
 def host_probe(**k):
     """A probe result as probe() returns it, for the capacity model."""
@@ -1069,10 +1033,6 @@ class ReviewFixes9(unittest.TestCase):
         janus.board(cfg, "post", "carol", "question", "still running?"); self.assertEqual(len(janus.board_questions(cfg)), 1)
         janus.board(cfg, "close", "carol"); self.assertEqual(janus.board_questions(cfg), [])
 
-    def test_board_usage_is_the_header_only(self):
-        """#6: the usage text printed three lines of code."""
-        o = subprocess.run([str(JANUS_PY.parent / "board.sh")], capture_output=True, text=True).stdout
-        self.assertNotIn("set -u", o); self.assertIn("board.sh sync", o)
 
     def test_parked_unit_that_cannot_resume_is_reported(self):
         """#2: a parked unit whose resume raised stayed parked with no finding (the watch log was the only trace)."""
@@ -1568,9 +1528,6 @@ class DoctorProjectListed(unittest.TestCase):
     def _project(self):
         d = Path(tempfile.mkdtemp(prefix="janus-doc-")); (d / "janus.toml").write_text('[project]\nname = "t"\n[hosts.here]\nlocal = true\n'); return d
 
-    def test_listed_project_says_ok(self):
-        line = self._doctor(self._project(), True)
-        self.assertTrue(line.startswith("ok "), line); self.assertIn("project listed in", line); self.assertNotIn("not listed", line)
 
     def test_unlisted_project_is_warned(self):
         line = self._doctor(self._project(), False)

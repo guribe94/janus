@@ -70,17 +70,12 @@ class HeartbeatTest(unittest.TestCase):
         self.write_beat(3600)
         r = self.run_watchdog()
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.run_watchdog()   # a second run over the same stale beat does not repeat the alert
         self.assertEqual(len(self.alert_lines()), 1)
         self.assertEqual(len(self.outbox_lines()), 1)
         self.assertIn("blocked", self.outbox_lines()[0])
         self.assertIn("stale", self.alert_lines()[0])
 
-    def test_second_run_does_not_repeat_the_alert(self):
-        self.write_beat(3600)
-        self.run_watchdog()
-        self.run_watchdog()
-        self.assertEqual(len(self.alert_lines()), 1)
-        self.assertEqual(len(self.outbox_lines()), 1)
 
     def test_recovery_posts_once(self):
         self.write_beat(3600)

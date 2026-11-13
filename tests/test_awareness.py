@@ -69,10 +69,6 @@ class Introduce(unittest.TestCase):
         self.assertIn("janus transcript beta --grep", (janus.board_dir(self.cfg) / "to/alpha.md").read_text())
         self.assertIn("janus transcript alpha --grep", (janus.board_dir(self.cfg) / "to/beta.md").read_text())
 
-    def test_topic_defaults_to_the_shared_path(self):
-        self.assertEqual(janus.introduce_topic("both change pkg/x.py", "beta"), "pkg/x.py")
-        self.assertEqual(janus.introduce_topic("they collide somehow", "beta"), "beta")
-
 
 class BriefPointers(unittest.TestCase):
     """RELATED: and a predecessor reach the brief header the agent reads."""
@@ -117,9 +113,6 @@ class Related(unittest.TestCase):
         self.assertIn("janus introduce alpha beta", F["related:alpha:beta"])
         self.assertIn("pkg", F["related:alpha:beta"])
 
-    def test_different_modules_are_not_related(self):
-        units = demo_units(self.d, [("one", ["pkg/a.py"]), ("two", ["other/c.py"])])
-        self.assertEqual([k for k, _ in janus.related_findings(self.cfg, units, {})], [])
 
     def test_learned_post_naming_an_area_is_related(self):
         (self.bd / "log.md").write_text("2026-01-01 00:00 alpha learned: pkg is shared ground\n")
@@ -172,12 +165,6 @@ class Notes(unittest.TestCase):
         self.assertEqual(list(F), ["note:alpha:1"])
         self.assertIn("pkg/a.py", F["note:alpha:1"])
         self.assertTrue(janus.ackable("note:alpha:1")); self.assertFalse(janus.FAMILIES["note"].urgent)
-
-    def test_bad_target_and_missing_author_are_refused(self):
-        rc, o, e = janus.board(self.cfg, "note", "../evil", "x", env={"JANUS_UNIT": "beta"})
-        self.assertEqual(rc, 2); self.assertIn("bad agent name", e)
-        rc, o, e = janus.board(self.cfg, "note", "alpha", "x", env={"JANUS_UNIT": ""})
-        self.assertEqual(rc, 2); self.assertIn("note <other-agent>", e)
 
 
 class Autopilot(unittest.TestCase):

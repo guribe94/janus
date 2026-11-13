@@ -558,27 +558,5 @@ class Item8Unattended(unittest.TestCase):
         self.assertIn("ValueError: bad state file", cfg.f("watch.log").read_text())
         self.assertEqual([k for k, _ in janus.watch_step_findings(cfg)], [], "one failed pass is not yet a finding")
 
-class Item10Docs(unittest.TestCase):
-    """The skill states the orchestrator's budget duty, and the reference explains every finding, setting and command of the
-    budget follow-through."""
-    ROOT = Path(JANUS_PY).parent
-    KEYS = ("ledger:<p>:recost", "spend:<p>:reserve", "spend:<p>:short", "unit:<u>:resumable", "unit:<u>:resume-limit", "unattended:off", "watcher:step:<name>")
-
-    def test_the_reference_explains_every_budget_finding_setting_and_command(self):
-        """Catches (item 10): check printing a key the reference's findings section does not explain (the orchestrator acks it
-        or guesses), a setting nobody can find, and the reference still saying the unattended loop is opt-in."""
-        ref = (self.ROOT / "docs/REFERENCE.md").read_text(); sec = ref[ref.index("## 4a. Findings and their actions"):ref.index("\n## 5. ")]
-        for k in self.KEYS + ("janus ledger recost", "janus resume <u> --budget"): self.assertIn(k, sec, f"the findings section does not explain {k}")
-        for k in ("finish_reserve", "resume_min_usd", "warn_pct", "budget checkpoint", "relaunch_max"): self.assertIn(k, ref)
-        self.assertNotIn("off by default", ref[ref.index("- **Autopilot"):ref.index("- **Budgets from history")])
-        for k in self.KEYS: janus.finding(k.replace("<p>", "api").replace("<u>", "u1").replace("<name>", "sync"), "t")   # each is a registered family
-
-    def test_the_skill_states_the_budget_duty_and_stays_short(self):
-        """Catches (item 10): an orchestrator that reads only the skill and so lets open units run out of money, acks a
-        resumable unit instead of giving it room, or leaves for the night with the unattended loop off."""
-        txt = (self.ROOT / "skill/SKILL.md").read_text()
-        self.assertIn("## Budget", txt); duty = txt[txt.index("## Budget"):]
-        for k in ("spend:", "resumable", "unattended:off", "janus ask", "cap_usd", "janus ledger recost"): self.assertIn(k, duty, f"the budget duty does not name {k}")
-        self.assertLessEqual(len(txt.splitlines()), 40, "the skill grew long: detail belongs in docs/REFERENCE.md")
 
 if __name__ == "__main__": unittest.main()

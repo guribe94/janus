@@ -61,8 +61,6 @@ class Templates(unittest.TestCase):
         self.sh_n(janus.CLEAN_PUEUE % {"real": "pueue"}, "CLEAN_PUEUE")
         self.sh_n(janus.UNIT_PROCS % {"unit": "u", "roots": "1 2"}, "UNIT_PROCS")
         self.sh_n(janus.FINGERPRINT % {"root": "'/tmp'", "n": "u", "ex": "--exclude=.git"}, "FINGERPRINT")
-
-    def test_gate_default(self):
         self.sh_n(janus.GATE_DEFAULT, "GATE_DEFAULT")
 
 

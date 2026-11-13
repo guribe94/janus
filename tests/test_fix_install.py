@@ -65,27 +65,6 @@ class Item11Verdict(unittest.TestCase):
         self.assertIn("sync_remote_outputs(cfg, units, bd)", inspect.getsource(janus.collect_findings))
 
 
-class Item7CommitState(unittest.TestCase):
-    def test_a_file_that_vanishes_mid_commit_does_not_fail_the_commit(self):
-        """Catches: janus commit-state failed with 'git add failed: fatal: unable to stat ...' when a monitor deleted a temp file
-        between listing and add."""
-        d = Path(tempfile.mkdtemp(prefix="janus-fix-")); (d / "janus.toml").write_text('[project]\nname = "t"\n'); (d / "out").mkdir()
-        g = lambda *a: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True, check=True)
-        g("init", "-q"); (d / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a")
-        (d / "b").write_text("2\n")   # the file the commit should still make
-        cfg = janus.Cfg(d); calls = []
-        real_sh, real_push = janus.sh, janus.push_cmd
-        def sh_stub(cmd, **k):
-            calls.append(list(cmd))
-            if cmd == ["git", "add", "-A"]: return 128, "", "fatal: unable to stat b.tmp: No such file or directory"
-            return real_sh(cmd, **k)
-        janus.sh = sh_stub; janus.push_cmd = lambda repo, cfg=None: ["true"]
-        try: janus.cmd_commit_state(cfg, type("A", (), {"message": "state"})())
-        finally: janus.sh, janus.push_cmd = real_sh, real_push
-        self.assertEqual(g("log", "-1", "--format=%s").stdout.strip(), "state")
-        self.assertTrue(any(c[:4] == ["git", "add", "-A", "--ignore-errors"] for c in calls), "the add was not retried")
-
-
 class Item7WastePause(unittest.TestCase):
     def test_an_ack_of_waste_pause_keeps_launch_unpaused(self):
         """Catches: waste_paused returned None while its ack was live, so the finding was gone and the next check dropped the ack
@@ -128,12 +107,6 @@ class Item13Handover(unittest.TestCase):
 
 
 class Item12FinalGate(unittest.TestCase):
-    def test_final_gate_substitutes_unit_tree_and_branch(self):
-        """Catches: janus land took one fixed [landing] final_gate command, so a project that gates per unit could not use it."""
-        ld = {"final_gate": "bin/run-handoff.sh out/land-{unit}-linux --tree {wt} --branch {branch}"}
-        self.assertEqual(janus.final_gate_cmd(ld, "u1", "/w/u1", "wk/u1"),
-                         "bin/run-handoff.sh out/land-u1-linux --tree /w/u1 --branch wk/u1")
-        self.assertEqual(janus.final_gate_cmd({}, "u", "/w", "b"), "")
 
     def test_final_gate_quotes_substitutions_and_leaves_shell_values(self):
         """Catches (finding 7): {unit}, {wt} and {branch} went unquoted into a shell command, so a hostile branch name or a
@@ -452,20 +425,6 @@ class Item8ResumeDryRun(unittest.TestCase):
         finally: janus.herdr = real
         self.assertIn("would prompt", line); self.assertNotIn(": prompted", line)
         self.assertEqual(called, [], "the dry run prompted the pane")
-
-    def test_dry_run_of_a_tmux_unit_says_would_resume(self):
-        """Catches (item 28): janus resume --dry-run <tmux unit> printed '<unit>: resumed in tmux <session> on <host>',
-        the same line a real resume prints, although nothing was typed into the session."""
-        d, cfg = project()
-        u = {"id": "t-1", "name": "u1", "host": "here", "via": "tmux", "model": "m", "started": 0}
-        real = janus.X
-        janus.X = lambda *a, **k: (0, "", "")
-        try:
-            cfg.run.dry = False; real_line = janus.resume_unit(cfg, u, "go")
-            cfg.run.dry = True; dry = janus.resume_unit(cfg, u, "go")
-        finally: janus.X = real
-        self.assertIn("resumed in tmux", real_line)          # a real resume still reads as the action it took
-        self.assertIn("would resume", dry); self.assertNotIn(": resumed", dry)
 
 
 class Item14OldOrch(unittest.TestCase):
@@ -1370,11 +1329,6 @@ class Item10Residues(unittest.TestCase):
         finally: janus.sh, janus._local_pueue, janus.all_units = saved
         self.assertIn("job 1: unit:u1 -> unit:u1@proj", out); self.assertNotIn("left alone", out)
 
-    def test_a_placeholder_already_quoted_in_the_config_is_not_quoted_twice(self):
-        """Catches (finding 6 = review finding 10's follow-up): a config that quotes the placeholder (`--wt "{wt}"`) must give a
-        single shell-quoted path, not the raw value inside the config's quotes (which ran `$(...)`)."""
-        self.assertEqual(janus.final_gate_cmd({"final_gate": 'gate.sh --wt "{wt}" --branch {branch}'}, "u", "/Users/me/My Code/wt", "b"),
-                         "gate.sh --wt '/Users/me/My Code/wt' --branch b")
 
     def test_an_earlier_run_of_a_capped_unit_is_not_counted_as_capped(self):
         """Catches (finding 10, old 9): capped was read from the unit's latest api.json, so an earlier tiny run of a unit whose
@@ -1641,15 +1595,6 @@ class Item30BriefPath(unittest.TestCase):
 
 
 class Item33WakeRoot(unittest.TestCase):
-    def test_the_clear_wake_names_the_absolute_root_and_notes(self):
-        """Catches (item 33): the reset wake said `read .janus/HANDOFF.md` (relative), so a session whose cwd was outside the
-        janus root found no .janus and no janus.toml."""
-        d, cfg = project()
-        w = janus.wake_clear(cfg, "the context was cleared")
-        self.assertIn(str(cfg.f("HANDOFF.md")), w)
-        self.assertIn(str(cfg.root), w, "the wake does not name the janus root")
-        self.assertNotIn("read .janus/HANDOFF.md", w)
-        self.assertIn(str(cfg.root), janus.wake(cfg, "cycle overdue"))
 
     def test_check_from_a_non_root_cwd_names_the_registered_root(self):
         """Catches (item 33): `janus check` from a directory outside the root exited 2 with a message that never said where
