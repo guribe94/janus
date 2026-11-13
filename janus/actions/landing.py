@@ -413,12 +413,19 @@ def conflict_stop(cfg, a, u, wt, branch, br, files):
                                        dry_run=False, share_with=a.unit))
     return 3
 
+GATE_DISPATCHER = re.compile(r"\s*((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)janus\s+(.*)", re.S)
+
+def gate_is_dispatcher(gc):
+    """True for the final gate that is a janus command (gate_place's own test): its waiting process only dispatches, so land marks
+    it `dispatcher` and the coordinator does not admit it as a build (its steps are admitted on the hosts they run on)."""
+    return bool(gc and GATE_DISPATCHER.match(gc))
+
 def gate_place(cfg, gh, gc):
     """(host, command) the final gate really runs as. A final gate that is a janus command (`janus gate ...`) is a dispatcher: it
     needs the project (janus.toml, the lanes' records) and sends its steps to the hosts itself, so it runs on the coordinator by
     this janus's own entrypoint, whatever host was named (row 64: on a remote host it was `janus: command not found`, exit 127,
     and with a launcher there a janus without a project). Any other command runs on gh as given."""
-    m = re.match(r"\s*((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)janus\s+(.*)", gc, re.S)
+    m = GATE_DISPATCHER.match(gc)
     if not m: return gh, gc
     return next(n for n, h in cfg.hosts.items() if h.get("local")), f"{m.group(1)}{shlex.quote(sys.executable)} {shlex.quote(str(JANUS_SELF))} {m.group(2)}"
 
@@ -503,7 +510,8 @@ def land_remote(cfg, a, u, wt, branch, br, ld, hn, why):
     else:
         gate_gen(cfg, ld, unit, wt)
         run_final_gate(cfg, a, argparse.Namespace(host=gh, lane="gates", unit=unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False,
-                                                  allow_unmerged=False, command=[gcmd], host_tree=tree if on_host else None), f"{hn}:{tree}")
+                                                  allow_unmerged=False, command=[gcmd], host_tree=tree if on_host else None,
+                                                  dispatcher=gate_is_dispatcher(gc) and not on_host), f"{hn}:{tree}")
     if keyed: G("fetch", "-q", "origin", f"+refs/heads/{br}:{rb}", timeout=300)
     if G("rev-parse", rb)[1].strip() != base: raise Err(f"{br} moved while {unit} was gated: run janus land {unit} again (it merges the new tip)")
     subj = T("log", "--format=%s", f"{base}..HEAD", "--no-merges")[1].splitlines()
@@ -595,7 +603,7 @@ def cmd_land(cfg, a):
     else:
         gate_gen(cfg, ld, a.unit, wt)
         gh2, gc2 = gate_place(cfg, gh, gc)   # row 64: a janus command gates from the coordinator by this janus's entrypoint
-        ra = argparse.Namespace(host=gh2, lane="gates", unit=a.unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False, allow_unmerged=False, command=[gc2])
+        ra = argparse.Namespace(host=gh2, lane="gates", unit=a.unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False, allow_unmerged=False, command=[gc2], dispatcher=gate_is_dispatcher(gc))
         if cfg.run.dry: say(f"+ janus run --host {gh2} --lane gates --unit {a.unit} --wt {wt} -- {gc}")
         else: run_final_gate(cfg, a, ra, wt)
     # 3. squash-land: tree of the gated HEAD, parent = the landing tip that was merged

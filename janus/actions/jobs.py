@@ -162,6 +162,9 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     ce = cache_env(cfg, hn, h); cdir = f'JC={ce[0]}; mkdir -p "$JC"\n' if ce else ""   # [caches]: before job_setup, so it uses them too
     adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
                    "waitmax": int(lane_wait(cfg, a.lane) * 60)}   # item 21: give up after the lane's wait limit
+    # skill-dispatch-admission: land's janus-gate dispatcher (landing.gate_is_dispatcher) only waits for steps that are admitted on
+    # their own hosts; it is not admitted as a build here, so a Linux gate never waits on the coordinator's disk or memory.
+    adm = ("NOADMIT=dispatcher\n" if h.get("local") and a.lane == "gates" and getattr(a, "dispatcher", False) else "NOADMIT=\n") + adm
     if h.get("local"):
         pre = ""
         if a.lane == "land":   # on the coordinator the land lane also waits for: the disk floor, the host's admit_check, no legacy_lanes lane busy

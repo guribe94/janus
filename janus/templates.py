@@ -253,6 +253,7 @@ HELD=; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; 
 said=; last=0; BS=; WAITMAX=${JANUS_ADMIT_MAX_S:-%(waitmax)d}; REPORT=${JANUS_ADMIT_REPORT_S:-60}   # item 21: say why at least every REPORT s; finding 3: give up only after WAITMAX s of being BLOCKED (a yield resets the clock)
 while :; do
   Y=
+  if [ "$NOADMIT" = dispatcher ]; then CC=1; MB=0; why="gate dispatcher: its steps are admitted on their own hosts"; break; fi
   if [ "$lane" = gates ] || ! gates_waiting; then
     lk; CAP_RO=; . "$RD/cap.sh"
     if admit_ok "$CLS"; then
