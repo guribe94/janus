@@ -3,7 +3,7 @@ orchestrator session."""
 import argparse, concurrent.futures as cf, json, os, re, shlex, sys, time, tomllib
 from pathlib import Path
 from types import SimpleNamespace
-from janus.actions.jobs import remote_wt
+from janus.actions.jobs import facts_line, remote_wt
 from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, wait_shell
 from janus.beads import Beads
@@ -816,7 +816,7 @@ def cmd_install_host(cfg, a):
     h = cfg.hosts[n]; f = discover(n, h)
     if not f: raise Err(f"{n} is unreachable (ssh {h.get('ssh', '')} must work with keys, BatchMode)")
     if not cfg.run.dry: cfg.jput("hosts-facts.json", {**cfg.jget("hosts-facts.json"), n: f})
-    say(f"{n}: {f['os']} {f['arch']}, {f['cores']} cores, {(f['mem_mb'] or 0) / 1024:.1f} GB; tools {' '.join(f['tools'])}")
+    say(facts_line(n, f))   # the host's capability profile, as janus hosts shows it
     steps = install_steps(cfg, n, h, f); rc = 0
     if not h.get("local"):
         root = h["root"]; dst = f"{h['ssh']}:{root.replace('$HOME/', '')}/janus/"

@@ -9,7 +9,7 @@ from janus.board import board
 from janus.cache import cache_key, input_hashes, lookup as cache_lookup, record as cache_record, settle as cache_settle
 from janus.cap import cap_lib, cap_nums, capv, class_mb, class_secs, class_usage, host_cap
 from janus.context import Err, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
-from janus.platform import ARCH, MAXRSS_PY, tree_groups_sh
+from janus.platform import ARCH, CACHE_ENV, MAXRSS_PY, cache_env_sh, tree_groups_sh
 from janus.project import own_label, tag, untagged
 from janus.probe import host_facts, probe, probe_all, pueue
 from janus.templates import ADMIT
@@ -130,6 +130,19 @@ def guarded_setup(h):
     note = shlex.quote("janus: job_setup skipped: no " + need + "/ in this tree (not the project's own)")
     return f"if [ -d {shlex.quote(need)} ]; then {setup}; else echo {note}; fi"
 
+CACHE_AT = "/janus-cache"   # where a container job sees its host's cache folder
+
+def cache_env(cfg, hn, h):
+    """(the host's cache folder as a shell word, shell that points the cache tools found where it runs at $JC), or None: the
+    shared build caches of janus.toml [caches] (dir, default $HOME/.cache/janus, expanded on each host; use, default every key of
+    platform.CACHE_ENV), per host [hosts.<h>] cache_dir and caches (an empty list: none there). Inert without a [caches] block."""
+    c = cfg.c.get("caches")
+    if c is None: return None
+    use = h.get("caches", c.get("use", list(CACHE_ENV)))
+    bad = [x for x in use if x not in CACHE_ENV]
+    if bad: raise Err(f"[caches] use / [hosts.{hn}] caches: unknown cache {', '.join(bad)} (known: {', '.join(CACHE_ENV)})")
+    return (qp(h.get("cache_dir", c.get("dir", "$HOME/.cache/janus"))), cache_env_sh(use)) if use else None
+
 def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     """The bash script pueue runs on the host. Output is tee'd to <runs>/<jid>.log, the exit code written to <jid>.rc.
     Every lane on every host (the Mac too, register item 5) waits for admission by reservations (ADMIT, runs/cap.sh), holds
@@ -146,6 +159,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
             + (f"export JANUS_ROOT={q(str(cfg.root))}\n" if h.get("local") else ""))
     broad = bool(getattr(a, "broad", None)); nice = 19 if broad else 10   # a broad run (--broad) runs at the lowest CPU priority
     setup = guarded_setup(h); log = h.get("job_log", "/dev/null")
+    ce = cache_env(cfg, hn, h); cdir = f'JC={ce[0]}; mkdir -p "$JC"\n' if ce else ""   # [caches]: before job_setup, so it uses them too
     adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
                    "waitmax": int(lane_wait(cfg, a.lane) * 60)}   # item 21: give up after the lane's wait limit
     if h.get("local"):
@@ -160,28 +174,28 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
                    f"  [ $((nowt - last)) -ge \"$WR\" ] && {{ echo \"janus: land lane waiting $((nowt - start))s (disk ${{d}} GB, floor {lfloor}; old lane busy: ${{busy:-none}})\"; last=$nowt; }}\n"
                    f"  [ \"$WM\" -gt 0 ] && [ $((nowt - start)) -ge \"$WM\" ] && {{ echo \"janus: land lane not admitted after $((nowt - start))s (disk ${{d}} GB, floor {lfloor}; old lane busy: ${{busy:-none}}): giving up (exit 121)\"; exit 121; }}\n"
                    f"  sleep ${{JANUS_LAND_POLL_S:-15}}; done\n")
-        body = f"{pre}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n {nice} bash -c {q(cmd)}\n"
+        body = f"{cdir}{ce[1] if ce else ''}{pre}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n {nice} bash -c {q(cmd)}\n"
     else:
         cap = int(h.get("job_gb", 2) * 1024)
         scope = f"systemd-run --user --scope -q {q('--unit=janus-' + jid)} -p MemoryMax={cap}M -p \"CPUQuota=$((CC * 100))%\" --"   # CC: the admitted cores
         if h.get("runner") == "podman":   # the job runs in the host's container settings, capped at job_gb
             c = ctr(h)
             if not c.get("image"): raise Err(f"host {hn}: runner podman needs [hosts.{hn}.container] image")
-            inner = (f"({setup}) && " if setup else "") + f"cd {q(sub)} && {cmd}"
+            inner = (f"JC={CACHE_AT}\n{ce[1]}" if ce else "") + (f"({setup}) && " if setup else "") + f"cd {q(sub)} && {cmd}"
             hw = " ".join(map(q, map(sub_, c.get("usb_args", [])))) + " " if a.usb else ""
             hw_ = wd or remote_wt(h, name); cw = in_container(h, hw_)
             args = " ".join(q(sub_(x)) for x in c.get("args", []))
-            body = (ACCOUNT_HOME + f"[ -d {qp(hw_)} ] || {{ echo {q(f'janus: no worktree {hw_} on {hn}')}; exit 2; }}\n"
+            body = (ACCOUNT_HOME + cdir + f"[ -d {qp(hw_)} ] || {{ echo {q(f'janus: no worktree {hw_} on {hn}')}; exit 2; }}\n"
                     + "".join(f"mkdir -p {q(sub_(d))}\n" for d in c.get("host_dirs", []))
                     + (f"exec 8>{qp(c['usb_lock'])}; flock 8\n" if a.usb and c.get("usb_lock") else "") + adm +
                     f"printf '%s janus-run start [%s] %s %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} {q(cmd)} >> {qp(log)}\n"
                     f"run_sampled {scope} nice -n {max(nice, 15)} ionice -c 3 podman run --rm --init --name {q('janus-run-' + jid)} {hw}"
-                    f"--memory={cap}m --memory-swap={cap}m --cpus=$CC -v {qp(c['mount'])}:{q(c['mount_at'])} -w {qp(cw)} {args} "
+                    f"--memory={cap}m --memory-swap={cap}m --cpus=$CC -v {qp(c['mount'])}:{q(c['mount_at'])} " + (f'-v "$JC":{CACHE_AT} ' if ce else "") + f"-w {qp(cw)} {args} "
                     f"{q(c['image'])} bash -c {q(inner)}; rc=$?\n"
                     f"printf '%s janus-run end [%s] %s exit %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} $rc >> {qp(log)}\nexit $rc\n")
         else:
             wd = wd or remote_wt(h, name)
-            body = (f"{h.get('run_env', '')}\ncd {qp(wd)} && " + (f"({setup}) && " if setup else "") + f"cd {q(sub)} || exit $?\n" + adm +
+            body = (f"{h.get('run_env', '')}\n{cdir}{ce[1] if ce else ''}cd {qp(wd)} && " + (f"({setup}) && " if setup else "") + f"cd {q(sub)} || exit $?\n" + adm +
                     f"printf '%s janus-run [%s] %s %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} {q(cmd)} >> {qp(log)}\n"
                     f"run_sampled {scope} nice -n {nice} bash -c {q(cmd)}\n")
     return head + "main() {\n" + body + "}\nmain 2>&1 | tee -a \"$R.log\"\nrc=${PIPESTATUS[0]}; echo $rc > \"$R.rc\"; exit $rc\n"
@@ -800,9 +814,10 @@ def facts_line(n, f):
     if not f: return f"{n}: never discovered (unreachable so far)"
     tools = [t for t in f["tools"] if t not in ("git", "rsync", "python3", "flock", "security")]
     extra = [x for x in f["features"] if x not in f["tools"] and x not in (f.get("os"), f.get("arch"))]
+    caches = " ".join(f"{k}={v}" for k, v in sorted(f.get("caches", {}).items()))   # facts saved by an older janus have neither key
     return (f"{n}: {f.get('os')} {f.get('arch')}, {f.get('cores')} cores, {(f.get('mem_mb') or 0) / 1024:.1f} GB RAM, {f.get('disk_gb')} GB free; "
             f"tools {' '.join(tools) or '-'}; features {' '.join(extra) or '-'}; logins {' '.join(f['logins']) or '-'}; "
-            f"devices {' '.join(f['devices']) or '-'} (as of {ts(f.get('at'))})")
+            f"devices {' '.join(f['devices']) or '-'}; container {f.get('container') or '-'}; caches {caches or '-'} (as of {ts(f.get('at'))})")
 
 def cmd_hosts(cfg, a):
     """janus hosts: what each host is (discovered: OS, arch, cores, memory, disk, tools, agent logins, devices; cached, refreshed

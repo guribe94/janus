@@ -134,9 +134,16 @@ else
   grep -qw memory /sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/cgroup.controllers 2>/dev/null && echo "feature=memory-max"
 fi
 d=%(root)s; [ -d "$d" ] || d=$HOME; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
-for t in pueue pueued podman docker systemd-run launchctl bwrap firejail sandbox-exec tmux herdr flock secret-tool pass security git rsync python3 uv cargo node nvidia-smi; do
+for t in pueue pueued podman docker systemd-run launchctl bwrap firejail sandbox-exec tmux herdr flock secret-tool pass security git rsync python3 uv cargo node npm pnpm sccache ccache nvidia-smi; do
   command -v "$t" >/dev/null 2>&1 && echo "tool=$t"
 done
+# the build and package caches already on the host (cache=<name> <dir>): what a job there can reuse instead of a cold start
+kc() { [ -n "$2" ] && [ -d "$2" ] && echo "cache=$1 $2"; }
+kc cargo "${CARGO_HOME:-$HOME/.cargo}"
+command -v uv >/dev/null 2>&1 && kc uv "$(uv cache dir 2>/dev/null)"
+command -v pnpm >/dev/null 2>&1 && kc pnpm "$(pnpm store path 2>/dev/null)"
+if [ "$(uname)" = Darwin ]; then kc sccache "${SCCACHE_DIR:-$HOME/Library/Caches/Mozilla.sccache}"; else kc sccache "${SCCACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sccache}"; fi
+command -v ccache >/dev/null 2>&1 && kc ccache "$(ccache -k cache_dir 2>/dev/null)"
 ( %(agent_env)s
   for t in claude codex opencode; do command -v "$t" >/dev/null 2>&1 && echo "tool=$t"; done   # agents' PATH may differ too
   { [ -s "$HOME/.claude/.credentials.json" ] || grep -qs oauthAccount "$HOME/.claude.json"; } && echo "login=claude"
@@ -144,13 +151,30 @@ done
   [ -s "$HOME/.local/share/opencode/auth.json" ] && echo "login=opencode" ) 2>/dev/null
 true'''
 
+# Shared build caches (janus.toml [caches]): one line per cache, run where the job's command runs (the host, or its container).
+# A tool found there is pointed at the host's one cache folder, $JC; a variable the job's environment already sets is kept; a
+# tool that is absent changes nothing. Never CARGO_TARGET_DIR: every worktree keeps its own target/ (jobs of two trees sharing
+# one would lock and overwrite each other). sccache cannot cache incremental builds, so those are switched off with it.
+CACHE_ENV = {
+    "sccache": 'export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}" SCCACHE_DIR="${SCCACHE_DIR:-$JC/sccache}" CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"',
+    "ccache": 'export CCACHE_DIR="${CCACHE_DIR:-$JC/ccache}" CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-ccache}" CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-ccache}"',
+    "cargo": 'export CARGO_HOME="${CARGO_HOME:-$JC/cargo}"',
+    "uv": 'export UV_CACHE_DIR="${UV_CACHE_DIR:-$JC/uv}"',
+    "pnpm": 'export npm_config_store_dir="${npm_config_store_dir:-$JC/pnpm}"',
+}
+
+def cache_env_sh(use):
+    """Shell for the caches named in `use` (keys of CACHE_ENV); the caller sets JC first."""
+    return "".join(f"command -v {t} >/dev/null 2>&1 && {CACHE_ENV[t]}\n" for t in use)
+
 ARCH = {"arm64": "aarch64", "amd64": "x86_64"}
 
 
 def parse_facts(text):
-    """HOST_FACTS output as {os, arch, cores, mem_mb, disk_gb, tools, features, logins, devices}. features holds the os, the
-    arch, every tool and the probed features, so one --needs list can name any of them."""
-    f = {"tools": [], "features": [], "logins": [], "devices": []}
+    """HOST_FACTS output as {os, arch, cores, mem_mb, disk_gb, tools, features, logins, devices, caches, container}. features
+    holds the os, the arch, every tool and the probed features, so one --needs list can name any of them. caches: {name: dir} of
+    the build and package caches found there; container: its container runtime (podman before docker), or None."""
+    f = {"tools": [], "features": [], "logins": [], "devices": [], "caches": {}}
     many = {"tool": "tools", "feature": "features", "login": "logins", "dev": "devices"}
     for l in text.splitlines():
         k, _, v = l.strip().partition("=")
@@ -159,8 +183,10 @@ def parse_facts(text):
             if v not in f[many[k]]: f[many[k]].append(v)
         elif k in ("cores", "mem_mb", "disk_gb"): f[k] = int(v) if v.isdigit() else None
         elif k in ("os", "arch"): f[k] = ARCH.get(v, v)
+        elif k == "cache" and " " in v: f["caches"].update([v.split(" ", 1)])
+    f["container"] = next((t for t in ("podman", "docker") if t in f["tools"]), None)
     f["features"] = sorted({f.get("os"), f.get("arch"), *f["tools"], *f["features"]} - {None})
     return f
 
 
-__all__ = ["group_cpu_s", "tree_groups_sh", "run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts"]
+__all__ = ["group_cpu_s", "tree_groups_sh", "run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts", "CACHE_ENV", "cache_env_sh"]

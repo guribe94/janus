@@ -167,6 +167,12 @@ critical = ["claude"]
 review = ["codex", "claude"]   # skips the implementer's vendor
 normal = ["codex"]
 
+# ---- shared build caches (skill-fix53; off unless this block is present): each job points the cache tools it finds where it
+# runs at one folder per host; every worktree keeps its own target/. Per host: [hosts.<h>] cache_dir = "...", caches = [...].
+# [caches]
+# dir = "$HOME/.cache/janus"                          # expanded on each host (the default)
+# use = ["sccache", "ccache", "cargo", "uv", "pnpm"]  # the default: all; "cargo" moves CARGO_HOME (drop it to keep ~/.cargo)
+
 # ---- capacity (janus-fixes8): admission by reservations on every host and lane, never by one reading.
 # Per host (or here as defaults): cores, cores_per_job, ram_gb, services_gb (memory not managed by janus: desktop, system,
 # daemons), job_gb (each job's MemoryMax and its reservation until its class is learned), agent_gb, min_disk_gb,

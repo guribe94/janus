@@ -220,7 +220,10 @@ A `cleanup` unit frees disk and load, so neither `min_disk_gb` nor the load limi
   and log, and nothing is reported as launched. `--item <id>` (or an `ITEM: <id>` line) ties the unit to a backlog item.
 - **Host:** `--host`; else where the unit's builds and tests run (`--test-host`, a `TEST-HOST: <h>` line in the brief, the
   first matching `[placement]` regex in janus.toml, or the sticky host in `out/linux-host/<unit>`) when the model may run
-  there; else the allowed host with the most room.
+  there; else the allowed host with the most room. Say what the work needs instead of naming a host: a `HOST-NEEDS: <needs>`
+  line in the brief (`pnpm`, `linux, sccache`, `device=usb`: the words of `janus run --needs`), or a `[placement]` value
+  that names no host (`"web|frontend" = "pnpm"`), keeps the allowed hosts whose discovered profile (`janus hosts`) has it;
+  when none has, every allowed host stays a candidate and the launch says which need each one misses.
 - **cwd:** `<worktrees>/<unit>` if it exists, else `--cwd`, else the project root. It refuses a cwd another open unit uses
   (a local review or audit may share it) and a main checkout that has linked worktrees (unless `--allow-main`).
 - **Order:** the beads issue is created and marked `in_progress` first; a failed start closes it with "launch failed".
@@ -740,13 +743,26 @@ environment queues a job. Remote API agents need `claude` on the host.
 One way to run a build or test job on any machine: that machine's pueue, never an ssh connection.
 
 **Hosts are discovered, not assumed.** `janus hosts [--refresh] [--json]` shows what each host is: OS, arch, cores, memory, disk,
-tools (pueue, podman, docker, systemd, launchd, sandbox tool, agent CLIs), agent logins and devices (usb, video, gpu, kvm),
-cached in `.janus/hosts-facts.json` and refreshed by `janus check` after `[capacity] discover_h`; a host's `cores` and `ram_gb`
+tools (pueue, podman, docker, systemd, launchd, sandbox tool, agent CLIs, cargo, uv, node, npm, pnpm, sccache, ccache), its
+container runtime, the build and package caches found there (cargo home, uv cache, pnpm store, sccache, ccache: name=folder),
+agent logins and devices (usb, video, gpu, kvm), cached in `.janus/hosts-facts.json` (`janus install-host` records it too) and refreshed by `janus check` after `[capacity] discover_h`; a host's `cores` and `ram_gb`
 default to what was found. Per job class it also shows runs, expected run time, learned cores, CPU and queue wait (p50/p95).
 **`janus install-host <host> [--dry-run]`** sets up a machine named in janus.toml: folders under its `root`, pueued as a user
 service (systemd, linked from `pueue_dir` on a shared server; brew services on macOS), a copy of janus in `<root>/janus` for
 read-only commands, and the heartbeat watchdog when `[heartbeat] watchdog` names it. The coordinator may be macOS or Linux
 (launchd agent or systemd user timer; keychain, secret-tool or pass; herdr or tmux): those choices live in `janus/platform.py`.
+
+**Shared build caches (`[caches]`, off unless the block is in janus.toml).** Hosts differ, so nothing is assumed: each job
+checks, where its command runs (the host, or its container), which cache tools are there, and points each one found at one
+folder per host (`dir`, default `$HOME/.cache/janus`, expanded on that host; `[hosts.<h>] cache_dir` overrides it):
+`sccache` (RUSTC_WRAPPER, SCCACHE_DIR, CARGO_INCREMENTAL=0), `ccache` (CCACHE_DIR, the CMake compiler launchers), `cargo`
+(CARGO_HOME), `uv` (UV_CACHE_DIR), `pnpm` (npm_config_store_dir). `use = [...]` names the ones wanted (default all five);
+`[hosts.<h>] caches = [...]` sets it for one host (`[]`: none there). A tool that is absent changes nothing, a variable the
+job's environment already sets is kept, and the host's `job_setup` runs with the same settings. A `runner = "podman"` job gets
+the folder mounted at `/janus-cache`. The target directory is never shared: every worktree keeps its own `target/`. Note that
+`cargo` moves CARGO_HOME, so a `config.toml` or credentials in the home's `~/.cargo` are not read: leave it out of `use` to
+keep them. sccache keys on absolute paths: dependencies (one shared CARGO_HOME) hit across worktrees, a worktree's own crates
+hit on later jobs of the same worktree.
 
 **`janus run --needs <requirements>`** instead of `--host`: `linux,x86_64`, `os=linux`, `arch=aarch64`, `feature=podman+cargo`,
 `device=usb`, `mem=4G` (bare words are features or devices; `[hosts.X] features`/`devices` add what discovery cannot see). The
