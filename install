@@ -116,11 +116,11 @@ def rollback():
     if not DRY: swap_link(CUR, older[-1])
 
 def linux_watcher(project):
-    """Linux: a systemd user timer runs `janus watch` in each project every 5 min (the launchd agent's counterpart)."""
+    """Linux: a systemd user timer runs `janus watch` in each project every 2 min (the launchd agent's counterpart)."""
     u = HOME / ".config/systemd/user"
     svc = ("[Unit]\nDescription=janus watch\n[Service]\nType=oneshot\nExecStart=/bin/sh -c '[ -f %h/.config/janus/projects ] || exit 0; "
            "while read -r p; do [ -d \"$p\" ] && (cd \"$p\" && %h/.local/bin/janus watch); done < %h/.config/janus/projects'\n")
-    tmr = "[Unit]\nDescription=janus watch every 5 min\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n[Install]\nWantedBy=timers.target\n"
+    tmr = "[Unit]\nDescription=janus watch every 2 min\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=2min\n[Install]\nWantedBy=timers.target\n"
     say(f"write {u}/janus-watch.service and .timer; enable the timer")
     if not DRY: u.mkdir(parents=True, exist_ok=True); (u / "janus-watch.service").write_text(svc); (u / "janus-watch.timer").write_text(tmr)
     pl = HOME / ".config/janus/projects"; have = pl.read_text().split() if pl.exists() else []

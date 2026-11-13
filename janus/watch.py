@@ -1,7 +1,7 @@
 """janus watch: the watcher's one pass (launchd/systemd every few minutes): board sync and alerts, check as a writer, tend
 parked units, thrash and tidy, cancel orphans, fill, and wake or restart the orchestrator. Each step is guarded (watch_step):
 one that fails is logged and counted, the others still run, and the next pass tries it again."""
-import argparse, os, traceback
+import argparse, os, threading, traceback
 from janus.actions.backlog import cmd_fill
 from janus.actions.jobs import cancel_job, job_state, orphan_jobs, task_rc, tend_thrash, wrap_token, wrapped_jobs
 from janus.actions.launch import new_tab, wait_shell
@@ -18,11 +18,37 @@ def cmd_watch(cfg, a):
     log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
     if getattr(a, "alert", False): board_alerts(cfg, log); return   # board.sh .notify: a new question or block, at once
     if getattr(a, "reset", False): reset_now(cfg); return   # the Stop hook's safe-boundary context reset (janus/reset.py)
+    watch_step(cfg, log, "sync", board_sync, cfg)   # first, before the writer lock: the hosts' posts are merged (their questions alert at once through .notify) before the check
+    stop = sync_ticker(cfg, log)
     try:
         with cfg.writer(wait=120): return watch_pass(cfg, log)   # the whole pass is one writer (panel problem 2)
     except Err as e: log(f"pass skipped: {e}")
     except Exception as e:   # never a silent death (budget-follow item 8): the cause is in watch.log, and the next pass runs
         log(f"pass failed: {type(e).__name__}: {e} | " + " | ".join(traceback.format_exc().strip().splitlines()[-3:-1])[:400])
+    finally: stop.set()
+
+def board_sync(cfg):
+    """Merge the hosts' outboxes into the board and push its copy to them. The shipped board only, when there are other hosts
+    (or posts this machine made before it was the board). Needs no writer lock: the board script has its own locks."""
+    if cfg.paths.get("board") or cfg.run.dry: return
+    board_files(cfg)
+    if (board_dir(cfg) / ".hosts").read_text().strip() or (board_dir(cfg).parent / "board-outbox" / "outbox.log").is_file(): board(cfg, "sync", timeout=180)
+
+SYNC_EVERY = 60   # seconds between board syncs while a pass waits for the writer lock or runs
+
+def sync_ticker(cfg, log, every=SYNC_EVERY):
+    """janus owns the board sync (issue 266): a pass can wait two minutes for the writer lock and then run for minutes (a check
+    over slow hosts), and the board was merged only at its two ends, so a remote agent's question sat in its outbox that long.
+    cmd_watch syncs first; this thread syncs again every minute until the pass is over (set the returned event); the installed
+    watcher starts a pass every two minutes, so a post waits about two minutes at most. A failure is logged; the next tick
+    tries again (the pass's own sync steps are the ones counted for watcher:step:sync)."""
+    stop = threading.Event()
+    def loop():
+        while not stop.wait(every):
+            try: board_sync(cfg)
+            except Exception as e: log(f"board sync failed: {type(e).__name__}: {e}"[:300])
+    threading.Thread(target=loop, daemon=True).start()
+    return stop
 
 def watch_step(cfg, log, name, fn, *a):
     """Run one step of the pass. Any failure is logged and counted in .janus/watch_steps.json (check: watcher:step:<name> after
@@ -39,12 +65,7 @@ def watch_step(cfg, log, name, fn, *a):
     return r
 
 def watch_pass(cfg, log):
-    def sync():   # the shipped board only, when there are other hosts (or posts this machine made before it was the board)
-        if cfg.paths.get("board") or cfg.run.dry: return
-        board_files(cfg)
-        if (board_dir(cfg) / ".hosts").read_text().strip() or (board_dir(cfg).parent / "board-outbox" / "outbox.log").is_file(): board(cfg, "sync", timeout=180)
     step = lambda name, fn, *a: watch_step(cfg, log, name, fn, *a)
-    step("sync", sync)   # the shipped board: merge the hosts' outboxes (their questions alert at once through .notify) before the check
     F, live, hs, units = run_check(cfg, cycle=False, writer=True)
     F = [f for f in F if f.family != "machine"]   # machine state (no project id) never wakes or starts an orchestrator
     step("heartbeat_beat", heartbeat_beat, cfg)   # the watchdog host sees this pass (inert until heartbeat/ ships and [heartbeat] watchdog is set)
@@ -55,7 +76,7 @@ def watch_pass(cfg, log):
     step("tend_autopilot", tend_autopilot, cfg, hs, units, F, log)   # [autopilot] enabled: the ending policy's fixed-rule actions (janus/autopilot.py)
     step("tend_thrash", tend_thrash, cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job (fixes10 item 3)
     step("tend_tidy", tend_tidy, cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)
-    step("sync", sync)   # push what this pass wrote (peers.md, directions) to every host
+    step("sync", board_sync, cfg)   # push what this pass wrote (peers.md, directions) to every host
     for r, why in step("orphan_jobs", orphan_jobs, cfg, hs, units) or []:   # nothing whose owner is gone keeps running or waiting (item 3)
         try: d = "; ".join(cancel_job(cfg, r)); log(f"orphan {r} ({why}): {d}"); record(cfg, f"orphan:job:{r}", "cancel", f"{why}: {d}")
         except Err as e: log(f"orphan {r} ({why}): not cancelled: {e}")

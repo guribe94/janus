@@ -1045,6 +1045,24 @@ class ReviewFixes9(unittest.TestCase):
         janus.board(cfg, "sync", env=env); janus.board(cfg, "sync", env=env)
         self.assertEqual(len(janus.board_questions(cfg)), 1, janus.board_questions(cfg))
 
+    def test_posts_that_wait_unsynced_are_reported_not_silent(self):
+        """Issue 266: a remote agent's posts sat in its host's outbox for minutes with no sign anywhere (the board looked
+        stopped). The host's board says how long its oldest post has waited, tells the agent, and check raises board:stale-sync."""
+        r = Path(tempfile.mkdtemp(prefix="janus-rem-")); (r / "bin").mkdir()
+        d, cfg = project(f'\n[hosts.far]\nssh = "far"\nroot = "{r}"\n')
+        for n, t in janus.board_shipped(cfg): (r / "bin" / n).write_text(t)
+        b = r / "bin/board.sh"; b.chmod(0o755)
+        run = lambda *a: subprocess.run([str(b), *a], capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+        self.assertEqual(run("post", "eve", "question", "which", "branch?").stderr, "")
+        self.assertEqual(run("outbox").stdout.strip(), "0")   # a fresh post is not late
+        ob = r / "board-outbox/outbox.log"; ob.write_text(time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - 600)) + ob.read_text()[16:])
+        self.assertIn("board:stale-sync", run("read", "eve").stderr)
+        line = next(l for l in janus.probe_extra({**cfg.hosts["far"], "_rd": str(r / "runs")}).splitlines() if "outbox_min" in l)
+        out = subprocess.run(["sh", "-c", line], capture_output=True, text=True).stdout.strip()
+        self.assertRegex(out, r"^outbox_min=(9|10)$")
+        self.assertEqual([k for k, _ in janus.sync_findings(cfg, {"far": {"outbox_min": out.split("=")[1]}})], ["board:stale-sync"])
+        self.assertEqual(janus.sync_findings(cfg, {"far": {"outbox_min": "3"}, "old": {}}), [])   # within the watcher's cadence; an older shipped board says nothing
+
     def test_close_withdraws_open_questions(self):
         """#3: closing an agent's card left its open questions open: question:<id> fired forever."""
         d, cfg = project(); cfg.run.ro = False; janus.board_upkeep(cfg, []); (janus.board_dir(cfg) / ".notify").write_text("true\n")

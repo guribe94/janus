@@ -9,7 +9,7 @@ from janus.context import FIXTURE_MARK, fl, herdr, hrun, now, qp, refuse_agent, 
 from janus.gates import landed, landing_branch
 from janus.project import own_card
 from janus.transcripts import card_fields
-from janus.units import all_units, herdr_agents, ws_id
+from janus.units import all_units, herdr_agents, orphan_tabs, ws_id
 
 def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
     """[(kind, target, why)] of what janus tidy removes: worktrees under paths.worktrees that are clean (no change, no untracked
@@ -42,6 +42,7 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
         if not ws or a.get("workspace_id") != ws: continue   # only panes in this project's workspace (cross-project safety)
         if k in names or k == "orchestrator" or au.get(k, {}).get("status") != "closed": continue
         P.append(("pane", a["pane_id"], f"herdr agent {k}: its unit is closed ({a.get('agent_status')})"))
+    P += [("tab", t, f"tab {lab!r}: unit {n} is closed") for t, n, lab in orphan_tabs(cfg, names)]
     for card, r in (rows if rows is not None else board_rows(cfg)).items():
         if r.get("gone") and card not in names and own_card(cfg, card_fields(cfg, card)): P.append(("card", card, "its process is gone and it belongs to no open unit"))
     return P
@@ -194,7 +195,7 @@ def tidy_all(cfg, units, hs=None):
     return P
 
 # The kinds the watcher may remove on its own with [tidy] auto = true: a clean landed worktree and a landed branch. Every other
-# kind (a remote copy, a container, a cache entry, a board card, a pane) still needs the orchestrator's `janus tidy`.
+# kind (a remote copy, a container, a cache entry, a board card, a pane, a tab) still needs the orchestrator's `janus tidy`.
 TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch")
 
 def tend_tidy(cfg, hs, units, log):
@@ -214,7 +215,7 @@ def tidy_do(cfg, kind, t):
     if kind == "worktree":
         top = sh(["git", "-C", t, "rev-parse", "--path-format=absolute", "--git-common-dir"])[1].strip()
         rc, o, e = sh(["git", "-C", str(Path(top).parent) if top else t, "worktree", "remove", t]); return rc, e   # never --force: clean only
-    if kind == "pane": return (0, "") if herdr("pane", "close", t) is not None else (1, "herdr pane close failed")
+    if kind in ("pane", "tab"): return (0, "") if herdr(kind, "close", t) is not None else (1, f"herdr {kind} close failed")
     if kind == "card": rc, o, e = board(cfg, "close", t); return rc, e
     if kind in ("branch", "remote-branch"):
         r, _, b = t.rpartition(":")

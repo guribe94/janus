@@ -12,7 +12,7 @@ from janus.board import board, board_dir, board_files, board_findings
 from janus.context import DECISION_ACKS, Err, LB, note_event, LE, NOTES0, atomic_write, handoff_path, hrun, is_orchestrator, now, say, ts
 from janus.decisions import decision_findings
 from janus.findings import ackable, ack_ttl, finding, live_acks
-from janus.findings.hosts import (enforce, host_findings, lane_findings, orphan_job_findings, pane_findings, proc_findings,
+from janus.findings.hosts import (enforce, host_findings, lane_findings, orphan_job_findings, pane_findings, sync_findings, tab_findings, proc_findings,
     script_findings, thrash_findings, tidy_findings)
 from janus.findings.awareness import note_findings, related_findings   # imp-awareness: related:<a>:<b>, note:<agent>:<n>
 from janus.findings.memory import memory_findings, rule_findings
@@ -47,7 +47,7 @@ def collect_findings(cfg, hs, units, ag, bd_err, bd=None):
     names = {u["name"] for u in units}
     for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no build position (host_cap)
     if bd is not None: sync_remote_outputs(cfg, units, bd)   # item 11 addendum: judge a remote unit on its synced report
-    F += host_findings(cfg, hs, units, viol) + pane_findings(cfg, units, ag)
+    F += host_findings(cfg, hs, units, viol) + pane_findings(cfg, units, ag) + tab_findings(cfg, units) + sync_findings(cfg, hs)
     F += board_findings(cfg, names) + card_findings(cfg, names) + note_findings(cfg)
     UF, running = unit_findings(cfg, hs, units, ag); F += UF
     F += autopilot_findings(cfg, units)   # unit:<n>:relaunch: a remote unit the autopilot leaves to the orchestrator (fix-core F4)

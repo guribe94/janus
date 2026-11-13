@@ -13,7 +13,7 @@ landing and troubleshooting. The design is in [DESIGN.md](DESIGN.md); the issue 
 Options: `--dry-run`, `--project DIR`, `--no-hosts` (skip the remote machines), `--hosts-only` (only run `janus install-host`
 for each remote host in janus.toml), `--release-only` (only build, test and switch to a new release: the way to make an edit live),
 `--rollback` (switch back to the previous release), `--skip-tests`. On Linux, install writes a systemd user timer
-`janus-watch.timer` (every 5 min) instead of the launchd agent.
+`janus-watch.timer` (every 2 min) instead of the launchd agent.
 
 **Releases: nothing live ever points at the working tree.** `install` copies `janus.py`, `skill/`, `example.janus.toml` and
 `tests/` into `~/.local/share/janus/releases/<date>-<content hash>/` (files made read-only), runs the checks on that copy
@@ -33,7 +33,7 @@ What `install` changes:
 | `~/.claude/skills/janus`, `~/.codex/skills/janus` | symlinks to `~/.local/share/janus/current/skill` (older links into a janus working tree are replaced) |
 | `~/.local/bin/janus` | symlink to `~/.local/share/janus/current/janus.py` (make sure `~/.local/bin` is on PATH). Project shims call `~/.local/bin/janus` |
 | `~/.claude/settings.json`, `~/.codex/hooks.json` | adds `~/.local/bin/janus hook <event>` for SessionStart, UserPromptSubmit, PreToolUse (matcher `Bash\|Edit\|Write\|MultiEdit\|NotebookEdit\|apply_patch`) and Stop. Existing keys and hooks are kept; a backup `*.bak-janus-<time>` is written first |
-| `~/Library/LaunchAgents/com.janus.watch.plist` | copied (not linked) and loaded with `launchctl`; runs every 300 s |
+| `~/Library/LaunchAgents/com.janus.watch.plist` | copied (not linked) and loaded with `launchctl`; runs every 120 s (the board is synced every minute of a pass) |
 | `~/.config/janus/projects` | the project directory is added; the watcher runs `janus watch` in each listed project |
 | Homebrew | `brew install beads pueue`, `brew services start pueue` |
 | each ssh host in janus.toml | downloads pueue's static binaries into the host's `bin`, writes and enables a user systemd service `pueued`; no sudo |
@@ -403,7 +403,7 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
 - **Land green units;** `janus close <unit>` once committed and pushed (`--force` only on the unit's own worktree).
   `janus tidy --dry-run`, then `janus tidy`: removes clean landed worktrees of no open unit, landed branches (local and remote,
   `[tidy] branches`), old run files, our stopped containers, remote copies of closed units with nothing uncollected, old test
-  roots, cache entries over a host's disk budget, panes of closed units and gone cards; never by hand. On `tidy:<n>` or
+  roots, cache entries over a host's disk budget, panes and tabs of closed units and gone cards; never by hand. On `tidy:<n>` or
   `disk:<host>`, run it.
 - **Launch within safe capacity and any owner caps:** `janus launch <unit> --kind implement|review|audit|cleanup --tier
   critical|normal [--host h] [--test-host h]`. `janus capacity` shows room; a full host refuses (a `cleanup` unit is exempt
@@ -485,7 +485,7 @@ reference must name; the recipes are in section 4a.
 | `backlog` | the checklist is not imported, or changed since the last import; `backlog:held`: briefed units fill cannot place now (with fill's reasons); `backlog:unbriefed`: ready items without briefs while no host has room |
 | `beads` | `bd` is unavailable: units cannot be read |
 | `blocked` | a host's jobs wait in an admission that says no or is paused; the line names the cause (disk, memory, PSI) |
-| `board` | a board card is blocked, has a question, is gone or is silent |
+| `board` | a board card is blocked, has a question, is gone or is silent; `board:stale-sync`: posts have waited over 3 min in a host's outbox (the watcher's board sync is not running: run `board.sh sync`, then read `watch.log`) |
 | `budget80` | a unit spent over `[budget] warn_pct` of its budget and its report is stale |
 | `burner` | a CPU burner an agent started (or orphaned) outside the lanes on this machine |
 | `cap` | more agents than the owner's total or per-host cap |
@@ -536,6 +536,7 @@ reference must name; the recipes are in section 4a.
 | `script` | a running script's file was changed after it started |
 | `spend` | a provider's committed spend is at its cap or over 80/90 % of it, or an API process janus did not start |
 | `stalled` | queued work with free slots, or an old queue that does not drain |
+| `tab` | `tab:<unit>:orphan`: a tab janus opened for a unit (label `<unit> · <model> · <host>`) is still open after the unit closed: `janus tidy` closes it |
 | `test-signal` | a long gate/test step that has not failed in N runs: scope or trim it |
 | `thrash` | the watcher stopped and re-queued a job on a thrashing shared host |
 | `tidy` | what `janus tidy` can reclaim |
@@ -623,7 +624,10 @@ folder, the board's sync carries them to every host: the same files serve one ma
 - `board.sh summary` groups cards: needs answer, question, blocked, working, waiting, done. `board.sh digest [--since 1h]`
   tells a human what landed, started, finished, was asked, answered, failed or learned.
 - Cards of closed units are archived by check. Other hosts post to an outbox under their root; `board.sh sync` (the watcher
-  runs it each pass) merges the outboxes and pushes the board, and the script itself, to `<root>/board/` and `<root>/bin/`.
+  runs it at the start of each pass, every minute while the pass waits or runs, and at its end; a pass starts every 2 min)
+  merges the outboxes and pushes the board, and the script itself, to `<root>/board/` and `<root>/bin/`. `board.sh outbox`
+  prints the minutes a host's oldest post has waited; over 3 min the agent is told on its next post or read, and check
+  raises `board:stale-sync`.
 
 ### The owner takes over, and hands back
 
@@ -835,7 +839,7 @@ idempotent. `janus backlog list` shows what it reads. `janus check` then reports
 **`janus tidy [--dry-run]`** does the bookkeeping that used to need hand operations: it removes worktrees under
 `paths.worktrees` that are clean (no change, no untracked file, no stash of their branch), contained in the landing branch
 and used by no open unit (`git worktree remove`, never `--force`; the branch is kept), closes the herdr panes of closed
-units, and archives board cards whose process is gone and that belong to no open unit. Each worktree it keeps is listed with
+units and the tabs janus opened for them (known by their label `<unit> · <model> · <host>`; never another tab), and archives board cards whose process is gone and that belong to no open unit. Each worktree it keeps is listed with
 the reason (uncommitted changes, stash, changed files not on the landing branch). `--dry-run` only reads (an agent may run it).
 It also covers the rest of the mess orchestration makes, each by a safe rule:
 - branches matching `[tidy] branches` (e.g. `["wk/*"]`; none by default) that no worktree has checked out and that are merged

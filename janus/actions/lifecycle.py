@@ -3,7 +3,7 @@ transcript; the watcher's tend_parked (resume a parked unit when its jobs finish
 import os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import collect_job, job_of, job_state, recorded_jid, runs_dir, save_task_log, task_rc, task_status, unit_jobs
-from janus.actions.launch import api_remote, confirm_started, cwd_taken
+from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken
 from janus.autopilot import apc, ending, forget, held, record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
@@ -90,7 +90,7 @@ def cmd_stop(cfg, a):
         if ps["ok"] and unit_state(u, {u["host"]: ps}, herdr_agents(cfg)) in ("gone", "done", "failed", "idle", "unknown"): break
         time.sleep(1)
     else: raise Err(f"{u['name']} is still alive after stop")
-    if u.get("pane") and via != "herdr": herdr("pane", "close", u["pane"])
+    if close_tab(cfg, u): bd.save(u)   # every kind: a stopped herdr agent leaves only an empty shell in its tab (issue 267)
     if h.get("local"): settle_run(cfg, u, "stopped")   # remote: collect brings back the cost first, close settles the rest
     bd.comment(u["id"], f"{ts()} stopped (every process group of the unit ended)"); say("stopped: no process of the unit is left")
 
@@ -294,10 +294,7 @@ def cmd_close(cfg, a):
             what = f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)"
             raise Err(f"{u['name']}: cannot hand over its tree: its agent is {what}; stop it first (janus stop {u['name']}), then hand its tree over")
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
-    if u.get("tab") or u.get("pane"):
-        if cfg.run.dry: say(f"+ herdr tab close {u.get('tab') or u.get('pane')}")
-        elif u.get("tab"): herdr("tab", "close", u["tab"])
-        else: herdr("pane", "close", u["pane"])
+    close_tab(cfg, u)
     if not h.get("local"):
         root = h["root"]; n = u["name"]
         others = [x["name"] for x in units if x["id"] != u["id"] and x.get("host") == u["host"] and x.get("rcwd") == u.get("rcwd")]
@@ -441,6 +438,11 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
     board(cfg, "post", name, "waiting", f"resumed as task {u['task']}", env={"BOARD_CHECK": chk})   # item 9: a queued run is not GONE
     return f"{name}: resumed session {sid[:8]} as run {run} (${budget:g}{', wrap-up' if wrapup else ''}), task {u['task']}"
 
+def park_tab(cfg, u):
+    """A parked unit's tab only shows a run that ended (pueue follow) or mirrors a session that waits (tmux attach): closed, so
+    tabs do not pile up (issue 267). A herdr agent lives in its tab and is resumed there: that one stays."""
+    return u.get("via") != "herdr" and close_tab(cfg, u)
+
 def cmd_park(cfg, a):
     """Stop a live agent's turn while its jobs wait or run (the remedy for waiting:<unit>); the watcher resumes it, same session,
     when they finish. API units: the run is ended (SIGTERM: its cost is still recorded); herdr and tmux agents: Escape."""
@@ -459,7 +461,7 @@ def cmd_park(cfg, a):
         if h.get("local"): settle_run(cfg, u, "parked")
     elif via == "herdr": herdr("pane", "send-keys", u["pane"], "Escape")
     elif via == "tmux": X(cfg, h, f"tmux send-keys -t {shlex.quote(unit_tmux(u))} Escape")
-    u["parked"] = {"jobs": jobs, "since": int(now()), "by": "janus park"}; bd.save(u)
+    park_tab(cfg, u); u["parked"] = {"jobs": jobs, "since": int(now()), "by": "janus park"}; bd.save(u)
     bd.comment(u["id"], f"{ts()} parked on {', '.join(jobs)}"); say(f"parked {n}")
 
 def cmd_resume(cfg, a):
@@ -579,7 +581,7 @@ def tend_parked(cfg, hs, units, log):
             jobs = u.get("_park")
             if jobs:
                 if (u.get("parked") or {}).get("jobs") != jobs:
-                    u["parked"] = {"jobs": jobs, "since": int(now()), "by": "report"}; bd.save(u); log(f"park {u['name']} on {', '.join(jobs)}")
+                    park_tab(cfg, u); u["parked"] = {"jobs": jobs, "since": int(now()), "by": "report"}; bd.save(u); log(f"park {u['name']} on {', '.join(jobs)}")
                     if card_fields(cfg, u["name"]).get("state") != "waiting": board(cfg, "post", u["name"], "waiting", " ".join(jobs))   # never SILENT/GONE
                 st = [job_state(hs, j)[0] for j in jobs]
                 if all(x in ("done", "gone") for x in st):

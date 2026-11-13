@@ -35,6 +35,7 @@ Usage:
   board.sh close <agent>                archive a card and its directions; its open questions are withdrawn
   board.sh rule <agent> [host]          the board rule a launcher adds to an agent's prompt (one place)
   board.sh sync                         pull every host's outbox, then push the board copy to every host
+  board.sh outbox                       minutes the oldest post here has waited for that sync (0: none waits)
 Every write on the coordinating machine takes one flock (.lock)."""
 
 KINDS = ("status", "step", "blocked", "question", "waiting", "learned", "done", "note")
@@ -55,6 +56,8 @@ def epoch_of(t):
     try: return int(time.mktime(time.strptime(t, "%Y-%m-%d %H:%M")))
     except (ValueError, OverflowError): return 0
 
+
+STALE_MIN = 3   # a post that waits longer in a host's outbox was not synced: said to the agent, and check's board:stale-sync
 
 NAME_RX = re.compile(r"[A-Za-z0-9._-]+")
 
@@ -259,7 +262,23 @@ class Board:
                 self.apply(now(), a, k, x, e("BOARD_BRIEF", ""), e("BOARD_REPORT", ""), e("BOARD_MACHINE", ""), e("BOARD_CHECK", ""), self.localname())
         else:
             os.makedirs(self.out, exist_ok=True)
+            self.warn_stale()
             with Locked(os.path.join(self.out, ".lock")), open(os.path.join(self.out, "outbox.log"), "a") as f: f.write(f"{now()} {a} {k}: {x}\n")
+
+    def waited(self):
+        """Minutes the oldest post in this host's outbox (outbox.log, and the sending files a sync did not finish) has waited
+        for the coordinating machine's sync; 0 when none waits. Stamps are whole minutes: over n means really over n."""
+        try: fs = [f for f in os.listdir(self.out) if f == "outbox.log" or f.startswith("sending.")]
+        except OSError: return 0
+        return max([int((time.time() - t) // 60) for t in (epoch_of(read(os.path.join(self.out, f))[:16]) for f in fs) if t] or [0])
+
+    def cmd_outbox(self, *_): sys.stdout.write(f"{self.waited()}\n")
+
+    def warn_stale(self):
+        """Never silent (board:stale-sync): an agent whose posts are not being merged is told so on its next post or read."""
+        m = 0 if self.master else self.waited()
+        if m > STALE_MIN: sys.stderr.write(f"board.sh: board:stale-sync: posts from this host have waited {m} min for the coordinating machine's sync "
+                                           f"(they are kept in {self.out} and merged when it runs again; directions read here may be as old)\n")
 
     def need_master(self, what):
         if not self.master: raise Die(f"{what} runs on the coordinating machine only")
@@ -303,7 +322,7 @@ class Board:
         with Locked(self.p(".lock")): self.direct1(field(self.p("questions", f"{q}.md"), "agent"), x, now(), only_q=q)
 
     def cmd_read(self, a="", *_):
-        okname(a); lines = [l for l in read(self.p("to", f"{a}.md")).splitlines() if l.strip()]
+        okname(a); self.warn_stale(); lines = [l for l in read(self.p("to", f"{a}.md")).splitlines() if l.strip()]
         seen = self.p("to", f".seen-{a}"); last = read(seen).strip()
         new = lines[:lines.index(last)] if last in lines else lines   # newest first: everything newer than the last line it saw
         if not new: sys.stdout.write(f"(no new directions for {a})\n"); return

@@ -65,6 +65,30 @@ class Auto(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class Tabs(unittest.TestCase):
+    def test_a_units_tab_closes_with_it_and_only_januss_own_tabs_are_flagged(self):
+        """Issue 267: a unit's tab stayed open after the unit parked or closed (27 tabs piled up). Park closes the tab that only
+        shows an ended run, never a herdr agent's own tab; a closed unit's leftover tab is flagged and tidied by its label,
+        and no other tab is ever touched (another label, an open unit, a host that is not this project's)."""
+        d, cfg = project(); calls = []
+        tabs = [{"tab_id": "T1", "label": "old \u00b7 m \u00b7 here"}, {"tab_id": "T2", "label": "notes"}, {"tab_id": "T3", "label": "live \u00b7 m \u00b7 here"},
+                {"tab_id": "T4", "label": "old \u00b7 m \u00b7 elsewhere"}, {"tab_id": "T5", "label": "never \u00b7 m \u00b7 here"}]
+        def herdr(*a, **k):
+            calls.append(a)
+            return {"workspaces": [{"label": "t", "workspace_id": "W"}]} if a[:2] == ("workspace", "list") else {"tabs": tabs} if a[:2] == ("tab", "list") else {}
+        old = {k: getattr(janus, k) for k in ("herdr", "all_units")}
+        janus.herdr = herdr; janus.all_units = lambda cfg: {"old": {"status": "closed"}, "live": {"status": "open"}}
+        try:
+            self.assertEqual([k for k, _ in janus.tab_findings(cfg, [{"name": "live"}])], ["tab:old:orphan"])
+            self.assertEqual([(k, t) for k, t, _ in janus.tidy_plan(cfg, [{"name": "live"}], ag={}, rows={}) if k == "tab"], [("tab", "T1")])
+            self.assertEqual(janus.tidy_do(cfg, "tab", "T1"), (0, "")); self.assertEqual(calls[-1], ("tab", "close", "T1"))
+            api = {"name": "live", "via": "pueue", "tab": "T3", "pane": "P3"}; own = {"name": "h", "via": "herdr", "tab": "T9", "pane": "P9"}
+            del calls[:]; janus.park_tab(cfg, api); janus.park_tab(cfg, own)
+            self.assertEqual(calls, [("tab", "close", "T3")]); self.assertNotIn("tab", api); self.assertEqual(own["tab"], "T9")
+        finally:
+            for k, v in old.items(): setattr(janus, k, v)
+
+
 class Artifacts(unittest.TestCase):
     def setUp(self):
         self.real = janus.all_units
