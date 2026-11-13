@@ -210,5 +210,41 @@ class Bug12AutopilotOffUnlessSet(unittest.TestCase):
         cfg.c["fill"] = {"watcher": False}; self.assertFalse(janus.fill_watcher(cfg))
 
 
+class Bug9ReconciledRunsPayTheirRealCost(unittest.TestCase):
+    def test_recost_reads_what_an_agent_gone_run_left_and_keeps_the_bound_only_when_nothing_exists(self):
+        """Catches (row 222): a run whose agent was gone stayed booked at its whole budget (`done unknown`) although its json
+        output reported what it cost: $3.44 held for a run that cost $0.04, under a cap that then refused work."""
+        import contextlib, io
+        d, cfg = project(); pv = cfg.prov["api"]; led = d / pv["ledger"]
+        at = lambda ago: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - ago))
+        rows = []
+        def run(unit, rid, budget, cost, how): rows.extend([(at(3600), unit, "running", budget, rid), (at(60), unit, cost, how, rid)])
+        def left(unit, name, text, age=0):
+            f = d / "out" / unit / name; f.parent.mkdir(exist_ok=True); f.write_text(text); os.utime(f, (time.time() - age,) * 2)
+        run("a", "a.7", 5.0, 5.0, "done unknown"); left("a", "api.json", json.dumps({"total_cost_usd": 4.2, "session_id": "A"}))   # a closed unit's only run
+        run("b", "b.1.100", 2.0, 0.13, "done rc=resumed"); left("b", "api-b.1.100.json", json.dumps({"total_cost_usd": 0.13, "session_id": "S"}))
+        run("b", "b.r2.200", 3.44, 3.44, "done unknown"); left("b", "api-b.r2.200.json", json.dumps({"total_cost_usd": 0.1743, "session_id": "S"}))   # a resumed run: its own part
+        run("c", "c.9", 5.0, 5.0, "done unknown"); left("c", "api.json", "")                                           # it left nothing: the bound stays
+        run("o", "o.3", 2.0, 2.0, "done unknown"); left("o", "api.json", json.dumps({"total_cost_usd": 0.5}), age=7200)   # a json older than the run: not its own
+        run("e", "e.1.100", 1.0, 1.0, "done unknown"); run("e", "e.r2.200", 1.0, 0.2, "done rc=0"); left("e", "api.json", json.dumps({"total_cost_usd": 0.5}))   # the later run's json
+        led.write_text("".join("\t".join(map(str, r)) + "\n" for r in rows)); before = led.read_text()
+        def recost(dry):
+            out = io.StringIO(); cfg.run.dry = dry
+            try:
+                with contextlib.redirect_stdout(out), mock.patch.object(janus, "refuse_agent", lambda *a, **k: None):
+                    janus.cmd_ledger(cfg, argparse.Namespace(action="recost", provider=None))
+            finally: cfg.run.dry = False
+            return out.getvalue()
+        out = recost(dry=True)
+        for want in ("a.7", "$5.00", "$4.20", "b.r2.200", "$3.44", "$0.04"): self.assertIn(want, out, "the dry run does not show the change")
+        for keep in ("c.9", "o.3", "e.1.100"): self.assertNotIn(keep, out, "a run that left no cost of its own was changed")
+        self.assertEqual(led.read_text(), before, "the dry run changed the ledger")
+        recost(dry=False)
+        runs = janus.ledger_read(cfg, pv)[0]
+        self.assertEqual([round(runs[k]["cost"], 4) for k in ("a.7", "b.r2.200", "c.9", "o.3", "e.1.100")], [4.2, 0.0443, 5.0, 2.0, 1.0])
+        self.assertEqual([runs[k]["how"] for k in ("a.7", "c.9")], ["done rc=reconciled", "done unknown"], "a recovered run is still shown as counted at its budget")
+        self.assertIn("nothing to correct", recost(dry=False))
+
+
 if __name__ == "__main__":
     unittest.main()

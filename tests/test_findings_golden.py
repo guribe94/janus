@@ -16,7 +16,7 @@ GOLDEN = [
     "disk:far", "gate-common:EXIT_tests", "gate:g1@{t}", "gate:g2@{t}", "handoff:missing", "host:dead", "instructions",
     "learned:u1:1", "ledger:api", "ledger:api:implausible", "ledger:api:unreconciled", "localtest:502", "margin:far:disk", "memory-review:1", "memory-source:1",
     "orphan:job:here:7", "orphan:tmux:far:janus-zzz@g", "machine:job:here:8", "machine:tmux:far:janus-old", "pressure:far", "provider:u3", "question:3", "report-due", "scheduler:far",
-    "spend:api", "tidy:1", "unit:u2:finished", "unit:u2:limit",
+    "spend:api", "tidy:1", "unattended:off", "unit:u2:finished", "unit:u2:limit",   # unattended:off: no [autopilot] section is off (ISSUES row 225)
 ]
 
 # the watcher's urgent prefixes before the registry (janus.py URGENT): the registry must keep the same findings urgent

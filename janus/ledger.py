@@ -173,15 +173,48 @@ def recost_plan(cfg, pv):
             prev, psid = float(c), sid
     return out
 
-def recost(cfg, pv, plan):
+def row_time(s):
+    """A ledger row's time stamp as epoch seconds (0 when it cannot be read)."""
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try: return time.mktime(time.strptime(str(s).strip(), f))
+        except ValueError: pass
+    return 0
+
+def left_cost(cfg, runs, k):
+    """(cost, file name) of what run `k` itself reported in the json it left, else (None, None): its kept json
+    (out/<unit>/api-<run>.json), else the unit's api.json when that is this run's (the run is the unit's latest in the ledger and
+    the file was written after the run started). Row 222: a run whose agent was gone was booked at its whole budget while its
+    api.json, read only for a unit still open, held the cost."""
+    r = runs[k]; od = cfg.p("out", "out") / r["unit"]
+    cost, rep = run_cost(od / f"api-{k}.json", r["budget"], k)
+    if rep: return cost, f"api-{k}.json"
+    p = od / "api.json"
+    try: mine = [x for x in runs if runs[x]["unit"] == r["unit"]][-1] == k and p.stat().st_mtime >= row_time(r["ts"])
+    except OSError: mine = False
+    cost, rep = run_cost(p, r["budget"], k) if mine else (None, False)
+    return (cost, "api.json") if rep else (None, None)
+
+def reconciled_plan(cfg, pv):
+    """[(run id, unit, charged, reported cost, file)]: runs closed `done unknown` at their budget (the upper bound) whose own json
+    reports what they cost. A run that left nothing keeps the bound."""
+    runs = ledger_read(cfg, pv)[0]; out = []
+    for k, r in runs.items():
+        if not r["done"] or r.get("how") != RECONCILED: continue
+        cost, src = left_cost(cfg, runs, k)
+        if src and abs(cost - r["cost"]) >= 5e-7: out.append((k, r["unit"], r["cost"], cost, src))
+    return out
+
+def recost(cfg, pv, plan, found=()):
     """Rewrite the cost of the done rows in plan (recost_plan) under the ledger's lock, after a backup <ledger>.bak-<time>; the
-    file is replaced by write-then-rename. Returns the backup path."""
-    p = ledger_path(cfg, pv); new = {k: own for k, _, _, own in plan}
+    file is replaced by write-then-rename. `found` (reconciled_plan) rows get their reported cost and are marked
+    `done rc=reconciled`: no longer counted at the bound. Returns the backup path."""
+    p = ledger_path(cfg, pv); new = {k: own for k, _, _, own in plan}; mark = {k: c for k, _, _, c, _ in found}
     with Locked(p):
         raw = p.read_text(); keep = []
         for l in raw.splitlines():
             f = l.split("\t")
             if len(f) == 5 and f[4] in new and f[2] != "running" and f[3].startswith("done"): f[2] = str(new.pop(f[4])); l = "\t".join(f)
+            elif len(f) == 5 and f[4] in mark and f[3] == RECONCILED: f[2], f[3] = str(mark.pop(f[4])), "done rc=reconciled"; l = "\t".join(f)
             keep.append(l)
         bak = p.with_name(p.name + time.strftime(".bak-%Y%m%d-%H%M%S")); bak.write_text(raw)
         atomic_write(p, "".join(x + "\n" for x in keep))
@@ -224,4 +257,4 @@ def model_ok(cfg, m):
 
 RECONCILED = "done unknown"   # a reconciled run: its agent is gone with no done row; its budget is counted as the upper bound
 
-__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_json", "run_time", "session_before", "run_cost", "keep_run_json", "settle_run", "recost_plan", "recost", "read_secret", "model_ok", "RECONCILED"]
+__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_json", "run_time", "session_before", "run_cost", "keep_run_json", "settle_run", "recost_plan", "reconciled_plan", "left_cost", "row_time", "recost", "read_secret", "model_ok", "RECONCILED"]
