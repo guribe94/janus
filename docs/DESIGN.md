@@ -62,7 +62,7 @@ calling `say()` across a layer.
 
 ### Seams (each removed a bug class)
 
-- **`Finding` registry** (`findings/__init__.py`): families are the spec; an unregistered key raises; the old URGENT /
+- **`Finding` registry** (`findings/__init__.py`): families are the spec; an unregistered key is reported as an urgent `unregistered:` finding; the old URGENT /
   NO_ACK / ACK_TTL prefix lists and `cfg._viol` are gone; `janus check --json` serialises the set.
 - **`Run` object** (`context.py`): one invocation (dry, read-only, units and rates read once) carried as `cfg.run`; the `DRY`
   global and `cfg.ro`/`cfg._hs`/`cfg._rates`/`cfg._all_units`/`cfg._park` side-state are gone.
