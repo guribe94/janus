@@ -88,6 +88,12 @@ MAXRSS_PY = ("import resource, subprocess, sys\n"
              "sys.exit(rc if rc >= 0 else 128 - rc)\n")
 
 
+def tree_groups_sh(root):
+    """Shell that prints the process groups of process `root` (a pid, or a shell expression of one) and of all its descendants:
+    a child may have left its parent's group (setsid, a job-control shell, a runner that starts its own session)."""
+    return ("ps -A -o pid=,ppid=,pgid= | awk -v r=" + str(root) + " '{pp[$1] = $2; pg[$1] = $3} END {for (p in pp) {q = p; n = 0; "
+            "while (q != r && (q in pp) && n++ < 99) q = pp[q]; if (q == r && pg[p] > 1) G[pg[p]] = 1}; for (g in G) printf \"%s \", g}'")
+
 def group_cpu_s(pgid):
     """CPU seconds the living processes of process group pgid have used so far (ps time: [d-]h:m:s or m:s.cc), None when ps fails."""
     try: o = subprocess.run(["ps", "-A", "-o", "pgid=,time="], capture_output=True, text=True, timeout=20).stdout
@@ -157,4 +163,4 @@ def parse_facts(text):
     return f
 
 
-__all__ = ["group_cpu_s", "run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts"]
+__all__ = ["group_cpu_s", "tree_groups_sh", "run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts"]

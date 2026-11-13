@@ -716,6 +716,7 @@ class Land(unittest.TestCase):
         self.d, self.cfg = project('\n[landing]\nbranch = "main"\n')
         self.r = self.d / "repo"; self.r.mkdir(); self.wt = self.d / "wt"
         self.g("init", "-q", "-b", "main"); (self.r / "a").write_text("1\n2\n3\n"); self.g("add", "a"); self.g("commit", "-qm", "base")
+        self.g("config", "user.name", "t"); self.g("config", "user.email", "t@t")   # land's own commits: a machine without a git identity failed these tests
         self.g("worktree", "add", "-q", "-b", "wk/u", str(self.wt))
         self.u = {"id": "x-1", "name": "u", "cwd": str(self.wt), "tier": "normal"}
         janus.Beads.units = lambda s: [self.u]; janus.Beads.comment = lambda s, *a: None

@@ -9,7 +9,7 @@ from janus.board import board
 from janus.cache import cache_key, input_hashes, lookup as cache_lookup, record as cache_record, settle as cache_settle
 from janus.cap import cap_lib, cap_nums, capv, class_mb, class_secs, class_usage, host_cap
 from janus.context import Err, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
-from janus.platform import ARCH, MAXRSS_PY
+from janus.platform import ARCH, MAXRSS_PY, tree_groups_sh
 from janus.project import own_label, tag, untagged
 from janus.probe import host_facts, probe, probe_all, pueue
 from janus.templates import ADMIT
@@ -165,7 +165,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
             hw = " ".join(map(q, map(sub_, c.get("usb_args", [])))) + " " if a.usb else ""
             hw_ = wd or remote_wt(h, name); cw = in_container(h, hw_)
             args = " ".join(q(sub_(x)) for x in c.get("args", []))
-            body = (f"[ -d {qp(hw_)} ] || {{ echo {q(f'janus: no worktree {hw_} on {hn}')}; exit 2; }}\n"
+            body = (ACCOUNT_HOME + f"[ -d {qp(hw_)} ] || {{ echo {q(f'janus: no worktree {hw_} on {hn}')}; exit 2; }}\n"
                     + "".join(f"mkdir -p {q(sub_(d))}\n" for d in c.get("host_dirs", []))
                     + (f"exec 8>{qp(c['usb_lock'])}; flock 8\n" if a.usb and c.get("usb_lock") else "") + adm +
                     f"printf '%s janus-run start [%s] %s %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} {q(cmd)} >> {qp(log)}\n"
@@ -180,6 +180,10 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
                     f"run_sampled {scope} nice -n {nice} bash -c {q(cmd)}\n")
     return head + "main() {\n" + body + "}\nmain 2>&1 | tee -a \"$R.log\"\nrc=${PIPESTATUS[0]}; echo $rc > \"$R.rc\"; exit $rc\n"
 
+# Row 232: pueue hands a task its caller's environment, and rootless podman keeps its images and containers under $HOME: a job
+# queued by an agent whose HOME is not the account's found no image (exit 125). A podman job uses the account's own home.
+ACCOUNT_HOME = 'H=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); [ -n "$H" ] && export HOME="$H"\n'
+
 def sync_wt(cfg, hn, h, src, name):
     """Sync a worktree to the host: --checksum and no -t (a changed file gets the transfer time as its mtime, so cargo never
     reuses an artifact built from older content), without the host's sync_exclude list (default .git, target, .venv,
@@ -193,7 +197,12 @@ def sync_wt(cfg, hn, h, src, name):
         if rc: raise Err(f"reflink clone on {hn} failed: {(e or o).strip()[-120:]}")
     rdst = dst.replace("$HOME/", "")   # rsync resolves a relative path under the remote home
     cmd = ["rsync", "-rlpgoD", "--checksum", "--delete", "-e", " ".join(SSH), *ex, f"{src}/", f"{h['ssh']}:{rdst}/"]
-    r = subprocess.run(cmd)
+    # Row 233: one sync of a worktree to a host at a time (a gate's steps placed on one host each sync the same tree; parallel
+    # rsync --delete runs removed each other's temp files, exit 23). A later one waits, then finds the tree there and sends little.
+    import fcntl
+    lk = cfg.state / "runs" / f"sync-{hn}-{re.sub(r'[^A-Za-z0-9._-]', '_', name)}.lock"; lk.parent.mkdir(parents=True, exist_ok=True)
+    with open(lk, "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX); r = subprocess.run(cmd)
     if r.returncode: raise Err(f"rsync to {hn} failed (exit {r.returncode})")
     for x in cfg.paths.get("sync_require", []):
         if (Path(src) / x).exists() and hrun(h, f"test -e {qp(dst + '/' + x)}")[0]: raise Err(f"{x} did not arrive on {hn}")
@@ -597,9 +606,12 @@ def cancel_job(cfg, ref, force=False, depth=0):
             if r[0] and not force: raise Err(f"refused: {hn}:{tid}'s files could not be saved here ({r[2].strip()[-80:]}); --force cancels anyway")
         elif not jid: save_task_log(cfg, h, {"name": f"_cancelled/{hn}-{tid}"}, tid)
         gf = qp(f"{runs_dir(cfg, h)}/{tok}.pgid") if tok and not jid else ""   # a gate's command runs in a process group of its own
-        grp = (f"g=$(cat {gf} 2>/dev/null); case $g in ''|*[!0-9]*) ;; *) kill -TERM -- -$g 2>/dev/null; sleep 3; kill -KILL -- -$g 2>/dev/null;; esac; "
+        # Row 237: the groups of the command's whole process tree, read BEFORE the kill (a runner that started its own process group
+        # outlived the cancel, kept the gate's lock and queued more steps; once its parent is dead the tree cannot be walked).
+        pre = f"g=$(cat {gf} 2>/dev/null); case $g in ''|*[!0-9]*) gs=;; *) gs=\"$g $({tree_groups_sh('$g')})\";; esac; " if gf else ""
+        grp = (f"[ -n \"$gs\" ] && {{ for x in $gs; do kill -TERM -- -$x 2>/dev/null; done; sleep 3; for x in $gs; do kill -KILL -- -$x 2>/dev/null; done; }}; "
                f"rm -f {gf} {qp(f'{runs_dir(cfg, h)}/{tok}.live')}; ") if gf else ""
-        hrun(h, f"{pueue(h)} kill {tid} 2>/dev/null; {stop_job_cmd(h, jid)}{grp}sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true", timeout=60)
+        hrun(h, f"{pre}{pueue(h)} kill {tid} 2>/dev/null; {stop_job_cmd(h, jid)}{grp}sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true", timeout=60)
         out.append(f"cancelled {hn}:{tid} ({t.get('label')}); its files are in {cfg.f('runs') if jid and not h.get('local') else runs_dir(cfg, h) if jid else cfg.p('out', 'out') / '_cancelled'}")
     for r, rj in recs:
         if depth > 3: break
@@ -716,6 +728,11 @@ def cmd_thrash(cfg, a):
     if not any(h.get("shared") for h in cfg.hosts.values()): say("no host has shared = true"); return
     for l in tend_thrash(cfg, hs, units, lambda m: None, dry=cfg.run.dry or cfg.run.ro) or ["nothing to do"]: say(l)
 
+def landing_now(cfg, unit):
+    """True while janus land <unit> runs on this machine: it wrote runs/land-<unit>.pid before its gate and its process lives."""
+    try: os.kill(int((cfg.f("runs") / f"land-{unit}.pid").read_text()), 0); return True
+    except (OSError, ValueError): return False
+
 def orphan_jobs(cfg, hs, units):
     """Jobs whose owner is gone (item 3): [(ref, why)]. A lane job of a closed unit, or of an open unit whose agent ended and is
     not parked; a job a wrapper queued (row 49) whose wrapper is no longer queued or running here."""
@@ -729,6 +746,7 @@ def orphan_jobs(cfg, hs, units):
             if any(r == f"{hn}:{tid}" and same_job(t, jid) for r, jid in wrapped): continue
             u = names.get(lab[5:])
             if not u: out.append((f"{hn}:{tid}", f"its unit {lab[5:]} is closed"))
+            elif t.get("group") == "gates" and landing_now(cfg, u["name"]): continue   # row 241: the gate janus land queued and waits for
             elif agent_ended(u) and not u.get("_park") and not u.get("parked") and not u.get("_sync_failed"):
                 out.append((f"{hn}:{tid}", f"its unit {u['name']}'s agent ended ({u['state']}) and is not parked"))
     try: recs = list((cfg.f("runs") / "wrap").iterdir())

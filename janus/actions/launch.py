@@ -346,7 +346,7 @@ def choose(cfg, a, brief, mc, units, hs):
     a free build reservation or a bounded queue position (build_room, janus-fixes8 item 3)."""
     if a.host and a.host not in cfg.hosts: raise Err(f"unknown host {a.host}")
     hosts, why_place, want = place(cfg, a, brief, mc, units, hs)
-    best, bn, notes = None, 0, []
+    best, bn, notes = None, (False, 0), []; git = needs_git(brief)
     for n in hosts:
         r, why = room(cfg, n, hs[n], units, a.kind == "cleanup")
         if r < 1: notes.append(f"{n}: {why}"); continue
@@ -354,9 +354,21 @@ def choose(cfg, a, brief, mc, units, hs):
         if not hs.get(b, {}).get("ok"): notes.append(f"{n}: build host {b} unreachable"); continue
         ok, bw = build_room(cfg, b, host_cap(cfg, b, hs[b], units), a.kind)
         if not ok: notes.append(bw); continue
-        if r > bn: best, bn = (n, b, f"{why_place}; {bw}"), r
+        k = (bool(git and cfg.hosts[n].get("local")), r)   # row 236: a brief that needs git goes to a host with the repository first
+        if k > bn: best, bn = (n, b, f"{why_place}; {bw}"), k
     if not best: raise Err("refused, no room (" + "; ".join(dict.fromkeys(notes)) + ")")
+    if git and not cfg.hosts[best[0]].get("local"):
+        loc = next((n for n, h in cfg.hosts.items() if h.get("local")), "<host>")
+        best = (*best[:2], best[2] + f"; WARNING: the brief's DONE-WHEN names '{git}' and the agent's copy on {best[0]} has no git (it cannot "
+                f"commit, push or run a landing gate there): place it with --host {loc}, or plan to collect and land its patch yourself")
     return best
+
+def needs_git(brief):
+    """What a brief's DONE-WHEN asks that needs the repository on the agent's host (a push, a landing gate), or None. A unit on
+    another host works in a copy without git (row 236: such a unit found out at turn 1 and asked)."""
+    m = re.search(r"DONE[- ]WHEN.*", brief.read_text() if brief.is_file() else "", re.S)
+    k = re.search(r"\bpush\w*|\blanding gate", m.group(0), re.I) if m else None
+    return k.group(0).lower() if k else None
 
 def resume_report(cfg, a, brief):
     """The report file --report names: the unit writes that file (the orchestrator chose it). None otherwise: the unit writes

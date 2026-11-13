@@ -6,6 +6,11 @@ herdr, cap.py calls sh, ...): every setattr on it is broadcast to each loaded ja
 import importlib, importlib.util, os, pkgutil, sys, types
 from pathlib import Path
 
+# The tests commit in scratch repositories: give git an identity where the machine has none.
+for _k, _v in (("NAME", "t"), ("EMAIL", "t@t")):
+    for _who in ("AUTHOR", "COMMITTER"):
+        os.environ.setdefault(f"GIT_{_who}_{_k}", _v)
+
 JANUS_PY = Path(os.environ.get("JANUS_PY") or Path(__file__).resolve().parent.parent / "janus.py")
 
 

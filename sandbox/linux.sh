@@ -49,7 +49,7 @@ deny_paths=${SANDBOX_DENY_PATHS:-}
 # Build bwrap's options NUL-separated and hand them over with --args, so paths with spaces or quotes survive
 # without eval. The file is unlinked before bwrap starts; the open fd 3 keeps the data readable.
 opts=$(mktemp "${TMPDIR:-/tmp}/janus-sandbox-args.XXXXXX") || die "mktemp failed"
-exec 3<"$opts"
+exec 3<"$opts" 4>"$opts"     # 3 reads for bwrap, 4 writes the options: a descriptor opened to read cannot be written
 rm -f "$opts"
 {
   printf '%s\0' --die-with-parent --dev /dev --ro-bind / /
@@ -66,6 +66,7 @@ rm -f "$opts"
   done
   IFS=$_ifs
   printf '%s\0' --chdir "$worktree"
-} >&3
+} >&4
+exec 4>&-
 
 exec bwrap --args 3 -- "$@"

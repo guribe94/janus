@@ -102,6 +102,12 @@ def write_handoff(cfg, live):
     new = f"# HANDOFF: {cfg.name}\n{LB}\n{live}\n{LE}{notes}"
     if new != t and not cfg.run.ro: atomic_write(p, new)
 
+def acks_after(cfg, F, hs):
+    """The acks still in force after this check. An ack whose finding is gone is dropped only when every host answered: a
+    finding read from a host (a unit's files, its jobs) is not gone because the host did not answer once (row 234: each
+    flap dropped the acks of overlap:/related: and they came back unacked)."""
+    return live_acks(cfg, {k for k, _ in F} if all(p.get("ok") for p in hs.values()) else None)
+
 def run_check(cfg, cycle=True, writer=None):
     """Returns (findings not acknowledged, live text, probes, units). writer (default: the caller is the registered orchestrator,
     or the watcher) regenerates the Live part of HANDOFF.md, saves acks and open problems and sets pueue limits; anyone else
@@ -115,7 +121,7 @@ def run_check(cfg, cycle=True, writer=None):
         F = collect_findings(cfg, hs, units, ag, bd_err, bd)
         if not cfg.run.ro and not cfg.run.dry: auto_log_issues(cfg)   # a key acked 3+ times earns an issue row once
         if not cfg.run.ro: tune_pueue(cfg, hs, units)
-        acks = live_acks(cfg, {k for k, _ in F}); cfg.jput("acks.json", acks)
+        acks = acks_after(cfg, F, hs); cfg.jput("acks.json", acks)
         F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)
         op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
         live = live_state(cfg, hs, units, F); write_handoff(cfg, live)
@@ -153,6 +159,8 @@ def cmd_ack(cfg, a):
     if not ackable(k):   # row 229: an ack of the instructions finding classified nothing and hid it; only closing or remembering clears it
         if k.split(":", 1)[0] == "instructions":
             raise Err("instructions cannot be acked: classify each instruction instead: bd close <id> once it is done, or bd remember --key <subject> for a standing rule (janus decide --instruction <id> for a decision)")
+        if k.split(":", 1)[0] == "handoff":   # row 238: 12 acks in one evening hid stale notes; only writing them clears it
+            raise Err("handoff cannot be acked: update the Orchestrator notes in the state folder's HANDOFF.md (what changed and what is next; move old notes to history.md when it is too long)")
         raise Err(f"{k} cannot be acked: it costs money every hour; act on it (janus park {k.split(':', 1)[-1]})")
     if k.split(":", 1)[0] in ("idle", "landing") and re.match(r"(?i)^\s*(?:i |we )?(?:will|'ll|am going to|are going to|going to|plan|intend|shall)\b", d or ""):
         raise Err(f"ack {k} with what was DONE, not what you will do (a plan is not a decision): run it, then ack")
