@@ -66,6 +66,11 @@ class Placement(unittest.TestCase):
         self.assertEqual(janus.parse_needs(["arm64"])["features"], {"aarch64"})          # macOS's name for the arch matches
         self.probes.clear(); self.assertEqual(janus.place_job(self.cfg, "jobs", janus.parse_needs(["linux", "mem=12G"]))[0], "big")   # lx has 8 GB
         with self.assertRaises(janus.Err): janus.place_job(self.cfg, "jobs", janus.parse_needs(["linux", "mem=20G"]))   # none has 20 GB
+        # skill-fix53: a unit whose brief says what it needs goes to a host whose profile has it (no host name in the brief);
+        # catches: such a unit placed by room alone on a host without the tool
+        brief = self.d / "b.md"; brief.write_text("HOST-NEEDS: podman, device=usb\n")
+        a = type("A", (), {"host": None, "test_host": None, "unit": "u"})()
+        self.assertEqual(janus.place(self.cfg, a, brief, {}, [], {})[0], ["lx"])
     def test_pinned_job_stays_and_needs_are_kept_on_requeue(self):
         """Catches: a thrash stop moving a job pinned with --host, or re-queueing a --needs job on a host that lacks them."""
         hs = {"here": probe_of(), "lx": probe_of(), "big": probe_of()}
@@ -169,6 +174,30 @@ class CpuScheduling(unittest.TestCase):
             r = subprocess.run(["bash", str(self.rd / f"s-{i}.sh")], env=env, capture_output=True, text=True, timeout=60)
             self.assertEqual(r.returncode, 0, f"{tree}: {r.stdout}{r.stderr}"); self.assertIn("JOB-RAN", r.stdout)
             self.assertEqual((wd / "setup.ran").exists(), has, f"{tree}: the setup must run in the project's tree only")
+    def test_shared_caches_reach_a_job_only_when_configured_and_found(self):
+        """Catches (skill-fix53): every job compiling from cold beside a compiler cache its host has (no RUSTC_WRAPPER, no cache
+        folder shared per host), a wrapper set for a tool that is not there (every cargo build of the job would fail), a
+        variable the host already set being replaced, one target/ shared by the jobs of two worktrees, and a project without
+        [caches] getting any of it."""
+        bin_ = self.d / "bin"; bin_.mkdir()
+        for tool, body in (("systemd-run", 'while [ "$1" != -- ]; do shift; done; shift; exec "$@"'), ("sccache", "exit 0")):
+            (bin_ / tool).write_text(f"#!/bin/sh\n{body}\n"); (bin_ / tool).chmod(0o755)
+        a = type("A", (), {"lane": "jobs", "subdir": None, "wt": str(self.d), "usb": False, "broad": None})()
+        drop = ("JANUS_CORES", "MAKEFLAGS", "CARGO_BUILD_JOBS", "RUST_TEST_THREADS", "RUSTC_WRAPPER", "SCCACHE_DIR", "CARGO_TARGET_DIR", "npm_config_store_dir")
+        env = {k: v for k, v in os.environ.items() if k not in drop}
+        env.update(JANUS_POLL_S="1", PATH=f"{bin_}:{os.environ['PATH']}", UV_CACHE_DIR="/kept")
+        remote = dict(self.h, local=False, job_setup="echo SETUP-$RUSTC_WRAPPER"); wd = self.d / "wt"; wd.mkdir()
+        self.assertNotIn("JC=", janus.job_script(self.cfg, "b", remote, a, "wt", "env", "c-0", wd=str(wd)))   # no [caches]: as before
+        self.cfg.c["caches"] = {"dir": str(self.d / "cache")}
+        js = janus.job_script(self.cfg, "b", remote, a, "wt", "env", "c-1", wd=str(wd)); (self.rd / "c-1.sh").write_text(js)
+        r = subprocess.run(["bash", str(self.rd / "c-1.sh")], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr); out = r.stdout.splitlines()
+        self.assertIn("SETUP-sccache", out)                                # the host's job_setup builds with the cache too
+        self.assertIn("RUSTC_WRAPPER=sccache", out); self.assertIn(f"SCCACHE_DIR={self.d}/cache/sccache", out)
+        self.assertIn("UV_CACHE_DIR=/kept", out)                           # what the environment already set is kept
+        has_pnpm = any(os.access(Path(x) / "pnpm", os.X_OK) for x in env["PATH"].split(":") if x)
+        self.assertEqual(any(l.startswith("npm_config_store_dir=") for l in out), has_pnpm)   # a tool that is absent changes nothing
+        self.assertNotIn("CARGO_TARGET_DIR", js + r.stdout)                # every worktree keeps its own target/
     def test_a_job_records_the_shape_of_its_command(self):
         """Catches (item 32) the recording half: history carried only the class and the probe's reservation line nothing about
         the command, so a running job could only be compared with every job of its class (a 3-crate `cargo test` with a

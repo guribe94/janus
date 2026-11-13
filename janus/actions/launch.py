@@ -2,7 +2,7 @@
 (API run as a pueue task, herdr pane, remote tmux), and briefs whose paths must reach a remote agent."""
 import argparse, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
-from janus.actions.jobs import agent_res, ensure_lanes, in_container, job_script, runs_dir, task_rc, task_status, write_cap
+from janus.actions.jobs import agent_res, ensure_lanes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_script, board_shipped
 from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost, waste_block
@@ -312,22 +312,34 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
 def place(cfg, a, brief, mc, units, hs):
     """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
     first matching [placement] rule of janus.toml (regex over unit name and brief text = host), or the worktree's sticky host in
-    out/linux-host/<unit>), when the model may run there; else the allowed host with the most measured room."""
+    out/linux-host/<unit>), when the model may run there; else the allowed host with the most measured room. No host named: a
+    'HOST-NEEDS: <needs>' line in the brief, or a [placement] value that names no host, is what the work needs (as janus run
+    --needs: pnpm, linux, device=usb), and the allowed hosts whose discovered profile has it are preferred."""
     allowed = [n for n in cfg.hosts if n in mc.get("hosts", list(cfg.hosts))]
     if a.host: return [a.host], "--host", (a.test_host if a.test_host in cfg.hosts else None)   # (hosts, why, build host): review-fixes8 #1
     txt = brief.read_text() if brief.is_file() else ""
     want = a.test_host
     if not want:
         m = re.search(r"^TEST-HOST:\s*(\S+)", txt, re.M); want = m.group(1) if m else None
+    m = re.search(r"^HOST-NEEDS:\s*(.+)", txt, re.M); words = m.group(1).strip() if m else None
     if not want:
         for rx, hn in cfg.c.get("placement", {}).items():
-            if re.search(rx, a.unit + "\n" + txt): want = hn; break
+            if not re.search(rx, a.unit + "\n" + txt): continue
+            if hn in cfg.hosts: want = hn
+            else: words = words or hn   # a value that names no host: what the work needs
+            break
     if not want:
         st = cfg.p("out", "out") / "linux-host" / a.unit
         want = st.read_text().strip() if st.is_file() else None
     if want and want in allowed: return [want], f"tests run on {want}", want
     if want and want not in cfg.hosts: want = None
-    return allowed, ("tests run on " + want + ", but " + a.unit + "'s model is not allowed there; " if want else "") + "most room", want
+    note = "tests run on " + want + ", but " + a.unit + "'s model is not allowed there; " if want else ""
+    if words:   # the cached profiles only (no discovery here); none has it: every allowed host stays a candidate, and the launch says so
+        fs = cfg.jget(FACTS); need = parse_needs([words]); miss = {n: host_meets(cfg, n, fs.get(n), need) for n in allowed}
+        fit = [n for n in allowed if miss[n][0]]
+        if fit: return fit, f"{note}needs {words} ({', '.join(fit)}); most room", want
+        note += f"needs {words}, but no allowed host's profile has it ({'; '.join(f'{n}: {w}' for n, (_, w) in miss.items())}: janus hosts --refresh); "
+    return allowed, note + "most room", want
 
 def land_first_block(cfg, units, hs):
     """Why a NEW implement unit is refused (None when it is not): [landing] hold_h is set, a capped provider has under 25 % of its
