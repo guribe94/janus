@@ -183,15 +183,16 @@ class F9ThreeWay(Case):
 
 class Guard(Case):
     def test_a_patch_that_does_not_rebuild_the_units_tree_is_refused(self):
-        """Catches the class, not a case: whatever makes the written patch wrong (here a git whose diff output loses its last
-        line), the builder applies it to the base tree, sees another tree than the unit's and fails instead of printing it."""
+        """Catches the class, not a case: whatever makes the written patch wrong (here a git whose diff output carries another
+        line than the unit wrote, in a patch that still applies cleanly), the builder applies it to the base tree, sees
+        another tree than the unit's and fails instead of printing it."""
         self.trees({"f": b"a\nb\n", "g": b"1\n"}, {"f": b"a\nb\nc\n", "g": b"2\n3\n"})
         real = shutil.which("git"); fake = self.root / "bin"; fake.mkdir()
-        (fake / "git").write_text(f'#!/bin/sh\ncase " $* " in *" diff-tree "*) {real} "$@" | sed \'$d\';; *) exec {real} "$@";; esac\n'); os.chmod(fake / "git", 0o755)
+        (fake / "git").write_text(f'#!/bin/sh\ncase " $* " in *" diff-tree "*) {real} "$@" | sed \'s/^+c$/+X/\';; *) exec {real} "$@";; esac\n'); os.chmod(fake / "git", 0o755)
         p = subprocess.run([sys.executable, "-c", janus.PATCH_PY, "u", "base/u", "worktrees/u"], cwd=self.root, capture_output=True,
                            env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"})
-        self.assertNotEqual(p.returncode, 0, "a patch that loses a line was printed as the unit's changes")
-        self.assertEqual(p.stdout, b""); self.assertIn(b"no complete patch", p.stderr)
+        self.assertNotEqual(p.returncode, 0, "a patch that does not give the unit's tree was printed as its changes")
+        self.assertEqual(p.stdout, b""); self.assertIn(b"does not rebuild the unit's tree", p.stderr)
     def test_excluded_folders_stay_out_and_an_unchanged_tree_gives_an_empty_patch(self):
         """Pins the neighbours: build output (target, .venv, ...) never reaches the patch, and no change is 0 bytes, exit 0."""
         self.trees({"k": b"k\n", "target/o": b"1\n"}, {"k": b"k\n", "target/o": b"2\n", ".venv/x": b"v\n", "sub/__pycache__/c.pyc": b"\0"})
