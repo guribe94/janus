@@ -2,7 +2,7 @@
 lane stalls, idle slots and job ages, thrash acts, tidy and disk; enforce (warn, then stop a burner or a direct build)."""
 import os, re, time, tomllib
 from pathlib import Path
-from janus.actions.jobs import LANES, lane_age, orphan_jobs, slots
+from janus.actions.jobs import LANES, job_of, lane_age, lane_stall, lane_wait, orphan_jobs, slots, wrap_token, wrapper_busy
 from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
 from janus.backlog import ready_work
 from janus.beads import Beads
@@ -323,12 +323,26 @@ def lane_findings(cfg, hs, units=()):
                 F.append((f"idle:{n}:{lane}", f"{n} {lane} IDLE: {len(q)} queued in pueue, {len(r)} running, and admission would admit one now: janus queue {n} to see why pueue holds it"))
             if q: backlog.setdefault(lane, []).append(n)
             elif len(r) < par and not wt and p.get("cap_admit", "yes").strip() == "yes": free.setdefault(lane, []).append(n)   # free by admission (row 48)
+            # age (row 214): a job that waits (queued, or held by admission) is over the lane's wait limit, counted from enqueue; a
+            # running job is stuck only when it has run past the lane's age limit (from its START) and shows no progress (its
+            # own mark, runs/<job>.live: no output and no CPU for the stall window) and waits for no job of its own. A job with
+            # no mark (started by an older release) cannot be judged and is left alone.
+            live = dict(l.split()[:2] for l in p.get("live", []) if len(l.split()) >= 2)
             for x in mine:
                 s = x["status"]; info = s.get(st(x), {}) if isinstance(s, dict) else {}
-                try: since = time.mktime(time.strptime(info.get("enqueued_at", "")[:19], "%Y-%m-%dT%H:%M:%S"))
+                if st(x) not in ("Queued", "Running") or own_label(cfg, x) is None: continue   # own jobs only
+                waits = st(x) == "Queued" or job_of(x) in p.get("waitjob", []); ref = f"{n}:{x['id']}"
+                try: since = time.mktime(time.strptime(((not waits and info.get("start")) or info.get("enqueued_at", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
                 except ValueError: continue
-                if st(x) in ("Queued", "Running") and now() - since > lane_age(cfg, lane) * 60 and own_label(cfg, x) is not None:   # own jobs only
-                    F.append((f"age:{n}:{x['id']}", f"{n}:{x['id']} {lane} {x.get('label')} {st(x).lower()} {int((now() - since) / 60)} min, over the {lane_age(cfg, lane)} min limit: janus cancel {n}:{x['id']} and re-queue it, or ack with why it is right"))
+                mins = int((now() - since) / 60); tok = wrap_token(x); quiet = fl(live.get(tok)) if live.get(tok) is not None else None
+                if waits:
+                    if mins > lane_wait(cfg, lane):
+                        F.append((f"age:{ref}", f"{ref} {lane} {x.get('label')} waiting {mins} min ({'queued' if st(x) == 'Queued' else 'held by admission'}), over the "
+                                  f"{lane_wait(cfg, lane)} min wait limit ([lanes.{lane}] wait_min): janus queue {n} says what holds it; janus cancel {ref} and re-queue it "
+                                  "where there is room, or ack with why it is right"))
+                elif mins > lane_age(cfg, lane) and quiet is not None and quiet >= lane_stall(cfg, lane) * 60 and not wrapper_busy(cfg, hs, tok):
+                    F.append((f"age:{ref}", f"{ref} {lane} {x.get('label')} STUCK: running {mins} min (limit {lane_age(cfg, lane)}) with no progress for {int(quiet / 60)} min "
+                              f"(no output, no CPU; stall limit {lane_stall(cfg, lane)}): janus cancel {ref} and re-queue it, or ack with why it is right"))
         if int(p.get("old_rule", 0) or 0):
             F.append((f"old-rule:{n}", f"{n}: {p['old_rule']} job(s) still wait under the old cap rule ({p.get('old_rule_jobs', '').strip()[:120]}): "
                                         "re-queue them with janus run, then stop the old tasks"))

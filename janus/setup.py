@@ -732,9 +732,18 @@ def doctor(cfg, a):
 def cmd_queue(cfg, a):
     """Read-only: each host's pueue status (or one task's log), so the orchestrator never needs ssh <host> pueue by hand."""
     L = []
+    if a.log is not None:   # row 218: task ids collide between hosts, so <host>:<id> names one; a bare id asks the host argument, else every host that has it
+        from janus.actions.jobs import task_output
+        hn, _, tid = str(a.log).rpartition(":"); hn = hn or a.host
+        if not tid.isdigit() or (hn and hn not in cfg.hosts): raise Err(f"--log {a.log}: expected <host>:<task id> (hosts: {', '.join(cfg.hosts)})")
+        got = [(n, *task_output(cfg, n, tid)) for n in ([hn] if hn else cfg.hosts)]
+        hit = [g for g in got if g[1] == 0] if not hn else got
+        for n, rc, o in hit or got: L += [f"== {n}" + ("" if rc == 0 else f" (exit {rc}: {o.strip()[-100:]})"), o.rstrip() if rc == 0 else ""]
+        if len(hit) > 1: L.append(f"note: task {tid} exists on {', '.join(n for n, _, _ in hit)}: name one with --log <host>:{tid}")
+        return 0, L
     for n, h in cfg.hosts.items():
         if a.host and n != a.host: continue
-        rc, o, e = hrun(h, f"{pueue(h)} " + (f"log {int(a.log)}" if a.log is not None else "status"), timeout=30)
+        rc, o, e = hrun(h, f"{pueue(h)} status", timeout=30)
         L += [f"== {n}" + ("" if rc == 0 else f" (exit {rc}: {(e or o).strip()[-100:]})"), o.rstrip()]
     return 0, L
 

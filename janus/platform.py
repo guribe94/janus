@@ -88,6 +88,22 @@ MAXRSS_PY = ("import resource, subprocess, sys\n"
              "sys.exit(rc if rc >= 0 else 128 - rc)\n")
 
 
+def group_cpu_s(pgid):
+    """CPU seconds the living processes of process group pgid have used so far (ps time: [d-]h:m:s or m:s.cc), None when ps fails."""
+    try: o = subprocess.run(["ps", "-A", "-o", "pgid=,time="], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError): return None
+    tot = 0.0
+    for l in o.splitlines():
+        f = l.split()
+        if len(f) != 2 or f[0] != str(pgid): continue
+        d, _, r = f[1].rpartition("-"); s = 0.0
+        try:
+            for x in r.split(":"): s = s * 60 + float(x)
+            tot += s + 86400 * int(d or 0)
+        except ValueError: pass
+    return tot
+
+
 def pane_tool():
     """The terminal/pane tool agents get here: "herdr", else "tmux", else None."""
     return next((t for t in ("herdr", "tmux") if shutil.which(t)), None)
@@ -141,4 +157,4 @@ def parse_facts(text):
     return f
 
 
-__all__ = ["run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts"]
+__all__ = ["group_cpu_s", "run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts"]

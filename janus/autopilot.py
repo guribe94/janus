@@ -169,13 +169,14 @@ def spec_of(cfg, hs, ref):
     except (OSError, ValueError): return jid, None
 
 def requeue_stuck(cfg, hs, units, F, log):
-    """age: a job over its class age limit: cancel it (files saved) and re-queue the recorded job on a host with room, once per
-    job; a job already re-queued once is reported, not re-queued again."""
-    from janus.actions.jobs import cancel_job, requeue, requeue_host
+    """age: a RUNNING job the check calls stuck (over its lane's age from its start, and no progress for the stall window): cancel
+    it (files saved) and re-queue the recorded job on a host with room, once per job; a job already re-queued once is reported,
+    not re-queued again. A job that only waits (queued, or held by admission) is left: cancelling it gains nothing."""
+    from janus.actions.jobs import cancel_job, job_state, requeue, requeue_host
     for f in F:
         if not f.key.startswith("age:"): continue
         _, hn, tid = f.key.split(":", 2); ref = f"{hn}:{tid}"; jid, spec = spec_of(cfg, hs, ref)
-        if not spec or (spec.get("unit") and held(cfg, spec["unit"])): continue
+        if not spec or (spec.get("unit") and held(cfg, spec["unit"])) or job_state(hs, ref)[0] != "running": continue
         if spec.get("requeued"):
             record(cfg, f.key, "stuck-again", f"{ref} ({jid}) is stuck again after a re-queue: left to the orchestrator"); continue
         to = requeue_host(cfg, hs, units, hn, spec)

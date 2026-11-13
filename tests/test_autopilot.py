@@ -211,8 +211,8 @@ class TwoProjects(unittest.TestCase):
         orphan or stuck and cancelling or re-queuing it; and a job with no project id acted on instead of listed."""
         d, cfg = project("\n[autopilot]\nenabled = true\n"); cfg.c["project"]["id"] = "b"
         old = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3 * 86400))
-        job = lambda lab, jid: {"id": int(jid[1:]), "group": "jobs", "label": lab, "command": f"bash /r/runs/{jid}.sh", "status": {"Running": {"enqueued_at": old}}}
-        hs = {"here": {"ok": True, "pueue": {"groups": {"jobs": {"status": "Running", "parallel_tasks": 4}},
+        job = lambda lab, jid: {"id": int(jid[1:]), "group": "jobs", "label": lab, "command": f"bash /r/runs/{jid}.sh", "status": {"Running": {"enqueued_at": old, "start": old}}}
+        hs = {"here": {"ok": True, "live": ["j1 99999", "j2 99999", "j3 99999"], "pueue": {"groups": {"jobs": {"status": "Running", "parallel_tasks": 4}},
                                              "tasks": {"1": job("unit:x@a", "j1"), "2": job("unit:gone@b", "j2"), "3": job("unit:y", "j3")}}}}
         jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
         for jid, tid in (("j1", 1), ("j2", 2), ("j3", 3)):   # b's records even name a's task (an id reused across projects)
