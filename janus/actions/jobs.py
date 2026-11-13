@@ -225,8 +225,8 @@ def sync_wt(cfg, hn, h, src, name):
     import fcntl
     lk = cfg.state / "runs" / f"sync-{hn}-{re.sub(r'[^A-Za-z0-9._-]', '_', name)}.lock"; lk.parent.mkdir(parents=True, exist_ok=True)
     with open(lk, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX); r = subprocess.run(cmd)
-    if r.returncode: raise Err(f"rsync to {hn} failed (exit {r.returncode})")
+        fcntl.flock(lf, fcntl.LOCK_EX); r = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, errors="replace")
+    if r.returncode: raise Err(f"rsync to {hn} failed (exit {r.returncode}): {(r.stderr or '').strip()[-160:]}")
     for x in cfg.paths.get("sync_require", []):
         if (Path(src) / x).exists() and hrun(h, f"test -e {qp(dst + '/' + x)}")[0]: raise Err(f"{x} did not arrive on {hn}")
 

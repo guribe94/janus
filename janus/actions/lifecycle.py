@@ -220,7 +220,7 @@ def cmd_collect(cfg, a):
     # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree (the patch
     # carries git's blob ids, so a checkout that has moved on is merged, not refused).
     prc, _, perr = remote_patch(cfg, h, n, "changes.patch")
-    if not save_output(cfg, u): raise Err(f"collect from {u['host']} failed (unreachable?)")   # out/<unit>/, the task log
+    if not save_output(cfg, u): raise Err(f"collect from {u['host']} failed (unreachable?): {u.get('_sync_error')}")   # out/<unit>/, the task log
     p = od / "changes.patch"
     if prc:   # no complete patch: the copy stays uncollected (no fingerprint recorded), so stop and close keep refusing
         raise Err(f"collect {n}: NO PATCH of its changes could be made on {u['host']} (exit {prc}): {(perr or '').strip()[-1500:] or 'no message (python3 missing on the host, or the 300 s limit?)'}\n"
@@ -521,7 +521,8 @@ def save_output(cfg, u):
     cmd = ["rsync", "-a", "--exclude", "*.key", "-e", " ".join(SSH), f"{h['ssh']}:{h['root']}/out/{n}/", str(od) + "/"]
     if cfg.run.dry: say("+ " + shlex.join(cmd)); return True
     od.mkdir(parents=True, exist_ok=True)
-    if sh(cmd, timeout=600)[0]: return False
+    rc, o, e = sh(cmd, timeout=600)
+    if rc: u["_sync_error"] = f"exit {rc}: {(e or o).strip()[-160:]}"; return False
     if u.get("via") == "pueue" and u.get("task") is not None: save_task_log(cfg, h, u, u["task"])
     return True
 
@@ -547,7 +548,7 @@ def refresh_remote(cfg, u, bd, log):
     if not ((fin and u.get("saved") != saved_marker(u)) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60): return
     prc, _, perr = remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
     if prc: log(f"{u['name']}: no backup patch could be made on {u['host']} (exit {prc}; the earlier one is kept): {(perr or '').strip()[-300:]}")
-    if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed"); return
+    if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed ({u.get('_sync_error')})"); return
     u["saved_at"] = int(now())
     if fin: u["saved"] = saved_marker(u); settle_remote(cfg, u)   # its run is closed when it ends, not at collect
     bd.save(u)

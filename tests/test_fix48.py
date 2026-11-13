@@ -55,6 +55,10 @@ class OneSyncPerHostAndWorktree(unittest.TestCase):
             for t in ts: t.start()
             for t in ts: t.join()
         self.assertEqual(errs, []); self.assertEqual(len(peak), 3); self.assertEqual(max(peak), 1, "two rsyncs of one tree ran at once")
+        # a failed sync keeps the command's exit and its stderr (the row 141 case: only "failed" reached the operator)
+        bad = lambda cmd, **k: subprocess.CompletedProcess(cmd, 255, stderr="Host key verification failed.\n")
+        with mock.patch("subprocess.run", bad), self.assertRaises(janus.Err) as c: janus.sync_wt(cfg, "b", h, str(d), "t")
+        self.assertIn("exit 255", str(c.exception)); self.assertIn("Host key verification failed", str(c.exception), "the rsync cause was dropped")
 
 
 class HostFlap(unittest.TestCase):
