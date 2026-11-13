@@ -193,6 +193,12 @@ class ReadyItemsWithoutBriefs(unittest.TestCase):
         t = F.get("idle-backlog:nobrief", "")
         self.assertIn("2 ready backlog item(s)", t); self.assertIn("janus brief draft A1 B2", t); self.assertIn("first thing", t)
         self.assertLessEqual(janus.ack_ttl("idle-backlog:nobrief"), 3600)
+        # rows 29/99: an item held on purpose (janus backlog set A1 hold=..., or HOLD: in its draft) neither counts nor nags
+        held = {**self.ISS, "backlog:A1": {**self.ISS["backlog:A1"], "labels": ["backlog", "backlog-ready", "hold:parked-by-owner"]}}
+        (d / "briefs" / "drafts").mkdir(); (d / "briefs" / "drafts" / "B2.md").write_text("# draft B2\nHOLD: waits for the owner's answer\n")
+        with mock.patch.object(janus, "backlog_issues", lambda cfg: held), mock.patch.object(janus, "room", lambda *a, **k: (3, "")), \
+             mock.patch.object(janus, "all_units", lambda cfg: {}):
+            self.assertEqual(dict(janus.backlog_findings(cfg, {"here": {"ok": True}}, [])), {})
 
     def test_a_second_ack_needs_fewer_items_without_a_brief(self):
         """Catches (row 245): idle-backlog:nobrief acked again and again (four re-acks, each hiding it 1 h) while not one brief

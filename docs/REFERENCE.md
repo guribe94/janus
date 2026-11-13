@@ -688,6 +688,22 @@ pane left without an agent for 20 minutes is closed first (section 2). A live se
 - **Landing.** `janus land <unit>` merges the landing branch (stops and dispatches `merge-<unit>` on a conflict), gates the merged
   tree on `[landing] final_gate_host`, then squash-lands. `final_gate` may name `{unit}`, `{wt}` and `{branch}`, substituted per
   land, so a project that gates per unit (`out/land-{unit}-linux/...`) gets the unit it is landing (item 12).
+- **A land runs on any host** (skill-fix55): `janus land <unit> --host <h>`, or `[landing] host = "<h>"`, or `host = "auto"`
+  (among the hosts that meet `[landing] needs`, written as `janus run --needs`, e.g. `"linux"` for a Linux gate, and have git:
+  the one with the most room; the coordinator only when no other qualifies). Unset: the coordinator, as before. On another
+  host the land's git work runs in that host's **landing lane**: a bare clone at `<[hosts.<h>] land, default <root>/land>/<project>.git`
+  with the project's remote as origin (`[landing] origin`, else the remote of the unit's worktree), one tree per unit in
+  `<land>/wt/<unit>`, git 2.38 or newer, and a key the remote accepts (`[hosts.<h>] land_env`: shell run before git there, e.g.
+  `export GIT_SSH_COMMAND='ssh -i <key>'` on a shared server). `janus install-host <h>` creates the clone and says whether the
+  host reaches the remote; `land --host` creates it on first use. The unit's commits arrive by a push over ssh from its
+  worktree; the host fetches the landing branch itself, merges, squash-commits and pushes to the remote from there. A host
+  without a key still merges and gates (the landing branch is sent from the coordinator as last fetched, the last push falls
+  back to the coordinator; land says so each time). The final gate of such a land: a plain command runs in the host's landing
+  tree through its `gates` lane (nothing is synced); a `janus ...` command is the dispatcher and runs on the coordinator by
+  this janus's own entrypoint, wherever the land runs (it needs the project and sends its steps to the hosts itself; on a
+  remote `final_gate_host` it used to end `janus: command not found`, exit 127), gating the unit's worktree after it took the
+  host's merge fast-forward. `janus land <unit> --host <h> --dry-run` runs the read-only half on the host (delivery to
+  `refs/janus/land/<unit>/`, fetch, `merge-tree`, `git push --dry-run`) and prints the rest.
 - **Every host is independent of the coordinator** (the machine `janus` runs on). The final gate is queued on
   `final_gate_host` and waits only for that host's lanes and admission, so a Linux final gate belongs on a Linux host
   (`final_gate_host = "<linux host>"`, `final_gate` = the test command run in the synced tree): then no landing waits behind
@@ -749,7 +765,8 @@ agent logins and devices (usb, video, gpu, kvm), cached in `.janus/hosts-facts.j
 default to what was found. Per job class it also shows runs, expected run time, learned cores, CPU and queue wait (p50/p95).
 **`janus install-host <host> [--dry-run]`** sets up a machine named in janus.toml: folders under its `root`, pueued as a user
 service (systemd, linked from `pueue_dir` on a shared server; brew services on macOS), a copy of janus in `<root>/janus` for
-read-only commands, and the heartbeat watchdog when `[heartbeat] watchdog` names it. The coordinator may be macOS or Linux
+read-only commands with a `janus` launcher in the host's `bin` (on every job's PATH there), the landing lane (see Landing) when
+`[landing] origin` or `[landing] repo` names the project's remote, and the heartbeat watchdog when `[heartbeat] watchdog` names it. The coordinator may be macOS or Linux
 (launchd agent or systemd user timer; keychain, secret-tool or pass; herdr or tmux): those choices live in `janus/platform.py`.
 
 **Shared build caches (`[caches]`, off unless the block is in janus.toml).** Hosts differ, so nothing is assumed: each job

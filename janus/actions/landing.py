@@ -5,8 +5,9 @@ from janus.actions.jobs import cmd_run, ensure_lanes, gate_group, task_output, t
 from janus.actions.launch import cmd_launch
 from janus.actions.swarm import write_index
 from janus.beads import Beads
-from janus.context import Err, JANUS_SELF, X, atomic_write, hrun, note_event, now, pq, say, sh, ts
+from janus.context import Err, JANUS_SELF, X, atomic_write, hrun, note_event, now, pq, qp, say, sh, ts
 from janus.gates import GATE_DEFAULT, GATE_LINE, baseline_failures, gate_baseline, gate_ids, judge_gate, landed, unapplied_patch
+from janus.landhost import HostGit, identity, land_clone, land_host, land_tree, lane_script, origin_url, ssh_url
 from janus.platform import group_cpu_s, tree_groups_sh
 from janus.project import own_label, tag
 from janus.probe import pueue
@@ -397,6 +398,132 @@ def gate_gen(cfg, ld, unit, wt):
     if rc: raise Err(f"[landing] gate_gen failed ({rc}): {(e or o).strip()[-200:]}; not landed, the merge stays committed in {wt}")
     say(f"gate script written by [landing] gate_gen: {cmd}")
 
+def conflict_stop(cfg, a, u, wt, branch, br, files):
+    """A land whose merge conflicts stops (the tree is left as it was) and dispatches the merge unit merge-<unit>; returns 3."""
+    files = files[:20] or ["(see git merge)"]
+    say(f"STOP: merging {br} conflicts in {len(files)} file(s): {', '.join(files[:6])}")
+    m = f"merge-{a.unit}"[:32]
+    if a.no_dispatch or cfg.run.dry: say(f"{'would dispatch' if cfg.run.dry else 'dispatch with'}: janus launch {m} --kind implement --cwd {wt} (brief {cfg.p('briefs', 'briefs') / (m + '.md')})"); return 3
+    bp = cfg.p("briefs", "briefs") / f"{m}.md"
+    if not bp.exists(): atomic_write(bp, MERGE_BRIEF.format(m=m, br=br, unit=a.unit, branch=branch, wt=wt, tier=(u.get("tier") or "normal").upper(),
+                                                          item=u.get("item") or a.unit, files="\n".join(f"- `{f}`" for f in files)))
+    cmd_launch(cfg, argparse.Namespace(unit=m, kind="implement", tier=u.get("tier") or "normal", host=None, model=None, brief=str(bp), cwd=str(wt),
+                                       budget=None, test_host=u.get("build"), allow_main=False, of=None, report=None, resume_of=None, item=u.get("item"),
+                                       dry_run=False, share_with=a.unit))
+    return 3
+
+def gate_place(cfg, gh, gc):
+    """(host, command) the final gate really runs as. A final gate that is a janus command (`janus gate ...`) is a dispatcher: it
+    needs the project (janus.toml, the lanes' records) and sends its steps to the hosts itself, so it runs on the coordinator by
+    this janus's own entrypoint, whatever host was named (row 64: on a remote host it was `janus: command not found`, exit 127,
+    and with a launcher there a janus without a project). Any other command runs on gh as given."""
+    m = re.match(r"\s*((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)janus\s+(.*)", gc, re.S)
+    if not m: return gh, gc
+    return next(n for n, h in cfg.hosts.items() if h.get("local")), f"{m.group(1)}{shlex.quote(sys.executable)} {shlex.quote(str(JANUS_SELF))} {m.group(2)}"
+
+def run_final_gate(cfg, a, ra, where):
+    mark = cfg.f("runs") / f"land-{a.unit}.pid"; mark.parent.mkdir(parents=True, exist_ok=True); mark.write_text(str(os.getpid()))
+    try: grc = cmd_run(cfg, ra)   # row 241: while the mark's process lives, this gate is land's own, not an orphan (landing_now)
+    finally: mark.unlink(missing_ok=True)
+    if grc: raise Err(f"final gate on {ra.host} failed (exit {grc}): not landed; the merge stays committed in {where}")
+    say(f"final gate on {ra.host}: PASS")
+
+def move_local(wt, br, new, base=None):
+    """Move the landing branch here to the landing commit: git merge --ff-only in its checkout when it is checked out (that
+    checkout's files follow), else update-ref (from base when given). The error text, or None."""
+    wl = git(wt, "worktree", "list", "--porcelain")[1]
+    co = next((blk.split("\n")[0][9:] for blk in wl.split("\n\n") if f"branch refs/heads/{br}" in blk), None)
+    if co:
+        rc, o, e = git(co, "merge", "--ff-only", new, timeout=300)
+        return f"{co} (where {br} is checked out) did not take the landing commit {new[:9]} fast-forward: {(e or o).strip()[-160:]}" if rc else None
+    rc, o, e = git(wt, "update-ref", f"refs/heads/{br}", new, *([base] if base else []))
+    return f"update-ref {br} failed: {e.strip()[:120]}" if rc else None
+
+def land_remote(cfg, a, u, wt, branch, br, ld, hn, why):
+    """The land's git work on another host (skill-fix55: the coordinator is no longer the only place a land can merge, gate and
+    push). In the host's landing clone (janus/landhost.py): the unit's commits arrive by a push over ssh from its worktree here;
+    the host fetches the landing branch from the remote itself (without a key there it is sent from here as last fetched, and
+    land says so); merge-tree, the merge, the squash commit and the push to the remote run there. The final gate: a plain
+    command runs in the host's own landing tree through its gates lane (nothing is synced); a janus command is the
+    coordinator's dispatcher (gate_place) and gates the unit's worktree here, which first takes the host's merge fast-forward.
+    --dry-run runs the read-only half there (the delivery to refs/janus/land/<unit>/ of the clone, the fetch, merge-tree,
+    git push --dry-run) and prints the rest; no branch, tree or remote changes."""
+    h = cfg.hosts[hn]; unit = a.unit; dry = cfg.run.dry; rem = cfg.c.get("git", {}).get("remote") or "origin"
+    url = origin_url(cfg, wt)
+    if not url: raise Err(f"{wt} has no remote {rem} and [landing] origin is not set: a land on {hn} needs the project's remote")
+    clone, tree = land_clone(cfg, h), land_tree(h, unit); ident = identity(wt); G, T = HostGit(h, clone, ident), HostGit(h, tree, ident)
+    rc, o, e = hrun(h, lane_script(cfg, h, url), timeout=60)
+    if rc: raise Err(f"{hn} has no landing lane ({(e or o).strip()[-120:]}): janus install-host {hn}")
+    ref, su, rb = f"refs/janus/land/{unit}", ssh_url(h, clone), f"refs/remotes/origin/{br}"
+    keyed = G("fetch", "-q", "origin", f"+refs/heads/{br}:{rb}", timeout=900)[0] == 0   # first: the unit's push below then sends only what the remote lacks
+    rc, o, e = git(wt, "push", "-q", "--force", su, f"HEAD:{ref}/head", timeout=900)
+    if rc: raise Err(f"sending {branch} to {hn}:{clone} failed: {(e or o).strip()[-160:]}")
+    if not keyed:
+        git(wt, "fetch", "-q", rem, timeout=120); lrb = f"refs/remotes/{rem}/{br}"
+        rc, o, e = git(wt, "push", "-q", "--force", su, f"{lrb if git(wt, 'rev-parse', '-q', '--verify', lrb)[0] == 0 else 'refs/heads/' + br}:{rb}", timeout=900)
+        if rc: raise Err(f"sending {br} to {hn}:{clone} failed: {(e or o).strip()[-160:]}")
+        say(f"note: {hn} cannot fetch {url} itself (no key the remote accepts there: an owner item); {br} was sent from here as last fetched, and the last push will be made from here")
+    base, head = G("rev-parse", rb)[1].strip(), G("rev-parse", f"{ref}/head")[1].strip()
+    if not base or not head: raise Err(f"{hn}:{clone} holds no {br} or no {ref}/head after the delivery")
+    ahead = int(G("rev-list", "--count", f"{base}..{head}")[1].strip() or 0); behind = int(G("rev-list", "--count", f"{head}..{base}")[1].strip() or 0)
+    if not ahead: raise Err(f"{branch} has no commits over {br} ({base[:9]}): nothing to land")
+    say(f"land {unit} on {hn} ({why}): {branch} {head[:9]} in {clone}, {ahead} commit(s) ahead of {br} ({base[:9]}, {'fetched there' if keyed else 'sent from here'}), {behind} behind")
+    rc, o, e = G("merge-tree", "--write-tree", "--name-only", head, base)
+    if rc not in (0, 1): raise Err(f"git merge-tree on {hn} failed (the landing lane needs git 2.38 or newer): {(e or o).strip()[:120]}")
+    if rc == 1:
+        if not dry: git(wt, "fetch", "-q", rem, timeout=120)   # the merge unit works here: it merges the remote's tip
+        return conflict_stop(cfg, a, u, wt, branch, f"{rem}/{br}", [l for l in o.split("\n\n")[0].splitlines()[1:] if l.strip()])
+    gc = None if a.no_gate else final_gate_cmd_checked(ld, unit, wt, branch)
+    if gc is not None and not gc: raise Err("set [landing] final_gate (the command that gates a merged tree) in janus.toml, or --no-gate")
+    gh, gcmd = gate_place(cfg, hn, gc) if gc else (hn, None)
+    on_host = gc is not None and gh == hn   # a plain command: in the landing tree there
+    if on_host: gcmd = final_gate_cmd_checked(ld, unit, tree, branch)
+    if dry:
+        prc, po, pe = G("push", "--dry-run", "origin", f"{head}:refs/heads/janus-land-probe", timeout=120) if keyed else (1, "", "it cannot fetch either")
+        say(f"+ [{hn}] git merge --no-edit {base[:9]} in {tree}  (merge-tree there: clean)")
+        say("+ gate skipped (--no-gate)" if gc is None else f"+ janus run --host {gh} --lane gates --unit {unit} " + (f"(in {tree} there, nothing synced)" if on_host else f"--wt {wt} (the dispatcher; {wt} first takes the merge fast-forward)") + f" -- {gcmd}")
+        say(f"+ [{hn}] git commit-tree <merged tree> -p {base[:9]}; git push origin <commit>:refs/heads/{br}  (push from {hn}: "
+            + ("ok, git push --dry-run there passed)" if prc == 0 else f"NOT possible ({(pe or po).strip()[-100:]}): the push would be made from here; an owner item)"))
+        return 0
+    rc, o, e = hrun(h, f"{G.env}if [ -e {qp(tree)}/.git ]; then git -C {qp(tree)} checkout -q --detach {head} && git -C {qp(tree)} reset -q --hard {head}; "
+                       f"else git -C {qp(clone)} worktree prune; git -C {qp(clone)} worktree add -q --detach {qp(tree)} {head}; fi", timeout=900)
+    if rc: raise Err(f"the landing tree {hn}:{tree} could not be set to {head[:9]}: {(e or o).strip()[-160:]}")
+    if behind:
+        rc, o, e = T("merge", "--no-edit", base, timeout=600)
+        if rc: T("merge", "--abort"); raise Err(f"git merge {br} on {hn} failed although merge-tree was clean: {(e or o).strip()[-160:]}; aborted")
+        say(f"merged {br} into {branch} on {hn}")
+    merged = T("rev-parse", "HEAD")[1].strip(); G("update-ref", f"{ref}/merged", merged)
+    if merged != head:   # the unit's worktree here follows: what it holds is what is gated and landed
+        rc, o, e = git(wt, "fetch", "-q", su, f"{ref}/merged", timeout=900)
+        if not rc: rc, o, e = git(wt, "merge", "--ff-only", "FETCH_HEAD", timeout=300)
+        if rc: raise Err(f"{wt} did not take the merge made on {hn} fast-forward: {(e or o).strip()[-160:]}")
+    if gc is None: say("gate skipped (--no-gate)")
+    else:
+        gate_gen(cfg, ld, unit, wt)
+        run_final_gate(cfg, a, argparse.Namespace(host=gh, lane="gates", unit=unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False,
+                                                  allow_unmerged=False, command=[gcmd], host_tree=tree if on_host else None), f"{hn}:{tree}")
+    if keyed: G("fetch", "-q", "origin", f"+refs/heads/{br}:{rb}", timeout=300)
+    if G("rev-parse", rb)[1].strip() != base: raise Err(f"{br} moved while {unit} was gated: run janus land {unit} again (it merges the new tip)")
+    subj = T("log", "--format=%s", f"{base}..HEAD", "--no-merges")[1].splitlines()
+    msg = f"{unit}: land {branch} ({len(subj)} commit(s), squashed)\n\n" + "\n".join(f"- {s}" for s in subj[:40]) + "\n"
+    rc, new, e = T("commit-tree", merged + "^{tree}", "-p", base, "-F", "-", inp=msg); new = new.strip()
+    if rc or not new: raise Err(f"git commit-tree on {hn} failed: {e.strip()[:120]}")
+    G("update-ref", f"{ref}/landed", new); pushed = False
+    if keyed:
+        rc, o, e = G("push", "-q", "origin", f"{new}:refs/heads/{br}", timeout=300); pushed = rc == 0
+        if not pushed: say(f"note: git push from {hn} was refused ({(e or o).strip()[-120:]}): {br} moves here instead, push it from here")
+    rc, o, e = git(wt, "fetch", "-q", su, f"{ref}/landed", timeout=900)   # the landing branch here follows
+    err = f"fetching the landing commit from {hn} failed: {(e or o).strip()[-120:]}" if rc else None
+    if not err and (pushed or git(wt, "rev-parse", br)[1].strip() != base) and git(wt, "merge-base", "--is-ancestor", br, new)[0]: err = f"{br} here is not an ancestor of the landing commit"
+    err = err or move_local(wt, br, new)
+    if pushed: git(wt, "fetch", "-q", rem, timeout=120)
+    if err and not pushed: raise Err(f"{unit} is merged, gated and committed on {hn} as {new[:9]} ({ref}/landed in {clone}) but is not on {br} anywhere yet: {err}")
+    say(f"landed {unit} on {hn}: {br} {base[:9]} -> {new[:9]} ({len(subj)} commit(s) squashed); " + (f"pushed to {url} from {hn}" if pushed else "not pushed: push from here")
+        + (f"; note: {br} here did not follow ({err}): git fetch, then fast-forward it" if err else "") + f"; close is separate (janus close {unit})")
+    if u.get("id"): Beads(cfg).comment(u["id"], f"{ts()} landed on {br} as {new[:9]} (on {hn}{', pushed from there' if pushed else ''})")
+    note_event(cfg, "landing")
+    return 0
+
 def cmd_land(cfg, a):
     """janus land <unit>: in the unit's worktree, merge the current landing branch ([landing] branch, default main); on a conflict
     stop (the tree is left as it was) and dispatch a merge unit merge-<unit> (--no-dispatch: only say so); gate the merged tree
@@ -422,6 +549,11 @@ def cmd_land(cfg, a):
                      f"git -C {wt} apply --3way {up}, commit, then janus land {a.unit} again; do not close it before (its work exists only in that patch)")
     if git(wt, "status", "--porcelain", "--untracked-files=no")[1].strip(): raise Err(f"{wt} has uncommitted changes: commit them first")
     if git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")[0] == 0: raise Err(f"{wt} has a merge in progress (MERGE_HEAD): finish or abort it")
+    hn, hwhy = land_host(cfg, getattr(a, "host", None))   # skill-fix55: any host with a landing lane lands; the coordinator is one of them
+    if not cfg.hosts[hn].get("local"):
+        qr = land_review(cfg, u)
+        if qr: raise Err(qr)
+        return land_remote(cfg, a, u, wt, branch, br, ld, hn, hwhy)
     base = git(wt, "rev-parse", br)[1].strip()
     if not base: raise Err(f"no branch {br}")
     # Row 240: the landing branch here may be behind its upstream (a commit already pushed that this checkout lacks). "Ahead of
@@ -447,17 +579,7 @@ def cmd_land(cfg, a):
         rc, o = (1, "-\n" + cf_) if cf_.strip() else (0, "")
     elif rc not in (0, 1): raise Err(f"git merge-tree failed: {(e or o).strip()[:120]}")
     if rc == 1:
-        files = [l for l in o.split("\n\n")[0].splitlines()[1:] if l.strip()][:20] or ["(see git merge)"]   # tree id, then the conflicted paths
-        say(f"STOP: merging {br} conflicts in {len(files)} file(s): {', '.join(files[:6])}")
-        m = f"merge-{a.unit}"[:32]
-        if a.no_dispatch or cfg.run.dry: say(f"{'would dispatch' if cfg.run.dry else 'dispatch with'}: janus launch {m} --kind implement --cwd {wt} (brief {cfg.p('briefs', 'briefs') / (m + '.md')})"); return 3
-        bp = cfg.p("briefs", "briefs") / f"{m}.md"
-        if not bp.exists(): atomic_write(bp, MERGE_BRIEF.format(m=m, br=br, unit=a.unit, branch=branch, wt=wt, tier=(u.get("tier") or "normal").upper(),
-                                                              item=u.get("item") or a.unit, files="\n".join(f"- `{f}`" for f in files)))
-        cmd_launch(cfg, argparse.Namespace(unit=m, kind="implement", tier=u.get("tier") or "normal", host=None, model=None, brief=str(bp), cwd=str(wt),
-                                           budget=None, test_host=u.get("build"), allow_main=False, of=None, report=None, resume_of=None, item=u.get("item"),
-                                           dry_run=False, share_with=a.unit))
-        return 3
+        return conflict_stop(cfg, a, u, wt, branch, br, [l for l in o.split("\n\n")[0].splitlines()[1:] if l.strip()])   # tree id, then the conflicted paths
     if behind:
         if cfg.run.dry: say(f"+ git -C {wt} merge --no-edit {br}  (merge-tree: clean)")
         else:
@@ -469,14 +591,10 @@ def cmd_land(cfg, a):
     elif not gh or not gc: raise Err("set [landing] final_gate_host and final_gate (the command that gates a merged tree) in janus.toml, or --no-gate")
     else:
         gate_gen(cfg, ld, a.unit, wt)
-        ra = argparse.Namespace(host=gh, lane="gates", unit=a.unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False, allow_unmerged=False, command=[gc])
-        if cfg.run.dry: say(f"+ janus run --host {gh} --lane gates --unit {a.unit} --wt {wt} -- {gc}"); 
-        else:
-            mark = cfg.f("runs") / f"land-{a.unit}.pid"; mark.parent.mkdir(parents=True, exist_ok=True); mark.write_text(str(os.getpid()))
-            try: grc = cmd_run(cfg, ra)   # row 241: while the mark's process lives, this gate is land's own, not an orphan (landing_now)
-            finally: mark.unlink(missing_ok=True)
-            if grc: raise Err(f"final gate on {gh} failed (exit {grc}): not landed; the merge stays committed in {wt}")
-            say(f"final gate on {gh}: PASS")
+        gh2, gc2 = gate_place(cfg, gh, gc)   # row 64: a janus command gates from the coordinator by this janus's entrypoint
+        ra = argparse.Namespace(host=gh2, lane="gates", unit=a.unit, wt=str(wt), subdir=None, usb=False, priority=10, no_wait=False, allow_unmerged=False, command=[gc2])
+        if cfg.run.dry: say(f"+ janus run --host {gh2} --lane gates --unit {a.unit} --wt {wt} -- {gc}")
+        else: run_final_gate(cfg, a, ra, wt)
     # 3. squash-land: tree of the gated HEAD, parent = the landing tip that was merged
     if cfg.run.dry: say(f"+ git commit-tree HEAD^{{tree}} -p {base[:9]}; move {br} (ff-only in its checkout); {ahead} commit(s) squashed"); return 0
     if git(wt, "rev-parse", br)[1].strip() != base: raise Err(f"{br} moved while {a.unit} was gated: run janus land {a.unit} again (it merges the new tip)")
@@ -485,14 +603,8 @@ def cmd_land(cfg, a):
     msg = f"{a.unit}: land {branch} ({len(subj)} commit(s), squashed)\n\n" + "\n".join(f"- {s}" for s in subj[:40]) + "\n"
     rc, new, e = sh(["git", "-C", str(wt), "commit-tree", tree, "-p", base, "-F", "-"], inp=msg)
     if rc: raise Err(f"git commit-tree failed: {e.strip()[:120]}")
-    new = new.strip(); wl = git(wt, "worktree", "list", "--porcelain")[1]
-    co = next((blk.split("\n")[0][9:] for blk in wl.split("\n\n") if f"branch refs/heads/{br}" in blk), None)
-    if co:
-        rc, o, e = git(co, "merge", "--ff-only", new, timeout=300)
-        if rc: raise Err(f"{co} (where {br} is checked out) did not take the landing commit {new[:9]} fast-forward: {(e or o).strip()[-160:]}")
-    else:
-        rc, o, e = git(wt, "update-ref", f"refs/heads/{br}", new, base)
-        if rc: raise Err(f"update-ref {br} failed: {e.strip()[:120]}")
+    new = new.strip(); err = move_local(wt, br, new, base)
+    if err: raise Err(err)
     say(f"landed {a.unit}: {br} {base[:9]} -> {new[:9]} ({len(subj)} commit(s) squashed); push and close are separate (janus close {a.unit})")
     if u.get("id"): Beads(cfg).comment(u["id"], f"{ts()} landed on {br} as {new[:9]}")
     note_event(cfg, "landing")

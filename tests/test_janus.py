@@ -673,6 +673,27 @@ class Land(unittest.TestCase):
         self.cfg.run.all_units = {"u": self.u}
     def g(self, *a, cwd=None): return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd or self.r), *a], capture_output=True, text=True)
     def a(self, **k): return type("A", (), {"unit": "u", "no_gate": True, "no_dispatch": True, **k})()
+    def test_a_land_on_another_host_merges_gates_and_pushes_there(self):
+        """Catches (skill-fix55): a land could only merge, gate and push in the coordinator's worktree: named another host, it
+        still did its git work on this machine's (stale) main and pushed nothing, so no other host could ever land."""
+        from unittest import mock
+        o = self.d / "o.git"; self.g("init", "-q", "--bare", "-b", "main", str(o)); self.g("remote", "add", "origin", str(o)); self.g("push", "-q", "-u", "origin", "main")
+        (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: add b", cwd=self.wt)
+        other = self.d / "other"; self.g("clone", "-q", str(o), str(other)); (other / "c").write_text("moved\n")
+        self.g("add", "c", cwd=other); self.g("commit", "-qm", "main: c", cwd=other); self.g("push", "-q", "origin", "main", cwd=other)   # the remote's main moves; this machine never fetches it
+        tip = self.g("rev-parse", "HEAD", cwd=other).stdout.strip()
+        self.cfg.hosts["far"] = {"ssh": "far", "root": str(self.d / "far")}; self.cfg.c["landing"]["final_gate"] = "test -f b"
+        ran = []
+        with mock.patch.object(janus, "hrun", lambda h, script, timeout=25, inp=None, env=None: janus.sh(["sh", "-c", script], timeout=timeout, inp=inp)), \
+             mock.patch.object(janus, "ssh_url", lambda h, p: p), mock.patch.object(janus, "cmd_run", lambda cfg, ra: ran.append(ra) or 0), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(janus.cmd_land(self.cfg, self.a(host="far", no_gate=False)), 0)
+        tree = self.d / "far" / "land" / "wt" / "u"
+        self.assertEqual((ran[0].host, ran[0].host_tree), ("far", str(tree)))   # the gate: in the host's own tree, through its lane
+        self.assertTrue((tree / "b").is_file() and (tree / "c").is_file())      # ... which holds the merge made there
+        self.assertEqual(self.g("log", "--format=%s %P", "-1", "main", cwd=o).stdout.strip(), f"u: land wk/u (1 commit(s), squashed) {tip}")   # pushed from there, onto the remote's tip
+        self.assertEqual(janus.gate_place(self.cfg, "far", "janus gate land-u --wait")[0], "here")   # row 64: a janus gate is the coordinator's dispatcher, never run on the far host
+
     def test_squash_land_and_conflict_stop(self):
         (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: add b", cwd=self.wt)
         (self.r / "c").write_text("main moved\n"); self.g("add", "c"); self.g("commit", "-qm", "main: c")   # main moves: merge needed
