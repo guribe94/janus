@@ -357,7 +357,7 @@ retired CLI exits 2 at once, and `janus check` raises `gate-setup:<name>` for a 
   host with a landing lane has a free gates lane. The line names the jobs, the cause, what the paused host's lanes hold and
   the one command: `janus land <u> --host <h> --restart` (stops the waiting land and its gate jobs, merges again, gates
   there). The watcher runs it itself when it is provably safe (the land is starved, still at its gate, its worktree holds
-  the merge as a commit with no open change, at most once in 6 h; `[landing] auto_recover = false` turns it off) and says
+  the merge as a commit with no open change, at most once in 6 h; off unless `[landing] auto_recover = true`: the real-pueue restart of a wrapped gate is not yet proven) and says
   so (`land:<u>:recovered`, log `.janus/runs/land-<u>.recover.log`); otherwise the line says why not.
 - *The install that waits for the blocker* (`install:blocked-by-blocker`): janus commits that change the code a stalled land
   runs are not installed. A running janus keeps its own release folder, so install now (`./install --release-only`), then

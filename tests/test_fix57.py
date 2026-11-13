@@ -39,7 +39,7 @@ class Stall(unittest.TestCase):
     def test_the_watcher_restarts_a_starved_land_only_when_its_merge_is_committed(self):
         """Catches (row 144): recovery waited for the owner to order it. The watcher re-runs a starved land on the idle host
         when the worktree holds the merge as a commit, reports it as a finding, and never touches a tree with open changes."""
-        d, cfg = project(LIN); git(d, "init", "-q"); (d / "f").write_text("1"); git(d, "add", "f"); git(d, "commit", "-qm", "a")
+        d, cfg = project(LIN + '\n[landing]\nauto_recover = true\n'); git(d, "init", "-q"); (d / "f").write_text("1"); git(d, "add", "f"); git(d, "commit", "-qm", "a")
         hs = starved(cfg, d); ran = []; log = []
         with mock.patch.object(janus, "spawn_land", lambda cfg, u, h: ran.append((u, h)) or 4242), mock.patch.object(janus, "land_proc", lambda pid, u: True):
             (d / "f").write_text("2")                                  # an uncommitted change: not provably safe
@@ -49,6 +49,9 @@ class Stall(unittest.TestCase):
             janus.tend_stalled_lands(cfg, hs, [], log.append); janus.tend_stalled_lands(cfg, hs, [], log.append)
         self.assertEqual(ran, [("u1", "lin")])                         # once, not every pass
         self.assertIn("land:u1:recovered", dict(janus.stall_findings(cfg, hs)))   # never silent
+        ran.clear(); cfg.jput("land_recover.json", {}); cfg.c["landing"]["auto_recover"] = False   # off (the default) it never acts
+        with mock.patch.object(janus, "spawn_land", lambda cfg, u, h: ran.append(u)), mock.patch.object(janus, "land_proc", lambda pid, u: True): janus.tend_stalled_lands(cfg, hs, [], log.append)
+        self.assertEqual(ran, [])
 
 
 class Restart(unittest.TestCase):
