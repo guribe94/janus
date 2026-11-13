@@ -25,5 +25,22 @@ class Fill(unittest.TestCase):
         self.assertEqual(got, [str(d.resolve()), str((d / "../code").resolve()), None])   # the root's repo; the brief's REPO:; its tree exists
 
 
+class RecurringAcks(unittest.TestCase):
+    def test_the_detector_never_feeds_on_its_own_findings_or_on_a_hold(self):
+        """Catches (row 93 and its meta rows): acks of issue:<key> raised issue:issue:<key> and a 'keeps coming back' row for
+        it; issue:<key> stayed after its row was written; and every re-ack of a finding that never cleared (a finished unit
+        held open for a chain) counted as a recurrence."""
+        d, cfg = project("\n[janus]\nack_issue_n = 3\n"); ack = lambda k: janus.cmd_ack(cfg, argparse.Namespace(problem=k, decision="held for the chain", decision_class=False))
+        with mock.patch.object(janus, "Beads", mock.Mock(side_effect=janus.Err("no beads"))), contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(4): ack("unit:u:finished")            # the finding stands all along: one episode, one count
+            self.assertEqual(cfg.jget("ack-counts.json"), {"unit:u:finished": 1})
+            janus.held_after(cfg, [], {"here": {"ok": True}}); ack("unit:u:finished")   # it cleared and came back: a recurrence
+            self.assertEqual(cfg.jget("ack-counts.json"), {"unit:u:finished": 2})
+        cfg.jput("ack-counts.json", {"overlap:a:b": 3, "issue:overlap:a:b": 5})
+        self.assertEqual([k for k, _ in janus.repeated_issue_findings(cfg)], ["issue:overlap:a:b"])
+        janus.auto_log_issues(cfg); self.assertNotIn("[issue:", janus.issue_path(cfg).read_text())
+        self.assertEqual(janus.repeated_issue_findings(cfg), [])   # its row exists: not raised again
+
+
 if __name__ == "__main__":
     unittest.main()

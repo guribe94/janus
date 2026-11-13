@@ -311,7 +311,9 @@ acked unit:parser:finished
 `janus doctor` names the file). A row is generic: no project, host or
 person. `--key <k>` makes it idempotent (a row for that key is written once) and is what `check`'s `issue:<k>` finding points
 at; when the register is configured, `janus check` writes that row itself the first time a key has been acked `[janus]
-ack_issue_n` (3) times, so a rule that keeps coming back is tracked, not re-remembered.
+ack_issue_n` (3) times, so a rule that keeps coming back is tracked, not re-remembered. An ack counts once per episode of its
+finding: a re-ack while the finding still stands (its ack ran out; a unit held open on purpose) is the same decision, not a
+recurrence. `issue:<key>` is not raised once the key's row exists, and acks of `issue:*` findings are never counted.
 
 **`janus intent add|done|list`**: what the orchestrator means to get done and has not finished, kept in beads (label `intent`)
 so it survives a context clear. `janus intent add "<what>" [--why ...] [--done-means ...] [--instruction <id>] [--unit <u> ...]`
