@@ -146,6 +146,14 @@ class F5RepetitiveFile(Case):
         self.assertEqual(snap(self.root / "chk"), snap(self.root / "worktrees/u"))
 
 
+class F6Binary(Case):
+    def test_new_modified_and_deleted_binary_files_arrive(self):
+        """Catches F6: every file with a NUL byte was skipped with exit 0 and no message, so a unit whose only change was a
+        binary fixture collected as 0 bytes and was marked collected."""
+        blob = bytes(range(256)) * 40
+        self.exact({"mod.bin": blob, "del.bin": b"\0\1\2", "t": b"t\n"}, {"mod.bin": blob[:5000] + b"\0NEW\0" + blob[5000:], "new.png": b"\x89PNG\0\0" + blob, "t": b"t\n"})
+
+
 class Guard(Case):
     def test_a_patch_that_does_not_rebuild_the_units_tree_is_refused(self):
         """Catches the class, not a case: whatever makes the written patch wrong (here a git whose diff output loses its last
