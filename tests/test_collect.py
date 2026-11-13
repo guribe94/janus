@@ -163,6 +163,12 @@ class F7ModesAndSymlinks(Case):
                     "tool": ("x", b"#!/bin/sh\necho\n"), "ln": ("link", "data"), "dlink": ("link", "dir")})
 
 
+class F8QuotedNames(Case):
+    def test_a_name_with_a_quote_a_tab_or_a_newline_arrives_under_its_own_name(self):
+        """Catches F8: names were written unquoted into the headers: `q"t<TAB>x.txt` arrived as a file named `q"t`."""
+        self.exact({'old"q\tx.txt': b"1\n"}, {'old"q\tx.txt': b"2\n", 'q"t\tx.txt': b"n\n", "nl\nname": b"n\n", "sp ace/café \\ b": b"s\n"})
+
+
 class Guard(Case):
     def test_a_patch_that_does_not_rebuild_the_units_tree_is_refused(self):
         """Catches the class, not a case: whatever makes the written patch wrong (here a git whose diff output loses its last
