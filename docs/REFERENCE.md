@@ -90,7 +90,10 @@ drains) with `legacy_slots`, `runner = "podman"` with a `[hosts.<h>.container]` 
 usb_args, usb_lock, host_dirs, clone_base, name_prefixes, cpus), `worktrees`, `job_log`, `run_env` (shell run before every
 job), `job_setup` (shell run in the worktree before the command; skipped, with a note, in a tree without the folder it `cd`s into, or `job_setup_in`: a job in another repository's checkout is not broken by it), `sync_exclude`, `cores_per_job` (CPU admission), and on the
 local machine `admit_check`/`admit_check_env` and `legacy_lanes` (dirs with a pid file of an older lane the land lane waits
-for). Optional `[lanes.<lane>] age_min` overrides a lane's age limit. `example.janus.toml` shows every key.
+for). Optional `[lanes.<lane>]` limits: `age_min` (minutes a job has RUN, from its start, before it is looked at), `stall_min`
+(30: a running job over `age_min` is reported `age:` STUCK only when it made no progress, no output and no CPU, for this long;
+a job that progresses is never re-queued) and `wait_min` (how long a job may wait queued or in admission, default the lane's
+age limit). `example.janus.toml` shows every key.
 
 **`[caps]`** (optional, only when the owner wants them): `total = 6`, and `[caps.host] server = 2`. With no caps the limit
 is what each machine can safely hold.
@@ -300,7 +303,8 @@ acked unit:parser:finished
 **`janus status`**: prints the Live state (hosts, units, ready work, spend, problems) without counting as a cycle.
 
 **`janus issue "<text>" [--evidence <path|sha|job>] [--key <finding key>]`**: append one row to the skill's issue register
-(`[janus] issues_file`, a path under the project root or absolute; refused when unset). A row is generic: no project, host or
+(`[janus] issues_file`, a path under the project root or absolute; unset: `ISSUES.md` in the project's state folder, and
+`janus doctor` names the file). A row is generic: no project, host or
 person. `--key <k>` makes it idempotent (a row for that key is written once) and is what `check`'s `issue:<k>` finding points
 at; when the register is configured, `janus check` writes that row itself the first time a key has been acked `[janus]
 ack_issue_n` (3) times, so a rule that keeps coming back is tracked, not re-remembered.
@@ -433,8 +437,9 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
   agent is told its run's budget in its prompt and in each resume message, and at `[budget] warn_pct` (80) % of it the watcher
   posts a budget checkpoint direction on the board: commit, write state, park or finish. A resume is refused when its budget
   cannot pay for loading the session's context again plus `[budget] resume_min_usd`; the unit then becomes resumable.
-- **Unattended loop.** With a cap (`cap_usd` and a ledger) the watcher keeps work moving while no orchestrator is at work:
-  the autopilot and the fill (section 6) are on unless janus.toml sets `[autopilot] enabled = false` or `[fill] watcher = false`.
+- **Unattended loop.** With `[autopilot] enabled = true` the watcher keeps work moving while no orchestrator is at work: the
+  autopilot and the fill (section 6). Unset is OFF (no `[autopilot]` section turns nothing on); `[fill] watcher` unset follows
+  the autopilot. `janus doctor` says whether the loop is on.
   On `unattended:off` a part of it is off while there is work it would move: turn it on, or ack with the owner's reason (the
   ack holds 7 days). On `watcher:step:<name>` one step of the watcher's pass failed three passes in a row (the other steps
   still ran): the error is in the finding and in `.janus/watch.log`; fix its cause (often one unit's record or one host), and
@@ -636,9 +641,9 @@ pane left without an agent for 20 minutes is closed first (section 2). A live se
 - **Agents count against build capacity.** A unit records its build host; `janus launch` refuses, saying when, unless a build
   reservation or a queue position (one queued job per running job) is free there.
 - **Fill.** `janus fill --dry-run` lists what fits now and why it stops; `janus fill` launches it, and so does the
-  watcher (`[fill] watcher`: on by default when a provider has a cap, else off). `check` reports `idle-with-backlog`.
-- **Autopilot (`[autopilot] enabled`: on by default when a provider has a `cap_usd` and a ledger, the cap being what bounds
-  it; `enabled = false` turns it off, `check` then says `unattended:off`).** The watcher applies the ending policy's fixed rules
+  watcher (`[fill] watcher`: unset follows `[autopilot] enabled`, so off by default). `check` reports `idle-with-backlog`.
+- **Autopilot (`[autopilot] enabled = true` turns it on; unset or false is off, and `check` then says `unattended:off` while
+  units are open).** The watcher applies the ending policy's fixed rules
   itself (docs/DESIGN.md, "Keeping work moving"): collect finished remote units; resume a unit stopped by its budget in its own
   session when the cap has room (before any new unit); relaunch a crashed unit from its report as `<unit>-r<k>` (same brief and tree, a copy of the report in its own out folder; never while the unit's own session, a resume of it or a job it is parked on is live: its host is asked just before; through `janus launch`: capacity, budget and
   the waste pause apply; at most `relaunch_max`, default 2); answer a board question that names a MEMORY.md subject exactly;
@@ -749,7 +754,9 @@ janus runs `tests.sh` itself and appends `<date> <time> <name> EXIT_tests=<rc> R
 `--host` is passed in `paths.gate_host_env` (default `JANUS_TEST_HOST`); `JANUS_LANE=gates` puts the gate's remote steps in the
 hosts' `gates` lanes. `--unit` (default `$JANUS_UNIT`) records the gate on the unit for the landing check. `--wait` prints the
 RESULT line, exit 0 on PASS. **`janus cancel <host>:<task>`** kills and removes a janus job that outlived its intent.
-**`janus queue [host] [--log N]`** prints each host's pueue status (or a task's log), read-only.
+**`janus queue [host] [--log [HOST:]N]`** prints each host's pueue status (or a task's log), read-only. Task ids repeat between
+hosts: `--log <host>:<id>` names one; a bare id prints only the hosts that have it. A janus job whose pueue output is empty or
+whose task is gone prints its run log instead.
 **`janus gate-log <name> [--task <host>:<id>]`** reads a failed gate's per-step summary and first error line: the RESULT line and
 the failing/passing test ids, then the gate's own output (the pueue task it was queued as, recorded in `out/<name>/task.txt`;
 `--task` overrides it; else a saved `out/<name>/log`), showing `EXIT_<step>=<rc>` per step and the first error-looking line.
