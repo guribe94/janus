@@ -169,6 +169,18 @@ class F8QuotedNames(Case):
         self.exact({'old"q\tx.txt': b"1\n"}, {'old"q\tx.txt': b"2\n", 'q"t\tx.txt': b"n\n", "nl\nname": b"n\n", "sp ace/café \\ b": b"s\n"})
 
 
+class F9ThreeWay(Case):
+    def test_git_apply_3way_merges_the_patch_into_a_checkout_that_moved(self):
+        """Catches F9: collect's hint says `git apply --3way`, but the patch had no `index` lines, so git could never merge:
+        `repository lacks the necessary blob to perform 3-way merge`, and a checkout that had moved refused the patch."""
+        lines = [b"line %d\n" % i for i in range(40)]
+        self.trees({"f": b"".join(lines)}, {"f": b"".join(lines[:35] + [b"the unit's line\n"] + lines[35:])}); self.assertEqual(self.build()[0], 0)
+        self.checkout(); (self.root / "chk/f").write_bytes(b"".join([b"moved on\n"] * 12 + lines)); self.git("commit", "-qam", "moved")
+        a = self.git("apply", "--3way", str(self.patch))
+        self.assertEqual(a.returncode, 0, a.stderr.decode()); self.assertNotIn(b"lacks the necessary blob", a.stderr)
+        got = (self.root / "chk/f").read_bytes(); self.assertIn(b"the unit's line\n", got); self.assertTrue(got.startswith(b"moved on\n"))
+
+
 class Guard(Case):
     def test_a_patch_that_does_not_rebuild_the_units_tree_is_refused(self):
         """Catches the class, not a case: whatever makes the written patch wrong (here a git whose diff output loses its last
