@@ -78,13 +78,13 @@ class Bug3GateStepsUnit(unittest.TestCase):
     def test_the_gate_s_task_carries_its_unit_for_the_steps_it_queues(self):
         """Catches (row 216): a gate's steps (`janus run` inside tests.sh) recorded `unit: null`, so a hold on the unit did not
         protect them and the autopilot's notice about them went to nobody."""
-        d, cfg = project(); FakeBeads.units_ = [{"id": "b1", "name": "pico", "cwd": str(d)}]; said = []
+        d, cfg = project(); FakeBeads.units_ = [{"id": "b1", "name": "u9", "cwd": str(d)}]; said = []
         def hrun(h, s, **k): said.append(s); return (0, '{"tasks": {}}' if "status --json" in s else "12", "")
         with mock.patch.object(janus, "Beads", FakeBeads), mock.patch.object(janus, "hrun", hrun):
-            janus.cmd_gate(cfg, self.gate(cfg, d, "land-pico-x", unit="pico"))
-            add = next(s for s in said if "--print-task-id" in s); self.assertIn("JANUS_UNIT=pico", add); said.clear()
-            janus.cmd_gate(cfg, self.gate(cfg, d, "land-pico-y"))   # no --unit: the open unit its name carries
-            self.assertIn("JANUS_UNIT=pico", next(s for s in said if "--print-task-id" in s))
+            janus.cmd_gate(cfg, self.gate(cfg, d, "land-u9-x", unit="u9"))
+            add = next(s for s in said if "--print-task-id" in s); self.assertIn("JANUS_UNIT=u9", add); said.clear()
+            janus.cmd_gate(cfg, self.gate(cfg, d, "land-u9-y"))   # no --unit: the open unit its name carries
+            self.assertIn("JANUS_UNIT=u9", next(s for s in said if "--print-task-id" in s))
 
     def test_a_step_of_a_live_gate_is_not_an_orphan_of_its_unit(self):
         """Catches (row 216): with the unit on the steps, a gate the orchestrator runs for a unit whose agent has ended would
