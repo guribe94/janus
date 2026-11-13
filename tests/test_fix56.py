@@ -1,6 +1,6 @@
 """skill-fix56: the known skill issues fixed at the root (project ISSUES rows 83, 93, 94, 59, 133 and the nobrief count).
 One test per failure, each naming what it catches. Standard library only; no network, no spend. Run by ./check."""
-import argparse, contextlib, io, subprocess, time, unittest
+import argparse, contextlib, io, re, subprocess, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -51,6 +51,19 @@ class Intents(unittest.TestCase):
         with mock.patch.object(janus, "Beads", lambda cfg: mock.Mock(issues=lambda *a: iss)):
             F = dict(janus.intent_findings(cfg, []))
         self.assertEqual(list(F), ["intent:i1:stale"]); self.assertIn("not moved for 5.0 h", F["intent:i1:stale"])
+
+
+class OrchestratorCard(unittest.TestCase):
+    def test_the_orchestrators_own_card_is_never_silent(self):
+        """Catches (row 59): the orchestrator's status post made a card that was judged like an agent's, so 30 min later check
+        told the cycling orchestrator that 'orchestrator' was silent, again after every ack."""
+        d, cfg = project(); cfg.run.ro = False; janus.board_upkeep(cfg, []); bd = d / "board"
+        for n in ("orchestrator", "a1"):
+            janus.board(cfg, "post", n, "status", "cycle"); c = bd / f"agents/{n}.md"; c.write_text(re.sub(r"- updated: .*", "- updated: 2000-01-01 00:00", c.read_text()))
+        self.assertEqual({n: r["silent"] for n, r in janus.board_rows(cfg).items()}, {"orchestrator": False, "a1": True})
+        silent = lambda cfg: {"orchestrator": {"state": "working", "silent": True, "gone": False, "text": ""}}   # a project's own board script
+        with mock.patch.object(janus, "board_rows", silent): self.assertEqual(janus.card_findings(cfg, set()), [])
+        self.assertEqual([k for k, _ in janus.card_findings(cfg, {"a1"})], ["board:a1:silent"])
 
 
 if __name__ == "__main__":
