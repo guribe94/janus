@@ -61,7 +61,7 @@ args = []
 # known_failures = "out/known-failures.tsv"       # <test id cols...> TAB <cause> TAB <unit fixing it>; gates with only these pass
 # stall_min = 180         # a land at its final gate longer than this is land:<unit>:stalled
 # starve_min = 20         # ... or one whose gate waits this long on a paused host while a landing host is free
-# auto_recover = true     # the watcher restarts a starved land on the free host when provably safe (land:<unit>:recovered)
+# auto_recover = true     # OFF unless true: the watcher restarts a starved land on the free host when provably safe (land:<unit>:recovered)
 # gate_timeout_min = 120  # a gate's process group is stopped after this long (RESULT: FAIL, EXIT_timeout=124)
 # quick_gate_min = 15     # gates expected under this many minutes use the one-slot gates-quick group
 

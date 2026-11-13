@@ -121,7 +121,7 @@ def recover_refusal(cfg, s):
     the merge as a commit with no open change, the recorded process is that land, and the watcher has not restarted it lately.
     A restart then loses gate time only: land --restart merges the landing branch again and gates the result."""
     r = s["rec"]; wt = r.get("wt") or ""
-    if cfg.c.get("landing", {}).get("auto_recover") is False: return "[landing] auto_recover is false"
+    if cfg.c.get("landing", {}).get("auto_recover") is not True: return "[landing] auto_recover is not true (off by default until a real pueue gate restart is proven; the command in this finding does it by hand)"
     if not s["starved"]: return "it is over the time bound but not starved beside a free landing host: a slow gate that still runs would lose its progress"
     if not Path(wt).is_dir(): return f"its worktree {wt or '(not recorded)'} is not on this machine"
     rc, o, e = sh(["git", "-C", wt, "status", "--porcelain", "--untracked-files=no"])
