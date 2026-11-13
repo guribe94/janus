@@ -241,7 +241,9 @@ class Board:
         for c in sorted(glob.glob(self.p("agents", "*.md"))):
             a = os.path.basename(c)[:-3]; st = field(c, "state")
             age = int((n - epoch_of(field(c, "updated"))) / 60); flag = ""
-            if st not in ("done", "waiting"):   # a parked agent (waiting) is never SILENT or GONE
+            # A parked agent (waiting) is never SILENT or GONE. Nor is the orchestrator's own card (its status posts make one):
+            # it is no agent that reports here; whether it cycles is the watcher's to judge (its check cycle), not the board's.
+            if st not in ("done", "waiting") and a != "orchestrator":
                 if age > int(os.environ.get("BOARD_SILENT_MIN") or 30): flag = f"SILENT {age}m"
                 if self.master and self.gone(field(c, "check")): flag = (flag + ", " if flag else "") + "GONE (no done post)"
             b = field(c, "blockers")

@@ -184,7 +184,8 @@ unreachable hosts and what was on them; hosts over their margins (key `margin:<h
 idle room while beads has ready work (units, `janus-log` and instructions are not work: `janus launch` marks every unit
 `in_progress`); orphan pueue jobs (including lane jobs labelled `unit:<name>` whose unit is closed), tmux sessions (`janus-*`)
 and herdr agents that belong to no open unit; blocked or finished units; every board card in state question or blocked, or
-SILENT (over `silent_min`) or GONE, including cards janus did not launch (marked "not a unit"); jobs still waiting under the
+SILENT (over `silent_min`) or GONE, including cards janus did not launch (marked "not a unit"); the orchestrator's own card (its
+status posts make one) is never SILENT or GONE: it does not post per cycle, and the watcher judges its cycle; jobs still waiting under the
 old cap rule (`old-rule:<host>`); on the coordinating machine, CPU burners an agent started (over 80 % CPU for 10 min, under an agent or
 orphaned) and test or build runs outside the pueue lanes (`localtest:<pid>`); an orchestrator kind in janus.toml that differs
 from the registered session's;

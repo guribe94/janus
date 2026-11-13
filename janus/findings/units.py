@@ -174,6 +174,9 @@ def card_findings(cfg, names):
         tag = "" if card in names else " (not a unit)"
         if r["state"] == "blocked" or (r["state"] == "question" and not qids):
             F.append((f"board:{card}:{r['state']}", f"{card}{tag} is {r['state'].upper()} on the board: {r['text']}; answer with board.sh direct"))
+        if card == "orchestrator": continue   # ISSUES row 59: its own card, made by its status posts, was judged like an agent's
+        # and raised board:orchestrator:silent to the orchestrator itself 30 min after each post, while it cycled (it does not
+        # post per cycle; the watcher judges its cycle). Also for a project's own board script, which may still flag it.
         if r["gone"]: F.append((f"board:{card}:gone", f"{card}{tag} GONE: its process ended without a done post: relaunch its unit from its report (--resume-of), or janus board-close it"))
         elif r["silent"] and r["state"] not in ("question", "blocked"):
             F.append((f"board:{card}:silent", f"{card}{tag} silent over {cfg.silent // 60} min on the board: read its report or transcript (janus transcript), then direct it"))
