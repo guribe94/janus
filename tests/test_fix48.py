@@ -201,6 +201,22 @@ class Landing(unittest.TestCase):
         git(self.wt, "apply", str(od / "changes.patch")); git(self.wt, "add", "b"); git(self.wt, "commit", "-qm", "u: b")
         self.assertNotIn("landing:u:patch", [k for k, _ in janus.landing_findings(self.cfg, [self.u], {})])
         self.assertEqual(self.land(), 0)   # applied and committed: it lands
+        (od / "changes.patch").write_text("diff --git a/.pytest_cache/v/x b/.pytest_cache/v/x\nnew file mode 100644\n--- /dev/null\n+++ b/.pytest_cache/v/x\n@@ -0,0 +1 @@\n+1\n")
+        self.assertIsNone(janus.unapplied_patch(self.cfg, self.u), "row 251: a patch of tool caches only was taken for unapplied work")
+
+    def test_land_writes_a_missing_or_stale_gate_script_with_gate_gen(self):
+        """Catches row 252: `janus land` failed at once ('out/land-<unit>/tests.sh not found') when nobody had generated the final
+        gate's script, and gated a stale script after a merge."""
+        self.cfg.c["landing"]["gate_gen"] = "mkdir -p out/land-{unit} && echo {worktree} >> out/land-{unit}/tests.sh"
+        t = self.d / "out/land-u/tests.sh"; seen = []; self.commit(self.wt, "b", "work")
+        def gen():
+            with contextlib.redirect_stdout(io.StringIO()): janus.gate_gen(self.cfg, self.cfg.c["landing"], "u", self.wt)
+            return len(t.read_text().splitlines())
+        with mock.patch.object(janus, "cmd_run", lambda cfg, a: seen.append(t.read_text() if t.is_file() else None) or 0):
+            self.assertEqual(self.land(no_gate=False), 0)
+        self.assertEqual(seen, [f"{self.wt}\n"], "the gate ran without a generated script")
+        self.assertEqual(gen(), 1, "a script newer than the tree was generated again")
+        os.utime(t, (1, 1)); self.assertEqual(gen(), 2, "a script older than the tree was kept")
 
     def test_land_refuses_a_landing_branch_that_is_behind_its_pushed_upstream(self):
         """Catches row 240: the local landing branch was one pushed commit behind its upstream; land counted that commit as the

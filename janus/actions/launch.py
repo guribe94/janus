@@ -6,7 +6,7 @@ from janus.actions.jobs import agent_res, ensure_lanes, in_container, job_script
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_script, board_shipped
 from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost, waste_block
-from janus.cap import build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
+from janus.cap import FACTS, build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
 from janus.context import EXCL, Err, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, note_event, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
 from janus.memory import MEM_SECTIONS, mem_line, memory_read, mset
@@ -346,7 +346,9 @@ def choose(cfg, a, brief, mc, units, hs):
     a free build reservation or a bounded queue position (build_room, janus-fixes8 item 3)."""
     if a.host and a.host not in cfg.hosts: raise Err(f"unknown host {a.host}")
     hosts, why_place, want = place(cfg, a, brief, mc, units, hs)
-    best, bn, notes = None, (False, 0), []; git = needs_git(brief)
+    best, bn, notes = None, (False, 0), []; git = needs_git(brief); facts = cfg.jget(FACTS) if git else {}
+    # row 248: a host has git when it is the coordinator or its discovered facts list it (the cache only: no discovery here)
+    has_git = lambda n: bool(cfg.hosts[n].get("local") or "git" in (facts.get(n) or {}).get("features", []))
     for n in hosts:
         r, why = room(cfg, n, hs[n], units, a.kind == "cleanup")
         if r < 1: notes.append(f"{n}: {why}"); continue
@@ -354,10 +356,10 @@ def choose(cfg, a, brief, mc, units, hs):
         if not hs.get(b, {}).get("ok"): notes.append(f"{n}: build host {b} unreachable"); continue
         ok, bw = build_room(cfg, b, host_cap(cfg, b, hs[b], units), a.kind)
         if not ok: notes.append(bw); continue
-        k = (bool(git and cfg.hosts[n].get("local")), r)   # row 236: a brief that needs git goes to a host with the repository first
+        k = (bool(git and has_git(n)), r)   # row 236: a brief that needs git goes to a host with git first; among those, the most room
         if k > bn: best, bn = (n, b, f"{why_place}; {bw}"), k
     if not best: raise Err("refused, no room (" + "; ".join(dict.fromkeys(notes)) + ")")
-    if git and not cfg.hosts[best[0]].get("local"):
+    if git and not has_git(best[0]):
         loc = next((n for n, h in cfg.hosts.items() if h.get("local")), "<host>")
         best = (*best[:2], best[2] + f"; WARNING: the brief's DONE-WHEN names '{git}' and the agent's copy on {best[0]} has no git (it cannot "
                 f"commit, push or run a landing gate there): place it with --host {loc}, or plan to collect and land its patch yourself")

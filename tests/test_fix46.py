@@ -86,6 +86,19 @@ class Bug3GateStepsUnit(unittest.TestCase):
             janus.cmd_gate(cfg, self.gate(cfg, d, "land-u9-y"))   # no --unit: the open unit its name carries
             self.assertIn("JANUS_UNIT=u9", next(s for s in said if "--print-task-id" in s))
 
+    def test_a_gate_for_another_host_does_not_take_a_coordinator_gates_slot(self):
+        """Catches row 245: `janus gate <name> --host <remote>` (or a script that names its host) was queued in the coordinator's
+        `gates` group, so two slow local gates held every other host's gates for hours."""
+        d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/r"\ngate_slots = 3\n'); said = []
+        def hrun(h, s, **k): said.append(s); return (0, '{"tasks": {}}' if "status --json" in s else "12", "")
+        def group(a): said.clear(); janus.cmd_gate(cfg, a); return next(s for s in said if "--print-task-id" in s)
+        with mock.patch.object(janus, "hrun", hrun), mock.patch.object(janus, "gate_unit", lambda *a: None):
+            self.assertIn(" -g gates-far ", group(self.gate(cfg, d, "g1", host="far")))
+            self.assertTrue(any("group add -p 3 gates-far" in s for s in said), "the coordinator has no gates-far group")
+            a = self.gate(cfg, d, "g2", quick=True); (d / "out/g2/tests.sh").write_text("#!/bin/sh\n# janus-gate-host: far\nexit 0\n")
+            self.assertIn(" -g gates-far ", group(a))
+            self.assertIn(" -g gates ", group(self.gate(cfg, d, "g3", host="here")), "a gate for the coordinator stays in its gates group")
+
     def test_a_step_of_a_live_gate_is_not_an_orphan_of_its_unit(self):
         """Catches (row 216): with the unit on the steps, a gate the orchestrator runs for a unit whose agent has ended would
         have its steps cancelled as orphans while the gate itself is running."""

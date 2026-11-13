@@ -670,6 +670,19 @@ pane left without an agent for 20 minutes is closed first (section 2). A live se
 - **Landing.** `janus land <unit>` merges the landing branch (stops and dispatches `merge-<unit>` on a conflict), gates the merged
   tree on `[landing] final_gate_host`, then squash-lands. `final_gate` may name `{unit}`, `{wt}` and `{branch}`, substituted per
   land, so a project that gates per unit (`out/land-{unit}-linux/...`) gets the unit it is landing (item 12).
+- **Every host is independent of the coordinator** (the machine `janus` runs on). The final gate is queued on
+  `final_gate_host` and waits only for that host's lanes and admission, so a Linux final gate belongs on a Linux host
+  (`final_gate_host = "<linux host>"`, `final_gate` = the test command run in the synced tree): then no landing waits behind
+  the coordinator's own gates. A final gate set on the coordinator (a `janus gate ...` command) takes one of its `gates` slots.
+  `[landing] gate_gen = "<command> {unit} {worktree}"` (optional): `janus land` runs it in the project root before the gate
+  when `out/land-<unit>/tests.sh` is missing or older than the merged tree's head commit; a failure stops the land. The
+  `land` lane exists on every host (one slot; on the coordinator it also waits for the disk floor, `admit_check` and
+  `legacy_lanes`). `janus fill --max <n>` counts per host. The autopilot relaunches a crashed or capped unit of any host: for
+  another host's unit it first applies the collected `out/<unit>/changes.patch` to the unit's worktree, and leaves the unit to
+  the orchestrator (finding `unit:<n>:relaunch`, with the reason) only when that patch cannot be applied. A brief whose
+  DONE-WHEN needs git is placed on any host with git (the coordinator, or a host whose discovered facts list `git`).
+  `janus collect` leaves tool caches (`.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.hypothesis`, `.tox`, `__pycache__`)
+  and new files the tree's own `.gitignore` ignores out of `changes.patch`; `janus land` treats a patch of caches only as empty.
 
 ### Hosts, queues and outages
 
@@ -855,6 +868,9 @@ over-counts clone-shared trees), so the space actually freed is visible.
   `EXIT_timeout=124 RESULT: FAIL` line is written. Every gate runs under `janus gate-exec`, which records its length.
 - `[landing] quick_gate_min`: a gate expected (median of its own last runs, else of its family `land-*-<suffix>`) under this
   many minutes, or queued with `--quick`, goes to the one-slot `gates-quick` group, so short gates never wait behind long ones.
+- A gate whose steps run on another host (`janus gate <name> --host <host>`, or a `# janus-gate-host: <host>` line in the first
+  10 lines of its `tests.sh`; `janus gate-scope` writes that line when every step is on one remote host) is queued in the
+  coordinator's group `gates-<host>` (that host's `gate_slots`): it never takes or waits for a `gates`/`gates-quick` slot.
 
 **Test fixtures never trip live findings.** `tests/test_janus.py` puts every fixture (temp projects, scripts, daemons) under one
 temporary root named `janus-test-fixture-*` and sets `JANUS_IN_TESTS` for itself. A live `janus check` (or the watcher) skips any

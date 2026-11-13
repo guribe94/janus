@@ -83,12 +83,11 @@ def fill_candidates(cfg, units):
 def fill_plan(cfg, hs, units, limit=None):
     """(plan [(name, item, model, agent host, build host, budget, why)], stops [why the rest does not launch now]): candidates
     in priority order, each placed by choose() against the open units plus those planned before it, until the hosts'
-    reservations or the provider budgets are used."""
+    reservations or the provider budgets are used. limit (--max): at most that many per agent host."""
     plan, stops, virt, spent, keep = [], [], [dict(u) for u in units], {}, {}
     cands = fill_candidates(cfg, units)
     if not cands: return plan, ["no ready backlog item has an unlaunched brief (a brief is for an item when it has an ITEM: <id> line)"]
     for pr, order, item, f, name, kind, tier in cands:
-        if limit and len(plan) >= limit: stops.append(f"--max {limit} reached; {len(cands) - len(plan)} more candidate(s)"); break
         a = argparse.Namespace(unit=name, host=None, test_host=None, kind=kind, tier=tier)
         try: m = pick_model(cfg, tier, kind, None)
         except Err as e: stops.append(f"{name}: {e}"); continue
@@ -102,6 +101,8 @@ def fill_plan(cfg, hs, units, limit=None):
                 stops.append(f"budget: {mc['provider']} has ${left:.2f} left" + (f" (${k:.2f} kept for {len(need)} open unit(s) to finish)" if k else "") + f", {name} needs ${budget:g}"); break
         try: hn, b, why = choose(cfg, a, f, mc, virt, hs)
         except Err as e: stops.append((name, str(e).removeprefix("refused, "))); continue
+        if limit and sum(1 for x in plan if x[3] == hn) >= limit:   # row 250: --max counts each host on its own; the other hosts go on
+            stops.append((name, f"--max {limit} reached on {hn}")); continue
         if budget is not None: spent[mc["provider"]] = spent.get(mc["provider"], 0) + hold
         plan.append((name, item, m, hn, b, budget, f"{why}; priority {pr}", kind, tier, f))
         virt.append({"name": name, "host": hn, "build": b, "state": "working", "item": item})

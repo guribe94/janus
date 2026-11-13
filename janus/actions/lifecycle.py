@@ -102,10 +102,11 @@ def cmd_stop(cfg, a):
 # writes the patch (`diff-tree -p --binary --full-index`, so `git apply --3way` has its blob ids), and the patch is proved
 # before it is printed: applied by git to the base tree it must give the unit's tree id. Anything that keeps the patch from
 # being complete (an unreadable path, no git, a patch that does not rebuild the tree) is an error on stderr and a non-zero
-# exit; a fifo, socket or device, which git cannot carry, is named on stderr and left out.
+# exit; a fifo, socket or device, which git cannot carry, is named on stderr and left out. Tool caches (SKIP) and new files the
+# tree's own .gitignore ignores are no part of the unit's changes (row 251); a file that was sent is carried whatever the rules say.
 PATCH_PY = r"""import filecmp, os, shutil, stat, subprocess, sys, tempfile
 unit, base, wt = sys.argv[1], sys.argv[2], sys.argv[3]
-SKIP = {"target", ".venv", "node_modules", "__pycache__", ".git"}
+SKIP = {"target", ".venv", "node_modules", "__pycache__", ".git", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".hypothesis", ".tox"}   # gates.CACHE_DIRS too
 bad, notes = [], []
 def die(msg):
     sys.stderr.write("janus patch (%s): %s\n" % (unit, msg.rstrip())); sys.exit(1)
@@ -154,6 +155,15 @@ try:
         return p.stdout.decode().strip() if out == subprocess.PIPE else ""
     git(["init", "-q"])
     with open(tmp + "/g/info/attributes", "w") as f: f.write("* -text -filter -ident -working-tree-encoding !eol !diff\n")
+    new = [r for r in ch if r not in A]   # row 251: a NEW file the tree's own .gitignore rules ignore (build output, a log) is not the unit's work
+    if new:
+        p = subprocess.run(G + ["check-ignore", "--no-index", "-z", "--stdin"], cwd=wt, input=b"".join(os.fsencode(r) + b"\0" for r in new),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(env, GIT_WORK_TREE=os.path.abspath(wt)))
+        if p.returncode not in (0, 1): die("no complete patch: git check-ignore failed: %s" % p.stderr.decode(errors="replace").strip()[-800:])
+        ign = set(os.fsdecode(x) for x in p.stdout.split(b"\0") if x)
+        if ign: sys.stderr.write("janus patch (%s): note: %d new path(s) ignored by .gitignore left out: %s\n" % (unit, len(ign), ", ".join(sorted(ign)[:8])))
+        ch = [r for r in ch if r not in ign]
+        if not ch: sys.exit(0)
     def tree(root, E, name):
         e = dict(GIT_INDEX_FILE=tmp + "/" + name, GIT_WORK_TREE=os.path.abspath(root))
         git(["update-index", "--add", "-z", "--stdin"], cwd=root, inp=b"".join(os.fsencode(r) + b"\0" for r in ch if r in E), **e)

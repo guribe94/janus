@@ -93,7 +93,7 @@ def main():
         A("--why", help="hold: why it is kept"), dry=True)
     add("busy", cmd_busy, A("wt", help="a worktree: exit 0 while a janus job, a unit's job or a mutation run uses it, else 1"))
     add("cancel", cmd_cancel, A("job", help="<host>:<task id> of a janus run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
-    add("fill", cmd_fill, A("--max", type=int, help="launch at most this many"), dry=True)
+    add("fill", cmd_fill, A("--max", type=int, help="launch at most this many on each host"), dry=True)
     add("brief", cmd_brief, A("action", choices=["draft", "accept"], help="draft: one cheap unit writes briefs for the items into <briefs>/drafts; accept: move one draft to <briefs> so fill can launch it"),
         A("items", nargs="+", help="backlog item ids (accept: one)"), A("--as", dest="as_name", metavar="UNIT", help="accept: the unit name (default: the one in the draft's first line)"),
         A("--model", help="draft: the model (default: the first available of [routing] draft, else of the normal route)"), dry=True)
