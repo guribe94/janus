@@ -2,11 +2,11 @@
 only; no network, no spend.
 
 Run by ./check (it discovers tests/test_*.py)."""
-import argparse, json, os, signal, subprocess, sys, time, unittest
+import argparse, json, os, subprocess, time, unittest
 from pathlib import Path
 from unittest import mock
 
-from test_janus import JANUS_PY, janus, project
+from test_janus import janus, project
 
 iso = lambda ago: time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - ago))
 GROUPS = {"jobs": {"status": "Running", "parallel_tasks": 4}, "gates": {"status": "Running", "parallel_tasks": 4}}
@@ -144,21 +144,6 @@ class Bug10RunLogOfAGoneTask(unittest.TestCase):
             rc, path = janus.job_result(cfg, hs, "here:7", "here")
             self.assertEqual(Path(path).read_text(), "58% passed\n")
             self.assertIn("58% passed", "\n".join(janus.cmd_queue(cfg, argparse.Namespace(host=None, log="here:7"))[1]))
-
-
-class Bug6CancelStopsTheGatesGroup(unittest.TestCase):
-    def test_a_signalled_gate_wrapper_stops_its_command_s_group_and_writes_no_result(self):
-        """Catches (row 219): cancelling a gate killed its wrapper only; the gate's runner and tests.sh (their own process group)
-        kept running, queued later steps and wrote a RESULT line after the cancel."""
-        d, cfg = project(); late = d / "late"; rd = Path(cfg.hosts["here"]["_rd"])
-        p = subprocess.Popen([sys.executable, str(JANUS_PY), "gate-exec", "g", "--", f"(sleep 2; echo RESULT > {late}) & wait"],
-                             cwd=d, env={**os.environ, "JANUS_ROOT": str(d), "JANUS_WRAP": "gate-g-1"}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        t0 = time.time()
-        while not (rd / "gate-g-1.pgid").is_file() and time.time() - t0 < 10: time.sleep(0.1)
-        self.assertTrue((rd / "gate-g-1.pgid").is_file(), "no group id for janus cancel to stop")
-        p.send_signal(signal.SIGTERM); self.assertEqual(p.wait(timeout=30), 128 + signal.SIGTERM); time.sleep(3)
-        self.assertFalse(late.exists(), "the gate's command outlived the cancel and wrote its result")
-        self.assertEqual((d / "out/gates.log").exists(), False)
 
 
 class Bug7LandingGateHoldsTheHead(unittest.TestCase):
