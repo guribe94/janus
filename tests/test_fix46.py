@@ -165,5 +165,50 @@ class Bug7LandingGateHoldsTheHead(unittest.TestCase):
             a.allow_unmerged = True; janus.cmd_gate(cfg, a)
 
 
+def doctor_lines(cfg):
+    """janus doctor's lines for a project, with the machine's tools, hooks and watcher stubbed."""
+    import contextlib, io, tempfile
+    out = io.StringIO()
+    with mock.patch.dict(os.environ, {"HOME": tempfile.mkdtemp(prefix="janus-home-")}), mock.patch.object(janus, "sh", lambda *a, **k: (0, "", "")), \
+         mock.patch.object(janus, "watcher_loaded", lambda *a: True), contextlib.redirect_stdout(out):
+        janus.doctor(cfg, type("A", (), {"no_hosts": True})())
+    return out.getvalue().splitlines()
+
+
+class Bug11IssueRegisterDefault(unittest.TestCase):
+    def test_an_issue_is_written_to_the_state_folder_when_no_register_is_configured(self):
+        """Catches (row 224): `janus issue` refused in a project with no `[janus] issues_file`, so what an agent met there was
+        never written down; and doctor not naming where the rows go."""
+        d, cfg = project()
+        self.assertNotIn("issues_file", cfg.c.get("janus", {}))
+        rc, L = janus.cmd_issue(cfg, type("A", (), {"text": "a gate ran on an old tree", "evidence": "here:7", "key": None})())
+        reg = cfg.f("ISSUES.md")
+        self.assertEqual(rc, 0, L); self.assertTrue(reg.is_file(), L); self.assertIn("| 1 | a gate ran on an old tree | here:7 |", reg.read_text())
+        self.assertIn(str(reg), L[0])
+        line = [l for l in doctor_lines(cfg) if "issue register" in l]
+        self.assertTrue(line and str(reg) in line[0] and "default" in line[0], line)
+        cfg.c.setdefault("janus", {})["issues_file"] = "docs/I.md"   # a configured register still wins
+        self.assertEqual(janus.issue_path(cfg), cfg.root / "docs/I.md")
+
+
+class Bug12AutopilotOffUnlessSet(unittest.TestCase):
+    def test_no_autopilot_section_means_the_unattended_loop_is_off_and_doctor_and_check_say_so(self):
+        """Catches (row 225): a project with a spending cap and no `[autopilot]` section had the watcher relaunch its units and
+        launch its backlog unasked (on by default with a cap); and nothing saying whether the loop is on."""
+        d, cfg = project("\n[backlog]\nfile = \"S.md\"\n")
+        self.assertTrue(janus.has_cap(cfg)); self.assertNotIn("autopilot", cfg.c)
+        self.assertFalse(janus.apc(cfg, "enabled"), "the autopilot is on with no [autopilot] section")
+        self.assertFalse(janus.fill_watcher(cfg), "the watcher fills from the backlog with no [autopilot] section")
+        F = dict(janus.unattended_findings(cfg, [{"id": "t-1", "name": "u1"}]))
+        self.assertIn("unattended:off", F); self.assertIn("[autopilot] enabled = true", F["unattended:off"]); self.assertNotIn("cap_usd", F["unattended:off"])
+        line = [l for l in doctor_lines(cfg) if "unattended loop" in l]
+        self.assertTrue(line and " off" in line[0] and "[autopilot] enabled" in line[0], line)
+        cfg.c["autopilot"] = {"enabled": True}   # the owner's setting turns both on
+        self.assertTrue(janus.apc(cfg, "enabled")); self.assertTrue(janus.fill_watcher(cfg))
+        self.assertEqual(janus.unattended_findings(cfg, [{"id": "t-1", "name": "u1"}]), [])
+        self.assertTrue(any("unattended loop" in l and " on" in l for l in doctor_lines(cfg)))
+        cfg.c["fill"] = {"watcher": False}; self.assertFalse(janus.fill_watcher(cfg))
+
+
 if __name__ == "__main__":
     unittest.main()

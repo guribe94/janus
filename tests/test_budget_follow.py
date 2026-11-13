@@ -483,8 +483,8 @@ class Item7Resumable(unittest.TestCase):
         self.assertIn("janus resume u1 --budget 1.5", dict(janus.resumable_findings(self.cfg, [self.u])).get("unit:u1:resumable", ""))
 
 class Item8Unattended(unittest.TestCase):
-    """With a spending cap the watcher keeps work moving on its own (relaunch, resume, fill), says so when that is off, and one
-    failing step never stops the rest of a pass."""
+    """With `[autopilot] enabled = true` the watcher keeps work moving on its own (relaunch, resume, fill); unset is off (ISSUES
+    row 225: it was on with a cap, unasked), check says so when that is off, and one failing step never stops the rest of a pass."""
     STEPS = ("heartbeat_beat", "board_alerts", "tend_parked", "tend_checkpoint", "tend_resumable", "tend_autopilot", "tend_thrash", "tend_tidy")
     def setUp(self):
         self.real = janus.Beads; janus.Beads = FakeBeads; FakeBeads.units_ = []; self.log = []
@@ -505,10 +505,10 @@ class Item8Unattended(unittest.TestCase):
         with mock.patch.multiple(sys.modules["janus.watch"], **stubs): janus.watch_pass(cfg, self.log.append)
         return ran
 
-    def test_with_a_cap_the_watcher_relaunches_and_fills_without_being_configured(self):
-        """Catches (item 8): a project with a cap and no [autopilot]/[fill] section left a crashed unit dead and ready backlog
-        units unlaunched all night: the unattended loop was off unless the owner had found both settings."""
-        d, cfg = project()
+    def test_one_setting_has_the_watcher_relaunch_and_fill(self):
+        """Catches (item 8, row 225): a project whose owner turned the autopilot on left ready backlog units unlaunched all night,
+        because the fill needed a second setting nobody had found."""
+        d, cfg = project("\n[autopilot]\nenabled = true\n")
         self.assertEqual(self.relaunched(cfg, d), ["u1-r1"], "a crashed unit was not relaunched in a project with a cap")
         self.assertIn("cmd_fill", self.watch(cfg, F=["idle-with-backlog"]), "ready backlog units were not launched in a project with a cap")
         self.assertEqual(janus.unattended_findings(cfg, [self.crashed(d)]), [])
@@ -521,16 +521,18 @@ class Item8Unattended(unittest.TestCase):
         F = dict(janus.unattended_findings(cfg, [self.crashed(d)]))
         self.assertEqual(list(F), ["unattended:off"]); self.assertIn("[autopilot] enabled", F["unattended:off"]); self.assertIn("[fill] watcher", F["unattended:off"])
         self.assertFalse(janus.finding("unattended:off", F["unattended:off"]).urgent)   # registered: check can report it
-        d, cfg = project("\n[fill]\nwatcher = false\n")   # the autopilot on by the cap; a fill with no backlog file does nothing
+        d, cfg = project("\n[autopilot]\nenabled = true\n[fill]\nwatcher = false\n")   # the autopilot on; a fill with no backlog file does nothing
         self.assertEqual(janus.unattended_findings(cfg, [self.crashed(d)]), [])
 
-    def test_without_a_cap_it_stays_off_and_check_says_so_while_work_is_open(self):
-        """Catches (item 8): the watcher launching and relaunching agents in a project with no spending cap; and that project's
-        orchestrator not told that nothing recovers its units while it is away."""
-        d, cfg = project(); del cfg.prov["api"]["cap_usd"]
+    def test_unset_it_stays_off_and_check_says_so_while_work_is_open(self):
+        """Catches (item 8, row 225): the watcher launching and relaunching agents in a project that never turned the loop on
+        (with or without a spending cap); and that project's orchestrator not told that nothing recovers its units while it is away."""
+        d, cfg = project()
+        self.assertEqual(self.relaunched(cfg, d), [], "relaunched with a cap and no [autopilot] section")
+        del cfg.prov["api"]["cap_usd"]
         self.assertEqual(self.relaunched(cfg, d), []); self.assertNotIn("cmd_fill", self.watch(cfg, F=["idle-with-backlog"]))
         F = dict(janus.unattended_findings(cfg, [self.crashed(d)]))
-        self.assertEqual(list(F), ["unattended:off"]); self.assertIn("cap_usd", F["unattended:off"])
+        self.assertEqual(list(F), ["unattended:off"]); self.assertIn("unset is off", F["unattended:off"])
         self.assertEqual(janus.unattended_findings(cfg, []), [], "reported with no open unit and no backlog: nothing to keep moving")
         cfg.c["autopilot"] = {"enabled": True}
         self.assertEqual(self.relaunched(cfg, d), ["u1-r1"]); self.assertEqual(janus.unattended_findings(cfg, [self.crashed(d)]), [])
@@ -538,7 +540,7 @@ class Item8Unattended(unittest.TestCase):
     def test_a_failing_step_is_logged_and_the_rest_of_the_pass_still_runs(self):
         """Catches (item 8): one watcher step that raised (a unit record it could not read) ended the whole pass, every pass: no
         resume, no relaunch, no fill and no orchestrator wake until someone looked at the log."""
-        d, cfg = project()
+        d, cfg = project("\n[autopilot]\nenabled = true\n")
         def bad(*a, **k): raise KeyError("host")
         for i in range(3):
             ran = self.watch(cfg, F=["idle-with-backlog"], tend_parked=bad); os.utime(cfg.f("last_fill"), (time.time() - 7200,) * 2)

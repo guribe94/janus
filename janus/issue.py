@@ -2,9 +2,9 @@
 
 The owner rule "log every oddity as an ISSUES row" lived only in docs; this makes it one command, so a finding an agent or the
 orchestrator met is written down instead of remembered. The register is the file `[janus] issues_file` names (relative to the
-project root, or absolute); each call appends one markdown table row `| <n> | <text> | <evidence> |`. The register is the
+project root, or absolute; unset: ISSUES.md in the project's state folder); each call appends one markdown table row `| <n> | <text> | <evidence> |`. The register is the
 skill's, so a row carries generic names only (no project, host or person). `janus check` raises `issue:<key>` for a finding key
-that has been acked `[janus] ack_issue_n` (3) or more times, and, when the register is configured, writes that row once per key
+that has been acked `[janus] ack_issue_n` (3) or more times, and writes that row once per key
 so a rule that keeps coming back is not forgotten. The acked-findings view (`janus check --acked`) shows what an ack is hiding.
 """
 import re
@@ -16,17 +16,17 @@ ISSUE_DEFAULTS = {"issues_file": None, "ack_issue_n": 3}
 def iset(cfg, k): return cfg.c.get("janus", {}).get(k, ISSUE_DEFAULTS[k])
 
 def issue_path(cfg):
-    """The register file ([janus] issues_file), or None when it is not configured."""
+    """The register file: [janus] issues_file (relative to the project root, or absolute), else ISSUES.md in the project's state
+    folder (row 224: with no default, `janus issue` refused and what was met was never written down)."""
     p = iset(cfg, "issues_file")
-    if not p: return None
+    if not p: return cfg.f("ISSUES.md")
     p = Path(p).expanduser()
     return p if p.is_absolute() else cfg.root / p
 
 def append_issue(cfg, text, evidence="", key=None):
-    """Append one row to the register (refused when it is not configured). Idempotent by key (`[<key>]`) or by exact text: a row
+    """Append one row to the register. Idempotent by key (`[<key>]`) or by exact text: a row
     for the same key or text is never written twice. Returns (rows written, message)."""
     p = issue_path(cfg)
-    if not p: raise Err("set [janus] issues_file in janus.toml (the skill's issue register) to log issues")
     old = p.read_text() if p.is_file() else ""
     if key and f"[{key}]" in old: return 0, f"issue {key}: already logged"
     if text and re.search(r"^\|[^|]*\|\s*" + re.escape(text.strip()) + r"\s*\|", old, re.M): return 0, "already logged"
@@ -56,9 +56,8 @@ def repeated_issue_findings(cfg):
              f"keeps happening and why>\"), so a recurring failure is tracked, not re-remembered") for k, n in sorted(c.items()) if n >= n0]
 
 def auto_log_issues(cfg):
-    """Append an issue row for each over-acked key not yet logged (once per key); a no-op when the register is not configured.
+    """Append an issue row for each over-acked key not yet logged (once per key).
     Called by janus check as a writer, so a rule that keeps coming back is written down where the skill keeps its register."""
-    if not issue_path(cfg): return
     done = cfg.jget("issued.json")
     for k, n in cfg.jget("ack-counts.json").items():
         if n < int(iset(cfg, "ack_issue_n")) or k in done: continue

@@ -34,10 +34,11 @@ class Issue(unittest.TestCase):
         janus.cmd_issue(cfg, type("A", (), {"text": "recurring again", "evidence": "y", "key": "waste:u"})())
         self.assertEqual(p.read_text().count("[waste:u]"), 1, p.read_text())   # idempotent by key: one row, not two
 
-    def test_issue_refuses_without_a_register(self):
+    def test_issue_without_a_configured_register_goes_to_the_state_folder(self):
+        """ISSUES row 224: it refused, and the finding was lost."""
         d, cfg = project(issues=False)
-        with self.assertRaises(janus.Err) as e: janus.cmd_issue(cfg, type("A", (), {"text": "x", "evidence": None, "key": None})())
-        self.assertIn("issues_file", str(e.exception))
+        rc, L = janus.cmd_issue(cfg, type("A", (), {"text": "x", "evidence": None, "key": None})())
+        self.assertEqual(rc, 0); self.assertIn("| 1 | x | - |", cfg.f("ISSUES.md").read_text())
 
     def test_repeated_acks_earn_an_issue_row(self):
         d, cfg = project(ack_n=3)
