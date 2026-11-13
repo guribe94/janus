@@ -575,7 +575,9 @@ def cmd_launch(cfg, a):
             if rc_ == 0 and o_.strip().startswith("/"): u["rcwd_abs"] = o_.strip().splitlines()[-1]   # the transcript folder's name (#4)
             cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
             if cfg.run.dry: say("+ " + shlex.join(cmd))
-            elif sh(cmd, timeout=900)[0]: raise Err("rsync to " + hn + " failed")
+            else:
+                rc, o, e = sh(cmd, timeout=900)
+                if rc: raise Err(f"rsync to {hn} failed (exit {rc}): {(e or o).strip()[-160:]}")
             # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
             X(cfg, h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
             put_script(cfg, h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
