@@ -236,9 +236,14 @@ stopped: no process of the unit is left
 ```
 
 **`janus collect <unit>`**: for a remote unit, makes `out/<unit>/changes.patch` on the host (the agent's tree against the copy
-it was sent, as a patch `git apply` takes: new and deleted files included, an empty new file too), brings back `out/<unit>/`
-(patch, REPORT, logs) and records API cost in the ledger. It never writes over the
-local checkout; apply the patch in the unit's worktree with `git apply --3way`. Local units: nothing to collect.
+it was sent), brings back `out/<unit>/` (patch, REPORT, logs) and records API cost in the ledger. git on the host writes the
+patch (the host needs `git` and `python3`) and it is proved there before it counts: applied to the copy the unit was sent it
+must give the unit's tree exactly (text in any encoding, binary files, executable bits, symlinks, new, empty and deleted
+files, any file name). When no complete patch can be made (a path that cannot be read, no git, the 300 s limit) collect fails
+with the reason, the earlier patch file is left as it was and the copy stays uncollected, so `janus stop` and `janus close`
+keep refusing; a fifo, socket or device, which no patch can carry, is named and left out. Collect never writes over the
+local checkout; apply the patch in the unit's worktree with `git apply --3way` (the patch carries git's blob ids, so a
+checkout that has moved on is merged). Local units: nothing to collect.
 
 **`janus close <unit> [--force] [--reason text]`**: for a unit with a worktree of its own, refuses on uncommitted or unpushed
 work (unless `--force`). A unit without one (cwd is the project root, or shared with another open unit) skips the git checks
