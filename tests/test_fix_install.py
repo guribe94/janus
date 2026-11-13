@@ -559,9 +559,27 @@ class Item6RetireMatch(unittest.TestCase):
             if cmd[:1] == ["ps"]: return 0, "888 sleep\n", ""
             kills.append(list(cmd)); return 0, "", ""
         real = janus.run; janus.run = fake_run
-        try: janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
+        try: janus.retire_old_orch(dry=False, retire=True, idle=True, ps_text=ps, root="/w/proj")   # --idle: the owner says no handoff is in flight
         finally: janus.run = real
         self.assertEqual(kills, [["kill", "-TERM", "701"], ["kill", "-TERM", "702"]], "an idle handoff-queue loop was kept")
+
+    def test_retire_keeps_a_worker_waiting_in_sleep_until_the_owner_says_idle(self):
+        """Catches (ISSUES row 150, reopened by the fix of row 159; review-fix-install7 F3): `janus migrate --retire` TERMed
+        a worker that was mid-handoff: it waits for its gate's result in a `sleep` poll loop, so its only child is `sleep`,
+        exactly as an idle loop's is; calling every sleep "not work" cut the handoff and orphaned its gate. A process that
+        waits in sleep is kept and the owner is told how to stop it; only `--idle` (the owner's word) stops it."""
+        ps = (" 701 /bin/zsh /w/proj/bin/fleet-loops.sh\n"
+              " 702 /bin/zsh /w/proj/bin/handoff-queue.sh w1 /w/proj/out/handoff-queue\n")
+        kills = []
+        def fake_run(cmd, **k):
+            if cmd[:1] == ["pgrep"]: return 0, ("888\n" if cmd[-1] == "702" else ""), ""
+            if cmd[:1] == ["ps"]: return 0, "888 sleep\n", ""
+            kills.append(list(cmd)); return 0, "", ""
+        real = janus.run; janus.run = fake_run
+        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
+        finally: janus.run = real
+        self.assertEqual(kills, [["kill", "-TERM", "701"]], "a worker waiting in sleep (mid-handoff or idle: it cannot be told) was TERMed")
+        self.assertTrue(any("kept pid 702" in l and "--retire --idle" in l and "kill -TERM 702" in l for l in out), out)
 
     def test_retire_reads_the_kill_result(self):
         """Catches (finding 5, fix-install6): the `kill` result was not read, so a loop started through `sudo` counted as 'sent
@@ -587,7 +605,7 @@ class Item6RetireMatch(unittest.TestCase):
             if cmd[:1] == ["ps"]: return 0, "777 sleep\n", ""
             kills.append(list(cmd)); return 0, "", ""
         real = janus.run; janus.run = fake_run
-        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
+        try: out = janus.retire_old_orch(dry=False, retire=True, idle=True, ps_text=ps, root="/w/proj")   # --idle: the owner says it is idle
         finally: janus.run = real
         self.assertEqual(kills, [["kill", "-TERM", "301"]], "an idle loop with only a sleep child was kept")
 

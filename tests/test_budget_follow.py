@@ -175,7 +175,7 @@ class Item3RemoteSettle(unittest.TestCase):
         def save(cfg, u):
             od = self.d / "out/u1"; od.mkdir(exist_ok=True); (od / "api.json").write_text(text)
             (od / "REPORT.md").write_text("VERDICT: PENDING\nstep 1 done, exit 0\nVERDICT: DONE - exit 0\n"); return True
-        return [mock.patch.object(janus, "save_output", save), mock.patch.object(janus, "remote_patch", lambda *a, **k: None)]
+        return [mock.patch.object(janus, "save_output", save), mock.patch.object(janus, "remote_patch", lambda *a, **k: (0, "", ""))]
 
     def test_check_closes_an_ended_remote_run_at_its_own_cost(self):
         """Catches (item 3): a remote unit that finished for $0.60 kept its whole reservation ($2.40) in the ledger until someone

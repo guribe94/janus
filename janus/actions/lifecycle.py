@@ -94,42 +94,90 @@ def cmd_stop(cfg, a):
     if h.get("local"): settle_run(cfg, u, "stopped")   # remote: collect brings back the cost first, close settles the rest
     bd.comment(u["id"], f"{ts()} stopped (every process group of the unit ended)"); say("stopped: no process of the unit is left")
 
-# Item 29: `diff -ruN | sed` wrote a new file as `--- a/<f>` with an epoch date and no `new file mode`, so `git apply` refused
-# the whole patch ("does not exist in index"); a host without `patch` (asgard) could not take it either, and a new EMPTY file
-# never appeared in the diff at all. This builds a patch git apply takes, from the two trees, in the host's own python3: a
-# `diff --git` header per file, `new file mode` / `deleted file mode`, `/dev/null` on the missing side, and no dependency on
-# the host's diff. Excludes are the same names as DIFF_X.
-PATCH_PY = '''import os, sys, difflib
-n, base, wt = sys.argv[1], sys.argv[2], sys.argv[3]
+# A remote unit's changes as a patch (janus collect, the backup patch). The patch is written by git itself, never by text
+# tools: `diff -ruN | sed` (item 29) could not say "new file", and a difflib builder lost or corrupted a file without a final
+# newline, non-UTF-8 text, a form feed, binaries, modes, symlinks and quoted names (collect-fix2). The host's python3 only
+# finds WHICH paths changed, byte for byte (content, executable bit, symlink target; the same excluded names as DIFF_X); both
+# sides of those paths go into a scratch git object store as they are (no filters, no ignore rules, no user config), git
+# writes the patch (`diff-tree -p --binary --full-index`, so `git apply --3way` has its blob ids), and the patch is proved
+# before it is printed: applied by git to the base tree it must give the unit's tree id. Anything that keeps the patch from
+# being complete (an unreadable path, no git, a patch that does not rebuild the tree) is an error on stderr and a non-zero
+# exit; a fifo, socket or device, which git cannot carry, is named on stderr and left out.
+PATCH_PY = r"""import filecmp, os, shutil, stat, subprocess, sys, tempfile
+unit, base, wt = sys.argv[1], sys.argv[2], sys.argv[3]
 SKIP = {"target", ".venv", "node_modules", "__pycache__", ".git"}
-def rels(root):
-    s = set()
-    for d, dirs, files in os.walk(root):
-        dirs[:] = [x for x in dirs if x not in SKIP]
-        for f in files: s.add(os.path.relpath(os.path.join(d, f), root))
-    return s
-A, B = rels(base), rels(wt)
-out = []
-for r in sorted(A | B):
-    anew, bnew = r not in A, r not in B
-    a = open(os.path.join(base, r), "rb").read() if not anew else b""
-    b = open(os.path.join(wt, r), "rb").read() if not bnew else b""
-    if a == b and not (anew or bnew): continue
-    if b"\\0" in a or b"\\0" in b: continue
-    L = list(difflib.unified_diff(a.decode(errors="replace").splitlines(True), b.decode(errors="replace").splitlines(True),
-                                  fromfile="/dev/null" if anew else "a/" + r, tofile="/dev/null" if bnew else "b/" + r, n=3))
-    if not L and not (anew or bnew): continue
-    out.append("diff --git a/%s b/%s\\n" % (r, r))
-    if anew: out.append("new file mode 100644\\n")
-    elif bnew: out.append("deleted file mode 100644\\n")
-    out.extend(L)
-sys.stdout.write("".join(out))
-'''
+bad, notes = [], []
+def die(msg):
+    sys.stderr.write("janus patch (%s): %s\n" % (unit, msg.rstrip())); sys.exit(1)
+def entries(root):
+    E = {}
+    def err(e): bad.append("%s: %s" % (e.filename, e.strerror))
+    for d, dirs, files in os.walk(root, onerror=err):
+        links = [x for x in dirs if os.path.islink(os.path.join(d, x))]
+        dirs[:] = [x for x in dirs if x not in SKIP and x not in links]
+        for f in files + [x for x in links if x not in SKIP]:
+            p = os.path.join(d, f)
+            try: st = os.lstat(p)
+            except OSError as e: bad.append("%s: %s" % (p, e.strerror)); continue
+            if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode): E[os.path.relpath(p, root)] = st
+            else: notes.append("%s: a fifo, socket or device, which no patch can carry: left out" % p)
+    return E
+if not os.path.isdir(wt): sys.exit(0)
+if not os.path.isdir(base): die("%s is missing: the tree the unit was sent, without which its changes cannot be told" % base)
+A, B = entries(base), entries(wt)
+def same(r):
+    a, b, pa, pb = A[r], B[r], os.path.join(base, r), os.path.join(wt, r)
+    if stat.S_IFMT(a.st_mode) != stat.S_IFMT(b.st_mode): return False
+    if stat.S_ISLNK(a.st_mode): return os.readlink(pa) == os.readlink(pb)
+    if (a.st_mode ^ b.st_mode) & 0o100 or a.st_size != b.st_size: return False
+    try: return filecmp.cmp(pa, pb, shallow=False)
+    except OSError as e: bad.append("%s: %s" % (e.filename or pb, e.strerror)); return True
+ch = sorted(r for r in set(A) | set(B) if r not in A or r not in B or not same(r))
+for r in ch:
+    p = os.path.join(wt if r in B else base, r)
+    if stat.S_ISREG(os.lstat(p).st_mode) and not os.access(p, os.R_OK): bad.append("%s: cannot be read" % p)
+if bad: die("no complete patch: " + "; ".join(bad[:20]) + (" (and %d more)" % (len(bad) - 20) if len(bad) > 20 else ""))
+for x in notes: sys.stderr.write("janus patch (%s): note: %s\n" % (unit, x))
+if not ch: sys.exit(0)
+tmp = tempfile.mkdtemp(prefix="janus-patch-")
+try:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_DIR=tmp + "/g", HOME=tmp, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_ATTR_NOSYSTEM="1", LC_ALL="C")
+    G = ["git", "-c", "core.bare=false", "-c", "core.fileMode=true", "-c", "core.symlinks=true", "-c", "core.autocrlf=false",
+         "-c", "core.safecrlf=false", "-c", "core.quotePath=true", "-c", "core.precomposeUnicode=false", "-c", "core.ignoreCase=false",
+         "-c", "core.protectHFS=false", "-c", "core.protectNTFS=false"]
+    def git(args, cwd=tmp, inp=None, out=subprocess.PIPE, **e):
+        try: p = subprocess.run(G + args, cwd=cwd, input=inp, stdout=out, stderr=subprocess.PIPE, env=dict(env, **e))
+        except OSError as x: die("git cannot be run on this host (%s): no patch without it" % x)
+        if p.returncode: die("no complete patch: git %s failed: %s" % (args[0], p.stderr.decode(errors="replace").strip()[-800:]))
+        return p.stdout.decode().strip() if out == subprocess.PIPE else ""
+    git(["init", "-q"])
+    with open(tmp + "/g/info/attributes", "w") as f: f.write("* -text -filter -ident -working-tree-encoding !eol !diff\n")
+    def tree(root, E, name):
+        e = dict(GIT_INDEX_FILE=tmp + "/" + name, GIT_WORK_TREE=os.path.abspath(root))
+        git(["update-index", "--add", "-z", "--stdin"], cwd=root, inp=b"".join(os.fsencode(r) + b"\0" for r in ch if r in E), **e)
+        return git(["write-tree"], cwd=root, **e)
+    ta, tb = tree(base, A, "ia"), tree(wt, B, "ib")
+    with open(tmp + "/patch", "wb") as f:
+        git(["diff-tree", "-r", "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", ta, tb], out=f)
+    os.mkdir(tmp + "/w"); e = dict(GIT_INDEX_FILE=tmp + "/iv", GIT_WORK_TREE=tmp + "/w")
+    git(["read-tree", ta], cwd=tmp + "/w", **e); git(["apply", "--cached", "--whitespace=nowarn", tmp + "/patch"], cwd=tmp + "/w", **e)
+    got = git(["write-tree"], cwd=tmp + "/w", **e)
+    if got != tb: die("no complete patch: the patch git wrote does not rebuild the unit's tree from its base (%s, wanted %s)" % (got, tb))
+    with open(tmp + "/patch", "rb") as f: shutil.copyfileobj(f, sys.stdout.buffer)
+    sys.stdout.buffer.flush()
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+"""
 
 def remote_patch(cfg, h, n, fname):
-    """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>), in a
-    form `git apply` accepts (new and deleted files included; see PATCH_PY for why the old `diff -ruN | sed` did not)."""
-    return X(cfg, h, f"cd {qp(h['root'])} && [ -d base/{n} ] && {{ python3 -c {shlex.quote(PATCH_PY)} {shlex.quote(n)} base/{n} worktrees/{n} > out/{n}/{fname}; }}", timeout=300)
+    """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>), written
+    and verified by git (PATCH_PY). Returns (rc, stdout, stderr): rc is non-zero when no complete patch could be made, and then
+    <fname> is left as it was (a partial patch never takes the place of an earlier whole one); stderr says why."""
+    f = shlex.quote(f"out/{n}/{fname}")
+    return X(cfg, h, f"cd {qp(h['root'])} && {{ python3 -c {shlex.quote(PATCH_PY)} {shlex.quote(n)} {shlex.quote('base/' + n)} {shlex.quote('worktrees/' + n)} > {f}.tmp && mv {f}.tmp {f}; }}"
+                     f" || {{ rc=$?; rm -f {f}.tmp; exit $rc; }}", timeout=300)
 
 # A remote copy's fingerprint: the checksum of the agent's changes and of its output folder (janus's own files left out), the
 # number of output files and the report's lines other than PENDING. collect records it; stop and close compare (item 4).
@@ -158,9 +206,17 @@ def cmd_collect(cfg, a):
     if h.get("local"): say("local unit: nothing to collect"); return
     root = h["root"]; n = u["name"]; od = cfg.p("out", "out") / n
     # The agent's changes come back as a patch against the tree it was sent (base/<unit>), never as an rsync over the Mac
-    # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree.
-    remote_patch(cfg, h, n, "changes.patch")
+    # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree (the patch
+    # carries git's blob ids, so a checkout that has moved on is merged, not refused).
+    prc, _, perr = remote_patch(cfg, h, n, "changes.patch")
     if not save_output(cfg, u): raise Err(f"collect from {u['host']} failed (unreachable?)")   # out/<unit>/, the task log
+    p = od / "changes.patch"
+    if prc:   # no complete patch: the copy stays uncollected (no fingerprint recorded), so stop and close keep refusing
+        raise Err(f"collect {n}: NO PATCH of its changes could be made on {u['host']} (exit {prc}): {(perr or '').strip()[-1500:] or 'no message (python3 missing on the host, or the 300 s limit?)'}\n"
+                  f"Its output folder was brought here, but its copy on {u['host']} is NOT collected and its changes exist only there"
+                  + (f"; {p} is from an earlier collect, not current" if p.exists() else "") + ". Remove the cause on the host, then janus collect again.")
+    for l in (perr or "").splitlines():
+        if l.strip(): say(l.strip())   # a path no patch can carry (fifo, socket, device) is named, never dropped in silence
     if not cfg.run.dry and not save_transcript(cfg, u): say(f"note: no transcript of {n} saved (none found on {u['host']})")   # out/<unit>/transcript.md
     st = task_status(h, u["task"]) if u.get("via") == "pueue" and u.get("task") is not None and not cfg.run.dry else None
     if not (st and task_rc(st) is None): X(cfg, h, f"rm -f {qp(f'{root}/run/{n}.key')}")   # the key fifo, once no task can still read it (row 52)
@@ -172,7 +228,6 @@ def cmd_collect(cfg, a):
     kv = fingerprint(cfg, u) if not cfg.run.dry else None
     if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
     if not cfg.run.dry: bd.comment(u["id"], f"{ts()} collected from {u['host']}")
-    p = od / "changes.patch"
     say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
 
 def unit_dirty(cfg, cwd):
@@ -460,7 +515,8 @@ def refresh_remote(cfg, u, bd, log):
     if cfg.hosts[u["host"]].get("local") or u.get("via") in ("failed", "starting"): return
     fin = u.get("state") in ENDED
     if not ((fin and u.get("saved") != saved_marker(u)) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60): return
-    remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
+    prc, _, perr = remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
+    if prc: log(f"{u['name']}: no backup patch could be made on {u['host']} (exit {prc}; the earlier one is kept): {(perr or '').strip()[-300:]}")
     if not save_output(cfg, u): log(f"{u['name']}: saving its output from {u['host']} failed"); return
     u["saved_at"] = int(now())
     if fin: u["saved"] = saved_marker(u); settle_remote(cfg, u)   # its run is closed when it ends, not at collect
