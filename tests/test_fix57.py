@@ -1,6 +1,6 @@
 """skill-fix57: the pipeline never stalls in silence (project ISSUES row 144, decision 0034) and a collected unit's result is
 presented. One test per failure, each naming what it catches. Standard library only; no network, no spend. Run by ./check."""
-import contextlib, io, os, subprocess, time, unittest
+import contextlib, io, os, subprocess, sys, time, unittest
 from unittest import mock
 
 from test_janus import janus, project
@@ -49,6 +49,34 @@ class Stall(unittest.TestCase):
             janus.tend_stalled_lands(cfg, hs, [], log.append); janus.tend_stalled_lands(cfg, hs, [], log.append)
         self.assertEqual(ran, [("u1", "lin")])                         # once, not every pass
         self.assertIn("land:u1:recovered", dict(janus.stall_findings(cfg, hs)))   # never silent
+
+
+class Restart(unittest.TestCase):
+    def test_restart_stops_only_the_recorded_land_and_cancels_only_its_own_gate(self):
+        """Catches (land --restart safety): the stop signalled any live pid in the record (a reused pid = an unrelated process),
+        matched any command that merely mentions the unit, and cancelled gate jobs although no land waited (another gate of the
+        unit, or a land already squashing). Real processes and signals; only the pueue cancel is replaced."""
+        d, cfg = project(LIN); fake = d / "janus.py"; fake.write_text("import time\ntime.sleep(60)\n")
+        spawn = lambda *a: subprocess.Popen(a, stdin=subprocess.DEVNULL)
+        land, other, bystander = spawn(sys.executable, str(fake), "land", "u1", "--host", "lin"), spawn(sys.executable, str(fake), "land", "u2"), spawn("sleep", "60")
+        cancelled = []; refs = ["lin:7"]
+        try:
+            with mock.patch("janus.findings.stall.land_jobs", lambda *a: refs), mock.patch("janus.probe.probe_all", lambda cfg: {}), \
+                 mock.patch("janus.actions.jobs.cancel_job", lambda cfg, r, **k: cancelled.append(r) or ["ok"]), contextlib.redirect_stdout(io.StringIO()):
+                time.sleep(0.3)
+                janus.stop_land(cfg, "u1")                                           # no record: the gate ended or it is not this land's
+                self.assertEqual((cancelled, land.poll(), other.poll()), ([], None, None))
+                janus.note_land(cfg, "u1", pid=bystander.pid, t=time.time(), host="lin", wt=str(d))   # a reused pid
+                with self.assertRaises(janus.Err): janus.stop_land(cfg, "u1")
+                janus.note_land(cfg, "u1", pid=other.pid, t=time.time(), host="lin", wt=str(d))       # another unit's land
+                with self.assertRaises(janus.Err): janus.stop_land(cfg, "u1")
+                self.assertEqual((cancelled, bystander.poll(), other.poll()), ([], None, None))
+                janus.note_land(cfg, "u1", pid=land.pid, t=time.time(), host="lin", wt=str(d))
+                janus.stop_land(cfg, "u1")                                           # the real one
+            land.wait(timeout=15); self.assertEqual(cancelled, ["lin:7"])
+            self.assertEqual((bystander.poll(), other.poll()), (None, None)); self.assertFalse(janus.land_file(cfg, "u1").exists())
+        finally:
+            for p in (land, other, bystander): p.kill(); p.wait()
 
 
 class Install(unittest.TestCase):
