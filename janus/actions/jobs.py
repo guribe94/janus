@@ -137,7 +137,9 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     tq = int(fl(os.environ.get("JANUS_TQ")) or now())   # when the job was asked for (a placement passes the original time): its queue wait
     head = (f"#!/bin/bash\n# janus run {jid}: host {hn}, lane {a.lane}, worktree {name}\nRD={qp(rd)}; R=\"$RD\"/{q(jid)}; TQ={tq}\n"
             + ("" if clsrc else f"printf '%s\\n' {q(cmd)} > \"$R.cmd\"\n")   # item 32: what the job's shape is computed from (the probe reads it too)
-            + f"export JANUS_WRAP={q(jid)}   # janus run inside records the jobs it queues under this (cancel follows them)\n")
+            + f"export JANUS_WRAP={q(jid)}   # janus run inside records the jobs it queues under this (cancel follows them)\n"
+            # Row 243: a local job runs in a worktree outside the project root; a janus command in it (land's final gate) finds the root by this
+            + (f"export JANUS_ROOT={q(str(cfg.root))}\n" if h.get("local") else ""))
     broad = bool(getattr(a, "broad", None)); nice = 19 if broad else 10   # a broad run (--broad) runs at the lowest CPU priority
     setup = guarded_setup(h); log = h.get("job_log", "/dev/null")
     adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
