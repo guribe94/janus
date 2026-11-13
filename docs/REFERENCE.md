@@ -209,7 +209,7 @@ launch parser: model=codex host=laptop cwd=/proj/worktrees/parser
 launched parser on laptop via herdr
 ```
 A `cleanup` unit frees disk and load, so neither `min_disk_gb` nor the load limit refuses it; memory and caps still apply.
-- **Model:** from `[routing]`, or `--model`, which passes the same checks (provider enabled, budget left). Every API launch
+- **Model:** from `[routing]`, or `--model`, which passes the same checks (provider enabled, budget left). The orchestrator decides the model before every delegation (skill section "Choosing the model"): user restrictions first, then the configured candidates and what `janus doctor` verifies (CLI, key present, within budget), the cap (`janus status` spend; the finish reserve shows in `spend:<p>:reserve|short` and in launch refusals, not in status), price and usage taken from supported or authoritative sources or marked unknown, and the task's complexity and consequence; the cheapest capable allowed model, with a one-line rationale. `--model` pins a launch's model; `janus resume` has none. `janus fill` and the autopilot follow `[routing]` and `enabled` only, so exclusivity must be set there (`janus fill --dry-run` shows the result). janus has no command for a provider's live catalogue, prices or remaining subscription usage. Every API launch
   checks `committed + budget <= cap_usd` and reserves the run's "running" row under the ledger's lock before anything is
   queued. A unit that continues another's work starts from that unit's report: `--resume-of <unit>` copies its
   `out/<unit>/REPORT.md` into the new unit's own `out/<new unit>/REPORT.md` (line 1 PENDING) and the new unit writes only its
@@ -479,8 +479,8 @@ Every `janus check` line names the action that resolves it. Act, then `janus ack
   refused until the ledger is valid. On `script:<pid>`, stop that process and relaunch
   it.
 - **Token rules.** Read `janus` output, never panes, logs or board files directly (`janus status` for the whole picture).
-  Briefs are short: goal, scope, tier line, report path, done-criteria. Spend sparingly; critical work goes to the top models
-  only.
+  Briefs are short: goal, scope, tier line, report path, done-criteria. Spend sparingly; choose the model per delegation
+  (cheapest capable allowed, see the skill's "Choosing the model").
 - **Handoff.** `.janus/HANDOFF.md` is your working memory: Live state (generated) plus your notes (goal, per unit why and what
   done means, decisions with reasons latest first, next steps, things to watch), under 150 lines; move old notes to
   `.janus/history.md`. Update the notes after every decision and before going idle. After a reset or `/clear`, SessionStart
