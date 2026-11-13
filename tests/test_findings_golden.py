@@ -20,7 +20,7 @@ GOLDEN = [
 ]
 
 # the watcher's urgent prefixes before the registry (janus.py URGENT): the registry must keep the same findings urgent
-URGENT_BEFORE = ("unit:", "board:", "question:", "related:", "overlap:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads",
+URGENT_BEFORE = ("land:", "install:", "present:", "unit:", "board:", "question:", "related:", "overlap:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads",
                  "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:", "idle-with-backlog", "scheduler:", "pressure:",
                  "direct:", "budget80:", "waiting:", "waste", "report-due", "parked:", "decision-missing:", "owner-question:",
                  "blocked:", "unregistered:",   # skill-fix50: new families, urgent from their first registration
@@ -110,7 +110,7 @@ class Golden(unittest.TestCase):
         self.assertEqual(sorted(f.key for f in F), want)
         self.assertEqual([f.key for f in F if f.urgent], [f.key for f in F if f.key.startswith(URGENT_BEFORE)])
         self.assertEqual([f for f, x in janus.FAMILIES.items() if x.urgent], [f for f in janus.FAMILIES if (f + ":").startswith(URGENT_BEFORE)])
-        self.assertEqual([f for f in janus.FAMILIES if not janus.ackable(f + ":x")], ["handoff", "instructions", "waiting"])
+        self.assertEqual([f for f in janus.FAMILIES if not janus.ackable(f + ":x")], ["handoff", "instructions", "present", "waiting"])
 
 
 if __name__ == "__main__":

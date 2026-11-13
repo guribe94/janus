@@ -98,10 +98,12 @@ def main():
     add("brief", cmd_brief, A("action", choices=["draft", "accept"], help="draft: one cheap unit writes briefs for the items into <briefs>/drafts; accept: move one draft to <briefs> so fill can launch it"),
         A("items", nargs="+", help="backlog item ids (accept: one)"), A("--as", dest="as_name", metavar="UNIT", help="accept: the unit name (default: the one in the draft's first line)"),
         A("--model", help="draft: the model (default: the first available of [routing] draft, else of the normal route)"), dry=True)
-    add("report", cmd_report, A("--brief", action="store_true", help="summary lines only"), A("--sent", action="store_true", help="record that the report was sent (clears report-due)"))
+    add("report", cmd_report, A("--brief", action="store_true", help="summary lines only"), A("--sent", action="store_true", help="record that the report was sent (clears report-due)"),
+        A("--presented", metavar="UNIT", help="record that this collected or closed unit's result was presented to the owner in chat (clears present:<unit>)"), A("--summary", help="--presented: what you told the owner"))
     add("land", cmd_land, A("unit"), A("--no-gate", action="store_true", help="skip the final gate (it is still refused mid-merge)"),
         A("--no-dispatch", action="store_true", help="on a conflict, only say what merge unit to dispatch"),
-        A("--host", help="the host whose landing lane merges, gates and pushes (default [landing] host: a name or auto; unset: this machine)"), dry=True)
+        A("--host", help="the host whose landing lane merges, gates and pushes (default [landing] host: a name or auto; unset: this machine)"),
+        A("--restart", action="store_true", help="first stop a land of this unit that waits for its final gate here and cancel its gate jobs (land:<unit>:stalled)"), dry=True)
     add("close", cmd_close, A("unit"), A("--force", action="store_true"), A("--reason"),
         A("--duplicate-of", metavar="UNIT", help="close a stopped relaunch that duplicated this open unit: no verdict needed, never --force"), dry=True)
     add("commit-state", cmd_commit_state, A("-m", "--message", default="janus: state"), dry=True)

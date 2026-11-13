@@ -95,6 +95,9 @@ def cmd_learned(cfg, a):
 def cmd_report(cfg, a):
     """The owner's status report: backlog completeness and remaining work, spend by outcome, the waste rule, open units.
     --brief: the summary lines only. --sent: record that it was sent (clears report-due until the next checkpoint)."""
+    if getattr(a, "presented", None):
+        from janus.findings.stall import mark_presented
+        mark_presented(cfg, a.presented, a.summary); return 0, [f"{a.presented}: its result is recorded as presented to the owner"]
     if a.sent: cfg.touch("report_sent"); return 0, ["report marked sent"]
     L = [f"janus report: {cfg.name}, {ts()}"]
     items = backlog_items(cfg)

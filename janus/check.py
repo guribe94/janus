@@ -18,6 +18,7 @@ from janus.findings.awareness import note_findings, related_findings   # imp-awa
 from janus.findings.memory import memory_findings, rule_findings
 from janus.findings.quality import quality_findings, review_findings, test_signal_findings
 from janus.findings.sched import overrun_findings
+from janus.findings.stall import lock_findings, install_findings, present_findings, stall_findings   # skill-fix57: land:<u>:stalled|recovered, install:blocked-by-blocker, present:<u>
 from janus.findings.units import (budget_findings, cap_findings, card_findings, ledger_findings, peer_findings,
     report_findings, reserve_findings, resumable_findings, spend_findings, unit_findings)
 from janus.findings.work import (backlog_findings, gate_findings, git_findings, known_failure_findings, landing_findings,
@@ -63,6 +64,7 @@ def collect_findings(cfg, hs, units, ag, bd_err, bd=None):
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg, viol=viol) + script_findings()
     F += ledger_findings(cfg, units)
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
+    SF = stall_findings(cfg, hs, units); F += SF + install_findings(cfg, SF) + present_findings(cfg, units) + lock_findings(cfg)   # a blocking step never stalls in silence (skill-fix57)
     F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running, units) + intent_findings(cfg, units)
     F += decision_findings(cfg)
     F += repeated_issue_findings(cfg)

@@ -1,6 +1,7 @@
 """janus gate (and its gate-exec, gate-judge and gate-scope helpers), janus land and janus commit-state."""
 import argparse, fnmatch, json, os, re, shlex, signal, subprocess, sys, time, unicodedata
 from pathlib import Path
+from janus.findings.stall import land_file, note_land, stop_land
 from janus.actions.jobs import cmd_run, ensure_lanes, gate_group, task_output, task_rc, tree_guard
 from janus.actions.launch import cmd_launch
 from janus.actions.swarm import write_index
@@ -423,8 +424,9 @@ def gate_place(cfg, gh, gc):
 
 def run_final_gate(cfg, a, ra, where):
     mark = cfg.f("runs") / f"land-{a.unit}.pid"; mark.parent.mkdir(parents=True, exist_ok=True); mark.write_text(str(os.getpid()))
+    note_land(cfg, a.unit, pid=os.getpid(), t=int(now()), host=ra.host, wt=str(ra.wt), where=str(where))   # skill-fix57: check judges this wait (land:<unit>:stalled)
     try: grc = cmd_run(cfg, ra)   # row 241: while the mark's process lives, this gate is land's own, not an orphan (landing_now)
-    finally: mark.unlink(missing_ok=True)
+    finally: mark.unlink(missing_ok=True); land_file(cfg, a.unit).unlink(missing_ok=True)
     if grc: raise Err(f"final gate on {ra.host} failed (exit {grc}): not landed; the merge stays committed in {where}")
     say(f"final gate on {ra.host}: PASS")
 
@@ -536,6 +538,7 @@ def cmd_land(cfg, a):
     ld = cfg.c.get("landing", {}); br = ld.get("branch") or "main"
     u = next((x for x in Beads(cfg).units() if x["name"] == a.unit), None) or all_units(cfg).get(a.unit)
     if not u: raise Err(f"no unit {a.unit}")
+    if getattr(a, "restart", False): stop_land(cfg, a.unit)   # skill-fix57: the one recovery command of land:<unit>:stalled
     wt = Path(u.get("cwd", "/"))
     if not own_tree(cfg, u, [x for x in Beads(cfg).units()]) or not wt.is_dir(): raise Err(f"{a.unit} has no worktree of its own ({wt}): nothing to land")
     rc, branch, e = git(wt, "symbolic-ref", "--short", "HEAD"); branch = branch.strip()

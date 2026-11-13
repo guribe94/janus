@@ -4,7 +4,7 @@ Err/say/now/ts, find_root/Cfg, clean_env/sh/hrun/X, the registered session's pro
 small helpers (pq/qp/secs/findkey/slug), Locked and atomic_write, the HANDOFF.md notes state (handoff_path/notes_state/
 handoff_stale) and refuse_agent (what only the orchestrator may do). No module imports janus or a higher layer. Run is what one
 invocation is (dry, read-only, what it read once), carried as cfg.run (section 7, seam 2)."""
-import contextlib, hashlib, json, os, re, shlex, time, tomllib
+import contextlib, hashlib, json, os, re, shlex, sys, time, tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from janus.platform import herdr, ps_table, run, secs   # re-exported: the OS/tool adapter (owner direction 2026-11-11)
@@ -235,13 +235,26 @@ def writer_lock(path, wait=300):
         while True:
             try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); break
             except BlockingIOError:
-                if time.time() - t0 >= wait: f.close(); raise Err(f"another janus writer (the watcher or a command) holds {Path(k).name} for over {wait:g} s: try again")
+                if time.time() - t0 >= wait: f.close(); raise Err(f"another janus writer ({lock_owner(k) or 'the watcher or a command'}) holds {Path(k).name} for over {wait:g} s: try again")
                 time.sleep(0.2)
-        held = _HELD[k] = [f, 1]
+        held = _HELD[k] = [f, 1, time.time()]
+        with contextlib.suppress(OSError): Path(k + ".owner").write_text(f"{os.getpid()} {int(held[2])} janus {' '.join(sys.argv[1:3])}")
     try: yield
     finally:
         held[1] -= 1
-        if not held[1]: _HELD.pop(k, None); held[0].close()
+        if not held[1]:
+            s = time.time() - held[2]
+            if s >= LOCK_SLOW:   # skill-fix57: who held the lock for long, in .janus/lock.log (short writers waited behind it)
+                with contextlib.suppress(OSError), open(Path(k).parent / "lock.log", "a") as lf: lf.write(f"{ts()} {Path(k).name} held {s:.0f} s by janus {' '.join(sys.argv[1:3])} (pid {os.getpid()})\n")
+            _HELD.pop(k, None); held[0].close()
+
+LOCK_SLOW = 30   # seconds a writer may hold the lock before its hold is logged
+
+def lock_owner(k):
+    """'janus watch (pid 7), for 212 s': the writer that holds lock k now, as it recorded itself; None when unknown."""
+    try: pid, since, cmd = Path(str(k) + ".owner").read_text().split(" ", 2)
+    except (OSError, ValueError): return None
+    return f"{cmd.strip()} (pid {pid}), for {time.time() - int(since):.0f} s"
 
 JANUS_SELF = Path(__file__).resolve().parent.parent / "janus.py"   # the installed release when run as `janus`: a queued task runs the version that queued it (this package sits next to it)
 

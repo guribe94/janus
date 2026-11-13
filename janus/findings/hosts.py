@@ -3,6 +3,7 @@ lane stalls, idle slots and job ages, thrash acts, tidy and disk; enforce (warn,
 import os, re, time, tomllib
 from pathlib import Path
 from janus.actions.jobs import LANES, job_of, lane_age, lane_stall, lane_wait, orphan_jobs, slots, wrap_token, wrapper_busy
+from janus.findings.stall import live_lands, queue_waits
 from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
 from janus.backlog import ready_work
 from janus.beads import Beads
@@ -395,7 +396,7 @@ def host_findings(cfg, hs, units, viol):
             F.append((f"idle:{n}", f"host {n} takes no work while its admission is paused ({p['cap_pause'].strip()}), and {work}: launch on another host, or when it clears"))
         hc = host_cap(cfg, n, p, units)
         if hc["pause"]:   # back-pressure (janus-fixes8 item 2): reported, never acted on by killing
-            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile"))
+            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile; it holds " + queue_waits(cfg, n, p, [r["unit"] for r in live_lands(cfg)])))
         # one scheduler per host (item 1): any other job-running process, or an old queue that still runs or holds work
         sch = list(p.get("sched", []))
         lg, lr = int(fl(p.get("legacy_wait"))), int(fl(p.get("legacy_run")))
