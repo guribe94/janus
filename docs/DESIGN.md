@@ -58,6 +58,7 @@ calling `say()` across a layer.
 | `janus/findings/{hosts,units,work,memory,quality}.py` | one function per finding family; `janus/check.py` runs `collect_findings` as the sequence of family calls |
 | `janus/actions/{jobs,launch,lifecycle,landing,backlog,swarm,tidy}.py` | one module per action group (run/gate/cancel, launch and prompts with the brief header and lint, stop/collect/close/park/resume, land, backlog/fill, memory/peers/report/index, tidy) |
 | `janus/quality.py`, `soak.py` | the quality subsystem: the `[quality]` settings, the pre-landing review (`janus quality review`) and the block `janus land` applies to it; and `janus soak`, the read-only exercise of the live read paths |
+| `janus/monitor.py` | `janus monitor`, the read-only terminal dashboard: collection (one background thread; each source keeps its last good data, age and error) kept apart from rendering (rows, lines, then curses) |
 | `janus/hooks.py`, `watch.py`, `setup.py`, `cli.py` | the hook parser and handlers; the watcher; init/doctor/queue/register; the argparse table and dispatch (the only file with subcommand wiring) |
 
 ### Seams (each removed a bug class)

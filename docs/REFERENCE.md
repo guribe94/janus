@@ -203,6 +203,46 @@ server room=0 avail=3.1G load=1.20 psi=0.00 disk=60G agents=2 FULL: memory 3.1G 
 `psi` is memory pressure stall information: the share of time work stalled on memory (the kernel's avg10 reading for the
 host); `-` means the host did not report a figure.
 
+**`janus monitor [--interval SECONDS]`**: a live, read-only terminal dashboard (Python's `curses`, no new dependency; run it in a
+terminal of its own, by hand: it needs a real terminal and the orchestrator has no use for it). `--interval` is the pause between refreshes,
+counted from the end of the last one (default 5, at least 1: every refresh is one ssh round trip per host).
+```
+janus monitor  ·  myproject  READ-ONLY  updated 2s ago  every 5s
+HOST    STATE        RUN/QUEUED AGENTS LOAD  RAM FREE NOTE
+laptop  ok           2/1        1      2.10  9.3G
+server  UNREACHABLE  3/?        2      0.40  3.1G     ssh: Connection timed out; last good 41s ago
+[Active (2)]  Backlog (4)  Finished (7)  Board (12, 2 new)
+  NAME        STATE            HOST    MODEL    ELAPSED
+> parser      working          laptop  opus     12m
+  lexer       queued           laptop  codex-5  3m
+```
+- **Machines** (every host of `janus.toml`, probed in parallel): builds running and queued (the host's job lanes, plus jobs
+  waiting in admission), agents (open units alive on it; `n+?` when some units' state is unknown), load, available RAM, and the
+  state `ok`, `PAUSED` (admission paused: the reason is in NOTE), `UNREACHABLE` or `checking`.
+- **Active**: open units, with the state janus derives (`working`, `queued`, `parked` with the jobs it waits for, `blocked`, `idle`,
+  `starting`, `closing`, `unknown`). **Backlog**: work not yet launched: ready beads items and the imported checklist items
+  (`ready`, `waiting`, `held`, `owner`, `launched`). **Finished**: open units whose process ended, then the latest closed units.
+  A process that ended is never read as success: only a report that ends `VERDICT: DONE` is `finished`; a report with no verdict is
+  `ended:no-verdict`, a failed process is `failed` (even when its report says DONE), `closed:<verdict>` is a closed unit.
+  Details (Enter) name the report, verdict, worktree, jobs and why the state means what it does.
+- **Board**: the board's posts newest first, as UPDATE, QUESTION (`*`: still open), BLOCKER, ANSWER (the orchestrator's reply to a
+  question) or DIRECTION. What is on the board when the monitor starts is not new; later posts show `NEW` (and the tab shows the count)
+  until you select them. That mark lives in the screen only: nothing is acknowledged or marked read on the board.
+- **Keys**: Tab / Left / Right (Shift-Tab back) or `1`-`4` switch tabs; Up / Down / PgUp / PgDn / Home / End select; Enter opens details
+  for the selected row and Enter or Esc closes them (Up/Down then scroll); `r` refreshes now; `q` quits. The selection follows its row
+  by name through refreshes, and open details stay on their unit and say so when it leaves the list.
+- **Read-only, whoever runs it.** Every refresh builds a fresh read-only context; the monitor never asks whether it is the
+  orchestrator and never runs `check`/`status` (which write), board `read`/`sync`, a handoff write, a writer lock, an ack or a
+  wake. It runs `bd --readonly`, reads report and board files directly and runs the hosts' read-only probes (their scratch
+  files under `/tmp`, as `janus capacity` makes). It writes no project file and creates no state folder.
+- **Slow or broken sources.** Collection runs in one background thread (never two at once); keys and quit never wait for it. Each source
+  (beads, each host, herdr, reports, board) keeps its last good data: a failed source shows `STALE` with the age of that data and the
+  error beside it (the banner under the tabs, and the NOTE of a host), and never reads as zero or empty. A source that never answered shows
+  `?` and `UNAVAILABLE`. Error text and board posts are scrubbed of credential-shaped text before they are shown.
+- **Terminals.** Colours (green working, yellow queued/parked/stale, red failed/blocked/unreachable, magenta new) always come with a
+  label; with no colours or `NO_COLOR` set it uses bold and underline. Small windows drop columns, then the host table to one summary line;
+  it follows resizing.
+
 **`janus launch <unit> --kind implement|review|audit|cleanup [--tier critical|normal] [--host h] [--test-host h] [--model m] [--brief f] [--cwd d] [--allow-main] [--budget usd] [--of unit] [--dry-run]`**
 ```
 $ janus launch parser --kind implement --tier normal

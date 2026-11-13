@@ -28,7 +28,7 @@ LOG_BYTES = 256 * 1024  # of the log's tail
 # ---------------------------------------------------------------- text hygiene: nothing outside is shown raw
 
 _SECRET = re.compile(r"""(?ix)\b(bearer\s+)\S+
-    | ([\w.-]*(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|authorization)[\w.-]*)(["']?\s*[=:]\s*["']?)(?!\*\*\*)[^\s"',;]+
+    | ([\w.-]*(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|authorization)[\w.-]*)(["']?\s*[=:]\s*["']?)(?:bearer\s+)?(?!\*\*\*)[^\s"',;]+
     | \b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,} | \bgh[pousr]_[A-Za-z0-9]{16,} | \bAKIA[0-9A-Z]{12,} | \bxox[abprs]-[A-Za-z0-9-]{8,}""")
 
 def scrub(s):
@@ -37,7 +37,7 @@ def scrub(s):
 
 def clean(x, n=None):
     """One line of printable text, scrubbed, at most n characters; terminal escapes from outside never reach the screen."""
-    s = scrub(re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", "" if x is None else str(x))).strip()
+    s = scrub(" ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", "" if x is None else str(x)).split()))
     return s[:n - 1] + "~" if n and len(s) > n else s
 
 def fmt_dur(s):
@@ -217,8 +217,8 @@ class Collector:
             prev = st.view()[0]
             units = self.step("units", collect_units, cfg)
             closed = self.step("closed", collect_closed, cfg)
-            if units is not None: self.step("reports:open", collect_reports, cfg, units)
-            if closed is not None: self.step("reports:closed", collect_reports, cfg, closed)
+            if units is not None: self.step("reports-open", collect_reports, cfg, units)
+            if closed is not None: self.step("reports-closed", collect_reports, cfg, closed)
             self.step("backlog", collect_backlog, cfg)
             self.step("board", collect_board, cfg)
             known = units if units is not None else (prev.get("units", Source()).data or [])
@@ -288,7 +288,8 @@ def source_note(label, s, now, limit):
 
 WORK_COLS = (("NAME", 24, 9, True), ("STATE", 22, 8, False), ("HOST", 10, 4, False), ("MODEL", 14, 3, False), ("ELAPSED", 8, 6, False))
 BOARD_COLS = (("NEW", 3, 7, False), ("TIME", 16, 5, False), ("KIND", 9, 8, False), ("AGENT", 16, 6, False), ("MESSAGE", 40, 9, True))
-HOST_COLS = (("HOST", 12, 9, False), ("STATE", 11, 8, False), ("RUN/QUEUED", 10, 6, False), ("AGENTS", 6, 7, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False), ("NOTE", 30, 3, True))
+HOST_COLS = (("HOST", 12, 9, False), ("STATE", 11, 8, False), ("RUN/QUEUED", 10, 7, False), ("AGENTS", 6, 6, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False), ("NOTE", 30, 3, True))
+NOT_READ = {"err": "report not read yet"}   # a unit's report before its first read: unknown, never 'no verdict'
 PRIO = {"blocked": 0, "failed": 1, "working": 2, "idle": 3, "queued": 4, "parked": 5, "starting": 6, "closing": 6, "unknown": 7}
 
 def state_style(st):
@@ -387,9 +388,9 @@ def derive(view, now, interval):
     rows = {t: [] for t in TABS}; live = {}   # live: host -> [agents known to be alive, agents whose state is unknown]
     def host_stale(u): return stale("herdr") if u.get("via") == "herdr" else stale(f"host:{u.get('host')}")
     for u in units or []:
-        rep = (S("reports:open").data or {}).get(u["name"])
+        rep = (S("reports-open").data or {}).get(u["name"], NOT_READ)
         tab, state, note = classify(u, ps, ag, rep)
-        rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports:open") or host_stale(u), rep))
+        rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or host_stale(u), rep))
         if tab == "Active" and u.get("host"):
             c = live.setdefault(u["host"], [0, 0])
             if state in ("working", "idle", "blocked"): c[0] += 1
@@ -397,16 +398,16 @@ def derive(view, now, interval):
     names = {u["name"] for u in units or []}
     for u in closed or []:
         if u["name"] in names: continue   # reopened or relaunched: the open unit is the truth
-        rep = (S("reports:closed").data or {}).get(u["name"]); tab, state, note = classify(u, ps, None, rep)
-        rows["Finished"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports:closed"), rep))
+        rep = (S("reports-closed").data or {}).get(u["name"], NOT_READ); tab, state, note = classify(u, ps, None, rep)
+        rows["Finished"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports-closed"), rep))
     rows["Active"].sort(key=lambda r: (PRIO.get(r.cells[1].split(" ")[0], 8), r.cells[0].lower()))
     rows["Finished"].sort(key=lambda r: (r.cells[1].startswith("closed"), r.cells[0].lower()))   # finished and waiting to be collected first
     if S("backlog").data is not None: rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"))
     if S("board").data is not None: rows["Board"] = message_rows(S("board").data, stale("board"))
     m.rows = rows
     herdr_used = any(u.get("via") == "herdr" for u in units or [])
-    srcs = {"Active": [("units", "units"), ("reports:open", "local reports")] + ([("herdr", "herdr")] if herdr_used else []), "Backlog": [("backlog", "beads backlog")],
-            "Finished": [("units", "units"), ("closed", "closed units"), ("reports:closed", "closed reports")], "Board": [("board", "board")]}
+    srcs = {"Active": [("units", "units"), ("reports-open", "local reports")] + ([("herdr", "herdr")] if herdr_used else []), "Backlog": [("backlog", "beads backlog")],
+            "Finished": [("units", "units"), ("closed", "closed units"), ("reports-closed", "closed reports")], "Board": [("board", "board")]}
     for t in TABS:
         known = all(S(n).data is not None for n in PRIMARY[t]); m.counts[t] = len(rows[t]) if known else None
         m.banners[t] = general + [x for x in (source_note(lbl, S(n), now, limit) for n, lbl in srcs[t]) if x]
@@ -438,7 +439,7 @@ def machine_row(n, s, now, limit, agents):
 def layout(cols, width):
     """[(column index, width)] that fit width: the least important columns go first; the flex column takes what is left."""
     use = list(range(len(cols)))
-    def total(): return sum(cols[i][1] for i in use) + len(use) - 1
+    def total(): return sum(8 if cols[i][3] else cols[i][1] for i in use) + len(use) - 1   # the flex column counts at a minimum: it never costs the others their place
     while total() > width and len(use) > 1:
         drop = [i for i in use if not cols[i][3]]
         if not drop: break
@@ -512,16 +513,16 @@ def wrap(lines, w):
     for l in lines:
         l = str(l)
         if not l: out.append(""); continue
-        ind = " " * (len(l) - len(l.lstrip()) + (11 if re.match(r"^[A-Z][A-Za-z ()]*: ", l) else 0))
+        ind = " " * min(w // 2, len(l) - len(l.lstrip()) + (11 if re.match(r"^[A-Z][A-Za-z ()]*: ", l) else 0))
         while len(l) > w: cut = l.rfind(" ", len(ind), w) if l.rfind(" ", len(ind), w) > len(ind) else w; out.append(l[:cut]); l = ind + l[cut:].lstrip()
         out.append(l)
     return out
 
 def render(model, ui, h, w, now, status):
     """The screen as lines of (text, style) segments, h lines of at most w columns. Pure: no curses here."""
-    if h < 3 or w < 24: return [[("janus monitor: terminal too small (q quits)"[:max(w, 1)], "warn")]][:max(h, 1)]
+    if h < 3 or w < 24: return [[("too small (q quits)"[:max(w, 1)], "warn")]][:max(h, 1)]
     L = []
-    new = ui.new_count(model); tab = TABS[ui.tab]
+    tab = TABS[ui.tab]
     L.append([("janus monitor", "bold"), (f" {model.project}  ", ""), ("READ-ONLY", "info"), (f"  {status}"[:max(0, w - 30)], "dim")])
     banners = model.banners.get(tab, [])[:2]
     foot = 1; tabbar = 1; colhead = 1
@@ -536,17 +537,18 @@ def render(model, ui, h, w, now, status):
     elif mach == "summary":
         c = {}
         for r in model.machines: c[r.cells[1]] = c.get(r.cells[1], 0) + 1
-        L.append([("hosts: ", "bold"), (", ".join(f"{k} {v}" for k, v in sorted(c.items())), "bad" if "UNREACHABLE" in c else "warn" if set(c) - {"ok"} else "ok")])
-    tabs = []
-    for i, t in enumerate(TABS):
-        n = model.counts.get(t); lab = f"{t} ({'?' if n is None else n}{f', {new} new' if t == 'Board' and new else ''})"
-        tabs.append((f"[{lab}]" if i == ui.tab else f" {lab} ", "rev bold" if i == ui.tab else "new" if t == "Board" and new else ""))
-    L.append(tabs)
+        L.append([("HOSTS ", "bold"), (", ".join(f"{k} {v}" for k, v in sorted(c.items())), "bad" if "UNREACHABLE" in c else "warn" if set(c) - {"ok"} else "ok")])
+    tab_at = len(L); L.append([])   # the tab bar is filled in below, once the selection has been settled (it counts the unread)
     for b in banners: L.append([(("! " + b)[:w], "warn")])
     bh = h - len(L) - colhead - foot
     cols = BOARD_COLS if tab == "Board" else WORK_COLS; rows = model.rows[tab]
     ui.sync(model, max(bh, 1))
-    sel = ui.sel.get(tab); i = ui.idx.get(tab, 0)
+    sel = ui.sel.get(tab); i = ui.idx.get(tab, 0); new = ui.new_count(model)
+    tabs = []
+    for ti, t in enumerate(TABS):
+        n = model.counts.get(t); lab = f"{t} ({'?' if n is None else n}{f', {new} new' if t == 'Board' and new else ''})"
+        tabs.append((f"[{lab}]" if ti == ui.tab else f" {lab} ", "rev bold" if ti == ui.tab else "new" if t == "Board" and new else ""))
+    L[tab_at] = tabs
     if ui.detail and not rows and ui.dcache: ui.detail = False
     if ui.detail and rows:
         row = next((r for r in rows if r.key == ui.dkey), None)
@@ -644,11 +646,16 @@ def cmd_monitor(cfg, a):
     import locale; locale.setlocale(locale.LC_ALL, "")   # curses needs the user's locale for non-ASCII text
     os.environ.setdefault("ESCDELAY", "25")
     store = Store(); col = Collector(cfg.root, store, a.interval)
+    def stop(*_): raise KeyboardInterrupt   # SIGTERM/SIGHUP end the screen the same way q does: the terminal is restored first
+    old = {s: signal.signal(s, stop) for s in (signal.SIGTERM, signal.SIGHUP)}
     try:
         with detached_stdin():
             col.start(); curses.wrapper(lambda scr: run_ui(scr, col, store, a.interval))
     except KeyboardInterrupt: pass
-    finally: col.stop(); kill_children()   # a probe waiting on a slow ssh must not outlive the screen
+    except curses.error as e: raise Err(f"the terminal cannot run the monitor ({clean(e, 80)}); is TERM set?")
+    finally:
+        col.stop(); kill_children()   # a probe waiting on a slow ssh must not outlive the screen
+        for s, h in old.items(): signal.signal(s, h)
     return 0
 
 __all__ = ["cmd_monitor", "interval_arg", "Collector", "Store", "Source", "derive", "render", "run_ui", "UI", "classify", "scrub", "clean", "kill_children", "fresh_cfg"]

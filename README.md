@@ -91,6 +91,7 @@ Common commands:
 | Command | What it does |
 |---|---|
 | `janus status`, `janus capacity` | the whole picture; room per host |
+| `janus monitor [--interval 5]` | a read-only terminal dashboard: hosts, work (Active, Backlog, Finished) and the board; Tab switches, Enter shows details, `r` refreshes, `q` quits |
 | `janus launch <unit> --kind implement --resume-of <unit>` | recover a crashed or capped unit from its report |
 | `janus remember --fact "<text>" --source <path>` | add to session memory (also `--decision`, `--pitfall`) |
 | `janus decide "<title>" --by owner --decision "…" --why "…"` | write a decision record |

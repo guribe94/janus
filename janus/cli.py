@@ -18,7 +18,6 @@ from janus.actions.lifecycle import cmd_board_close, cmd_close, cmd_collect, cmd
 from janus.actions.swarm import cmd_forget, cmd_index, cmd_introduce, cmd_learned, cmd_ledger, cmd_memory, cmd_peers, cmd_remember, cmd_report, cmd_transcript
 from janus.actions.tidy import cmd_tidy
 from janus.check import cmd_ack, cmd_capacity, cmd_check, cmd_status
-from janus.monitor import cmd_monitor, interval_arg
 from janus.quality import cmd_quality
 from janus.setup import cmd_doctor, cmd_init, cmd_install_host, cmd_queue, cmd_register, cmd_resume_orch, migrate
 from janus.soak import cmd_soak
@@ -45,7 +44,6 @@ def main():
     A = lambda *n, **k: (n, k)
     add("check", cmd_check, A("--brief", action="store_true"), A("--escalate", action="store_true"), A("--acked", action="store_true", help="list the findings a live ack is hiding (key, decision, age, ttl)"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent, ackable, open_since)"))
     add("hosts", cmd_hosts, A("--refresh", action="store_true", help="discover every host again now"), A("--json", action="store_true"))
-    add("monitor", cmd_monitor, A("--interval", type=interval_arg, default=5.0, metavar="SECONDS", help="seconds between refreshes, counted from the end of the last one (default 5, at least 1)"))
     add("capacity", cmd_capacity); add("status", cmd_status); add("watch", cmd_watch, A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"),
         A("--reset", action="store_true", help="the Stop hook's context reset: /clear once the turn ended, then the wake prompt"))
     add("learned", cmd_learned, A("--reject", help="reject learned post <agent>:<n> (check stops listing it)"), A("--why", help="why it is rejected"))
