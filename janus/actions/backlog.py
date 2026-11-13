@@ -1,12 +1,12 @@
 """janus backlog (import, list, set actor), janus fill (launch ready backlog units up to capacity) and janus brief (draft the
 briefs of ready items with one cheap unit; accept a draft so fill can launch it)."""
-import argparse, re, time
+import argparse, os, re, time
 from janus.actions.launch import choose, cmd_launch, pick_model
 from janus.context import atomic_write
 from janus.backlog import backlog_cfg, backlog_issues, backlog_items, item_actors, unit_items
 from janus.beads import Beads
 from janus.budgets import budget_for, finish_reserve, waste_block
-from janus.context import Err, say, slug
+from janus.context import Err, say, sh, slug
 from janus.ledger import committed, reserved
 from janus.probe import probe_all
 from janus.units import all_units, herdr_agents, unit_state
@@ -113,6 +113,20 @@ def fill_plan(cfg, hs, units, limit=None):
         grp.setdefault(w, []).append(n)
     return plan, [(f"{len(ns)} candidate(s) ({', '.join(ns[:5])}{'...' if len(ns) > 5 else ''}): " if ns[0] else "") + w for w, ns in grp.items()]
 
+def fill_repo(cfg, name, brief):
+    """ISSUES row 83: the repository a fill launch makes the unit's worktree from, exactly as janus launch --new-worktree <repo>
+    does. None when <worktrees>/<name> exists (launch takes that tree) or the project is in no git repository (the unit runs in
+    the project root, as before). The repository: the brief's `REPO: <path>` line, else [fill] repo, else the repository that
+    holds the project root. Before, fill passed no tree at all, so every unit got the project root, a main checkout, and was
+    refused: each fill launch needed a manual janus launch --new-worktree."""
+    if (cfg.p("worktrees", "worktrees") / name).is_dir(): return None
+    try: m = re.search(r"^REPO:\s*(\S+)", "".join(open(brief, errors="replace").readlines()[:12]), re.M)
+    except OSError: m = None
+    r = m.group(1) if m else cfg.c.get("fill", {}).get("repo")
+    if r: return str((cfg.root / os.path.expanduser(r)).resolve())
+    rc, o, e = sh(["git", "-C", str(cfg.root), "rev-parse", "--show-toplevel"])
+    return o.strip() if rc == 0 and o.strip() else None
+
 def cmd_fill(cfg, a):
     """Launch ready backlog units that have briefs, highest priority first, until every host's reservations or the budget are
     used, and no further. --dry-run lists what it would launch now and why it stops there."""
@@ -130,7 +144,8 @@ def cmd_fill(cfg, a):
     rc = 0
     for name, item, m, hn, b, budget, why, kind, tier, f in plan:
         la = argparse.Namespace(unit=name, kind=kind, tier=tier, host=None, model=m, brief=str(f), cwd=None, budget=None, test_host=None,
-                                allow_main=False, of=None, report=None, resume_of=None, item=item, dry_run=False)
+                                allow_main=False, of=None, report=None, resume_of=None, item=item, dry_run=False,
+                                new_worktree=fill_repo(cfg, name, f), from_ref=cfg.c.get("fill", {}).get("from"))   # row 83
         try: cmd_launch(cfg, la)
         except Err as e: say(f"fill: {name} not launched: {e}"); rc = 1
     cfg.touch("last_fill")

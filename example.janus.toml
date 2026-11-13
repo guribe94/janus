@@ -198,6 +198,8 @@ discover_h = 24          # janus check discovers each host again after this many
 [fill]                   # janus fill: ready backlog units with an ITEM: <id> brief, by priority, up to capacity and budget
 watcher = false          # true: the watcher runs janus fill when check finds idle-with-backlog (owner: "launch within capacity")
 every_min = 10
+# repo = "../code"       # the repository fill makes each unit's worktree from (a brief's REPO: <path> line wins); unset: the one
+#                        # holding the project root. from = "main": the ref the new branch starts from (unset: [landing] branch)
 
 [budget]                 # an API unit's default budget: median cost of past runs of its kind and tier + margin_pct
 margin_pct = 30
