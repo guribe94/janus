@@ -154,6 +154,15 @@ class F6Binary(Case):
         self.exact({"mod.bin": blob, "del.bin": b"\0\1\2", "t": b"t\n"}, {"mod.bin": blob[:5000] + b"\0NEW\0" + blob[5000:], "new.png": b"\x89PNG\0\0" + blob, "t": b"t\n"})
 
 
+class F7ModesAndSymlinks(Case):
+    def test_an_executable_a_mode_change_and_symlinks_arrive_as_they_are(self):
+        """Catches F7: a new executable arrived 100644, chmod +x alone made no patch, and a symlink arrived as a regular file
+        holding its target's content."""
+        self.exact({"run.sh": b"#!/bin/sh\n", "was.sh": ("x", b"#!/bin/sh\n"), "data": b"d\n", "cur": ("link", "data"), "dir/f": b"f\n"},
+                   {"run.sh": ("x", b"#!/bin/sh\n"), "was.sh": b"#!/bin/sh\n", "data": b"d\n", "cur": ("link", "dir/f"), "dir/f": b"f\n",
+                    "tool": ("x", b"#!/bin/sh\necho\n"), "ln": ("link", "data"), "dlink": ("link", "dir")})
+
+
 class Guard(Case):
     def test_a_patch_that_does_not_rebuild_the_units_tree_is_refused(self):
         """Catches the class, not a case: whatever makes the written patch wrong (here a git whose diff output loses its last
