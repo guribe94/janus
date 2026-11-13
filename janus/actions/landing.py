@@ -1,5 +1,5 @@
 """janus gate (and its gate-exec, gate-judge and gate-scope helpers), janus land and janus commit-state."""
-import argparse, os, re, shlex, signal, subprocess, sys, time
+import argparse, os, re, shlex, signal, subprocess, sys, time, unicodedata
 from pathlib import Path
 from janus.actions.jobs import cmd_run, ensure_lanes, tree_guard
 from janus.actions.launch import cmd_launch
@@ -273,17 +273,29 @@ def final_gate_cmd(ld, unit, wt, branch):
         out.append(c); i += 1
     return "".join(out)
 
-GATE_BRANCH_RX = re.compile(r"^[A-Za-z0-9._/+@-]+$")
+GATE_BRANCH_ASCII = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/+@=,%#-")
+
+def gate_branch_refusal(branch):
+    """Why the final gate cannot take this branch name, or None. A second shell level (`sh -c '..."{branch}"...'`,
+    `ssh h "...'{branch}'..."`) re-parses the command in a fresh shell, so no quoting of one template can make an arbitrary value
+    safe there (finding D part 2); only a name whose every character is literal in every quoting context at every level is let
+    through: ASCII letters, digits and `._/+@=,%#-`, and letters, marks and digits beyond ASCII (`wk/fix#12`, `issue-12=retry`
+    and a name with an umlaut are legal branch names and pass). A leading `-` would arrive as an option of the gate's command and
+    a leading `#` as a comment, so neither may start the name."""
+    b = str(branch)
+    bad = sorted({c for c in b if not (c in GATE_BRANCH_ASCII or (ord(c) > 127 and unicodedata.category(c)[0] in "LMN"))})
+    if bad: return "it holds " + " ".join(repr(c) for c in bad[:8]) + ", which a second shell level cannot be made to take literally"
+    if not b or b[0] in "-#": return f"it starts with {b[:1]!r}, which the gate's command would read as an option or a comment" if b else "it is empty"
+    return None
 
 def final_gate_cmd_checked(ld, unit, wt, branch):
-    """final_gate_cmd after checking the agent-named branch (finding D part 2): a branch outside `[A-Za-z0-9._/+@-]` is refused.
-    A second shell level (`sh -c '..."{branch}"...'`, `ssh h "...'{branch}'..."`) re-parses the command in a fresh shell, so no
-    quoting of one template can make an arbitrary value safe there; refusing the metacharacters is the sound generic rule (and the
-    branch is the only agent-controlled value), so cmd_land gates only through here. A branch name outside the set (a space, a
-    quote, a `$`, a backtick, a `;`, `&`, `|` or a newline) is refused with how to rename it."""
-    if not GATE_BRANCH_RX.match(str(branch)):
-        raise Err(f"branch {branch!r} holds characters outside [A-Za-z0-9._/+@-]: the final gate inserts it into a shell command and a "
-                  f"second shell level cannot be quoted safely; rename it (git branch -m) and land again")
+    """final_gate_cmd, refusing an agent-named branch the gate's shell text cannot carry (gate_branch_refusal). The branch is
+    checked only when the command takes it (the template holds `{branch}`): a gate that never sees the branch has no reason to
+    refuse a legal name. cmd_land builds its gate command only through here, before it merges or dispatches anything."""
+    why = gate_branch_refusal(branch) if "{branch}" in (ld.get("final_gate") or "") else None
+    if why:
+        raise Err(f"branch {branch!r} cannot be put into the final gate's command ([landing] final_gate holds {{branch}}): {why}. Nothing was "
+                  f"merged or landed. Rename it (git branch -m) and land again, or land without the gate (--no-gate)")
     return final_gate_cmd(ld, unit, wt, branch)
 
 def cmd_land(cfg, a):
@@ -302,6 +314,9 @@ def cmd_land(cfg, a):
     rc, branch, e = git(wt, "symbolic-ref", "--short", "HEAD"); branch = branch.strip()
     if rc: raise Err(f"{wt} is not on a branch")
     if branch == br: raise Err(f"{wt} is on {br} itself")
+    # the gate's command is built (and the branch name judged) before anything is merged or dispatched, and only when a gate
+    # will run: a refusal after the merge left a merge commit behind for a land that could never go on (review finding F2)
+    gh, gc = ld.get("final_gate_host"), None if a.no_gate else final_gate_cmd_checked(ld, a.unit, wt, branch)
     if git(wt, "status", "--porcelain", "--untracked-files=no")[1].strip(): raise Err(f"{wt} has uncommitted changes: commit them first")
     if git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")[0] == 0: raise Err(f"{wt} has a merge in progress (MERGE_HEAD): finish or abort it")
     base = git(wt, "rev-parse", br)[1].strip()
@@ -339,7 +354,6 @@ def cmd_land(cfg, a):
             if rc: git(wt, "merge", "--abort"); raise Err(f"git merge {br} failed although merge-tree was clean: {(e or o).strip()[-160:]}; aborted")
             say(f"merged {br} into {branch}")
     # 2. gate the merged tree on the final-gate host
-    gh, gc = ld.get("final_gate_host"), final_gate_cmd_checked(ld, a.unit, wt, branch)
     if a.no_gate: say("gate skipped (--no-gate)")
     elif not gh or not gc: raise Err("set [landing] final_gate_host and final_gate (the command that gates a merged tree) in janus.toml, or --no-gate")
     else:

@@ -362,40 +362,43 @@ def old_orch_procs(ps_text=None, root=None):
             if len(f) == 2 and f[0].isdigit() and _old_orch_script(int(f[0]), _sh_words(f[1]), r)]
 
 def live_children(pid):
-    """pids of the process's living children that are real work: a standing loop idles in `sleep 30` (its only child), which is
-    not work, so TERMing the loop is safe and `--retire` stops the loops it exists for (finding 4). Finding F: the worker's OWN
-    live state -- a real child (its gate mid-handoff), not the loop's name -- decides; a `sleep` child is never work, so an idle
-    loop, a handoff-queue worker included, is stopped, while a worker whose gate runs is kept. The literal `handoff-queue` test
-    the previous fix added is dropped: it could never tell an idle handoff-queue loop (also in sleep) from a mid-handoff one."""
+    """(pids of the process's children that are real work, pids of its children that are `sleep`). A child that is not `sleep`
+    (a gate the worker runs) is work. A `sleep` child proves nothing either way: a standing loop idles in `sleep 30`, and a
+    worker that waits for its gate's result polls in `sleep 5` with the gate running elsewhere, so the two look the same from
+    outside (review finding F3; a rule by the loop's name, or one that calls every sleep "not work", each got one of them wrong)."""
     rc, o, e = run(["pgrep", "-P", str(pid)], timeout=10)
-    if rc or not o.strip(): return []
+    if rc or not o.strip(): return [], []
     kids = [int(x) for x in o.split()]
     rc, o, e = run(["ps", "-o", "pid=,comm=", "-p", ",".join(map(str, kids))], timeout=10)
-    if rc or not o.strip(): return kids
-    return [int(l.split()[0]) for l in o.splitlines()
-            if l.strip() and os.path.basename(l.split(None, 1)[1]) != "sleep"]
+    if rc or not o.strip(): return kids, []
+    rows = [(int(l.split()[0]), os.path.basename(l.split(None, 1)[1])) for l in o.splitlines() if l.strip()]
+    return [k for k, c in rows if c != "sleep"], [k for k, c in rows if c == "sleep"]
 
-def retire_old_orch(dry=False, retire=False, ps_text=None, root=None):
+def retire_old_orch(dry=False, retire=False, ps_text=None, root=None, idle=False):
     """Item 14: list the old orch's standing processes (the full command line, so the owner can tell a loop from a waiter) and,
-    only with the owner's explicit yes (--retire), stop them (TERM). Finding 6: a process that still holds a live child (a
-    worker mid-handoff, whose child gate TERM would orphan) is listed and left alone. Finding 4: an idle loop's `sleep` child is
-    not work, so the loop is stopped (not kept). Finding F: the worker's own live state decides -- a real child (a gate) keeps
-    it, a `sleep` child does not, whatever the loop is named -- so an idle handoff-queue loop is stopped and a mid-handoff one
-    kept; and the `kill` result is read (a refused TERM is reported, never counted as sent)."""
+    only with the owner's explicit yes (--retire), stop them (TERM). A process with a child that is real work (a worker whose
+    gate runs under it) is listed and left alone: TERM would orphan the gate. A process whose only child is `sleep` is either an
+    idle loop or a worker waiting for its gate's result, which janus cannot tell apart, so it is left alone as well and the
+    owner is told how to stop it: `--retire --idle` is the owner's word that no handoff is in flight, and stops those too. The
+    `kill` result is read (a refused TERM is reported, never counted as sent)."""
     procs = old_orch_procs(ps_text, root)
     if not procs: return []
     out = [f"old orch process {p} still running: {c}" for p, c in procs]
     if retire and not dry:
         n = 0
         for p, c in procs:
-            ch = live_children(p)
-            if ch:
-                out.append(f"-> kept pid {p}: it has a live child ({', '.join(map(str, ch))}): a mid-handoff worker, TERM would orphan its gate")
+            work, asleep = live_children(p)
+            if work:
+                out.append(f"-> kept pid {p}: it has a live child ({', '.join(map(str, work))}): a mid-handoff worker, TERM would orphan its gate")
+                continue
+            if asleep and not idle:
+                out.append(f"-> kept pid {p}: it waits in sleep, as an idle loop does and as a worker does that waits for its gate's result; janus cannot "
+                           f"tell which. When no handoff is in flight, stop it: janus migrate --retire --idle (or kill -TERM {p})")
                 continue
             rc, o, e = run(["kill", "-TERM", str(p)])
             if rc: out.append(f"-> could not TERM pid {p} ({(e or o).strip()[:80] or 'kill failed'}): it keeps running")
             else: n += 1
-        out.append(f"-> sent TERM to {n} old orch process(es) (--retire)")
+        out.append(f"-> sent TERM to {n} old orch process(es) (--retire{' --idle' if idle else ''})")
     else: out.append("-> not stopped (janus migrate --retire stops them, or stop them by hand)")
     return out
 
@@ -423,7 +426,7 @@ def port_old_scripts(root, dry=False):
     if listed: out.append(f"{listed} line(s) still call `orch`: port them to `janus` (a gate step that calls the retired CLI exits 2 at once, not a test result)")
     return out
 
-def migrate(project=None, dry=False, retire=False):
+def migrate(project=None, dry=False, retire=False, idle=False):
     """One-time, idempotent move from orch to janus: the project's orch.toml -> janus.toml and .orch/ -> .janus/, every config
     value that still names the old state folder or an old name (item 1), the hook commands a previous install wrote, the watcher,
     and the project's own pre-existing jobs, sessions and cards which get their project id (item 6). Safe to run twice; prints
@@ -449,7 +452,7 @@ def migrate(project=None, dry=False, retire=False):
     if src.is_file(): did += rewrite_config(src, dry=dry)   # item 1
     did += migrate_hooks(dry=dry) + migrate_watcher(dry=dry)
     if new_cfg.is_file() or (dry and old_cfg.is_file()): did += adopt_items(root, dry=dry, config=src)   # item 6
-    did += retire_old_orch(dry=dry, retire=retire, root=root)   # item 14: the old orch's standing processes (finding 4)
+    did += retire_old_orch(dry=dry, retire=retire, root=root, idle=idle)   # item 14: the old orch's standing processes (finding 4)
     did += port_old_scripts(root, dry=dry)   # soak 39: port shims / list scripts still calling the retired CLI
     for x in did: say(x)
     say("janus migrate: " + ("done" if did else "nothing to do (already migrated)") + (" [dry-run: nothing changed]" if dry else ""))
