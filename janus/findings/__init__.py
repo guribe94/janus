@@ -132,7 +132,9 @@ def repeat_is_issue(key):
     """True when repeated acks of key are a sign of something to fix. Not for a family whose condition returns by nature
     (recurs), nor for one that cannot be acked (rows 5, 6, 9, 10, 12 of a project's register: memory pressure on a host, a
     repository that new work dirties again, notes that only writing clears)."""
-    f = FAMILIES.get(key.split(":", 1)[0], Family("")); return f.ack_ttl > 0 and not f.recurs
+    n = key.split(":", 1)[0]
+    if n == "issue": return False   # row 93: the detector's own findings: acks of issue:<key> raised issue:issue:<key>, without end
+    f = FAMILIES.get(n, Family("")); return f.ack_ttl > 0 and not f.recurs
 
 
 def live_acks(cfg, keys=None):

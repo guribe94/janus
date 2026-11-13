@@ -110,6 +110,12 @@ def acks_after(cfg, F, hs):
     flap dropped the acks of overlap:/related: and they came back unacked)."""
     return live_acks(cfg, {k for k, _ in F} if all(p.get("ok") for p in hs.values()) else None)
 
+def held_after(cfg, F, hs):
+    """Row 93: end the ack episode of every key whose finding is gone (the next ack of it counts as a recurrence). Like the
+    acks, only when every host answered."""
+    held = cfg.jget("ack-held.json"); keys = {k for k, _ in F}
+    if held and all(p.get("ok") for p in hs.values()) and not set(held) <= keys: cfg.jput("ack-held.json", {k: v for k, v in held.items() if k in keys})
+
 def run_check(cfg, cycle=True, writer=None):
     """Returns (findings not acknowledged, live text, probes, units). writer (default: the caller is the registered orchestrator,
     or the watcher) regenerates the Live part of HANDOFF.md, saves acks and open problems and sets pueue limits; anyone else
@@ -124,6 +130,7 @@ def run_check(cfg, cycle=True, writer=None):
         if not cfg.run.ro and not cfg.run.dry: auto_log_issues(cfg)   # a key acked 3+ times earns an issue row once
         if not cfg.run.ro: tune_pueue(cfg, hs, units)
         acks = acks_after(cfg, F, hs); cfg.jput("acks.json", acks)
+        held_after(cfg, F, hs)
         F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)
         op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
         live = live_state(cfg, hs, units, F); write_handoff(cfg, live)
@@ -173,7 +180,13 @@ def cmd_ack(cfg, a):
                       "drop. Get the briefs written (janus brief draft <items>), or janus backlog set <id> actor=owner for what no agent does")
         cfg.jput("nobrief.json", {**st, "acked": st.get("n", 0)})
     acks = live_acks(cfg); acks[k] = {"t": now(), "d": d}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
-    cnt = cfg.jget("ack-counts.json"); cnt[k] = cnt.get(k, 0) + 1; cfg.jput("ack-counts.json", cnt)   # a key acked 3+ times earns an issue row
+    # A key acked 3+ times earns an issue row, counted once per episode of its finding (row 93): a re-ack while the finding
+    # stands (the ack's time ran out; a finished unit held open for a chain, two units that share a file by plan) is the same
+    # decision again, a hold and not a failure that came back. ack-held.json: keys acked whose finding has not cleared since.
+    held = cfg.jget("ack-held.json")
+    if k not in held:
+        cnt = cfg.jget("ack-counts.json"); cnt[k] = cnt.get(k, 0) + 1; cfg.jput("ack-counts.json", cnt)
+        held[k] = int(now()); cfg.jput("ack-held.json", held)
     if getattr(a, "decision_class", False) or k.split(":", 1)[0] in DECISION_ACKS: note_event(cfg, "decision")   # routine acks leave the notes fresh
     try:
         bd = Beads(cfg); m = re.match(r"unit:([^:]+)", k)

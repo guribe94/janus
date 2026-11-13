@@ -50,9 +50,13 @@ def cmd_issue(cfg, a):
     return 0, [msg]
 
 def repeated_issue_findings(cfg):
-    """issue:<key> for every finding key acked [janus] ack_issue_n or more times (the acks are a sign it keeps coming back, so
-    it earns an issue row): name the key and `janus issue --key <key>`."""
+    """issue:<key> for every finding key acked [janus] ack_issue_n or more times that has no issue row yet (the acks are a sign
+    it keeps coming back, so it earns an issue row): name the key and `janus issue --key <key>`. A writer's check logs the row
+    in the same pass (auto_log_issues), so the finding shows once; before row 93 it stayed for ever, was acked, and those acks
+    raised issue:issue:<key>. Acks are counted once per episode of a finding (check.cmd_ack), never for the issue family."""
     n0 = int(iset(cfg, "ack_issue_n")); c = cfg.jget("ack-counts.json")
+    p = issue_path(cfg); old = p.read_text() if p.is_file() else ""; done = cfg.jget("issued.json")
+    c = {k: n for k, n in c.items() if k not in done and f"[{k}]" not in old}   # row 93: a key whose row exists is not raised again
     return [(f"issue:{k}", f"{k} has been acked {n} times (>= {n0}): open an issue row for it once (janus issue --key {k} \"<what "
              f"keeps happening and why>\"), so a recurring failure is tracked, not re-remembered") for k, n in sorted(c.items()) if n >= n0 and repeat_is_issue(k)]
 
