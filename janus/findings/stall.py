@@ -10,7 +10,7 @@ land:<unit>:recovered the watcher ran that command itself (tend_stalled_lands), 
 install:blocked-by-blocker  janus commits not yet installed change the code a stalled land runs: install now, then restart.
 present:<unit>        a collected or closed unit whose result was never presented to the owner (janus report --presented).
 It imports jobs, probe, project and context only; check.py, watch.py and the actions build on it."""
-import json, os, signal, subprocess, sys, time
+import json, os, re, signal, subprocess, sys, time
 from pathlib import Path
 from janus.actions.jobs import job_state, task_rc, wrap_token, wrapped_jobs
 from janus.context import Err, JANUS_SELF, atomic_write, now, say, sh, ts
@@ -46,9 +46,10 @@ def live_lands(cfg):
     return out
 
 def land_proc(pid, unit):
-    """True when pid on this machine is a `janus land <unit>` (never signal a reused pid)."""
-    rc, o, _ = sh(["ps", "-p", str(pid), "-o", "command="]); w = o.split()
-    return rc == 0 and "land" in w and unit in w
+    """True when pid on this machine is a `janus land <unit>` run (never signal a reused pid, a shell that only mentions it,
+    or the land of another unit): the command line holds `janus[.py] land` followed by the unit as a whole word."""
+    rc, o, _ = sh(["ps", "-p", str(pid), "-o", "command="])
+    return rc == 0 and re.search(r"(^|[\s/])janus(\.py)?\s+land\s(.*\s)?" + re.escape(unit) + r"(\s|$)", o.strip()) is not None
 
 def _st(t): s = t.get("status"); return s if isinstance(s, str) else next(iter(s or {}), "")
 
@@ -153,16 +154,26 @@ def tend_stalled_lands(cfg, hs, units, log):
     return done
 
 def stop_land(cfg, unit):
-    """janus land <unit> --restart: end a land of this unit that waits for its gate on this machine, and cancel its gate jobs."""
+    """janus land <unit> --restart: end the land of this unit that waits for its gate on this machine, and cancel its gate jobs.
+    Safe by construction: it acts only on the record the land itself wrote while it waits (no record = the gate ended or no
+    land waits: the land may be squashing or pushing, or the jobs are someone else's gate: nothing is stopped or cancelled);
+    it signals only a process that is that unit's `janus land`; it re-reads the record right before the signal (a land that
+    just passed its gate has removed it: it is left alone); it cancels only unfinished jobs that land_jobs names."""
     from janus.actions.jobs import cancel_job
     from janus.probe import probe_all
     f = land_file(cfg, unit)
     try: r = json.loads(f.read_text())
     except (OSError, ValueError): r = {}
+    if not r:
+        say(f"--restart: no land of {unit} waits for its gate here (no {f.name}): nothing stopped, no gate job cancelled"); return
     pid = r.get("pid")
     if pid and int(pid) != os.getpid() and alive(pid):
         if not land_proc(pid, unit): raise Err(f"--restart: process {pid} recorded in {f} is not a janus land {unit}: nothing stopped")
         if cfg.run.dry: say(f"+ stop the running land {unit} (pid {pid}) and cancel its gate jobs"); return
+        try: again = json.loads(f.read_text()).get("pid")
+        except (OSError, ValueError): again = None
+        if again != pid:
+            say(f"--restart: land {unit} (pid {pid}) left its gate while we looked: nothing stopped, no gate job cancelled"); return
         os.kill(int(pid), signal.SIGTERM); t0 = now()
         while alive(pid) and now() - t0 < 10: time.sleep(0.2)
         if alive(pid): os.kill(int(pid), signal.SIGKILL)
