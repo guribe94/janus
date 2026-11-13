@@ -194,7 +194,7 @@ def session_findings(cfg, running, units=()):
     try:
         its = intents(cfg); live = {i["instruction"] for i in its if i.get("instruction") and not intent_stale(cfg, i, units)}
         ins = [i for i in Beads(cfg).issues("instruction") if i["id"] not in live]
-        if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done; bd remember --key <subject>: same subject replaces; "
+        if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (the owner's answer comes first: give it if one still waits; then close as done; bd remember --key <subject>: same subject replaces; "
                           "or, while its work is in progress, janus intent add --instruction <id> \"<what>\"): " + "; ".join(i['title'][:50] for i in ins[:3])))
     except Err: pass
     hp = handoff_path(cfg)
