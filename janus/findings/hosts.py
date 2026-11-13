@@ -374,9 +374,10 @@ def host_findings(cfg, hs, units, viol):
     def other_root(r):   # under another listed project (the deepest listed root holding r is not this project)
         hold = [x for x in [str(cfg.root.resolve())] + [x for x, _ in others] if r == x or r.startswith(x.rstrip("/") + "/")]
         return bool(hold) and max(hold, key=len) != str(cfg.root.resolve())
-    ready = 0
-    try: ready = len(ready_work(cfg))
+    ready = []   # the ready work an agent could be launched on (titles), not every ready bead
+    try: ready = [str(i.get("title", ""))[:40] for i in ready_work(cfg)]
     except Err: pass
+    work = f"{len(ready)} ready work item(s) in beads have no unit ({'; '.join(ready[:3])}{'...' if len(ready) > 3 else ''})"
     for n, p in hs.items():
         if not p["ok"]:
             qd = [u["name"] for u in units if u.get("host") == n]
@@ -388,7 +389,9 @@ def host_findings(cfg, hs, units, viol):
         if mg or low:   # the key names the kinds (load, memory, disk), so an ack of one never hides another (H12)
             kinds = sorted({w.split()[0] for w in mg} | ({"memory"} if low else set()))
             F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}; launch elsewhere, or free it (janus tidy for disk)"))
-        elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} but {ready} unit(s) are ready: janus launch"))
+        elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} and {work}: write a brief for each and janus launch it"))
+        elif ready and (p.get("cap_pause") or "").strip():   # skill-fix52: the waiting work is said with the pause, never dropped
+            F.append((f"idle:{n}", f"host {n} takes no work while its admission is paused ({p['cap_pause'].strip()}), and {work}: launch on another host, or when it clears"))
         hc = host_cap(cfg, n, p, units)
         if hc["pause"]:   # back-pressure (janus-fixes8 item 2): reported, never acted on by killing
             F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile"))

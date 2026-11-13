@@ -23,7 +23,8 @@ GOLDEN = [
 URGENT_BEFORE = ("unit:", "board:", "question:", "related:", "overlap:", "orphan:", "host:", "margin:", "stalled:", "spend:", "instructions", "beads",
                  "old-rule:", "burner:", "ledger:", "script:", "idle-backlog:", "landing:", "idle-with-backlog", "scheduler:", "pressure:",
                  "direct:", "budget80:", "waiting:", "waste", "report-due", "parked:", "decision-missing:", "owner-question:",
-                 "blocked:", "unregistered:")   # skill-fix50: new families, urgent from their first registration
+                 "blocked:", "unregistered:",   # skill-fix50: new families, urgent from their first registration
+                 "intent:")   # skill-fix52: a stale intent
 
 PS = (" 501     1   501  99.0 20:00 /opt/miner --all\n"                      # an orphaned CPU burner, 20 min
       " 502     1   502   1.0 00:30 cargo test -p x\n")                       # a test run outside the lanes

@@ -6,6 +6,7 @@ from janus.actions.jobs import LANES
 from janus.context import Cfg, Err, Run, find_root, projects, say, session_root
 from janus.decisions import cmd_answer, cmd_ask, cmd_decide, cmd_decisions
 from janus.hooks import cmd_hook
+from janus.intents import cmd_intent
 from janus.issue import cmd_issue
 from janus.memory import MEM_SECTIONS
 from janus.setup import doctor, init_project
@@ -23,7 +24,7 @@ from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
 WRITERS = {"ack", "launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
-           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue", "qualify", "brief"}
+           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue", "qualify", "brief", "intent"}
 
 def cmd_resume(cfg, a):
     """janus resume: a parked unit when one is named, else the orchestration itself (janus/setup.cmd_resume_orch): continue it
@@ -114,6 +115,10 @@ def main():
         A("--topic", help="the regex each reads in the other's transcript (default: a path named in --why)"), dry=True)
     add("quality", cmd_quality, A("action", choices=["lint", "review"], help="lint: a brief alone; review: the pre-landing review"),
         A("arg", nargs="?", help="lint: a brief path or unit name; review: the unit"), A("--override", help="review: accept the findings with this reason"), dry=True)
+    add("intent", cmd_intent, A("action", choices=["add", "done", "list"], help="add: record what you mean to get done (or update one with --id); done: close it; list: the open ones"),
+        A("args", nargs="*", help="add: what; done: <intent id> [reason]"), A("--why"), A("--done-means", help="what done means"),
+        A("--instruction", metavar="ID", help="the owner instruction it answers (check then treats that instruction as in progress)"),
+        A("--unit", action="append", help="a unit that works on it (repeatable)"), A("--id", help="add: update this intent instead of adding one"))
     add("issue", cmd_issue, A("text", help="what happened, in generic terms (no project, host or person)"),
         A("--evidence", help="a path, commit sha or job the row points at"), A("--key", help="a finding key the row is for; a row for the same key is written once"), dry=True)
     add("qualify", cmd_qualify, A("model", help="a model with [models.<m>] qualified = false"),
