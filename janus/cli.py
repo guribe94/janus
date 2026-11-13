@@ -9,7 +9,7 @@ from janus.hooks import cmd_hook
 from janus.issue import cmd_issue
 from janus.memory import MEM_SECTIONS
 from janus.setup import doctor, init_project
-from janus.actions.backlog import cmd_backlog, cmd_fill
+from janus.actions.backlog import cmd_backlog, cmd_brief, cmd_fill
 from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_hosts, cmd_run, cmd_thrash
 from janus.actions.landing import cmd_commit_state, cmd_gate, cmd_gate_exec, cmd_gate_judge, cmd_gate_log, cmd_gate_scope, cmd_land
 from janus.actions.launch import cmd_api_run, cmd_launch, cmd_qualify
@@ -23,7 +23,7 @@ from janus.soak import cmd_soak
 from janus.watch import cmd_watch
 
 WRITERS = {"ack", "launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
-           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue", "qualify"}
+           "remember", "forget", "memory", "index", "learned", "register", "board-close", "report", "issue", "qualify", "brief"}
 
 def cmd_resume(cfg, a):
     """janus resume: a parked unit when one is named, else the orchestration itself (janus/setup.cmd_resume_orch): continue it
@@ -94,6 +94,9 @@ def main():
     add("busy", cmd_busy, A("wt", help="a worktree: exit 0 while a janus job, a unit's job or a mutation run uses it, else 1"))
     add("cancel", cmd_cancel, A("job", help="<host>:<task id> of a janus run/gate job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", cmd_fill, A("--max", type=int, help="launch at most this many"), dry=True)
+    add("brief", cmd_brief, A("action", choices=["draft", "accept"], help="draft: one cheap unit writes briefs for the items into <briefs>/drafts; accept: move one draft to <briefs> so fill can launch it"),
+        A("items", nargs="+", help="backlog item ids (accept: one)"), A("--as", dest="as_name", metavar="UNIT", help="accept: the unit name (default: the one in the draft's first line)"),
+        A("--model", help="draft: the model (default: the first available of [routing] draft, else of the normal route)"), dry=True)
     add("report", cmd_report, A("--brief", action="store_true", help="summary lines only"), A("--sent", action="store_true", help="record that the report was sent (clears report-due)"))
     add("land", cmd_land, A("unit"), A("--no-gate", action="store_true", help="skip the final gate (it is still refused mid-merge)"),
         A("--no-dispatch", action="store_true", help="on a conflict, only say what merge unit to dispatch"), dry=True)

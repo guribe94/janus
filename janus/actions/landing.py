@@ -24,8 +24,36 @@ def gate_times(cfg): return cfg.jget("gate-times.json")
 
 # The lines of a gate's own output that look like the first error (the soak-40 need: `janus queue --log <gate task>` printed only
 # host headers and gate-judge only the RESULT line, so nothing showed why a gate failed).
-GERR_RX = re.compile(r"(?i)\b(error|failed|failure|assert(ion)?|panic|traceback|not found|no such file|expected|"
+GERR_RX = re.compile(r"(?i)\b(error|(?-i:\w+(Error|Exception))|failed|failure|assert(ion)?|panic(ked)?|traceback|not found|no such file|expected|"
                      r"exit(ed)? [1-9]|exit code [1-9])\b")
+
+# A step's own log (out/<gate>/steps/<step>.log, where a gate script sends each step's output): the lines naming a failed test
+# (cargo test, nextest, pytest, unittest) and the lines that only look like an error (a passing test whose name holds "failed").
+STEP_FAIL_RX = re.compile(r"^(?:test (.+?) \.\.\. FAILED|(?:FAILED|ERROR) (\S+::\S+)(?: - .*)?|(\S+::\S+) (?:FAILED|ERROR)\b.*|"
+                          r"\s*FAIL \[[^\]]*\]\s+(\S.*?)|(?:FAIL|ERROR): (\S.*?))\s*$")
+STEP_OK_RX = re.compile(r"\.\.\. ok\s*$|^PASSED\b|\bPASSED\b[^:]*$|^test result:|^\s*(PASS|ok)\b|^janus: ")   # janus: its own job notices
+
+def step_failures(text):
+    """(failing test ids, first error line or None, the CACHED PASS line or None) of one step's log."""
+    ids, err, cached = [], None, None
+    for l in text.splitlines():
+        m = STEP_FAIL_RX.match(l)
+        if m: ids += [i for i in (next(g for g in m.groups() if g),) if i not in ids]
+        elif l.startswith("CACHED PASS "): cached = l.strip()
+        elif err is None and GERR_RX.search(l) and not STEP_OK_RX.search(l): err = l.strip()
+    return ids, err, cached
+
+def step_lines(sd, steps):
+    """The lines gate-log prints from the step logs: per failing step (every step log when the gate's output named none) its
+    failing test ids and first error line; per step answered by the result cache, its CACHED PASS line."""
+    L = []; rcs = dict(steps)
+    for f in sorted(sd.glob("*.log")) if sd.is_dir() else []:
+        n = f.stem; ids, err, cached = step_failures(f.read_text(errors="replace"))
+        if cached: L.append(f"step {n}: {cached}")
+        if rcs.get(n, "1" if not rcs and (ids or err) else "0") == "0": continue
+        L.append(f"step {n}: failed test(s) ({len(ids)}): " + ", ".join(ids[:20]) + ("..." if len(ids) > 20 else "") if ids else f"step {n}: no failing test id in {f}")
+        if err: L.append(f"  first error: {err[:220]}")
+    return L
 
 def cmd_gate_log(cfg, a):
     """janus gate-log <name> [--task <host>:<id>]: a failed gate's per-step summary and first error line. The RESULT line and
@@ -51,14 +79,17 @@ def cmd_gate_log(cfg, a):
     if log is None:
         for f in (out / name / "log", out / name / "gate.log"):
             if f.is_file(): log = f.read_text(errors="replace"); break
+    steps = re.findall(r"EXIT_(\w+)=(\d+)", log or "") or re.findall(r"EXIT_(\w+)=(\d+)", last or "")   # the RESULT line names them too
+    SL = step_lines(out / name / "steps", steps)   # row 228: a gate whose steps write their own logs has its test ids and errors there
     if log is None:
         L.append("no gate output found (recorded task out/<name>/task.txt, --task <host>:<id>, or out/<name>/log)")
     else:
-        steps = re.findall(r"EXIT_(\w+)=(\d+)", log)
         if steps: L.append("steps: " + ", ".join(f"{s}=rc{r}" for s, r in steps))
         errs = [l.strip() for l in log.splitlines() if GERR_RX.search(l)]
-        L.append("first error line(s):" if errs else "no error-looking line; last lines:")
-        for l in (errs[:5] if errs else log.splitlines()[-8:]): L.append("  " + l[:220])
+        if errs or not SL:
+            L.append("first error line(s):" if errs else "no error-looking line; last lines:")
+            for l in (errs[:5] if errs else log.splitlines()[-8:]): L.append("  " + l[:220])
+    L += SL
     return (0 if last and last.endswith("RESULT: PASS") else 1), L
 
 def gate_estimate(cfg, name):

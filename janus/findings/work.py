@@ -94,8 +94,13 @@ def backlog_findings(cfg, hs, units):
     if nob and not plan and any("budget" in s for s in stops):
         F.append(("idle-backlog:budget", f"budget-limited: {'; '.join(s for s in stops if 'budget' in s)[:160]}; {len(nob)} ready item(s) wait"))
     elif nob and any(room(cfg, n, p, units)[0] > 0 for n, p in hs.items() if p.get("ok")):
-        F.append(("idle-backlog:nobrief", f"{len(nob)} ready backlog item(s) have no unlaunched brief while hosts have room: write briefs (ITEM: <id> line) for: "
-                  + "; ".join(t[:50] for _, t in nob[:6]) + ("..." if len(nob) > 6 else "")))
+        # row 227: name the items and the cheap way to get their briefs; drafts that only wait for janus brief accept are named too
+        dr = cfg.p("briefs", "briefs") / "drafts"; drafted = [i for i, _ in nob if (dr / f"{i}.md").is_file()]; top = [i for i, _ in nob if i not in drafted][:6]
+        F.append(("idle-backlog:nobrief", f"{len(nob)} ready backlog item(s) have no unlaunched brief while hosts have room ("
+                  + ", ".join(f"{n} {room(cfg, n, p, units)[0]}" for n, p in hs.items() if p.get("ok") and room(cfg, n, p, units)[0] > 0) + "): "
+                  + "; ".join(f"{i} {t[:40]}" for i, t in nob[:6]) + ("..." if len(nob) > 6 else "")
+                  + (f"; draft their briefs with one cheap unit: janus brief draft {' '.join(top)}" if top else "")
+                  + (f"; {len(drafted)} draft(s) wait for janus brief accept: {' '.join(drafted[:6])}" if drafted else "")))
     return F
 
 def landing_findings(cfg, units, hs=None):
