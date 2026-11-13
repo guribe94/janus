@@ -134,6 +134,18 @@ class F4LineSeparators(Case):
         self.exact({"f.c": b"top\n" + odd + b"end\n"}, {"f.c": b"top\n" + odd + b"changed\x0c\n", "n.py": odd})
 
 
+class F5RepetitiveFile(Case):
+    def test_a_long_repetitive_file_is_patched_in_seconds(self):
+        """Catches F5: difflib is quadratic on repetitive lines: 20,000 lines with every 50th changed took 14 to 32 s, 40,000
+        over 60 s, and past collect's 300 s limit there was no patch at all. (The limit here is 20 s; git needs under one.)"""
+        a = [b'  {"k": %d, "v": "row"},\n' % (i % 280) for i in range(40000)]
+        b = [l if i % 50 else b'  {"k": "changed"},\n' for i, l in enumerate(a)]
+        self.trees({"data.json": b"".join(a)}, {"data.json": b"".join(b)}); rc, _, err = self.build(limit=20)
+        self.assertEqual(rc, 0, f"no patch within 20 s (exit {rc}): {err}")
+        self.checkout(); self.assertEqual(self.git("apply", "--index", str(self.patch)).returncode, 0)
+        self.assertEqual(snap(self.root / "chk"), snap(self.root / "worktrees/u"))
+
+
 class Guard(Case):
     def test_a_patch_that_does_not_rebuild_the_units_tree_is_refused(self):
         """Catches the class, not a case: whatever makes the written patch wrong (here a git whose diff output loses its last
