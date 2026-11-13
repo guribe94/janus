@@ -75,7 +75,12 @@ def ws_id(cfg, create=False):
         r = herdr("workspace", "create", "--label", lab, "--no-focus") or {}
         return r.get("workspace", {}).get("workspace_id")
 
-def report_path(cfg, u): return Path(u["report"]) if u.get("report") else cfg.p("out", "out") / u["name"] / "REPORT.md"
+def report_path(cfg, u):
+    """The report janus reads for the unit: out/<unit>/REPORT.md; a local unit launched with --report writes that file instead.
+    A remote unit's is always its own folder's (soak 43b): its agent writes <root>/out/<unit>/REPORT.md there and collect
+    brings that folder here, never into another unit's."""
+    remote = u.get("host") in cfg.hosts and not cfg.hosts[u["host"]].get("local")
+    return Path(u["report"]) if u.get("report") and not remote else cfg.p("out", "out") / u["name"] / "REPORT.md"
 
 def report_json(cfg, u):
     """The unit's structured report, report.json next to its REPORT.md (verdict, files_changed, jobs with exit codes,

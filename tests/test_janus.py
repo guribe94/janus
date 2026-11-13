@@ -323,7 +323,7 @@ class Resume(unittest.TestCase):
         b = d / "briefs/r.md"; b.write_text(f"Continue the same report {rep} (line 1 PENDING).\n")
         a = type("A", (), {"report": None, "resume_of": None, "unit": "r"})()
         self.assertIsNone(janus.resume_report(cfg, a, b))   # never parsed from the brief's prose (a launch died on such a path)
-        a.resume_of = "orig"; b.write_text("x\n"); self.assertEqual(janus.resume_report(cfg, a, b), rep.resolve())
+        a.resume_of = "orig"; b.write_text("x\n"); self.assertIsNone(janus.resume_report(cfg, a, b)); self.assertEqual(janus.seed_report(cfg, a), rep.resolve())   # continued as a copy (soak 43b)
         a.resume_of = None; a.report = str(rep); self.assertEqual(janus.resume_report(cfg, a, b), rep.resolve())
         u = {"name": "r", "report": str(rep), "resume": True, "started": time.time() + 5}
         self.assertIsNone(janus.verdict(cfg, u))   # the old verdict does not count

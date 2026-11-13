@@ -224,7 +224,6 @@ def cmd_collect(cfg, a):
     if not cfg.run.dry and u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("run"):
         cost, reported = run_cost(od / "api.json", None, u["run"])
         if reported: keep_run_json(cfg, od, u["run"]); ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], n, cost, "collected")   # idempotent: once per run id
-    if not cfg.run.dry and u.get("report"): say(f"report -> {u['report']}")
     kv = fingerprint(cfg, u) if not cfg.run.dry else None
     if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
     if not cfg.run.dry: bd.comment(u["id"], f"{ts()} collected from {u['host']}")
@@ -248,9 +247,23 @@ def unit_dirty(cfg, cwd):
     rc2, ptop, _ = sh(["git", "-C", str(cfg.root), "rev-parse", "--show-toplevel"])
     return out, rc2 == 0 and Path(ptop.strip()).resolve() == top and Path(cwd).resolve() != top
 
+def duplicate_check(cfg, u, units, orig):
+    """`janus close <unit> --duplicate-of <orig>` (soak 43): the way to close a relaunch that duplicated a unit still at work.
+    It has no verdict and shares the original's tree, so neither the verdict rule nor --force can close it. Allowed only when
+    janus recorded it as a relaunch of the open unit <orig> and its agent is stopped (asked of its host now); the original, its
+    tree and its out folder are not touched, and the uncollected guard still holds for a remote copy."""
+    o = next((x for x in units if x["name"] == orig and x["id"] != u["id"]), None)
+    if not o: raise Err(f"--duplicate-of {orig}: no other open unit of that name")
+    if u.get("relaunch_of") != orig and o.get("relaunched") != u["name"]: raise Err(f"{u['name']} is not a relaunch of {orig} (janus recorded none): close it by its verdict")
+    if cfg.run.dry: return
+    st = unit_state(u, {u["host"]: probe(u["host"], cfg.hosts[u["host"]])}, herdr_agents(cfg))
+    if st in ("working", "queued", "blocked", "unknown"):
+        raise Err(f"{u['name']}: its agent is " + (f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)") + f"; stop it first (janus stop {u['name']})")
+
 def cmd_close(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
-    handover = bool(getattr(a, "handover", False))
+    handover = bool(getattr(a, "handover", False)); dup = getattr(a, "duplicate_of", None)
+    if dup and a.force: raise Err("--duplicate-of with --force: --duplicate-of is the close without --force")
     mine = own_tree(cfg, u, units) or handover   # item 13: a successor took its tree, so --force is right
     if a.force and not mine: raise Err(f"--force refused: {u['cwd']} is shared (project root or another open unit's cwd)")
     if mine:
@@ -258,6 +271,7 @@ def cmd_close(cfg, a):
         if dirty and not a.force: raise Err(f"{u['cwd']} has uncommitted changes ({', '.join(dirty[:3])}); commit and push, or --force")
         rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=u["cwd"])
         if rc == 0 and o.strip() != "0" and not a.force and not state_repo: raise Err("unpushed commits; push first, or --force")
+    elif dup: duplicate_check(cfg, u, units, dup)   # soak 43: a stopped duplicate has no verdict to give and no tree of its own
     elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
         raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
     # A handover is never a reason to skip the uncollected guard (finding 3): a remote predecessor's dirty tree is its copy on
@@ -485,14 +499,14 @@ def cmd_resume(cfg, a):
 
 def save_output(cfg, u):
     """Bring a remote unit's output folder here (out/<unit>/: REPORT.md, api.json and each run's api-<run>.json, logs; never the
-    key fifo) and keep its pueue task's log; a resumed unit's report also goes back to its original path. True when done."""
+    key fifo) and keep its pueue task's log. Nothing is written outside out/<unit>/ (soak 43b: the report of a unit that continued
+    another's used to be copied over that other unit's REPORT.md). True when done."""
     h = cfg.hosts[u["host"]]; n = u["name"]; od = cfg.p("out", "out") / n
     cmd = ["rsync", "-a", "--exclude", "*.key", "-e", " ".join(SSH), f"{h['ssh']}:{h['root']}/out/{n}/", str(od) + "/"]
     if cfg.run.dry: say("+ " + shlex.join(cmd)); return True
     od.mkdir(parents=True, exist_ok=True)
     if sh(cmd, timeout=600)[0]: return False
     if u.get("via") == "pueue" and u.get("task") is not None: save_task_log(cfg, h, u, u["task"])
-    if u.get("report") and (od / "REPORT.md").is_file(): atomic_write(Path(u["report"]), (od / "REPORT.md").read_text())
     return True
 
 def settle_remote(cfg, u):

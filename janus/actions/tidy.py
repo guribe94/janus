@@ -1,6 +1,6 @@
 """janus tidy: bookkeeping without hand operations (landed branches, old run files, stopped containers, closed units'
 remote copies, old test roots, cache entries over a host's disk budget)."""
-import re, shlex, tempfile
+import os, re, shlex, tempfile
 from pathlib import Path
 from janus.actions.lifecycle import uncollected
 from janus.beads import Beads
@@ -13,7 +13,9 @@ from janus.units import all_units, herdr_agents, ws_id
 
 def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
     """[(kind, target, why)] of what janus tidy removes: worktrees under paths.worktrees that are clean (no change, no untracked
-    file, no stash of their branch), whose tree is contained in the landing branch and that no open unit uses; herdr panes
+    file, no stash of their branch), whose tree is contained in the landing branch and that no open unit uses (as its cwd, or by name: soak 44, a
+    worktree whose folder or branch is named after an open unit is that unit's whatever cwd the unit recorded -- a unit launched
+    without a worktree records the project root, and the tree its agent then made was listed as "no open unit"); herdr panes
     of closed units; board cards whose process is gone and that belong to no open unit."""
     P = []; names = {u["name"] for u in units}
     used = {Path(u["cwd"]).resolve() for u in units if u.get("cwd")}
@@ -21,9 +23,11 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
     for d in sorted(wd.iterdir()) if wd.is_dir() else []:
         if not (d / ".git").is_file() or d.resolve() in used or d.resolve() == cfg.root.resolve(): continue
         keep = (lambda why: kept.append((str(d), why))) if kept is not None else (lambda why: None)
+        br = sh(["git", "-C", str(d), "symbolic-ref", "-q", "--short", "HEAD"])[1].strip()
+        own = next((n for n in (d.name, br) if n in names), None)
+        if own: keep(f"open unit {own}'s worktree (its folder or branch has the unit's name)"); continue
         rc, o, e = sh(["git", "-C", str(d), "status", "--porcelain", "--ignore-submodules=none"])
         if rc or o.strip(): keep(f"{len(o.splitlines())} uncommitted change(s)" if not rc else "git status failed"); continue
-        br = sh(["git", "-C", str(d), "symbolic-ref", "-q", "--short", "HEAD"])[1].strip()
         if br and any(l.startswith((f"WIP on {br}:", f"On {br}:")) for l in sh(["git", "-C", str(d), "stash", "list", "--format=%gs"])[1].splitlines()):
             keep(f"stashed changes on {br}"); continue
         lt = landed(cfg, {"cwd": str(d)})
@@ -56,6 +60,10 @@ def tset(cfg, k): return cfg.c.get("tidy", {}).get(k, TIDY_DEFAULTS[k])
 # Recorded holds (soak 41): `janus tidy hold <target>` keeps one item a clean worktree an open unit still depends on (not as its
 # cwd) would otherwise be removed with the rest, so the orchestrator no longer skips the whole tidy and tidy:<n> keeps firing.
 # A hold matches a target equal to it, under it (a path prefix) or containing it; `janus tidy holds` lists them, `unhold` clears.
+# Paths are compared resolved (soak 45): tidy names a worktree as it is configured (<root>/../worktrees/<name>, or through a
+# symlink), the orchestrator holds it by its real path, and the raw strings never matched, so the held tree was removed.
+def real_path(t): return os.path.realpath(t) if os.path.isabs(t) else t
+
 def tidy_holds(cfg): return cfg.jget("tidy-holds.json")
 
 def hold_item(cfg, target, why=""):
@@ -68,8 +76,8 @@ def unhold_item(cfg, target):
 
 def held_by(cfg, target, holds=None):
     """The hold string that keeps this target, or None."""
-    hs = tidy_holds(cfg) if holds is None else holds
-    return next((h for h in hs if target == h or target.startswith(h.rstrip("/") + "/") or h in target), None)
+    hs = tidy_holds(cfg) if holds is None else holds; t = real_path(target)
+    return next((h for h in hs for r in (real_path(h),) if t == r or t.startswith(r.rstrip("/") + "/") or r in t or h in target), None)
 
 def apply_holds(cfg, P, holds=None):
     """P without the items a recorded hold keeps."""

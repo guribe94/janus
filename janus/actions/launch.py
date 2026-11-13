@@ -359,15 +359,32 @@ def choose(cfg, a, brief, mc, units, hs):
     return best
 
 def resume_report(cfg, a, brief):
-    """The report a resumed unit continues: --report, else out/<--resume-of>/REPORT.md. None for a new unit (it writes
-    out/<unit>/REPORT.md). Never parsed from the brief's prose (a path cut out of prose broke a launch, janus-fixes9); the path
-    must be a REPORT file whose folder exists."""
-    p = a.report or (str(cfg.p("out", "out") / a.resume_of / "REPORT.md") if a.resume_of else None)
-    if not p: return None
-    p = Path(os.path.expanduser(p)); p = (p if p.is_absolute() else cfg.root / p).resolve()
+    """The report file --report names: the unit writes that file (the orchestrator chose it). None otherwise: the unit writes
+    out/<unit>/REPORT.md. Never parsed from the brief's prose (a path cut out of prose broke a launch, janus-fixes9); the path
+    must be a REPORT file whose folder exists. --resume-of X is not this (soak 43b): see seed_report."""
     if a.resume_of and not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", a.resume_of): raise Err(f"--resume-of {a.resume_of!r} is not a unit name")
+    if not a.report: return None
+    p = Path(os.path.expanduser(a.report)); p = (p if p.is_absolute() else cfg.root / p).resolve()
     if not p.parent.is_dir(): raise Err(f"report {p}: its folder does not exist")
     return None if p == (cfg.p("out", "out") / a.unit / "REPORT.md").resolve() else p
+
+def seed_report(cfg, a):
+    """The report a unit continues FROM: out/<--resume-of>/REPORT.md, or the report of the unit the autopilot relaunches
+    (a.seed_report). Launch copies it into the unit's own out/<unit>/REPORT.md (write_seed) and the unit writes only that copy
+    (soak 43, 43b: the new unit used to record the original's file as its report, so the two units and `janus collect` wrote
+    over each other in the original's folder). None when there is none or it is the unit's own report."""
+    p = getattr(a, "seed_report", None) or (str(cfg.p("out", "out") / a.resume_of / "REPORT.md") if a.resume_of else None)
+    if not p: return None
+    p = Path(p).resolve()
+    return p if p.is_file() and p != (cfg.p("out", "out") / a.unit / "REPORT.md").resolve() else None
+
+def write_seed(src, dst):
+    """Copy the report a unit continues into its own folder: line 1 is PENDING, and the copy keeps the original's age, so its
+    old VERDICT and WAITING lines count for nothing until the unit writes the report itself (units.verdict, waiting_line_jobs)."""
+    t = src.read_text().split("\n", 1); mt = src.stat().st_mtime
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(dst, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 and t[0].startswith("VERDICT:") else "\n".join(t)))
+    os.utime(dst, (mt, mt))
 
 DIALOGS = [   # startup dialogs janus gets past (fixes5 item 10): (text in the pane, keys to send)
     (r"trust the (files|contents) (in|of) this (folder|directory)|Do you trust", ["Enter"]),
@@ -400,6 +417,16 @@ def cwd_taken(cfg, units, cwd, name, resume_of=None, share_with=None):
     if share_with: shared = [x for x in shared if x != share_with]
     handover = resume_of if resume_of in shared else None
     return [x for x in shared if x != handover], handover
+
+def launch_cwd(cfg, a, name):
+    """(the unit's cwd, a note when launch makes no worktree). --new-worktree: <worktrees>/<unit>, made after every refusal
+    check (finding 12); --cwd; else <worktrees>/<unit> when it exists; else the project root, and then launch says so (soak 44:
+    a brief that expected "the worktree made at launch" got the project root in silence)."""
+    cwd = cfg.p("worktrees", "worktrees") / name
+    if getattr(a, "new_worktree", None) or (cwd.is_dir() and not a.cwd): return cwd.resolve(), None
+    if a.cwd: return Path(a.cwd).resolve(), None
+    return cfg.root.resolve(), (f"note: no worktree made for {name}: it runs in the project root {cfg.root.resolve()}. For a tree of its own "
+                                "launch with --new-worktree <repo> (or --cwd <its worktree>)")
 
 def new_worktree(repo, cwd, name, ref="main"):
     """Item 16b: make a fresh worktree of repo at cwd on a new branch name, started from ref. A unit that gets a tree of its own
@@ -439,11 +466,7 @@ def cmd_launch(cfg, a):
     h = cfg.hosts[hn]; local = h.get("local", False)
     if getattr(a, "new_worktree", None) and a.cwd:   # finding 12: --new-worktree makes its own tree
         raise Err("--cwd with --new-worktree: --new-worktree makes its own worktree (drop --cwd)")
-    cwd = cfg.p("worktrees", "worktrees") / name
-    if getattr(a, "new_worktree", None): cwd = cwd.resolve()   # the fresh worktree is made after every refusal check (finding 12)
-    elif a.cwd: cwd = Path(a.cwd).resolve()
-    elif cwd.is_dir(): cwd = cwd.resolve()
-    else: cwd = cfg.root.resolve()
+    cwd, no_tree = launch_cwd(cfg, a, name)
     shared, handover = cwd_taken(cfg, units, cwd, name, getattr(a, "resume_of", None), getattr(a, "share_with", None))
     if shared and not (local and a.kind in ("review", "audit")):
         raise Err(f"refused: {cwd} is the cwd of open unit(s) {', '.join(shared)}; give the unit its own worktree (H9)")
@@ -469,6 +492,7 @@ def cmd_launch(cfg, a):
         why = finish_refusal(cfg, mc, name, budget, units, but=[x for x in (getattr(a, "resume_of", None),) if x])   # item 4: the open units' money stays theirs
         if why: raise Err(why)
     say(f"launch {name}: model={mname} host={hn} builds on {build} ({why_place}) cwd={cwd}")
+    if no_tree: say(no_tree)
     btext = brief.read_text()
     if not local:   # every path the brief names must reach the agent there (refused before anything is recorded)
         btext, bcopy, bnotes = brief_plan(cfg, h, name, cwd, btext)
@@ -480,7 +504,7 @@ def cmd_launch(cfg, a):
         if not ok and "ledger" in w: raise Err(f"refused: {w}")
     # A resumed unit continues its original report (--report or --resume-of only, never a path from the brief's prose); the
     # unit records it, so check and the Stop hook read that report.
-    report = resume_report(cfg, a, brief)
+    report = resume_report(cfg, a, brief); seed = None if report else seed_report(cfg, a)
     if report and report.exists():
         t = report.read_text().split("\n", 1)
         if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not cfg.run.dry: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
@@ -495,12 +519,15 @@ def cmd_launch(cfg, a):
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
     if a.of: u["of"] = a.of   # the unit a review checks (review:<unit> for a critical unit needs a later review of it)
     if report: u["report"] = str(report); u["resume"] = True
+    elif seed: u["resume"] = True   # its own out/<unit>/REPORT.md, seeded below
     item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
     if item: u["item"] = item
     if cfg.run.dry: say(f"+ bd create unit:{name}; bd update --status in_progress")
     else:
         u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
         bd.run("update", u["id"], "--status", "in_progress"); bd.save(u)
+    if seed and not cfg.run.dry: write_seed(seed, outd / "REPORT.md")
+    start = report if report and report.exists() else outd / "REPORT.md" if seed and not cfg.run.dry else None   # the report it starts from
     env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root),
            **({"BOARD_DIR": str(board_dir(cfg))} if local else {})}   # remote: <root>/bin/board.sh finds <root>/board itself
     try:
@@ -521,8 +548,8 @@ def cmd_launch(cfg, a):
             if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
             ship_context(cfg, h, name, bcopy)
             put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + btext, "644")
-            if report and report.exists():   # a resumed unit continues its original report there; collect copies it back
-                put_script(cfg, h, f"{root}/out/{name}/REPORT.md", report.read_text(), "644")
+            if start:   # a resumed unit starts from the report it continues; there it writes <root>/out/<unit>/REPORT.md, its own
+                put_script(cfg, h, f"{root}/out/{name}/REPORT.md", start.read_text(), "644")
             else: X(cfg, h, f"[ -s {qp(env['JANUS_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['JANUS_REPORT'])}")
         rep = outd / "REPORT.md"
         if not report and not rep.exists() and not cfg.run.dry: rep.write_text("VERDICT: PENDING\n")

@@ -494,7 +494,7 @@ class Item8Unattended(unittest.TestCase):
     def relaunched(self, cfg, d):
         got = []
         with mock.patch.object(janus, "cmd_launch", lambda cfg, a: got.append(a.unit)), mock.patch.object(janus, "board", lambda c, *a, **k: (0, "", "")), \
-             mock.patch.object(janus, "board_questions", lambda c: []):
+             mock.patch.object(janus, "board_questions", lambda c: []), mock.patch.object(janus, "probe", lambda *a, **k: {"name": "here", "ok": True, "pueue": {"tasks": {}}}):
             janus.tend_autopilot(cfg, {}, [self.crashed(d)], [], self.log.append)
         return got
     def watch(self, cfg, F=(), **more):
