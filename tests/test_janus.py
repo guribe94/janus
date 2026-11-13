@@ -745,6 +745,29 @@ class Land(unittest.TestCase):
         with self.assertRaises(janus.Err) as e: janus.cmd_land(self.cfg, self.a())
         self.assertIn("already landed", str(e.exception))
         self.assertEqual(self.g("rev-list", "--count", "main").stdout.strip(), "3")   # no duplicate squash commit
+    def _odd_branch(self, name):
+        self.assertEqual(self.g("branch", "-m", name, cwd=self.wt).returncode, 0, f"git itself refuses the branch name {name}")
+        (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: b", cwd=self.wt)
+        (self.r / "c").write_text("main moved\n"); self.g("add", "c"); self.g("commit", "-qm", "main: c")   # behind main: a merge is due
+        return self.g("rev-parse", "HEAD", cwd=self.wt).stdout.strip()
+    def test_a_legal_branch_name_lands_when_no_gate_command_takes_it(self):
+        """Catches (review-fix-install7 F2): `janus land --no-gate` on branch `wk/fix#12` merged main into it and THEN refused
+        the name for a gate command that was never going to be built; the same with a gate template that has no {branch}."""
+        self._odd_branch("wk/fix#12")
+        self.assertEqual(janus.cmd_land(self.cfg, self.a()), 0)
+        self.assertEqual(self.g("log", "-1", "--format=%s", "main").stdout.strip()[:1], "u", "nothing was landed on main")
+        for legal in ("wk/fix#12", "issue-12=retry", "wk/\u00fcberholt", "release,candidate", "fix%20thing"):
+            self.assertIn(legal, janus.final_gate_cmd_checked({"final_gate": "./gate {branch}"}, "u", "/w", legal), f"{legal} is a legal branch name")
+        self.assertEqual(janus.final_gate_cmd_checked({"final_gate": "./check"}, "u", "/w", "wk/a;b"), "./check")   # the gate never sees it
+    def test_a_branch_the_gate_cannot_take_is_refused_before_anything_is_merged(self):
+        """Catches (review-fix-install7 F2): the refusal came after step 1, so the unit's branch was left holding a merge commit
+        for a land that could not go on; and a name starting with `-` reached the gate's command as an option."""
+        head = self._odd_branch("wk/a;b"); self.cfg.c["landing"].update(final_gate_host="here", final_gate="./gate {branch}")
+        with self.assertRaises(janus.Err) as e: janus.cmd_land(self.cfg, self.a(no_gate=False))
+        self.assertEqual(self.g("rev-parse", "HEAD", cwd=self.wt).stdout.strip(), head, "main was merged into the branch before the refusal")
+        self.assertIn("';'", str(e.exception))
+        for hostile in ("--force", "#x", "a b", "a$b", "a`b", "a&b", "a|b", "a'b", 'a"b', "a\nb", "a!b", "a\u00a0b", ""):
+            with self.assertRaises(janus.Err, msg=repr(hostile)): janus.final_gate_cmd_checked({"final_gate": "git push origin {branch}"}, "u", "/w", hostile)
     def test_gate_required(self):
         (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: b", cwd=self.wt)
         with self.assertRaises(janus.Err) as e: janus.cmd_land(self.cfg, self.a(no_gate=False))
