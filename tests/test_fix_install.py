@@ -334,7 +334,7 @@ class Item10GiveUpResidues(unittest.TestCase):
         js = janus.job_script(cfg, "here", h, r, "u", "true", "j-2")
         p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                              env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"})
-        p.stdin.write(js); p.stdin.close()
+        p.stdin.write(js); p.stdin.close(); p.stdin = None   # closed: communicate() before Python 3.13 flushes it and raises ValueError
         try:
             out, _ = p.communicate(timeout=30)
         finally:
@@ -358,7 +358,7 @@ class Item10GiveUpResidues(unittest.TestCase):
         js = janus.job_script(cfg, "here", h, r, "u", "true", "j-3")
         p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                              env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "30", "JANUS_ADMIT_REPORT_S": "1"})
-        p.stdin.write(js); p.stdin.close()
+        p.stdin.write(js); p.stdin.close(); p.stdin = None   # closed: communicate() before Python 3.13 flushes it and raises ValueError
         try:
             time.sleep(2.5)
             (rd / "g.gwait").unlink()   # the gate was admitted: the jobs job may run now
@@ -386,7 +386,7 @@ class Item10GiveUpResidues(unittest.TestCase):
         js = janus.job_script(cfg, "here", h, r, "u", "true", "j-4")
         p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                              env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "3600"})
-        p.stdin.write(js); p.stdin.close()
+        p.stdin.write(js); p.stdin.close(); p.stdin = None   # closed: communicate() before Python 3.13 flushes it and raises ValueError
         try:
             out, _ = p.communicate(timeout=30)
         finally:

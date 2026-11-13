@@ -628,7 +628,7 @@ def cancel_job(cfg, ref, force=False, depth=0):
         # Row 237: the groups of the command's whole process tree, read BEFORE the kill (a runner that started its own process group
         # outlived the cancel, kept the gate's lock and queued more steps; once its parent is dead the tree cannot be walked).
         pre = f"g=$(cat {gf} 2>/dev/null); case $g in ''|*[!0-9]*) gs=;; *) gs=\"$g $({tree_groups_sh('$g')})\";; esac; " if gf else ""
-        grp = (f"[ -n \"$gs\" ] && {{ for x in $gs; do kill -TERM -- -$x 2>/dev/null; done; sleep 3; for x in $gs; do kill -KILL -- -$x 2>/dev/null; done; }}; "
+        grp = (f"[ -n \"$gs\" ] && {{ for x in $gs; do kill -s TERM -- -$x 2>/dev/null; done; sleep 3; for x in $gs; do kill -s KILL -- -$x 2>/dev/null; done; }}; "
                f"rm -f {gf} {qp(f'{runs_dir(cfg, h)}/{tok}.live')}; ") if gf else ""
         hrun(h, f"{pre}{pueue(h)} kill {tid} 2>/dev/null; {stop_job_cmd(h, jid)}{grp}sleep 2; {pueue(h)} remove {tid} 2>/dev/null; true", timeout=60)
         out.append(f"cancelled {hn}:{tid} ({t.get('label')}); its files are in {cfg.f('runs') if jid and not h.get('local') else runs_dir(cfg, h) if jid else cfg.p('out', 'out') / '_cancelled'}")
