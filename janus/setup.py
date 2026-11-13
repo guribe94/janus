@@ -809,6 +809,13 @@ def install_steps(cfg, n, h, f):
                       'echo "note: user services stop at logout until linger is on (loginctl enable-linger $USER, may need an admin)"'))
     return steps
 
+def launcher_cmd(b, root):
+    """The shell line that writes janus's launcher on a host: only where there is none or it is exactly this launcher; an installed
+    janus link and any other file stay (install-host must not overwrite what `install --release-only` linked)."""
+    return (f"mkdir -p {qp(b)} && L={qp(b)}/janus && W=$(printf '#!/bin/sh\\nexec python3 %s/janus/janus.py \"$@\"\\n' {qp(root)}) && "
+           "if [ -L \"$L\" ]; then echo \"note: $L is an installed janus link: kept\"; elif [ ! -e \"$L\" ] || [ \"$(cat \"$L\")\" = \"$W\" ]; then "
+           "printf '%s\\n' \"$W\" > \"$L\" && chmod +x \"$L\"; else echo \"note: $L is not janus's launcher: kept\"; fi")
+
 def cmd_install_host(cfg, a):
     """janus install-host <host>: discover it, then run install_steps there, copy janus to <root>/janus (read-only commands) and
     install the heartbeat watchdog when [heartbeat] watchdog is this host."""
@@ -823,7 +830,7 @@ def cmd_install_host(cfg, a):
         root = h["root"]; dst = f"{h['ssh']}:{root.replace('$HOME/', '')}/janus/"
         steps.append(("janus copy", ["rsync", "-a", "--delete", "--exclude", "__pycache__", "-e", " ".join(SSH), str(JANUS_SELF), str(JANUS_SELF.parent / "janus"), dst]))
         b = h.get("bin", "$HOME/.local/bin")   # row 64: `janus` resolves in a job's shell there (job scripts put this folder on PATH)
-        steps.append(("janus launcher", f"mkdir -p {qp(b)} && printf '#!/bin/sh\\nexec python3 %s/janus/janus.py \"$@\"\\n' {qp(root)} > {qp(b)}/janus && chmod +x {qp(b)}/janus"))
+        steps.append(("janus launcher", launcher_cmd(b, root)))
         url = origin_url(cfg)   # skill-fix55: the host's landing lane (janus/landhost.py), when the project's remote is known here
         if url: steps.append(("landing lane", lane_script(cfg, h, url) + " && { " + lane_probe(cfg, h) + "; }"))
         else: say(f"note: no landing lane set up on {n}: set [landing] origin (the project's remote) or [landing] repo (a checkout of it); janus land --host {n} creates it on first use")

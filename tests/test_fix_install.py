@@ -1666,3 +1666,33 @@ class Item36ReusedJobId(unittest.TestCase):
         try: out = janus.cancel_job(self.cfg, "here:5")
         finally: janus.task_status = real; self.cfg.run.dry = False
         self.assertEqual(len(out), 1, out)
+
+
+class LauncherLinks(unittest.TestCase):
+    """Real asgard install: the release check passed and `current` switched, then finish_links exited because install-host had
+    written a regular ~/.local/bin/janus; and install-host must never overwrite the link install made."""
+    def test_install_migrates_only_its_own_launcher_and_install_host_keeps_the_link(self):
+        """Catches: (1) install exits after switching current when ~/.local/bin/janus is janus's own generated launcher;
+        (2) a user's unknown file there is replaced, or refused only AFTER the switch; (3) install-host rewrites an installed link."""
+        src = Path(JANUS_PY).parent / "install"
+        if not src.is_file(): self.skipTest("install is not shipped in the release copy; ./check runs this against the tree")
+        home = Path(tempfile.mkdtemp(prefix="janus-home-")); (home / ".local/bin").mkdir(parents=True); (home / ".local/share/janus/releases/r1").mkdir(parents=True)
+        (home / ".local/share/janus/releases/r1/janus.py").write_text("")
+        ns = {"__name__": "install_under_test", "__file__": str(src)}
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(sys, "argv", ["install", "--dry-run"]), contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(src.read_text().rsplit("\nmain()", 1)[0], str(src), "exec"), ns)
+        J = ns["JANUS"]; ns["swap_link"](ns["CUR"], home / ".local/share/janus/releases/r1")
+        J.write_text('#!/bin/sh\nexec python3 /srv/x/janus/janus.py "$@"\n')   # what install-host wrote
+        self.assertTrue(ns["generated_launcher"](J))
+        ns["DRY"] = False
+        with contextlib.redirect_stdout(io.StringIO()): ns["finish_links"]()
+        self.assertTrue(J.is_symlink() and os.readlink(J).endswith("current/janus.py"))      # migrated, no exit
+        J.unlink(); J.write_text("#!/bin/sh\necho mine\n")                                   # a user's own file
+        self.assertFalse(ns["generated_launcher"](J))
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()): ns["check_launcher"]()   # refused before any switch
+        self.assertEqual(J.read_text(), "#!/bin/sh\necho mine\n")
+        # install-host's line: keeps a link and an unknown file, writes where absent
+        run = lambda: subprocess.run(["sh", "-c", janus.launcher_cmd(str(home / ".local/bin"), "/srv/x")], capture_output=True, text=True, env={**os.environ, "HOME": str(home)})
+        run(); self.assertEqual(J.read_text(), "#!/bin/sh\necho mine\n")
+        J.unlink(); J.symlink_to(home / ".local/share/janus/releases/r1/janus.py"); run(); self.assertTrue(J.is_symlink())
+        J.unlink(); run(); self.assertTrue(ns["generated_launcher"](J)); self.assertTrue(os.access(J, os.X_OK))

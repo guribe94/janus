@@ -72,10 +72,22 @@ def smoke(d):
             return f"tests failed (every failure: {log}):\n" + (r.stderr or r.stdout)[-1500:]
     return None
 
+import re
+def generated_launcher(p):
+    """p is a regular file that is exactly the launcher `janus install-host` writes (`#!/bin/sh` + `exec python3 <root>/janus/janus.py "$@"`):
+    the one non-link janus may replace with its link. Any other file is the user's and is never touched."""
+    try: return p.is_file() and not p.is_symlink() and re.fullmatch(r'#!/bin/sh\nexec python3 \S+/janus/janus\.py "\$@"\n', p.read_text()) is not None
+    except (OSError, UnicodeDecodeError): return False
+
+def check_launcher():
+    """Refuse BEFORE the release is switched (not after: current then pointed at a release whose links were refused)."""
+    if JANUS.exists() and not JANUS.is_symlink() and not generated_launcher(JANUS): sys.exit(f"{JANUS} exists and is neither a symlink nor janus's own generated launcher: not replaced, nothing installed (move it away, then rerun)")
+
 def release():
     """Build releases/<version> from this tree, test the copy, switch current to it atomically, point the links at current."""
     for part in PARTS[:3]:
         if not (HERE / part).exists(): sys.exit(f"{HERE / part} missing")
+    check_launcher()
     v, h = version()
     have = [d for d in REL.glob(f"*-{h}") if d.is_dir()] if REL.is_dir() else []
     d = have[0] if have else REL / v
@@ -101,7 +113,8 @@ def release():
     finish_links(); prune()
 
 def finish_links():
-    if JANUS.exists() and not JANUS.is_symlink(): sys.exit(f"{JANUS} exists and is not a symlink: not replaced")
+    check_launcher()
+    if generated_launcher(JANUS): say(f"migrate {JANUS}: janus's generated launcher (install-host) -> link to {CUR}/janus.py"); swap_link(JANUS, CUR / "janus.py")
     link(JANUS, CUR / "janus.py")
     link(HOME / ".claude/skills/janus", CUR / "skill"); link(HOME / ".codex/skills/janus", CUR / "skill")
 
