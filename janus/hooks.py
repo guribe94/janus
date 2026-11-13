@@ -387,7 +387,8 @@ def session_start_text(cfg):
     either way, so a resumed session loses nothing (imp-resume reuses this from janus/setup.py)."""
     # The instruction comes first, the one place the model weights most, and every part is labelled and capped on its own
     # (F2): a long handoff or bd prime can no longer push the instruction past the cut.
-    head = (f"[janus] You are the orchestrator of {cfg.name} (janus skill). First act: run janus check, act on every line, "
+    head = (f"[janus] You are the orchestrator of {cfg.name} (janus skill). A message from the owner is answered first, before "
+            f"any housekeeping. Otherwise your first act: run janus check, act on every line, "
             f"janus ack <key> \"what you did\", then update the Orchestrator notes. Below: (1) HANDOFF.md: Live state as of "
             f"the last check, then your notes; (2) session MEMORY.md; (3) decision titles; (4) owner rules (bd prime).")
     parts = [head]
@@ -433,9 +434,16 @@ def cmd_hook(ev):
         if pr and not janus_own and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
             try:
                 i = Beads(cfg).create("instr: " + re.sub(r"\s+", " ", pr)[:70], "instruction", pr[:4000]); note_event(cfg, "instruction")
-                ctx(ev, f"[janus] Filed as instruction {i}. Do it, then: close it; or, if it is a standing rule, bd remember "
-                    f"\"<rule>\" --key <subject> (reuse an existing key to replace it: bd memories <word>); if agents must follow "
-                    f"it, janus remember it instead; if it settles a choice, janus decide ... --instruction {i}.")
+                # ISSUES row 133 [report-first]: the deliverable is the owner's answer, given first; the bead is bookkeeping.
+                # The old text ("Filed as instruction <id>. Do it, then: close it") made closing the bead the task, and the
+                # loop ran check/ack/notes before the owner got a word.
+                ctx(ev, f"[janus] The owner wrote this. Answer the owner FIRST, in this turn, before janus check, acks or notes: "
+                    f"a question gets its answer, an order gets what you do about it and by when. That answer is the "
+                    f"deliverable. Housekeeping after it: the message is filed as instruction {i}; close it once it is done "
+                    f"(bd close {i}); or, if it is a standing rule, bd remember \"<rule>\" --key <subject> (reuse an existing "
+                    f"key to replace it: bd memories <word>); if agents must follow it, janus remember it instead; if it "
+                    f"settles a choice, janus decide ... --instruction {i}; work that takes longer: janus intent add "
+                    f"--instruction {i}.")
             except Err: pass
     elif ev == "PreToolUse":
         why = pretool_why(cfg, d)

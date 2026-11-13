@@ -13,7 +13,8 @@ SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
 EXCL = ["--exclude", ".git", "--exclude", "target", "--exclude", ".venv", "--exclude", "node_modules"]
 
-WAKE = "Wake ({reason}): in {root} run janus check, act on each line, janus ack, update the notes."
+# Row 133: an owner message that still waits for its answer comes before the cycle's housekeeping.
+WAKE = "Wake ({reason}): if the owner waits for an answer, answer first; then in {root} run janus check, act on each line, janus ack, update the notes."
 # after /clear or a brand-new session only (it holds no state, F15): both the notes and the root are named by ABSOLUTE path --
 # the session's cwd may be outside the janus root, so a relative `.janus/HANDOFF.md` was not found (item 33).
 WAKE_CLEAR = "read {handoff}, then " + WAKE
