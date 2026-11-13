@@ -12,6 +12,7 @@ Keeping work moving is your core job: never leave a unit, job, gate or host brok
 1. `janus check` (silent when all is well). Each line is `[key] problem: action`; take the action.
 2. `janus ack <key> "<what you did>"` for each line.
 3. Update *Orchestrator notes* in `.janus/HANDOFF.md` (goal; per unit why and done-means; decisions latest first; next steps). Never edit the Live state part. Under 150 lines; old notes go to `.janus/history.md`.
+Work you mean to do but cannot finish now: `janus intent add "<what>" --why .. --done-means .. [--instruction <id>] [--unit <u>]` (shown in the Live state, so it survives a context clear; `janus intent done <id>` when finished).
 Stop is blocked while a finding is unacked past its deadline or the notes are stale. Register once per session: `janus register`.
 
 ## Never by hand

@@ -5,6 +5,7 @@ from janus.actions.backlog import fill_candidates, fill_plan
 from janus.backlog import backlog_cfg, backlog_issues, item_actors, unit_items
 from janus.beads import Beads
 from janus.context import Err, LE, handoff_path, handoff_stale, now, sh
+from janus.intents import intent_stale, intents
 from janus.gates import gate_ids, gate_results, kf_active, known_failures, landed, unapplied_patch
 from janus.platform import watcher_loaded, watcher_service
 from janus.probe import room
@@ -82,26 +83,43 @@ def backlog_findings(cfg, hs, units):
     todo = [(r[8:], i.get("title", "")[9:]) for r, i in iss.items()
             if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or []) and r[8:] not in cov
             and act.get(r[8:], "agent") == "agent"]   # owner and hardware items are never idle backlog (row 54)
-    if not todo: return F
+    if not todo: nobrief_seen(cfg, 0); return F
     plan, stops = fill_plan(cfg, hs, units)
     if plan:   # janus-fixes8 item 4: how many ready units with briefs fit now
         per = {}
         for x in plan: per[x[3]] = per.get(x[3], 0) + 1
         F.append(("idle-with-backlog", f"{len(plan)} ready backlog unit(s) with briefs would fit now ({', '.join(f'{k}: {v}' for k, v in per.items())}): "
                   + ", ".join(x[0] for x in plan[:6]) + ("..." if len(plan) > 6 else "") + "; run janus fill (janus fill --dry-run shows why it stops there)"))
-    briefed = {x[2] for x in fill_candidates(cfg, units)}
-    nob = [(i, t) for i, t in todo if i not in briefed]
+    cands = fill_candidates(cfg, units); briefed = {x[2] for x in cands}
+    held = [x[4] for x in cands if x[4] not in {p[0] for p in plan}]
+    if held:   # skill-fix52: briefed units the plan cannot place were counted by no finding; named with fill's own reasons
+        F.append(("backlog:held", f"{len(held)} ready backlog unit(s) with briefs do not launch now ({', '.join(held[:6])}{'...' if len(held) > 6 else ''}): "
+                  + "; ".join(stops)[:300] + "; janus fill --dry-run shows each"))
+    nob = [(i, t) for i, t in todo if i not in briefed]; nobrief_seen(cfg, len(nob))
     if nob and not plan and any("budget" in s for s in stops):
         F.append(("idle-backlog:budget", f"budget-limited: {'; '.join(s for s in stops if 'budget' in s)[:160]}; {len(nob)} ready item(s) wait"))
-    elif nob and any(room(cfg, n, p, units)[0] > 0 for n, p in hs.items() if p.get("ok")):
+    if nob:   # skill-fix52: never hidden by the budget finding (it was an elif), nor dropped when no host has room
         # row 227: name the items and the cheap way to get their briefs; drafts that only wait for janus brief accept are named too
         dr = cfg.p("briefs", "briefs") / "drafts"; drafted = [i for i, _ in nob if (dr / f"{i}.md").is_file()]; top = [i for i, _ in nob if i not in drafted][:6]
-        F.append(("idle-backlog:nobrief", f"{len(nob)} ready backlog item(s) have no unlaunched brief while hosts have room ("
-                  + ", ".join(f"{n} {room(cfg, n, p, units)[0]}" for n, p in hs.items() if p.get("ok") and room(cfg, n, p, units)[0] > 0) + "): "
-                  + "; ".join(f"{i} {t[:40]}" for i, t in nob[:6]) + ("..." if len(nob) > 6 else "")
-                  + (f"; draft their briefs with one cheap unit: janus brief draft {' '.join(top)}" if top else "")
-                  + (f"; {len(drafted)} draft(s) wait for janus brief accept: {' '.join(drafted[:6])}" if drafted else "")))
+        rooms = [(n, *room(cfg, n, p, units)) for n, p in hs.items() if p.get("ok")]
+        tail = ("; ".join(f"{i} {t[:40]}" for i, t in nob[:6]) + ("..." if len(nob) > 6 else "")
+                + (f"; draft their briefs with one cheap unit: janus brief draft {' '.join(top)}" if top else "")
+                + (f"; {len(drafted)} draft(s) wait for janus brief accept: {' '.join(drafted[:6])}" if drafted else "")
+                + "; an item no agent can do (hardware, the owner) is never agent work: janus backlog set <id> actor=hardware|owner")
+        if any(r > 0 for _, r, _ in rooms):
+            F.append(("idle-backlog:nobrief", f"{len(nob)} ready backlog item(s) have no unlaunched brief while hosts have room ("
+                      + ", ".join(f"{n} {r}" for n, r, _ in rooms if r > 0) + "): " + tail))
+        else:   # nothing can launch now, so not urgent; the items are still named, with why each host has no room
+            F.append(("backlog:unbriefed", f"{len(nob)} ready backlog item(s) have no unlaunched brief and no host has room now ("
+                      + "; ".join(f"{n}: {w}" for n, _, w in rooms)[:200] + "): " + tail))
     return F
+
+def nobrief_seen(cfg, n):
+    """Records how many ready items have no brief now (nobrief.json; cleared with the last one). ack reads it: an ack of
+    idle-backlog:nobrief hides it once, and another is refused until this count is below the count at that ack (skill-fix52:
+    four re-acks hid 63 ready items for hours while not one brief was written)."""
+    st = cfg.jget("nobrief.json")
+    if st.get("n", 0) != n: cfg.jput("nobrief.json", {**st, "n": n} if n else {})
 
 def landing_findings(cfg, units, hs=None):
     ld = cfg.c.get("landing", {}); mins = ld.get("finished_min", 30); need = ld.get("gates_required", 1)
@@ -168,12 +186,16 @@ def orchestrator_findings(cfg):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but janus.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))
     return F
 
-def session_findings(cfg, running):
-    """instructions (owner instructions to classify), handoff (stale notes, or a missing state file), watcher (not loaded)."""
+def session_findings(cfg, running, units=()):
+    """instructions (owner instructions to classify), handoff (stale notes, or a missing state file), watcher (not loaded).
+    An instruction an open intent tracks (janus intent add --instruction <id>) is in progress, not unclassified; it is
+    flagged again when that intent goes stale (skill-fix52)."""
     F = []
     try:
-        ins = Beads(cfg).issues("instruction")
-        if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done, or bd remember --key <subject>: same subject replaces): " + "; ".join(i['title'][:50] for i in ins[:3])))
+        its = intents(cfg); live = {i["instruction"] for i in its if i.get("instruction") and not intent_stale(cfg, i, units)}
+        ins = [i for i in Beads(cfg).issues("instruction") if i["id"] not in live]
+        if ins: F.append(("instructions", f"{len(ins)} unclassified owner instruction(s) (close as done; bd remember --key <subject>: same subject replaces; "
+                          "or, while its work is in progress, janus intent add --instruction <id> \"<what>\"): " + "; ".join(i['title'][:50] for i in ins[:3])))
     except Err: pass
     hp = handoff_path(cfg)
     if not hp.exists():   # item 2: a missing state file is a finding with its fix, never a traceback

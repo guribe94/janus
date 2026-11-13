@@ -26,6 +26,7 @@ from janus.ledger import committed
 from janus.issue import auto_log_issues, repeated_issue_findings
 from janus.project import own_card
 from janus.transcripts import card_fields
+from janus.intents import intent_findings, intent_lines
 from janus.reset import context_findings
 from janus.probe import cap_line, probe_all, pueue, room
 from janus.units import all_units, herdr_agents, unit_state
@@ -62,7 +63,7 @@ def collect_findings(cfg, hs, units, ag, bd_err, bd=None):
     if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg, viol=viol) + script_findings()
     F += ledger_findings(cfg, units)
     F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
-    F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running)
+    F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running, units) + intent_findings(cfg, units)
     F += decision_findings(cfg)
     F += repeated_issue_findings(cfg)
     F += spend_findings(cfg) + reserve_findings(cfg, units) + resumable_findings(cfg, units) + unattended_findings(cfg, units)
@@ -93,6 +94,7 @@ def live_state(cfg, hs, units, F):
     except Err as e: L.append(f"Queue: unavailable ({e})")
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv: L.append(f"Spend {n}: ${committed(cfg, pv):.2f} of ${pv['cap_usd']}")
+    L += intent_lines(cfg)   # skill-fix52: what is meant and not finished survives a context clear here
     L.append("Problems:"); L += [f"- [{k}] {t}" for k, t in F] or ["- none"]
     return "\n".join(L)
 
@@ -164,6 +166,12 @@ def cmd_ack(cfg, a):
         raise Err(f"{k} cannot be acked: it costs money every hour; act on it (janus park {k.split(':', 1)[-1]})")
     if k.split(":", 1)[0] in ("idle", "landing") and re.match(r"(?i)^\s*(?:i |we )?(?:will|'ll|am going to|are going to|going to|plan|intend|shall)\b", d or ""):
         raise Err(f"ack {k} with what was DONE, not what you will do (a plan is not a decision): run it, then ack")
+    if k == "idle-backlog:nobrief":   # skill-fix52: an ack hides ready items without briefs once; the next needs progress
+        st = cfg.jget("nobrief.json")
+        if st.get("acked") is not None and st.get("n", 0) >= st["acked"]:
+            raise Err(f"{k} was acked at {st['acked']} item(s) without a brief and {st.get('n', 0)} still have none: an ack hides it once, then the count must "
+                      "drop. Get the briefs written (janus brief draft <items>), or janus backlog set <id> actor=owner for what no agent does")
+        cfg.jput("nobrief.json", {**st, "acked": st.get("n", 0)})
     acks = live_acks(cfg); acks[k] = {"t": now(), "d": d}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
     cnt = cfg.jget("ack-counts.json"); cnt[k] = cnt.get(k, 0) + 1; cfg.jput("ack-counts.json", cnt)   # a key acked 3+ times earns an issue row
     if getattr(a, "decision_class", False) or k.split(":", 1)[0] in DECISION_ACKS: note_event(cfg, "decision")   # routine acks leave the notes fresh

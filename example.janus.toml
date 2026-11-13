@@ -50,6 +50,7 @@ args = []
 # actor_col = "actor"    # optional column: who does the item (agent, owner, hardware, ...); `janus backlog set <id> actor=owner`
 #                        # sets it too. Only agent items (the default) count as idle backlog or are launched by janus fill.
 
+# [intents] stale_h = 2  # hours an open intent (janus intent) may have no running linked unit and no update before intent:<id>:stale
 # [landing]              # "finished, not landing" in janus check
 # kinds = ["implement"]  # unit kinds that land (reviews, audits and cleanups do not)
 # finished_min = 30      # a unit with VERDICT DONE this long ago needs a gate, or landing once its gates passed

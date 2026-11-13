@@ -15,16 +15,19 @@ from janus.context import Err, slug
 LOG_RX = re.compile(r"^(?:janus|orch):\s*(?:decisions?|log)\b", re.I)   # the toolkit's own decision/log bead, not work (item 15)
 LOG_LABELS = {"janus-log", "orch-log"}   # finding 8: only the toolkit's own log label, not any bead whose label merely ends -log
 
+ITEM_RX = re.compile(r"^ITEM:\s*(\S+)", re.M)   # a brief's explicit item mark (actions/backlog.BRIEF_KEYS reads the same line)
+
 def ready_work(cfg):
     """Ready work items in beads: not units (launched work), not janus's decision log (the `janus-log`/`orch-log` label, or a
     `janus:`/`orch: decisions`/`log` title -- only those; a bead whose title or label merely contains log is real work,
-    finding 8), not owner instructions (audit H7)."""
-    skip = {"unit", "instruction", "backlog"}   # backlog items have their own finding (idle with backlog)
+    finding 8), not owner instructions (audit H7), not intents (janus intent), and not work another actor does (label
+    actor:<owner|hardware|...>): only what an agent could be launched on (skill-fix52)."""
+    skip = {"unit", "instruction", "backlog", "intent"}   # backlog items have their own finding (idle with backlog)
     out = []
     for i in Beads(cfg).run("ready"):
         labels = set(i.get("labels") or []); title = str(i.get("title", ""))
-        if skip & labels or labels & LOG_LABELS: continue
-        if title.startswith(("unit:", "janus:", "instr:")) or LOG_RX.match(title): continue
+        if skip & labels or labels & LOG_LABELS or any(l.startswith("actor:") and l != "actor:agent" for l in labels): continue
+        if title.startswith(("unit:", "janus:", "instr:", "intent:")) or LOG_RX.match(title): continue
         out.append(i)
     return out
 
@@ -83,10 +86,12 @@ def backlog_issues(cfg):
     return {i.get("external_ref"): i for i in r if str(i.get("external_ref", "")).startswith("backlog:")}
 
 def unit_items(cfg, units):
-    """Backlog item ids that open units cover: their --item / ITEM: line, or an item id named in the first lines of their brief."""
+    """Backlog item ids that open units cover: their --item, or an ITEM: <id> line in the head of their brief (the mark fill
+    reads too). Only these explicit ids: a brief that merely mentions an id (every word of its first lines used to count)
+    hid that ready item from the idle-backlog findings and from fill (skill-fix52)."""
     out = set()
     for u in units:
         if u.get("item"): out.add(u["item"])
-        try: out.update(re.findall(r"[A-Za-z0-9][\w.-]*", "\n".join(Path(u["brief"]).read_text().splitlines()[:6])))
+        try: out.update(x.rstrip(".,;") for x in ITEM_RX.findall("\n".join(Path(u["brief"]).read_text().splitlines()[:12])))
         except (OSError, KeyError): pass
     return out

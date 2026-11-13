@@ -23,7 +23,7 @@ class Family(NamedTuple):
 
 FAMILIES = {
     "age": Family("a lane job queued or running over its class age limit ([lanes] age)"),
-    "backlog": Family("the checklist is not imported, or changed since the last import"),
+    "backlog": Family("the checklist is not imported or changed since the import; ready items held: briefed units fill cannot place, items without briefs while no host has room"),
     "beads": Family("bd is unavailable: units cannot be read", urgent=True),
     "blocked": Family("a host's jobs wait in an admission that says no or is paused (the cause is named)", urgent=True, recurs=True),
     "board": Family("a board card is blocked, has a question (a project's own board), is gone or silent", urgent=True),
@@ -45,6 +45,7 @@ FAMILIES = {
     "idle-with-backlog": Family("ready backlog units with briefs would fit now (janus fill)", urgent=True),
     "instructions": Family("unclassified owner instructions in beads (an ack cannot clear it: close or remember each)", urgent=True, ack_ttl=0),
     "issue": Family("a finding key acked 3+ times with no issue row logged (every oddity is logged)"),
+    "intent": Family("an open intent (janus intent) no unit works on and nothing moved for [intents] stale_h hours", urgent=True, ack_ttl=H),
     "known-failure": Family("a known failure with no open unit fixing it, or one that passes now"),
     "landing": Family("a finished DONE unit has no gate, or passed its gates and is not landed", urgent=True),
     "learned": Family("an agent's learned post awaits remember or reject"),

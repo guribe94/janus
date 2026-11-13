@@ -118,6 +118,62 @@ class InstructionsAck(unittest.TestCase):
         self.assertEqual(janus.live_acks(cfg, {"instructions"}), {})
 
 
+def fake_beads(store):
+    """A beads double over a dict of issues: what janus intent, ack and the findings read and write."""
+    class FakeBeads:
+        def __init__(self, cfg): pass
+        def run(self, *a):
+            if a[0] == "create":
+                i = f"x{len(store) + 1}"; store[i] = {"id": i, "title": a[1], "labels": [a[a.index("-l") + 1]], "status": "open", "notes": ""}
+                return {"id": i}
+            if a[0] == "update": store[a[1]]["notes"] = a[a.index("--notes") + 1]
+            if a[0] == "close": store[a[1]]["status"] = "closed"
+            return []
+        def issues(self, label, status="open"): return [i for i in store.values() if label in i["labels"] and i["status"] in status.split(",")]
+        def create(self, title, label, desc=""): return self.run("create", title, "-l", label, "-d", desc)["id"]
+        def units(self): return []
+        def comment(self, i, text): pass
+    return FakeBeads
+
+
+class Intents(unittest.TestCase):
+    def setUp(self):
+        self.d, self.cfg = project(); self.store = {"ins1": {"id": "ins1", "title": "instr: build the retention permit", "labels": ["instruction"], "status": "open"}}
+        p = mock.patch.object(janus, "Beads", fake_beads(self.store)); p.start(); self.addCleanup(p.stop)
+
+    def intent(self, action, *args, **k):
+        return janus.cmd_intent(self.cfg, argparse.Namespace(action=action, args=list(args), why=k.get("why"), done_means=k.get("done_means"),
+                                                             instruction=k.get("instruction"), unit=k.get("unit"), id=k.get("id")))
+
+    def later(self, h): return mock.patch.object(janus, "now", lambda t=janus.now() + h * 3600: t)
+
+    def test_an_intent_is_in_the_live_state_and_tracks_its_instruction_until_it_is_stale_or_done(self):
+        """Catches (row 247): work in progress kept only in hand-written notes (a context clear lost an owner request), and
+        the instructions finding clearable only by closing the instruction before its work was built."""
+        ins = lambda: dict(janus.session_findings(self.cfg, 0, [])).get("instructions", "")
+        self.assertIn("janus intent add --instruction", ins())
+        self.intent("add", "build the retention permit", done_means="landed on main", instruction="ins1", unit=["u1"])
+        i = next(k for k, x in self.store.items() if "intent" in x["labels"])
+        live = janus.live_state(self.cfg, {}, [], [])
+        for w in ("Intents:", i, "build the retention permit", "landed on main", "ins1", "u1"): self.assertIn(w, live)
+        self.assertEqual(ins(), "", "an instruction with a live intent was still unclassified")
+        with self.later(3): self.assertIn("build the retention permit", ins(), "a stale intent kept its instruction quiet")
+        self.intent("done", i)
+        self.assertNotIn("build the retention permit", janus.live_state(self.cfg, {}, [], []))
+
+    def test_an_intent_nothing_works_on_goes_stale_and_is_urgent(self):
+        """Catches (row 247): an intent whose unit ended (or never started) sitting unnoticed: after [intents] stale_h (default
+        2 h) without a running linked unit or an update, check raises the urgent intent:<id>:stale."""
+        self.intent("add", "build the retention permit", unit=["u1"]); i = next(k for k, x in self.store.items() if "intent" in x["labels"])
+        key = f"intent:{i}:stale"; keys = lambda units: [k for k, _ in janus.intent_findings(self.cfg, units)]
+        self.assertEqual(keys([]), [])
+        with self.later(3):
+            self.assertEqual(keys([{"name": "u1", "state": "working"}]), [], "stale while its unit runs")
+            self.assertEqual(keys([{"name": "u1", "state": "done"}]), [key]); self.assertTrue(janus.finding(key, "x").urgent)
+            self.intent("add", id=i, unit=["u2"])   # an update moves it
+            self.assertEqual(keys([]), [])
+
+
 class ReadyItemsWithoutBriefs(unittest.TestCase):
     ISS = {"backlog:A1": {"id": "b1", "title": "backlog: A1 first thing", "status": "open", "labels": ["backlog", "backlog-ready"], "priority": 1},
            "backlog:B2": {"id": "b2", "title": "backlog: B2 second thing", "status": "open", "labels": ["backlog", "backlog-ready"], "priority": 2}}
@@ -137,6 +193,30 @@ class ReadyItemsWithoutBriefs(unittest.TestCase):
         t = F.get("idle-backlog:nobrief", "")
         self.assertIn("2 ready backlog item(s)", t); self.assertIn("janus brief draft A1 B2", t); self.assertIn("first thing", t)
         self.assertLessEqual(janus.ack_ttl("idle-backlog:nobrief"), 3600)
+
+    def test_a_second_ack_needs_fewer_items_without_a_brief(self):
+        """Catches (row 245): idle-backlog:nobrief acked again and again (four re-acks, each hiding it 1 h) while not one brief
+        was written, so ready work stayed hidden for hours."""
+        d, cfg = self.proj()
+        def seen(iss):
+            with mock.patch.object(janus, "backlog_issues", lambda cfg: iss), mock.patch.object(janus, "room", lambda *a, **k: (3, "")), \
+                 mock.patch.object(janus, "all_units", lambda cfg: {}):
+                self.assertIn("idle-backlog:nobrief", dict(janus.backlog_findings(cfg, {"here": {"ok": True}}, [])))
+        def ack():
+            with mock.patch.object(janus, "Beads", fake_beads({})), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                janus.cmd_ack(cfg, argparse.Namespace(problem="idle-backlog:nobrief", decision="seen", decision_class=False))
+        seen(self.ISS); ack(); seen(self.ISS)
+        with self.assertRaises(janus.Err) as e: ack()
+        self.assertIn("janus brief draft", str(e.exception))
+        seen({"backlog:A1": self.ISS["backlog:A1"]}); ack()   # one item fewer: progress
+
+    def test_a_brief_that_mentions_an_item_does_not_cover_it(self):
+        """Catches (row 245): every word of a brief's first lines read as an item id, so an open unit whose brief said 'A12'
+        hid the ready item A12 from the idle-backlog findings and from fill."""
+        d, cfg = self.proj(); b = d / "briefs" / "pump.md"; b.write_text("# Brief: the pump fix follows A12 and B2\nKIND: implement\n")
+        self.assertEqual(janus.unit_items(cfg, [{"name": "pump", "brief": str(b)}]), set())
+        b.write_text("# Brief: the pump\nITEM: B2\n")
+        self.assertEqual(janus.unit_items(cfg, [{"name": "pump", "brief": str(b)}, {"name": "v", "item": "C3"}]), {"B2", "C3"})
 
     def test_a_draft_launches_one_cheap_unit_and_only_an_accepted_draft_can_be_filled(self):
         """Catches: a drafted brief launched unaccepted (fill reading briefs/drafts), a draft unit started on the critical

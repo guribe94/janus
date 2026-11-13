@@ -292,7 +292,7 @@ OpenRouter, OpenAI (`sk-proj-`), hex `sk-` keys, AWS access key ids, GitHub and 
 private-key blocks. A bare prefix mention passes. On a hit it unstages again, refuses and lists the paths, never the values.
 Otherwise it commits and pushes.
 
-**`janus ack <key> "<decision>"`**: acknowledges a problem for 4 hours (margin problems 30 min, `idle-backlog` 1 h; `waiting`
+**`janus ack <key> "<decision>"`**: acknowledges a problem for 4 hours (margin problems 30 min, `idle-backlog` 1 h, and a second ack of `idle-backlog:nobrief` is refused until fewer items lack a brief; `waiting`
 `instructions` and `handoff` cannot be acked: park the unit; close or remember each instruction; write the notes), until the problem clears
 (a cleared problem's ack is dropped, so it comes back if it recurs), and records the decision as a beads comment (on the
 unit's issue for `unit:<name>:...` keys, otherwise on a `janus: decisions` issue).
@@ -309,6 +309,16 @@ acked unit:parser:finished
 person. `--key <k>` makes it idempotent (a row for that key is written once) and is what `check`'s `issue:<k>` finding points
 at; when the register is configured, `janus check` writes that row itself the first time a key has been acked `[janus]
 ack_issue_n` (3) times, so a rule that keeps coming back is tracked, not re-remembered.
+
+**`janus intent add|done|list`**: what the orchestrator means to get done and has not finished, kept in beads (label `intent`)
+so it survives a context clear. `janus intent add "<what>" [--why ...] [--done-means ...] [--instruction <id>] [--unit <u> ...]`
+records one (`--id <intent>` updates it: link the next unit, and the update counts as movement); `janus intent done <id> [reason]`
+closes it; `janus intent list` prints the open ones. Every `janus check` writes them under `Intents` in the Live state of
+HANDOFF.md, and raises the urgent `intent:<id>:stale` when no linked unit is running and nothing moved for `[intents] stale_h`
+hours (default 2). An owner instruction named by an open intent is in progress: the `instructions` finding leaves it out, and
+lists it again when that intent goes stale; closing the instruction still means done. `idle:<host>` counts and names only the
+ready work an agent could be launched on (not intents, not `actor:owner`/`actor:hardware` items), and says so when the host's
+admission is paused instead of saying nothing.
 
 **`janus decide` / `janus decisions`**: the decision records (docs/DECISIONS.md). `janus decide "<title>" --by owner|orchestrator
 --decision "<one sentence>" [--why "<ruling>"] [--context ...] [--options "<option and trade-off>" ...] [--consequences ...]
@@ -472,7 +482,7 @@ reference must name; the recipes are in section 4a.
 | family | what it means |
 |---|---|
 | `age` | a lane job queued or running over its class age limit (`[lanes] age`) |
-| `backlog` | the checklist is not imported, or changed since the last import |
+| `backlog` | the checklist is not imported, or changed since the last import; `backlog:held`: briefed units fill cannot place now (with fill's reasons); `backlog:unbriefed`: ready items without briefs while no host has room |
 | `beads` | `bd` is unavailable: units cannot be read |
 | `blocked` | a host's jobs wait in an admission that says no or is paused; the line names the cause (disk, memory, PSI) |
 | `board` | a board card is blocked, has a question, is gone or is silent |
@@ -492,7 +502,8 @@ reference must name; the recipes are in section 4a.
 | `idle` | a host or lane has room while work waits |
 | `idle-backlog` | ready backlog items without briefs while hosts have room, or held by budget |
 | `idle-with-backlog` | ready backlog units with briefs would fit now (`janus fill`) |
-| `instructions` | unclassified owner instructions in beads (an ack cannot clear it: close or remember each) |
+| `instructions` | unclassified owner instructions in beads (an ack cannot clear it: close or remember each; one an open intent tracks is in progress and not listed) |
+| `intent` | `intent:<id>:stale`: an open intent (`janus intent`) no linked unit works on and nothing moved for `[intents] stale_h` hours (default 2) |
 | `issue` | a finding key acked 3+ times with no issue row logged (every oddity is logged) |
 | `known-failure` | a known failure with no open unit fixing it, or one that passes now |
 | `landing` | a finished DONE unit has no gate, or passed its gates and is not landed |
@@ -814,7 +825,7 @@ labelled `backlog` and `status:<status>` (plus `backlog-ready` when its status i
 ref `backlog:<id>`; a re-import updates labels, closes items that became done and reopens ones that came back, so it is
 idempotent. `janus backlog list` shows what it reads. `janus check` then reports:
 - `idle-backlog:<host>`: the host has room while ready backlog items have no open unit ("write briefs for: ..."); a unit
-  covers an item by `janus launch --item <id>`, an `ITEM: <id>` line, or the id named in the first lines of its brief;
+  covers an item by `janus launch --item <id>`, or an `ITEM: <id>` line in the head of its brief (only these explicit ids: a brief that mentions an id does not cover it);
 - `backlog:stale` / `backlog:import`: the checklist changed since the last import, or was never imported;
 - `landing:<unit>:nogate`: a unit with VERDICT DONE for over `[landing] finished_min` (30) minutes has no gate queued or
   run (gates belong to a unit by `janus gate --unit` or `[landing] gate_names` patterns);
