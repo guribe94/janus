@@ -246,5 +246,29 @@ class Bug9ReconciledRunsPayTheirRealCost(unittest.TestCase):
         self.assertIn("nothing to correct", recost(dry=False))
 
 
+class Bug8RoomUsesTheWaitingJobsVerdict(unittest.TestCase):
+    def test_a_pause_a_waiting_job_just_met_is_the_report_s_verdict_too(self):
+        """Catches (row 221): a job held by admission for memory pressure while the check's own reading, taken at another instant,
+        saw none and reported free room on that host (launch more there)."""
+        d, cfg = project("\n[capacity]\nmin_disk_gb = 0\n")
+        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h); rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True)
+        lib = (rd / "cap.sh").read_text()
+        (rd / "cap.sh").write_text(lib + "\ncap_measure() { PSI=50; LOAD=0; DF=50; }\n")   # what the waiting job reads: memory pressure
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True, allow_unmerged=False, command=["--", "true"], broad=None)
+        p = subprocess.run(["bash"], input=janus.job_script(cfg, "here", h, r, "u", "true", "j-8"), capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "2", "JANUS_ADMIT_REPORT_S": "1"})
+        self.assertEqual(p.returncode, 121, p.stdout[-400:]); self.assertIn("PAUSED: memory PSI", p.stdout)
+        def report():   # the check's reading a moment later: no pressure at that instant
+            o = subprocess.run(["bash", "-c", f"RD={rd}; CAP_RO=1; . $RD/cap.sh\ncap_measure() {{ PSI=0; LOAD=0; DF=50; }}\ncap_report"], capture_output=True, text=True).stdout
+            return dict(l.split("=", 1) for l in o.splitlines() if l.startswith(("cap_pause=", "cap_admit=")))
+        got = report()
+        self.assertIn("memory PSI", got["cap_pause"], "the report says the host is free while a job there was just held for memory pressure")
+        self.assertIn("paused", got["cap_admit"])
+        probe = {"ok": True, "cap_pause": got["cap_pause"], "cap_rj": "0", "cap_rc": "0", "cap_rm": "0", "cap_ra": "0", "cap_ram": "0", "pueue": {"tasks": {}}}
+        self.assertEqual(janus.room(cfg, "here", probe, [])[0], 0, "room on a host whose admission is paused")
+        (rd / "paused").write_text(f"{int(time.time()) - 600} memory PSI avg10 50 over 20\n")   # an old verdict is not kept
+        self.assertEqual(report(), {"cap_pause": "", "cap_admit": "yes"})
+
+
 if __name__ == "__main__":
     unittest.main()

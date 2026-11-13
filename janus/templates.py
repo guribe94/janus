@@ -185,10 +185,19 @@ cap_record() {  # $1 class $2 peak MB $3 seconds $4 exit code $5 CPU seconds $6 
   [ "$(wc -l < "$RD/history.tsv")" -gt 2400 ] && tail -n 2000 "$RD/history.tsv" > "$RD/history.tsv.$$" && mv -f "$RD/history.tsv.$$" "$RD/history.tsv"
   return 0
 }
+cap_seen() {  # row 221: the pause a job waiting for admission met in the last ${PAUSE_KEEP:-60} s is the report's verdict too. The
+  # report reads the pressure at its own instant (macOS: a level, no average), so it said "room" while the jobs were held.
+  SEEN=; [ -n "$PAUSE" ] && return 0
+  pt= pw=; { read -r pt pw < "$RD/paused"; } 2>/dev/null
+  case $pt in ''|*[!0-9]*) return 0;; esac
+  [ $(($(date +%%s) - pt)) -le "${PAUSE_KEEP:-60}" ] && SEEN="$pw ($(($(date +%%s) - pt)) s ago, met by a job waiting for admission)"
+  return 0
+}
 cap_report() {  # for janus's probe: the sums, the pause, each reservation, the last 300 history lines
-  res_sum; cap_measure; cap_paused
-  echo "cap_rj=$RJ"; echo "cap_rc=$RC"; echo "cap_rm=$RM"; echo "cap_ra=$RA"; echo "cap_ram=$RAM"; echo "cap_pause=$PAUSE"; echo "cap_psi=$PSI"
-  admit_ok job >/dev/null 2>&1; echo "cap_admit=${BLK:-yes}"   # the admission's own verdict for one more job now (yes, or what blocks it)
+  res_sum; cap_measure; cap_paused; cap_seen
+  echo "cap_rj=$RJ"; echo "cap_rc=$RC"; echo "cap_rm=$RM"; echo "cap_ra=$RA"; echo "cap_ram=$RAM"; echo "cap_pause=${PAUSE:-$SEEN}"; echo "cap_psi=$PSI"
+  admit_ok job >/dev/null 2>&1; [ -n "$SEEN" ] && case " $BLK " in *" paused "*) ;; *) BLK="paused${BLK:+ $BLK}";; esac
+  echo "cap_admit=${BLK:-yes}"   # the admission's own verdict for one more job now (yes, or what blocks it)
   [ -n "$RL" ] && printf '%%s\n' "$RL" | sed '/^$/d'
   [ -f "$RD/history.tsv" ] && tail -n 300 "$RD/history.tsv" | sed 's/^/hist=/'
   true
@@ -252,6 +261,7 @@ while :; do
       else echo "$$ $CC $MB $(date +%%s) $CLS" > "$R.res.$$" && mv -f "$R.res.$$" "$R.res"; ulk; break; fi
     fi
     ulk; nowt=$(date +%%s)
+    case " $BLK " in *" paused "*) echo "$nowt $PAUSE" > "$RD/paused.$$" && mv -f "$RD/paused.$$" "$RD/paused";; esac   # row 221: this job's verdict, for the report (cap_seen)
     if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): $why"; said=$BLK; last=$nowt; fi
   else
     # finding 10: a jobs-lane job yields while a gates job waits, and says why (the old branch left BLK empty, so the give-up
