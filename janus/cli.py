@@ -117,7 +117,8 @@ def main():
     add("answer", cmd_answer, A("id", help="q<N>: a board question; <N>: an owner question (janus ask)"), A("answer"), A("--decide", action="store_true", help="also write a decision record of the answer"), dry=True)
     add("init", cmd_init, A("--name", help="project name for a new janus.toml (default: the folder's name)"), dry=True)
     add("migrate", migrate, A("project", nargs="?", help="a project with an old orch.toml/.orch to move to janus (default: here)"),
-        A("--retire", action="store_true", help="stop the old orch's standing processes on this machine (the owner's yes)"), dry=True)
+        A("--retire", action="store_true", help="stop the old orch's standing processes on this machine (the owner's yes); one that waits in sleep is kept"),
+        A("--idle", action="store_true", help="with --retire: also stop the processes that wait in sleep (only when no handoff is in flight: an idle loop and a worker waiting for its gate look the same)"), dry=True)
     add("board-close", cmd_board_close, A("agent", help="a board card that is not an open unit"), dry=True)
     add("register", cmd_register, A("session", nargs="?"), dry=True)
     add("hook", cmd_hook, A("event", choices=["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"]))
@@ -126,7 +127,7 @@ def main():
         try: cmd_hook(a.event)
         except Exception as e: print(f"janus hook: {e}", file=sys.stderr)
         return 0
-    if a.cmd == "migrate": return migrate(a.project, dry=a.dry_run, retire=a.retire)   # no janus.toml yet: the project still has orch.toml
+    if a.cmd == "migrate": return migrate(a.project, dry=a.dry_run, retire=a.retire, idle=a.idle)   # no janus.toml yet: the project still has orch.toml
     root = find_root(os.getcwd()) if a.cmd in ("init", "doctor") else find_root()   # never $JANUS_ROOT for setup commands
     if a.cmd == "init" and not root: return init_project(Path.cwd(), a)
     if a.cmd == "doctor" and not root: return doctor(None, a)
