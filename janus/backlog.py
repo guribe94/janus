@@ -80,6 +80,25 @@ def item_actors(cfg):
     except Err: pass
     return a
 
+def item_holds(cfg):
+    """{item id: reason} of the items held on purpose (rows 29/99: a deliberately parked item or draft kept idle-backlog:nobrief
+    coming back, acked again and again). Held: the beads label hold:<reason> that `janus backlog set <id> hold=<reason>` sets
+    (hold=off clears it), or a `HOLD: <reason>` line in the head of its draft (briefs/drafts/<id>.md). A held item is not idle
+    backlog and is not filled: it neither counts nor nags until the hold is taken off; janus backlog list shows it."""
+    hs = {}
+    try:
+        for r, i in backlog_issues(cfg).items():
+            x = next((l[5:] for l in (i.get("labels") or []) if l.startswith("hold:")), None)
+            if x: hs[r[8:]] = x
+    except Err: pass
+    try: drafts = sorted((cfg.p("briefs", "briefs") / "drafts").glob("*.md"))
+    except OSError: drafts = []
+    for f in drafts:
+        try: m = re.search(r"^HOLD:[ \t]*(.*)$", "\n".join(f.read_text(errors="replace").splitlines()[:12]), re.M)
+        except OSError: continue
+        if m: hs.setdefault(f.stem, m.group(1).strip() or "held")
+    return hs
+
 def backlog_issues(cfg):
     r = Beads(cfg).run("list", "--label", "backlog", "--all", "-n", "0")
     r = r.get("issues", r) if isinstance(r, dict) else r

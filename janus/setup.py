@@ -8,6 +8,7 @@ from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, wait_shell
 from janus.beads import Beads
 from janus.board import board_dir, board_script
+from janus.landhost import lane_probe, lane_script, origin_url
 from janus.context import (CLAIM_WINDOW, Err, JANUS_MARK, JANUS_SELF, SSH, Run, atomic_write, clean_env, herdr, hrun, now, pending_age, qp,
     record_session_proc, say, session_alive, sh, slug, ts, wake_clear)
 from janus.hooks import session_start_text
@@ -821,6 +822,11 @@ def cmd_install_host(cfg, a):
     if not h.get("local"):
         root = h["root"]; dst = f"{h['ssh']}:{root.replace('$HOME/', '')}/janus/"
         steps.append(("janus copy", ["rsync", "-a", "--delete", "--exclude", "__pycache__", "-e", " ".join(SSH), str(JANUS_SELF), str(JANUS_SELF.parent / "janus"), dst]))
+        b = h.get("bin", "$HOME/.local/bin")   # row 64: `janus` resolves in a job's shell there (job scripts put this folder on PATH)
+        steps.append(("janus launcher", f"mkdir -p {qp(b)} && printf '#!/bin/sh\\nexec python3 %s/janus/janus.py \"$@\"\\n' {qp(root)} > {qp(b)}/janus && chmod +x {qp(b)}/janus"))
+        url = origin_url(cfg)   # skill-fix55: the host's landing lane (janus/landhost.py), when the project's remote is known here
+        if url: steps.append(("landing lane", lane_script(cfg, h, url) + " && { " + lane_probe(cfg, h) + "; }"))
+        else: say(f"note: no landing lane set up on {n}: set [landing] origin (the project's remote) or [landing] repo (a checkout of it); janus land --host {n} creates it on first use")
         e, d = heartbeat_env(cfg), heartbeat_files()
         if e and e["host"] == n:
             if d:

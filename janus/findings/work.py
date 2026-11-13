@@ -2,7 +2,7 @@
 and the project's own git state."""
 import re, time
 from janus.actions.backlog import brief_index, fill_candidates, fill_plan
-from janus.backlog import backlog_cfg, backlog_issues, item_actors, unit_items
+from janus.backlog import backlog_cfg, backlog_issues, item_actors, item_holds, unit_items
 from janus.beads import Beads
 from janus.context import Err, LE, handoff_path, handoff_stale, now, sh
 from janus.intents import intent_stale, intents
@@ -79,10 +79,10 @@ def backlog_findings(cfg, hs, units):
     F = []
     if (cfg.root / b["file"]).exists() and (cfg.root / b["file"]).stat().st_mtime > cfg.mtime("backlog_imported") + 60:
         F.append(("backlog:stale", f"{b['file']} changed since the last janus backlog import: run it again"))
-    cov = unit_items(cfg, units); act = item_actors(cfg)
+    cov = unit_items(cfg, units); act = item_actors(cfg); hold = item_holds(cfg)   # rows 29/99: held items neither count nor nag
     todo = [(r[8:], i.get("title", "")[9:]) for r, i in iss.items()
             if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or []) and r[8:] not in cov
-            and act.get(r[8:], "agent") == "agent"]   # owner and hardware items are never idle backlog (row 54)
+            and act.get(r[8:], "agent") == "agent" and r[8:] not in hold]   # owner and hardware items are never idle backlog (row 54)
     if not todo: nobrief_seen(cfg, 0); return F
     plan, stops = fill_plan(cfg, hs, units)
     if plan:   # janus-fixes8 item 4: how many ready units with briefs fit now
@@ -106,7 +106,7 @@ def backlog_findings(cfg, hs, units):
     if spent:
         F.append(("backlog:spent", f"{len(spent)} ready backlog item(s) are still open though their brief already ran ("
                   + ", ".join(f"{i}: {' '.join(ns[:3])}" for i, ns in spent[:6]) + ("..." if len(spent) > 6 else "") + "): read the unit's report; when the item is "
-                  f"finished set its status in {b['file']} (janus backlog import closes it), else write its next brief under a new unit name with ITEM: <id>"))
+                  f"finished set its status in {b['file']} (janus backlog import closes it), else write its next brief under a new unit name with ITEM: <id> (or park it: janus backlog set <id> hold=<reason>)"))
     nob = [(i, t) for i, t in todo if i not in briefed and i.lower() not in linked]; nobrief_seen(cfg, len(nob))
     if nob and not plan and any("budget" in s for s in stops):
         F.append(("idle-backlog:budget", f"budget-limited: {'; '.join(s for s in stops if 'budget' in s)[:160]}; {len(nob)} ready item(s) wait"))
