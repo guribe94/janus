@@ -311,7 +311,14 @@ def cmd_close(cfg, a):
         if u.get("busy") and not busy_dead(u): raise Err(f"{u['name']}: a {u['busy']['op']} of it is running (pid {u['busy'].get('pid')}); wait for it")
         u["closing"] = True; u["busy"] = busy_mark("close"); bd.save(u)
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
+    why2 = None
     with cfg.unlocked():   # the host's cleanup, its probe and the task log take as long as the host does: the unit is recorded closing, busy
+        if not ((a.force and not handover) or cfg.run.dry or redo):   # revalidate: the guard above ran before the lock was let go; collect now refuses this unit, so a fresh fingerprint against the current record is final
+            why2 = uncollected(cfg, {**u, "closing": False, "busy": None})
+    if why2:   # something changed since the guard: nothing was removed; undo the marks and refuse
+        u = next((x for x in bd.units() if x["id"] == u["id"]), u); u.pop("closing", None); u.pop("busy", None); bd.save(u)
+        raise Err(f"refused: {u['name']}: {why2} (it changed while the close was starting)")
+    with cfg.unlocked():
         close_tab(cfg, u)
         if not h.get("local"):
             root = h["root"]; n = u["name"]
