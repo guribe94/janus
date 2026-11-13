@@ -2,7 +2,7 @@
 and the project's own git state."""
 import re, time
 from janus.actions.backlog import fill_candidates, fill_plan
-from janus.backlog import backlog_cfg, backlog_issues, item_actors, unit_items
+from janus.backlog import backlog_cfg, backlog_issues, item_actors, item_holds, unit_items
 from janus.beads import Beads
 from janus.context import Err, LE, handoff_path, handoff_stale, now, sh
 from janus.intents import intent_stale, intents
@@ -79,10 +79,10 @@ def backlog_findings(cfg, hs, units):
     F = []
     if (cfg.root / b["file"]).exists() and (cfg.root / b["file"]).stat().st_mtime > cfg.mtime("backlog_imported") + 60:
         F.append(("backlog:stale", f"{b['file']} changed since the last janus backlog import: run it again"))
-    cov = unit_items(cfg, units); act = item_actors(cfg)
+    cov = unit_items(cfg, units); act = item_actors(cfg); hold = item_holds(cfg)   # rows 29/99: held items neither count nor nag
     todo = [(r[8:], i.get("title", "")[9:]) for r, i in iss.items()
             if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or []) and r[8:] not in cov
-            and act.get(r[8:], "agent") == "agent"]   # owner and hardware items are never idle backlog (row 54)
+            and act.get(r[8:], "agent") == "agent" and r[8:] not in hold]   # owner and hardware items are never idle backlog (row 54)
     if not todo: nobrief_seen(cfg, 0); return F
     plan, stops = fill_plan(cfg, hs, units)
     if plan:   # janus-fixes8 item 4: how many ready units with briefs fit now

@@ -3,7 +3,7 @@ briefs of ready items with one cheap unit; accept a draft so fill can launch it)
 import argparse, re, time
 from janus.actions.launch import choose, cmd_launch, pick_model
 from janus.context import atomic_write
-from janus.backlog import backlog_cfg, backlog_issues, backlog_items, item_actors, unit_items
+from janus.backlog import backlog_cfg, backlog_issues, backlog_items, item_actors, item_holds, unit_items
 from janus.beads import Beads
 from janus.budgets import budget_for, finish_reserve, waste_block
 from janus.context import Err, say, slug
@@ -13,17 +13,22 @@ from janus.units import all_units, herdr_agents, unit_state
 
 def cmd_backlog(cfg, a):
     if a.action == "set":   # janus backlog set <id> actor=<x>
-        if not a.args or len(a.args) != 2 or not a.args[1].startswith("actor="): raise Err("usage: janus backlog set <item id> actor=<agent|owner|hardware|...>")
+        if not a.args or len(a.args) != 2 or not a.args[1].startswith(("actor=", "hold=")): raise Err("usage: janus backlog set <item id> actor=<agent|owner|hardware|...> | hold=<reason> (hold=off: no longer held)")
         x = backlog_issues(cfg).get(f"backlog:{a.args[0]}")
         if not x: raise Err(f"no backlog item {a.args[0]} in beads (janus backlog import first)")
+        if a.args[1].startswith("hold="):   # rows 29/99: an item parked on purpose is not idle backlog until the hold is taken off
+            v = slug(a.args[1][5:]); v = "" if v in ("off", "none", "no") else v
+            labels = [l for l in (x.get("labels") or []) if not l.startswith("hold:")] + ([f"hold:{v}"] if v else [])
+            if cfg.run.dry: say(f"+ bd update {x['id']} --set-labels {','.join(labels)}"); return
+            Beads(cfg).run("update", x["id"], "--set-labels", ",".join(labels)); say(f"{a.args[0]}: " + (f"held ({v})" if v else "no longer held")); return
         v = slug(a.args[1][6:]) or "agent"; labels = [l for l in (x.get("labels") or []) if not l.startswith("actor:")] + ([f"actor:{v}"] if v != "agent" else [])
         if cfg.run.dry: say(f"+ bd update {x['id']} --set-labels {','.join(labels)}"); return
         Beads(cfg).run("update", x["id"], "--set-labels", ",".join(labels)); say(f"{a.args[0]}: actor {v}"); return
     items = backlog_items(cfg)
     if items is None: raise Err("no checklist: set [backlog] file (or paths.checklist) in janus.toml")
     if a.action == "list":
-        act = item_actors(cfg)
-        for i, t, st, d, rd in items: say(f"{'done ' if d else 'ready' if rd else 'wait '} {i:8} {act.get(i, 'agent'):8} {st[:24]:24} {t[:90]}")
+        act = item_actors(cfg); hold = item_holds(cfg)
+        for i, t, st, d, rd in items: say(f"{'done ' if d else 'held ' if i in hold else 'ready' if rd else 'wait '} {i:8} {act.get(i, 'agent'):8} {st[:24]:24} {t[:90]}")
         return
     bd = Beads(cfg); ex = backlog_issues(cfg); n = {"created": 0, "updated": 0, "closed": 0, "reopened": 0, "same": 0}
     for i, t, st, d, rd in items:
@@ -37,7 +42,7 @@ def cmd_backlog(cfg, a):
             r = bd.run("create", title, "-l", ",".join(labels), "-d", f"From {backlog_cfg(cfg)['file']}: {t}\nstatus: {st}", "--external-ref", ref)
             n["created"] += 1; continue
         if x.get("status") == "closed": bd.run("reopen", x["id"]); n["reopened"] += 1
-        labels += [l for l in (x.get("labels") or []) if l.startswith("actor:")]   # set by janus backlog set: kept
+        labels += [l for l in (x.get("labels") or []) if l.split(":")[0] in ("actor", "hold")]   # set by janus backlog set: kept
         if sorted(x.get("labels") or []) != sorted(labels) or x.get("title") != title:
             bd.run("update", x["id"], "--title", title, "--set-labels", ",".join(labels)); n["updated"] += 1
         else: n["same"] += 1
@@ -66,9 +71,9 @@ def fill_candidates(cfg, units):
     if iss: items = [(int(i.get("priority", 2) if i.get("priority") is not None else 2), n, r[8:], i.get("title", "")[9:]) for n, (r, i) in enumerate(iss.items())
                      if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or [])]
     else: items = [(int(2), n, i, t) for n, (i, t, st, d, rd) in enumerate(backlog_items(cfg) or []) if rd]
-    cov = unit_items(cfg, units); ever = all_units(cfg); out = []; idx = brief_index(cfg); taken = set(); act = item_actors(cfg)
+    cov = unit_items(cfg, units); ever = all_units(cfg); out = []; idx = brief_index(cfg); taken = set(); act = item_actors(cfg); hold = item_holds(cfg)
     for pr, order, item, title in sorted(items):
-        if item in cov or act.get(item, "agent") != "agent": continue
+        if item in cov or act.get(item, "agent") != "agent" or item in hold: continue
         for f, name, keys, head in idx:
             if keys.get("ITEM", "").lower() != item.lower(): continue
             if name in ever or name in taken or (cfg.p("out", "out") / name).exists(): continue

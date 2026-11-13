@@ -156,7 +156,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
             + ("" if clsrc else f"printf '%s\\n' {q(cmd)} > \"$R.cmd\"\n")   # item 32: what the job's shape is computed from (the probe reads it too)
             + f"export JANUS_WRAP={q(jid)}   # janus run inside records the jobs it queues under this (cancel follows them)\n"
             # Row 243: a local job runs in a worktree outside the project root; a janus command in it (land's final gate) finds the root by this
-            + (f"export JANUS_ROOT={q(str(cfg.root))}\n" if h.get("local") else ""))
+            + (f"export JANUS_ROOT={q(str(cfg.root))}\n" if h.get("local") else f"export PATH={qp(h.get('bin', '$HOME/.local/bin'))}:\"$PATH\"   # the janus launcher install-host puts there (row 64)\n"))
     broad = bool(getattr(a, "broad", None)); nice = 19 if broad else 10   # a broad run (--broad) runs at the lowest CPU priority
     setup = guarded_setup(h); log = h.get("job_log", "/dev/null")
     ce = cache_env(cfg, hn, h); cdir = f'JC={ce[0]}; mkdir -p "$JC"\n' if ce else ""   # [caches]: before job_setup, so it uses them too
@@ -428,10 +428,11 @@ def cmd_run(cfg, a):
     cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
     if not cmd: raise Err("no command")
     cmd = cmd[0] if len(cmd) == 1 else shlex.join(cmd)   # one argument is shell text; several are quoted words
-    src = str(Path(a.wt).resolve()); name = Path(src).name
-    if not Path(src).is_dir(): raise Err(f"worktree {src} not found")
+    ht = getattr(a, "host_tree", None)   # skill-fix55: a tree that is on the host already (a land's own tree there): nothing is synced
+    src = ht or str(Path(a.wt).resolve()); name = Path(src).name
+    if not ht and not Path(src).is_dir(): raise Err(f"worktree {src} not found")
     unit = a.unit or os.environ.get("JANUS_UNIT")
-    why = tree_guard(cfg, src, behind=a.lane in ("gates", "land"))   # behind main matters for gates and landing only (item 5)
+    why = None if ht else tree_guard(cfg, src, behind=a.lane in ("gates", "land"))   # behind main matters for gates and landing only (item 5)
     if why and not a.allow_unmerged: raise Err(f"refused: {src} {why} (--allow-unmerged to run anyway)")
     jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
     keys = {}   # --inputs: the result cache (janus/cache.py); a key that already passed on a host this job may run on is not run again
@@ -462,11 +463,11 @@ def cmd_run(cfg, a):
         why = broad_why(cfg, hn, h, cmd)
         if why: raise Err(f"refused: a whole-suite run ({why}) needs --broad <reason>: it then runs at low priority (nice 19, after shorter jobs); or narrow it (one package, a test filter)")
     if broad: print(f"janus: broad run ({broad}): low priority", file=sys.stderr)
-    if cfg.run.dry: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
-    if not h.get("local"): sync_wt(cfg, hn, h, src, name)
+    if cfg.run.dry: say(job_script(cfg, hn, h, a, name, cmd, jid, wd=ht)); return
+    if not h.get("local") and not ht: sync_wt(cfg, hn, h, src, name)
     rd = runs_dir(cfg, h)
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True)
-    rc, o, e = hrun(h, f"mkdir -p {qp(rd)} && cat > {qp(f'{rd}/{jid}.sh')} && {ensure_lanes(h, cfg)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
+    rc, o, e = hrun(h, f"mkdir -p {qp(rd)} && cat > {qp(f'{rd}/{jid}.sh')} && {ensure_lanes(h, cfg)}", inp=job_script(cfg, hn, h, a, name, cmd, jid, wd=ht))
     if not rc: rc, o, e = write_cap(cfg, hn, h)
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
     rc, o, e = hrun(h, f"{pueue(h)} add -g {shlex.quote(a.lane)} -l {shlex.quote(label)} -w {qp(rd)} --print-task-id"
