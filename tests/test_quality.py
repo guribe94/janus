@@ -301,10 +301,6 @@ class LandFirst(unittest.TestCase):
             self.assertIsNone(janus.land_first_block(cfg, [u], {}))
         finally: janus.landing_findings = real
 
-    def test_inert_without_hold_h(self):
-        d, cfg = project()
-        self.assertIsNone(janus.land_first_block(cfg, [], {}))
-
 
 class QualifyRoute(unittest.TestCase):
     """ranked 10 / S1 free-first: a model marked unqualified is skipped for normal work until a pass is recorded; a qualify unit

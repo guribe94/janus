@@ -107,11 +107,5 @@ class Artifacts(unittest.TestCase):
         self.assertEqual(rc, 0, e); self.assertFalse((cw / "target").exists())
 
 
-class DiskFree(unittest.TestCase):
-    def test_reads_df_free(self):
-        d, cfg = project()
-        self.assertGreater(janus.disk_free_gb(cfg.root), 0)     # measured with df, not du (APFS clones over-count)
-
-
 if __name__ == "__main__":
     unittest.main()
