@@ -42,5 +42,16 @@ class RecurringAcks(unittest.TestCase):
         self.assertEqual(janus.repeated_issue_findings(cfg), [])   # its row exists: not raised again
 
 
+class Intents(unittest.TestCase):
+    def test_an_intent_without_a_moved_time_counts_from_its_issue_dates(self):
+        """Catches (row 94): an intent with no t in its notes (made by bd create, or notes edited by hand) counted from epoch 0:
+        'has not moved for 498494 h'."""
+        d, cfg = project(); iso = lambda h: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - h * 3600))
+        iss = [{"id": "i1", "title": "intent: by hand", "updated_at": iso(5), "created_at": iso(9)}, {"id": "i2", "title": "intent: fresh", "notes": '{"t": 0}', "created_at": iso(1)}]
+        with mock.patch.object(janus, "Beads", lambda cfg: mock.Mock(issues=lambda *a: iss)):
+            F = dict(janus.intent_findings(cfg, []))
+        self.assertEqual(list(F), ["intent:i1:stale"]); self.assertIn("not moved for 5.0 h", F["intent:i1:stale"])
+
+
 if __name__ == "__main__":
     unittest.main()
