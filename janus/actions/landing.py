@@ -258,7 +258,7 @@ def cmd_gate(cfg, a):
         except Err as e: say(f"note: gate not recorded on {unit}: {e}")
     X(cfg, h, ensure_lanes(h, cfg))
     tok = f"gate-{re.sub(r'[^A-Za-z0-9_-]', '_', a.name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"   # cancel follows the jobs it queues
-    rc, o, e = X(cfg, h, f"env {pre} {pueue(h)} add -g {shlex.quote(group)} -l {shlex.quote(tag(cfg, 'gate:' + a.name))} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env JANUS_WRAP={tok} {run}')}")
+    rc, o, e = X(cfg, h, f"{pueue(h)} add -g {shlex.quote(group)} -l {shlex.quote(tag(cfg, 'gate:' + a.name))} -w {shlex.quote(str(cfg.root))} --print-task-id -o {int(a.priority)} -- {pq(f'env {pre} JANUS_WRAP={tok} {run}')}")
     if rc: raise Err("pueue add failed: " + (e or o).strip()[:100])
     if cfg.run.dry: return
     tid = o.strip(); say(f"queued gate {a.name} as {ln}:{tid} in {group}" + (f" for unit {unit}" if unit else "")
@@ -427,7 +427,9 @@ def gate_place(cfg, gh, gc):
     and with a launcher there a janus without a project). Any other command runs on gh as given."""
     m = GATE_DISPATCHER.match(gc)
     if not m: return gh, gc
-    return next(n for n, h in cfg.hosts.items() if h.get("local")), f"{m.group(1)}{shlex.quote(sys.executable)} {shlex.quote(str(JANUS_SELF))} {m.group(2)}"
+    rest = m.group(2)
+    if not cfg.hosts[gh].get("local") and rest.startswith("gate ") and "--host" not in rest: rest = f"gate --host {shlex.quote(gh)} {rest[5:]}"   # the dispatcher gates on the host named, not another
+    return next(n for n, h in cfg.hosts.items() if h.get("local")), f"{m.group(1)}{shlex.quote(sys.executable)} {shlex.quote(str(JANUS_SELF))} {rest}"
 
 def run_final_gate(cfg, a, ra, where):
     mark = cfg.f("runs") / f"land-{a.unit}.pid"; mark.parent.mkdir(parents=True, exist_ok=True); mark.write_text(str(os.getpid()))

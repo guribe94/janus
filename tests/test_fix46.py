@@ -86,6 +86,16 @@ class Bug3GateStepsUnit(unittest.TestCase):
             janus.cmd_gate(cfg, self.gate(cfg, d, "land-u9-y"))   # no --unit: the open unit its name carries
             self.assertIn("JANUS_UNIT=u9", next(s for s in said if "--print-task-id" in s))
 
+    def test_the_environment_is_in_the_command_pueue_stores_not_only_on_its_client(self):
+        """Catches: JANUS_LANE/JANUS_ROOT/the gate host/JANUS_UNIT were set around the `pueue add` client only, so the daemon ran the
+        stored command without them and a landing aimed at one host fell back to another."""
+        d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/r"\n'); FakeBeads.units_ = [{"id": "b1", "name": "u9", "cwd": str(d)}]; said = []
+        def hrun(h, s, **k): said.append(s); return (0, '{"tasks": {}}' if "status --json" in s else "12", "")
+        with mock.patch.object(janus, "Beads", FakeBeads), mock.patch.object(janus, "hrun", hrun):
+            janus.cmd_gate(cfg, self.gate(cfg, d, "land-u9-x", unit="u9", host="far"))
+        stored = next(s for s in said if "--print-task-id" in s).split(" -- ", 1)[1]
+        for v in ("JANUS_LANE=gates", "JANUS_ROOT=", "JANUS_TEST_HOST=far", "JANUS_UNIT=u9"): self.assertIn(v, stored)
+
     def test_a_gate_for_another_host_does_not_take_a_coordinator_gates_slot(self):
         """Catches row 245: `janus gate <name> --host <remote>` (or a script that names its host) was queued in the coordinator's
         `gates` group, so two slow local gates held every other host's gates for hours."""

@@ -710,6 +710,7 @@ class Land(unittest.TestCase):
         self.assertTrue((tree / "b").is_file() and (tree / "c").is_file())      # ... which holds the merge made there
         self.assertEqual(self.g("log", "--format=%s %P", "-1", "main", cwd=o).stdout.strip(), f"u: land wk/u (1 commit(s), squashed) {tip}")   # pushed from there, onto the remote's tip
         self.assertEqual(janus.gate_place(self.cfg, "far", "janus gate land-u --wait")[0], "here")   # row 64: a janus gate is the coordinator's dispatcher, never run on the far host
+        self.assertIn("gate --host far land-u", janus.gate_place(self.cfg, "far", "janus gate land-u --wait")[1])   # the dispatcher is told the host it lands on: without it a landing aimed at far gated on another host
 
     def test_squash_land_and_conflict_stop(self):
         (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: add b", cwd=self.wt)
