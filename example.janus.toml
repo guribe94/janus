@@ -7,7 +7,7 @@
 name = "myproject"
 # id = "myproject"        # the project id every job, tmux session and card janus creates carries (default: name); on a machine
                          # shared by several janus projects each sees and acts on its own items only. Unique per machine.
-beads = "."              # directory holding .beads/ (units, backlog); `bd init` there once
+beads = ".janus"         # directory holding .beads/ (units, backlog); `bd init` there once
 silent_min = 30          # an agent with no board post for this long is silent
 reset_tokens = 150000    # context size at which the Stop hook asks for the handoff and the session is reset
 unreachable_min = 20

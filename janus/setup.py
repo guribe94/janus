@@ -209,7 +209,7 @@ def init_project(root, a):
     atomic_write(t, text)
     for d in ("briefs", "out", "board"): (root / ".janus" / d).mkdir(parents=True, exist_ok=True)
     say(f"wrote {t} (this machine is [hosts.{host}], named after its host name — rename it if you like); created .janus/briefs, out, board")
-    say("next: edit .janus/janus.toml (hosts, models, the API key's secret store), run `bd init` here if there is no .beads/, then `janus doctor`")
+    say("next: edit .janus/janus.toml (hosts, models, the API key's secret store), run `(cd .janus && bd init)` if there is no .janus/.beads/, then `janus doctor`")
     return 0
 
 def cmd_init(cfg, a):

@@ -19,7 +19,7 @@ There are no generated gates, mandatory reviews or deadlines: findings (`janus c
 - Optional: `herdr` (agent panes; the watcher can only start or wake the orchestrator through it) and `tmux` (agent sessions on remote hosts; a fallback pane tool for `janus resume`).
 - Each remote host: key-based ssh (BatchMode), `git`, `rsync`, `pueue` (`janus install-host H` sets it up on Linux without sudo) and coreutils `timeout`.
   A host without `timeout` makes each bounded wait fail at once, so janus polls every few seconds instead.
-- macOS or Linux (launchd agent or systemd user timer for the watcher). `janus doctor` checks all of this.
+- macOS or Linux (launchd agent or systemd user timer for the watcher). `janus doctor` checks most of this (not the remote `timeout`).
 
 ## Fresh setup
 Order matters: the watcher acts on every project listed in `~/.config/janus/projects`, so configure and register before it runs.
@@ -32,9 +32,10 @@ Order matters: the watcher acts on every project listed in `~/.config/janus/proj
 2. **Install the release only** (optional but recommended for a first setup): `./install --release-only` builds, smoke-checks and switches
    `~/.local/share/janus/current`, and links `~/.local/bin/janus` and the skill folders. It adds no hooks and starts no watcher.
    Make sure `~/.local/bin` is on your `PATH`.
-3. **Initialize the project** (in `PROJECT`; `bd init` there first if it has no `.beads/`):
+3. **Initialize the project** (in `PROJECT`):
    ```
    janus init                   # writes .janus/janus.toml from example.janus.toml (see janus init --name NAME)
+   (cd .janus && bd init)       # beads database lives in .janus/.beads
    $EDITOR .janus/janus.toml    # hosts, models, routing, API key store, [orchestrator] kind
    janus doctor                 # add --no-hosts to skip ssh checks
    ```
@@ -45,7 +46,7 @@ Order matters: the watcher acts on every project listed in `~/.config/janus/proj
    installs the watcher (a launchd agent or systemd user timer, every 2 minutes), lists `PROJECT` in `~/.config/janus/projects`, installs missing
    `bd` and `pueue` through Homebrew on macOS, and runs `janus install-host` for each remote host (`--no-hosts` skips that).
    Running a full `./install` before step 4 is allowed, but then the watcher may start an orchestrator itself, in the `[orchestrator]` tool
-   with the `[routing]` limits you set, once it finds work and no live orchestrator.
+   and `args`/settings you set under `[orchestrator]`, once it finds work and no live orchestrator.
 6. `janus doctor` again, then `janus status`.
 
 ## Day to day
@@ -68,7 +69,8 @@ command class and only order the queue and flag overruns (`janus check`); the "a
 
 ## Models and authentication (your choice)
 janus enforces only what you write in `.janus/janus.toml`; it has no built-in vendor or login rule. `[routing] allow_tools` and `allow_auth` limit
-which coding clients and which auth kinds (`api_key` or `subscription`) may launch, on launch and on resume alike, and a model outside them is refused.
+which coding clients and which auth kinds (`api_key` or `subscription`) may launch, on launch and on resume alike, and a model outside them is refused. These limits apply to workers only; they do not authenticate the
+orchestrator, which is set separately through `[orchestrator]` `args` and its own settings (e.g. `claude --settings FILE`).
 Unset, nothing is restricted. Only the first entry of each routing list is used unless you set `fallback = true`. For example, an API-key-only setup:
 ```toml
 [routing]
