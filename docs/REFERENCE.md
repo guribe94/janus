@@ -11,22 +11,22 @@ has `$JANUS_ROOT`.
 |---|---|
 | `janus init` | write a starter `.janus/janus.toml` and the folders |
 | `janus doctor` | check tools, release, hooks, watcher, config, keys, hosts |
-| `janus migrate SOURCE [--to TARGET] [--apply]` | the one-time move from an old root to `TARGET/.janus` (dry run unless `--apply`); keeps identity, messages, instructions, registry; refuses while jobs, agents or outboxes are live or unknown |
+| `janus migrate SOURCE [--to TARGET] [--apply]` | the one-time move from an old root to `TARGET/.janus` (dry run unless `--apply`); keeps identity, messages, instructions, registry; refuses while jobs, agents or outboxes are live or unknown; moves worktrees only for units that record them (closed ones too); never writes the bd database: it prepares `.janus/migration/bd-relocate.sh`, `bd-path-updates.sh` and `PENDING.md` for your approval |
 | `janus status` / `janus check [--json]` | the state now, derived from hosts, units, board, queues; findings clear when their condition clears |
 | `janus hosts [--refresh]` | each host: OS, arch, cores, RAM, disk, GPU, tools, coding clients (installed / login present / usable by config), caches |
 | `janus capacity` | each host's admission now: room, reservations, pause reason |
-| `janus monitor` | read-only curses dashboard; works from the root and any subdirectory; `?` help, `/` filter |
+| `janus monitor` | read-only curses dashboard; works from the root and any subdirectory; tabs Active, Backlog, Finished, Board, Overview (current % checkpoint from `HANDOFF.md`); tool/model per unit; per host admission reason, coding clients and the age of that reading; `?` help, `/` filter |
 | `janus launch UNIT --kind K` | start an agent on a host with room; model chosen by `[routing]`, only if allowed (see Routing) |
 | `janus fill` | launch ready backlog units that fit; `[fill] watcher = true` lets the watcher do it |
-| `janus run --host H -- CMD` | queue a job through the host's own admission (`--detach` returns `host:task`; `--needs` places by capability) |
+| `janus run --host H -- CMD` | queue a job through the host's own admission (`--detach` returns `host:task`; `--needs` places by capability). A remote agent's `<root>/run/<unit>.lane [--detach] [--broad R] CMD` is the same code (`janus/lane.py`: guard, queueing, a job record beside the files) |
 | `janus queue`, `janus cancel`, `janus busy`, `janus thrash` | read queues; cancel one job; is a tree in use; shared-host thrash acts |
 | `janus park`, `janus resume [UNIT]` | park a unit on its jobs / resume it; with no unit, continue the orchestration in a new session |
 | `janus collect`, `janus stop`, `janus close` | bring back a unit's output, stop it, close it (checks nothing is lost) |
-| `janus land UNIT [--host H] [--push]` | merge the landing branch into the unit's branch, squash, move the branch from the tip merged (expected ref), optionally push (never forced); on the unit's own host |
+| `janus land UNIT [--host H] [--push]` | merge the landing branch into the unit's branch, squash, move the branch from the tip merged (expected ref), optionally push (never forced); on the unit's own host. A requested push that stays refused exits non-zero (`NOT PUBLISHED`): the integrated result stays on the unit's branch and the remote is untouched |
 | `janus remember`, `janus forget`, `janus memory` | MEMORY.md: `--instruction`, `--decision`, `--fact`, `--pitfall`, `--key` replaces |
 | `janus answer q<N> TEXT`, `janus board-close AGENT` | answer a board question; archive a card |
 | `janus transcript UNIT`, `janus index`, `janus report` | grep/tail a transcript; the reports index; derived status view |
-| `janus backlog`, `janus ledger`, `janus qualify`, `janus tidy`, `janus commit-state` | checklist import; API spend ledger; model qualification; clean up; commit and push state |
+| `janus backlog`, `janus ledger`, `janus tidy`, `janus commit-state` | checklist import; API spend ledger; clean up; commit and push state |
 | `janus register`, `janus install-host H`, `janus watch` | register the orchestrator session; set a host up; the watcher pass (`--reset`: verified new session) |
 
 `board.sh` (also `janus` for answers): `post`, `send <agent> <text>` (one addressed message), `direct <agent> <text>`, `read`, `summary`,
@@ -41,8 +41,9 @@ after a meaningful change of plan, and before a reset (the Stop hook asks once o
 
 ## Routing (one place: `janus.toml`)
 `[providers.X] enabled`, `auth = "api_key"|"subscription"`; `[models.M] tool`, `provider`, `hosts`; `[routing] allow_tools = [...]`,
-`allow_auth = [...]` and the ordered `critical`/`normal`/`review` lists. A model outside these is never launched. A fallback to a later
-entry is printed; `janus fill` never falls back. Current operation: Claude through `ANTHROPIC_API_KEY` only (`allow_auth = ["api_key"]`,
+`allow_auth = [...]` and the ordered `critical`/`normal`/`review` lists. A model outside these is never launched. Only the first entry of a list is used; a later
+entry (another provider or login) is used only when you write `fallback = true` in `[routing]`, and then it is printed. The same restrictions bind a
+resume. No model qualification or vendor rule exists. Current operation: Claude through `ANTHROPIC_API_KEY` only (`allow_auth = ["api_key"]`,
 `allow_tools = ["claude"]`, the other providers disabled).
 
 ## Capacity
@@ -51,15 +52,25 @@ host's own admission use one calculation. The first job on an idle host is exemp
 Pending authorized work fills every capable host with room; nothing is pinned to a default host. A host that does not answer is *unknown*:
 its jobs are not cancelled, moved or relaunched. SSH is retried only when the master connection refused the session (nothing ran).
 
+## Remote units and git
+A unit on another host gets its copy by rsync (no `.git`) plus a git bundle of the landing branch and its HEAD, fetched into a new `.git` there:
+it commits on its own branch (`janus/<unit>` when the source tree was on the landing branch), with the source's origin url, user name and email.
+`janus land` then runs on that host (merge, squash, expected-ref move, plain push). A source that is no git tree stays a snapshot (changes come
+back with `janus collect`). Publication needs that host to reach the remote; without one the result stays in the host's repository (fetch it
+over ssh). Closing still checks the copy was collected.
+
 ## Tests
 There are no generated gates. Tests are the project's own explicit commands, run with `janus run` through ordinary admission; a whole-suite
 run needs `--broad REASON`. Landing runs none: after `janus land` reports it integrated moved work, a clean merge does not prove the merged
 tree is right; run the tests that matter.
 
 ## Reset
-`janus watch --reset` uses the tool's own new-session command (Claude Code `/clear`, Codex `/new`; read from the harness), marks the session
-pending, and counts the reset done only when the registered session id and transcript are new. Otherwise it says why and restores the old
-registration. Any other tool is reported unsupported.
+`janus watch --reset` uses the tool's own new-session command (Claude Code `/clear`, Codex `/new`, OpenCode `/new`; read from each binary), marks
+the session pending, and counts the reset done only when a new session registers (Claude, Codex: also a new transcript). OpenCode has no hook:
+the new session runs `janus register` (it reads `OPENCODE_SESSION_ID`), and OpenCode keeps no transcript janus can read, so it has no automatic
+size trigger and no end-to-end live run was made. Otherwise it says why and restores the old registration. Other tools are unsupported.
+Launch and resume command lines (`launch.tool_argv`) are the ones each client's `--help` shows: claude `--model/--resume`, codex `resume`/`-m`,
+opencode `run --model/--session`.
 
 ## Findings
 | Family | Meaning |
@@ -101,5 +112,5 @@ update the handoff over the context threshold. A worker's Stop hook blocks once 
 
 ## Install
 `./check [test_file.py ...]` is a smoke check (and only the named tests). `./install --stage-only` builds an immutable release and checks it
-without switching; `./install --release-only` switches `current`; `--rollback` goes back. Releases a running process or queued job names are
+without switching; `./install --release-only` (and a full `./install`) switches `current` but refuses while a registered project is still on the old layout (migrate it first); `--rollback` goes back. Releases a running process or queued job names are
 never pruned. Skill links: `~/.claude/skills/janus` (Claude Code and opencode) and `~/.agents/skills/janus` (Codex).

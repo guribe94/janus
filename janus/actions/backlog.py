@@ -1,5 +1,6 @@
 """janus backlog (import, list, set actor) and janus fill (launch ready backlog units up to capacity)."""
 import argparse, os, re
+from pathlib import Path
 from janus.actions.launch import choose, cmd_launch, pick_model
 from janus.backlog import backlog_cfg, backlog_issues, backlog_items, item_actors, item_holds, unit_items
 from janus.beads import Beads
@@ -92,7 +93,7 @@ def fill_plan(cfg, hs, units, limit=None):
     if not cands: return plan, ["no ready backlog item has an unlaunched brief (a brief is for an item when it has an ITEM: <id> line)"]
     for pr, order, item, f, name, kind, tier in cands:
         a = argparse.Namespace(unit=name, host=None, test_host=None, kind=kind, tier=tier)
-        try: m = pick_model(cfg, tier, kind, None, fallback=False)   # unattended: the first route entry or a stated refusal, never a silent substitute
+        try: m = pick_model(cfg, tier, kind)   # unattended: the first route entry or a stated refusal, a fallback only where [routing] fallback = true
         except Err as e: stops.append(f"{name}: {e}"); continue
         mc = cfg.models[m]; budget, bwhy = budget_for(cfg, mc, kind, tier) if mc.get("kind") == "api" else (None, ""); hold = budget
         pv = cfg.prov.get(mc.get("provider"), {})
@@ -119,8 +120,9 @@ def fill_plan(cfg, hs, units, limit=None):
 def fill_repo(cfg, name, brief):
     """ISSUES row 83: the repository a fill launch makes the unit's worktree from, exactly as janus launch --new-worktree <repo>
     does. None when <worktrees>/<name> exists (launch takes that tree) or the project is in no git repository (the unit runs in
-    the project root, as before). The repository: the brief's `REPO: <path>` line, else [fill] repo, else the repository that
-    holds the project root. Before, fill passed no tree at all, so every unit got the project root, a main checkout, and was
+    the project root, as before). The repository: the brief's `REPO: <path>` line, else [fill] repo (a path from the project root: the
+    project root need not be a Git root, the repository may be nested in it), else the project root itself when it is a repository's
+    top; never a parent's repository found by walking up. Before, fill passed no tree at all, so every unit got the project root, a main checkout, and was
     refused: each fill launch needed a manual janus launch --new-worktree."""
     if (cfg.p("worktrees", "worktrees") / name).is_dir(): return None
     try: m = re.search(r"^REPO:\s*(\S+)", "".join(open(brief, errors="replace").readlines()[:12]), re.M)
@@ -128,7 +130,7 @@ def fill_repo(cfg, name, brief):
     r = m.group(1) if m else cfg.c.get("fill", {}).get("repo")
     if r: return str((cfg.root / os.path.expanduser(r)).resolve())
     rc, o, e = sh(["git", "-C", str(cfg.root), "rev-parse", "--show-toplevel"])
-    return o.strip() if rc == 0 and o.strip() else None
+    return o.strip() if rc == 0 and o.strip() and Path(o.strip()).resolve() == cfg.root.resolve() else None
 
 def cmd_fill(cfg, a):
     """Launch ready backlog units that have briefs, highest priority first, until every host's reservations or the budget are

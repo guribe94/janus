@@ -17,8 +17,9 @@ from janus.units import ws_id
 def cmd_register(cfg, a):
     """The only way to change the registered orchestrator session (with the watcher's pending claim for a new one it started)."""
     if os.environ.get("JANUS_ROLE") == "agent": raise Err("refused: an agent (JANUS_ROLE=agent) cannot register as the orchestrator (issue 2)")
-    sid = a.session or next((os.environ[k] for k in ("JANUS_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID") if os.environ.get(k)), None)
-    kind = "codex" if os.environ.get("CODEX_THREAD_ID") and not os.environ.get("CLAUDECODE") else "claude"
+    sid = a.session or next((os.environ[k] for k in ("JANUS_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "OPENCODE_SESSION_ID") if os.environ.get(k)), None)
+    kind = "codex" if os.environ.get("CODEX_THREAD_ID") and not os.environ.get("CLAUDECODE") else \
+        "opencode" if os.environ.get("OPENCODE_SESSION_ID") and not os.environ.get("CLAUDECODE") else "claude"
     old = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
     if old and sid and old != sid and session_alive(cfg): say(f"note: replacing registered session {old}, whose process is still alive")
     if cfg.run.dry: say(f"+ register {sid or 'pending'} ({kind})"); return
@@ -275,6 +276,7 @@ def doctor(cfg, a):
     for tier, lst in cfg.route.items():
         for m in lst:
             if m not in cfg.models: r(False, f"routing {tier}: unknown model {m}", "fix [routing]")
+    if cfg.f("migration/PENDING.md").is_file(): r(None, "migration is not final: the bd database and its unit records still name the old root", f"review {cfg.f('migration/PENDING.md')}")
     for w in model_host_warnings(cfg): r(None, w, "drop [models.<m>] hosts to allow every host, or add the missing ones")
     for k, d in (("briefs", "briefs"), ("out", "out")):
         r(cfg.p(k, d).is_dir() or None, f"paths.{k} {cfg.p(k, d)}", f"mkdir {cfg.p(k, d)}")

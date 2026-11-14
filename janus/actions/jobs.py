@@ -7,7 +7,8 @@ from pathlib import Path
 from janus.beads import Beads
 from janus.board import board
 from janus.cache import cache_key, input_hashes, lookup as cache_lookup, record as cache_record, settle as cache_settle
-from janus.cap import cap_lib, cap_nums, capv, class_mb, class_secs, class_usage, host_cap
+from janus import lane
+from janus.cap import cap_call, cap_lib, cap_nums, capv, class_rows, host_cap
 from janus.context import Err, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
 from janus.platform import ARCH, CACHE_ENV, MAXRSS_PY, cache_env_sh
 from janus.project import own_label, tag, untagged
@@ -76,8 +77,7 @@ def agent_res(cfg, hn, h, name, pid):
     """An interactive agent's reservation (runs/agent-<unit>.res, its pane's pid), as API agents write theirs: the shell admission
     (cap.sh) then counts it like the launcher does (review-fixes8 #3); it is dropped when the pid is gone."""
     if not pid: return
-    mb = class_mb([], "agent", cap_nums(cfg, h)["agmb"], 0)
-    write_cap(cfg, hn, h)
+    write_cap(cfg, hn, h); mb = cap_call(h, f"cap_mb agent {cap_nums(cfg, h)['agmb']} 0") or cap_nums(cfg, h)["agmb"]   # the host's own rule
     hrun(h, f"mkdir -p {qp(h['_rd'])} && echo '{int(pid)} 0 {int(mb)} {int(now())} agent' > {qp(h['_rd'] + f'/agent-{name}.res')}")
 
 def ensure_lanes(h, cfg=None):
@@ -326,79 +326,16 @@ def place_job(cfg, lane, needs):
         if room and (score is None or hc["free"] - hc["queued"] > score): best, score = n, hc["free"] - hc["queued"]
     return best, lines
 
-# A whole-suite run needs --broad <reason> (owner rule after two broad runs held 7 cores for 3 h while short jobs waited 4 h): it
-# then runs at the lowest priority (nice 19, pueue priority -5, counted double in the short-first order). Broad: the command matches
-# [capacity] broad_patterns (default below), or its job class ran a median of [capacity] broad_min minutes or more on that host.
-# Gates (their own steps too) and the land lane are exempt (whole-suite by design, and ordered by their own lanes).
-BROAD_PATTERNS = [r"\bcargo\s+(test|nextest\s+run|clippy|build|check)\b.*\s--(workspace|all)(?![-\w])", r"(^|[;&|]\s*)(\S*/)?pytest\s*($|[;&|])"]
-PKG_RX = re.compile(r"(^|\s)(?:-p\s*|--package[=\s])\S")   # a cargo command that names one package (-p X, --package=X)
-WS_RX = re.compile(r"--(workspace|all)(?![-\w])")          # a whole-workspace/all-packages flag (never --all-targets/--all-features)
-CARGO_RX = re.compile(r"(^|\s)cargo\s+(test|nextest\s+run|clippy|build|check)\b")
-CARGO_BROAD = BROAD_PATTERNS[0]   # the default cargo whole-suite pattern: the one-package exception applies to IT only (finding 4)
-
 def job_class(cfg, hn, h, cmd):
     """The job class runs/cap.sh will give cmd on host hn (cap_class, run here on the host's library)."""
     rc, o, e = sh(["sh", "-c", cap_lib(cfg, hn, h) + '\ncap_class "$1"', "sh", cmd])
     return o.strip() or "job"
 
-def host_history(cfg, h):
-    """The host's runs/history.tsv lines (the last 2000)."""
-    if h.get("local"):
-        try: return (Path(h["_rd"]) / "history.tsv").read_text().splitlines()[-2000:]
-        except OSError: return []
-    return hrun(h, f"tail -n 2000 {qp(h['_rd'] + '/history.tsv')} 2>/dev/null")[1].splitlines()
-
-def one_package_cargo(seg):
-    """True when seg is a cargo test/build/check run that names ONE package (`-p X`/`--package=X`) and has no
-    `--workspace`/`--all`: only then is it not a whole-suite run (item 25b). `--all-targets`/`--all-features` do not count as
-    `--all` (finding 1), and `--workspace` wins over `-p` (cargo runs the whole workspace then)."""
-    return bool(CARGO_RX.search(seg)) and bool(PKG_RX.search(seg)) and not WS_RX.search(seg)
-
-def _segments(c):
-    """The commands in c, each a list of words: quoting and backslash escapes are honoured, so a ; or | inside a quoted
-    argument (an ack or a commit message) never starts a new command (finding 4), and the `&` of a redirect (`2>&1`, `&>log`,
-    `<&3`) and the `|` of a clobber redirect (`>|`) are part of their word, never a separator (finding 4, fix-install6, finding E)."""
-    segs, cur, w, q, esc = [], [], "", None, False
-    for i, ch in enumerate(c):
-        if esc: w += ch; esc = False; continue
-        if q:
-            if ch == q: q = None
-            elif ch == "\\" and q == '"': esc = True
-            else: w += ch
-        elif ch in "'\"": q = ch
-        elif ch == "\\": esc = True
-        elif ch in ";&|()\n":
-            if ch in "()" and not w and cur:
-                continue   # a paren inside a command (an unquoted ps rendering of a quoted message): not a subshell, not a separator
-            if ch == "&" and (i > 0 and c[i - 1] in "<>" or i + 1 < len(c) and c[i + 1] == ">"):
-                w += ch   # the `&` of a redirect (`2>&1`, `&>log`, `<&3`), not a separator
-            elif ch == "|" and i > 0 and c[i - 1] == ">":
-                w += ch   # the `|` of a clobber redirect (`>|`), not a pipe (finding E)
-            else:
-                if w: cur.append(w); w = ""
-                if cur: segs.append(cur); cur = []
-        elif ch.isspace():
-            if w: cur.append(w); w = ""
-        else: w += ch
-    if w: cur.append(w)
-    if cur: segs.append(cur)
-    return segs
-
 def broad_why(cfg, hn, h, cmd):
-    """Why cmd is a whole-suite run on host hn, or None. Item 25(b): a cargo command that names a package (`-p X`,
-    `--package=X`) covers one package, not the whole workspace, so the DEFAULT cargo pattern does not apply to it. Finding 1:
-    each command is judged on its own (a ` -p x` in a *different* command never switches the guard off). Finding 4 (fix-install6):
-    the split is the quote-aware `_segments` (a `;`/`|` inside a quoted argument never starts a command, and the `&` of a
-    redirect -- `2>&1`, `&>log` -- never splits), and the one-package exception applies to the default cargo pattern ONLY, so a
-    project's own cargo-like pattern (`\\bcargo\\s+nextest\\b`, `--release\\b`) keeps its meaning."""
-    segs = [" ".join(w) for w in _segments(cmd)]
-    for rx in cfg.capc.get("broad_patterns", BROAD_PATTERNS):
-        for seg in segs:
-            if re.search(rx, seg) and not (rx == CARGO_BROAD and one_package_cargo(seg)):
-                return f"it matches the broad pattern {rx!r}"
-    cls = job_class(cfg, hn, h, cmd); e = class_secs(host_history(cfg, h), cls); lim = capv(cfg, h, "broad_min")
-    if e and e >= lim * 60: return f"its job class {cls} ran a median of {e // 60} min on {hn} (broad_min {lim:g})"
-    return None
+    """Why cmd is a whole-suite run on host hn (lane.broad_why: [capacity] broad_patterns, or its class's median run time on that
+    host from the host's own cap.sh), or None. `lane --broad` on a remote unit's host runs the very same check."""
+    cls = job_class(cfg, hn, h, cmd); lim = capv(cfg, h, "broad_min")
+    return lane.broad_why(cmd, cfg.capc.get("broad_patterns", lane.BROAD_PATTERNS), lim, cls, int(cap_call(h, f"cap_secs {shlex.quote(cls)}", cap_lib(cfg, hn, h)) or 0))
 
 def record_job(cfg, ref, jid, src, spec):
     """The tree a job uses, for janus busy (dropped once the job has ended), and what it ran, so a thrash stop can re-queue it."""
@@ -474,13 +411,11 @@ def cmd_run(cfg, a):
     if not h.get("local"): sync_wt(cfg, hn, h, src, name)
     rd = runs_dir(cfg, h)
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True)
-    rc, o, e = hrun(h, f"mkdir -p {qp(rd)} && cat > {qp(f'{rd}/{jid}.sh')} && {ensure_lanes(h, cfg)}", inp=job_script(cfg, hn, h, a, name, cmd, jid))
-    if not rc: rc, o, e = write_cap(cfg, hn, h)
+    rc, o, e = write_cap(cfg, hn, h)   # the rule the job reads at its start
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
-    rc, o, e = hrun(h, f"{pueue(h)} add -g {shlex.quote(a.lane)} -l {shlex.quote(label)} -w {qp(rd)} --print-task-id"
-                       + (f" -o={int(a.priority)}" if a.priority else " -o=-5" if broad else "") + f" -- {pq('bash ' + qp(f'{rd}/{jid}.sh'))}")
-    if rc: raise Err(f"pueue add on {hn} failed: {(e or o).strip()[-120:]}")
-    tid = o.strip()
+    run = lambda c, inp=None: hrun(h, c, inp=inp)
+    rc, tid = lane.queue_job(run, pueue(h), ensure_lanes(h, cfg), rd, jid, job_script(cfg, hn, h, a, name, cmd, jid), a.lane, label, a.priority, bool(broad))
+    if rc: raise Err(f"queueing on {hn} failed: {tid}")
     record_job(cfg, f"{hn}:{tid}", jid, src, {"lane": a.lane, "unit": unit, "wt": src, "cmd": cmd, "subdir": a.subdir, "usb": bool(a.usb),
                                               "priority": a.priority, "needs": getattr(a, "needs", None), "pinned": not needs, "broad": broad,
                                               "requeued": getattr(a, "requeued", None)})   # row 215: the job this one replaces (re-queued once only)
@@ -692,7 +627,8 @@ def tend_thrash(cfg, hs, units, log, dry=False):
 def cmd_thrash(cfg, a):
     """Shared hosts' memory pressure and what the watcher does (--dry-run: says what it would do, changes nothing)."""
     if cfg.run.dry: cfg.run.ro = True
-    hs = probe_all(cfg); units = Beads(cfg).units()
+    with cfg.unlocked(): hs = probe_all(cfg)   # never under the writer lock
+    units = Beads(cfg).units()
     for u in units: u["state"] = unit_state(u, hs, {})
     if not any(h.get("shared") for h in cfg.hosts.values()): say("no host has shared = true"); return
     for l in tend_thrash(cfg, hs, units, lambda m: None, dry=cfg.run.dry or cfg.run.ro) or ["nothing to do"]: say(l)
@@ -759,7 +695,7 @@ def clients_line(cfg, n, f):
     janus model of that tool is allowed by the one config and may run on the host) for each coding client. A host never
     discovered says unknown, never absent."""
     if not f: return f"  clients: unknown ({n} not discovered)"
-    from janus.actions.launch import model_tool
+    from janus.ledger import model_tool
     from janus.ledger import model_ok
     out = []
     for c in CLIENTS:
@@ -773,13 +709,13 @@ def cmd_hosts(cfg, a):
     cfg.run.ro = cfg.run.ro or not a.refresh   # only --refresh saves what it found
     fs = host_facts(cfg, refresh=True if a.refresh else "stale")
     with cf.ThreadPoolExecutor(8) as ex: hs = dict(zip(cfg.hosts, ex.map(lambda n: probe(n, cfg.hosts[n], ro=True, cfg=cfg), cfg.hosts)))
-    use = {n: class_usage(p.get("hist", []), cap_nums(cfg, cfg.hosts[n])["cpj"]) if p["ok"] else [] for n, p in hs.items()}
+    use = {n: class_rows(p) if p["ok"] else [] for n, p in hs.items()}
     if a.json: return 0, [json.dumps({n: {**(fs.get(n) or {}), "usage": use[n]} for n in cfg.hosts}, indent=1)]
     m = lambda s: "-" if s is None else f"{s / 60:.0f}m" if s >= 90 else f"{s}s"
     L = []
-    for n in cfg.hosts:   # per job class: runs, expected run time, learned cores, CPU, queue wait (the report's numbers)
+    for n in cfg.hosts:   # per job class: runs, expected run time, learned cores (the host's own cap.sh numbers)
         L.append(facts_line(n, fs.get(n))); L.append(clients_line(cfg, n, fs.get(n)))
-        L += [f"  {u['class']}: {u['runs']} runs, expect {m(u['expect_s'])}, {u['cores']} core(s), cpu {m(u['cpu_s'])}, wait p50 {m(u['wait_p50'])} p95 {m(u['wait_p95'])}" for u in use[n][:8]]
+        L += [f"  {u['class']}: {u['runs']} runs, expect {m(u['expect_s'])}, {u['cores']} core(s)" for u in use[n][:8]]
     return 0, L
 
 def collect_job(cfg, ref):

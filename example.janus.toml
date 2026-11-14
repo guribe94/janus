@@ -142,7 +142,8 @@ vendor = "openai"
 kind = "codex"
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
-[routing]                # ordered; the first model that is allowed and usable (a later entry is printed when it replaces an unusable first one)
+[routing]                # ordered; only the first entry is used. A later one (another provider or login) is used only with fallback = true (then printed)
+# fallback = true        # your explicit authorization to fall through to the later entries; absent: an unusable first entry is a refusal
 allow_tools = ["claude"]     # machine-enforced: only models of these coding clients may launch
 allow_auth = ["api_key"]     # machine-enforced: only providers with these auth kinds ([providers.X] auth, default api_key for kind api)
 critical = ["claude"]
@@ -180,8 +181,9 @@ discover_h = 24          # janus check discovers each host again after this many
 [fill]                   # janus fill: ready backlog units with an ITEM: <id> brief, by priority, up to capacity and budget
 watcher = false          # true: the watcher runs janus fill when check finds idle-with-backlog (owner: "launch within capacity")
 every_min = 10
-# repo = "../code"       # the repository fill makes each unit's worktree from (a brief's REPO: <path> line wins); unset: the one
-#                        # holding the project root. from = "main": the ref the new branch starts from (unset: [landing] branch)
+# repo = "app"           # the repository fill makes each unit's worktree from, relative to the project folder: it may be nested in it (the
+#                        # project folder need not be a Git root); a brief's REPO: <path> line wins. Unset: the project folder if it is
+#                        # itself a repository's top, else fill cannot make worktrees. from = "main": the ref the branches start from
 
 [budget]                 # an API unit's default budget: median cost of past runs of its kind and tier + margin_pct
 margin_pct = 30

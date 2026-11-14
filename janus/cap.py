@@ -1,8 +1,8 @@
 """Reservations, back-pressure and learned history: the one capacity rule per host (section 7, Step 2).
 
-CAP_DEFAULTS/capv/cap_nums, cap_lib (renders templates.CAP_LIB for runs/cap.sh), class_mb/class_secs, record_history,
+CAP_DEFAULTS/capv/cap_nums, cap_lib (renders templates.CAP_LIB for runs/cap.sh: the only place the history arithmetic lives), record_history,
 host_cap/next_free/build_room. build_room's refusal names when room is expected (section 9: keep that)."""
-from janus.context import fl, ts, now, sh
+from janus.context import fl, ts, now, sh, hrun, qp
 from janus.templates import CAP_LIB
 import re, shlex
 from pathlib import Path
@@ -75,41 +75,20 @@ def cap_lib(cfg, hn, h):
                       "disk": int(capv(cfg, h, "min_disk_gb")), "jobids": jobids, "sample": sample, "classes": cls,
                       "cpusample": cpusample, "agew": capv(cfg, h, "age_weight"), "exps": int(capv(cfg, h, "expect_s"))}
 
-def class_mb(hist, cls, d, cap, hn=5, margin=15):
-    """The reservation of a job class from history lines (time, class, peak MB, secs, rc): the same rule as cap_mb in runs/cap.sh."""
-    ag = cls == "agent"
-    pk = sorted([int(f[2]) for f in (l.split("\t") for l in hist) if len(f) >= 3 and f[1] == cls and f[2].isdigit() and int(f[2]) > 0][-(hn * 3 if ag else hn):])
-    if not pk: return d
-    v = max(128 if ag else 256, int((pk[(len(pk) - 1) // 2] if ag else pk[-1]) * (100 + margin) / 100))
-    return min(v, cap) if cap > 0 else v
-
-def class_secs(hist, cls, shape=None):
-    """Median run time (s) of a job class from history lines, None without history. shape (a command signature, column 8 of a
-    history line) limits the runs to COMPARABLE jobs (item 32): one class lumps a 1-minute `cargo test` together with a
-    20-minute one, so the class median flagged the long job as stuck; with a shape, only jobs of the same command count."""
-    rows = [f for f in (l.split("\t") for l in hist)
-            if len(f) >= 4 and f[1] == cls and f[3].isdigit() and (shape is None or (len(f) >= 8 and f[7] == shape))]
-    s = sorted(int(f[3]) for f in rows)
-    return s[len(s) // 2] if s else None
-
-def class_cores(hist, cls, cpj, hn=5):
-    """The cores a job class reserves (and is capped at): the same rule as cap_cores in runs/cap.sh."""
-    r = [int(f[5]) / int(f[3]) for f in (l.split("\t") for l in hist) if len(f) >= 6 and f[1] == cls and f[3].isdigit() and int(f[3]) > 0 and f[5].isdigit() and int(f[5]) > 0][-hn:]
-    return max(1, min(cpj, int(max(r) + 0.5))) if r else cpj
-
-def class_usage(hist, cpj, hn=5):
-    """Per job class, from history lines: runs, expected (median) run time, learned cores, median CPU seconds, queue wait median
-    and 95th percentile (the columns cap_record writes: time, class, peak MB, secs, rc, CPU s, wait s)."""
-    by = {}
-    for f in (l.split("\t") for l in hist):
-        if len(f) >= 5 and f[1] != "agent" and f[3].isdigit(): by.setdefault(f[1], []).append(f)
-    med = lambda v, q=0.5: sorted(v)[min(len(v) - 1, int(len(v) * q))] if v else None
+def class_rows(p):
+    """The per-class summary the host's own library printed (cap.sh cap_summary: class, runs, median seconds, learned cores):
+    [{"class", "runs", "expect_s", "cores"}]. The history arithmetic lives only in cap.sh; this just reads its output."""
     out = []
-    for c, fs in sorted(by.items(), key=lambda kv: -len(kv[1])):
-        cpu = [int(f[5]) for f in fs if len(f) >= 7 and f[5].isdigit()]; wait = [int(f[6]) for f in fs if len(f) >= 7 and f[6].isdigit()]
-        out.append({"class": c, "runs": len(fs), "expect_s": class_secs(hist, c), "cores": class_cores(hist, c, cpj, hn),
-                    "cpu_s": med(cpu), "wait_p50": med(wait), "wait_p95": med(wait, 0.95)})
+    for l in p.get("cls", []):
+        f = l.split()
+        if len(f) == 4 and f[1].isdigit(): out.append({"class": f[0], "runs": int(f[1]), "expect_s": int(f[2]) if f[2].isdigit() else None, "cores": int(f[3]) if f[3].isdigit() else None})
     return out
+
+def cap_call(h, call, lib=None):
+    """Run one function of the host's cap.sh (cap_secs <class>, cap_mb <class> <default> <cap>) on that host, against its own
+    history: the single rule. lib: the library text to source instead of the host's written runs/cap.sh."""
+    src = lib if lib else ". $RD/cap.sh"
+    return hrun(h, f"RD={qp(h['_rd'])}; [ -f $RD/cap.sh ] || [ -n {shlex.quote(lib or '')} ] || exit 0\n{src}\n{call}")[1].strip()
 
 def tree_rss_mb(pid):
     """Resident memory (MB) of process pid and its descendants (one ps call)."""
@@ -132,11 +111,10 @@ def record_history(rd, cls, peak, secs, rc):
 def host_cap(cfg, n, p, units):
     """The host's capacity now, from its probe (the numbers the admission sees) and the open units:
     slots: build jobs that fit when nothing runs; free: further jobs that fit now; agents: open units whose builds run here."""
-    h = cfg.hosts[n]; c = cap_nums(cfg, h); hist = p.get("hist", [])
-    # a typical job here: the largest reservation of the classes run lately (job_gb when nothing is recorded yet)
-    recent = {l.split("\t")[1] for l in hist[-50:] if l.count("\t") >= 2}
-    jmb = max([class_mb(hist, k, c["capmb"], c["capmb"], c["hn"], c["margin"]) for k in recent] or [c["capmb"]])
-    amb = class_mb(hist, "agent", c["agmb"], 0, c["hn"], c["margin"])
+    h = cfg.hosts[n]; c = cap_nums(cfg, h)
+    # a typical job and an agent here, as the host's own cap.sh reported them (cap_jmb: the largest reservation of the classes run
+    # lately; cap_amb: the agent class); the configured figures until a probe has answered
+    jmb = int(fl(p.get("cap_jmb")) or c["capmb"]); amb = int(fl(p.get("cap_amb")) or c["agmb"])
     rj, rc, rm, ra, ram = (int(fl(p.get(k))) for k in ("cap_rj", "cap_rc", "cap_rm", "cap_ra", "cap_ram"))
     t = list(((p.get("pueue") or {}).get("tasks") or {}).values())
     qd = sum(1 for x in t if x.get("group") in ("jobs", "place") and "Queued" in str(x.get("status")))
@@ -149,7 +127,7 @@ def host_cap(cfg, n, p, units):
     free = 0 if pause else max(0, min((c["cores"] - rc) // c["cpj"], (c["memcap"] - rm - agents_mb) // max(jmb, 1)))
     if rj == 0 and not pause and jmb <= c["memcap"] and c["cpj"] <= c["cores"]: free = max(free, 1)   # as the shell admission: the first job fits the host alone or none
     return {**c, "jmb": jmb, "amb": amb, "rj": rj, "rc": rc, "rm": rm, "ra": ra, "agents_mb": agents_mb, "queued": qd, "slots": slots,
-            "free": free, "pause": pause, "agents": [u["name"] for u in here], "on": len(on), "hist": hist, "res": p.get("res", [])}
+            "free": free, "pause": pause, "agents": [u["name"] for u in here], "on": len(on), "classes": class_rows(p), "res": p.get("res", [])}
 
 def next_free(hc):
     """When a build reservation is expected to free: the earliest (start + median run time of its class) of the running jobs."""
@@ -157,7 +135,7 @@ def next_free(hc):
     for r in hc["res"]:
         f = r.split()
         if len(f) >= 5 and f[3].isdigit():
-            s = class_secs(hc["hist"], f[4])
+            s = next((x["expect_s"] for x in hc["classes"] if x["class"] == f[4]), None)
             if s: ends.append(int(f[3]) + s)
     return min(ends) if ends else None
 
@@ -177,4 +155,4 @@ def build_room(cfg, n, hc, kind="implement"):
     return False, (f"{n} build capacity full: {a} agent(s) for {s} build slot(s) + {s} queue position(s); {hc['rj']} running, "
                    f"{hc['queued']} queued; {when}")
 
-__all__ = ["CAP_DEFAULTS", "FACTS", "facts", "capv", "cap_nums", "cap_lib", "class_mb", "class_secs", "class_cores", "class_usage", "tree_rss_mb", "record_history", "host_cap", "next_free", "build_room"]
+__all__ = ["CAP_DEFAULTS", "FACTS", "facts", "capv", "cap_nums", "cap_lib", "class_rows", "cap_call", "tree_rss_mb", "record_history", "host_cap", "next_free", "build_room"]

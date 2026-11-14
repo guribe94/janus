@@ -11,9 +11,9 @@ FAR = '\n[hosts.far]\nssh = "far"\nroot = "/x"\n'
 MUTATING_BD = {"update", "create", "close", "comments", "comment", "remember", "forget", "delete", "sync", "init", "reopen", "label", "dep", "import", "export"}
 
 
-def probe_text(avail=8192, load="1.50", rj=2, pause="", tasks=None, waits=(1, 0)):
+def probe_text(avail=8192, load="1.50", rj=2, pause="", tasks=None, waits=(1, 0), admit="yes"):
     return (f"avail_mb={avail}\nload={load}\nos=linux\ndisk_gb=100\nwait_jobs={waits[0]}\nwait_gates={waits[1]}\ncap_rj={rj}\ncap_rc=2\ncap_rm=1024\ncap_ra=0\ncap_ram=0\n"
-            f"cap_pause={pause}\n--pueue\n{json.dumps({'tasks': tasks or {}, 'groups': {}})}\n--tmux\n")
+            f"cap_pause={pause}\ncap_admit={admit}\n--pueue\n{json.dumps({'tasks': tasks or {}, 'groups': {}})}\n--tmux\n")
 
 
 def task(i, status, group="agents"): return {"id": i, "group": group, "label": f"t{i}", "status": status}
@@ -97,6 +97,22 @@ class States(Base):
         self.assertEqual({r.cells[0]: r.cells[1] for r in M.derive(view, time.time(), 5).rows["Finished"]}, {"x": "ended:unverified"})
         self.assertEqual(self.states("Finished"), {"x": "finished"})
 
+    def test_tool_model_admission_capability_freshness_and_the_handoff_checkpoint(self):
+        """Catches: a unit row without its tool beside its model, a host row that hides why it does not admit, capabilities that read
+        as 'none' when never discovered (or as fresh when old, or silently when the cache is unreadable), an overview without the
+        handoff's current percentage."""
+        w = self.w; w.units = [unit("a", model="m")]; w.probes["far"] = probe_text(admit="paused memory", rj=0)
+        (self.d / ".janus/hosts-facts.json").write_text(json.dumps({"far": {"at": time.time() - 3 * 3600, "tools": ["claude", "codex", "git"], "logins": ["claude"]}}))
+        (self.d / ".janus/HANDOFF.md").write_text("# HANDOFF\n## Objective\nship x\n## Next actions\nCheckpoint: ~60% complete - parser done; tests left; blocker none\n")
+        self.collect(); m = self.model(); r = {x.cells[0]: x.cells for x in m.machines}
+        self.assertEqual(r["far"][6], "blocked: paused memory"); self.assertEqual(r["here"][6], "admits")
+        self.assertTrue(r["far"][7].startswith("claude+ codex ("), r["far"][7])
+        self.assertTrue(r["here"][7].startswith("unknown"), r["here"][7])               # never discovered: unknown, not none
+        self.assertEqual(m.rows["Overview"][0].cells[0], "Checkpoint"); self.assertIn("~60%", m.rows["Overview"][0].cells[1]); self.assertIn("tests left", m.rows["Overview"][0].cells[1])
+        self.assertIn("/", next(x for x in m.rows["Active"] + m.rows["Finished"] if x.key == "a").cells[3])   # tool/model
+        (self.d / ".janus/hosts-facts.json").write_text("{not json"); self.collect(); m = self.model()
+        self.assertIn("unreadable", {x.cells[0]: x.cells for x in m.machines}["far"][7]); self.assertIn("unreadable", m.rows["Overview"][-1].cells[1])
+
     def test_machine_row_numbers(self):
         """Catches: wrong running/queued builds, agents, load, RAM, paused or unreachable on the machine table."""
         self.w.units = [unit("a", task=1), unit("b", task=2)]
@@ -104,7 +120,7 @@ class States(Base):
         self.w.probes["far"] = probe_text(pause="memory pressure 40")
         self.collect(); r = {x.cells[0]: x.cells for x in self.model().machines}
         self.assertEqual(r["here"][:6], ("here", "ok", "3/3", "2", "2.50", "2.0G"))   # queued: one pueue job + 2 waiting in admission
-        self.assertEqual((r["far"][1], r["far"][3]), ("PAUSED", "0")); self.assertIn("memory pressure 40", r["far"][6])
+        self.assertEqual((r["far"][1], r["far"][3]), ("PAUSED", "0")); self.assertIn("memory pressure 40", r["far"][8])
 
     def test_backlog_queue_states(self):
         """Catches: queued backlog work shown as launched, an owner's item shown as ready, ready work missing."""
@@ -166,7 +182,7 @@ class Recovery(Base):
         m = self.model(offset=40)
         self.assertEqual(self.states("Active", m), {"a": "working STALE"}); self.assertTrue(m.rows["Active"][0].stale); self.assertIn("STALE", m.rows["Active"][0].cells[1])
         self.assertTrue(any("units: STALE, last good" in b and "dolt server unreachable" in b for b in m.banners["Active"]), m.banners)
-        far = next(r for r in m.machines if r.cells[0] == "far"); self.assertEqual(far.cells[1], "UNREACHABLE"); self.assertEqual(far.cells[5], "4.0G"); self.assertIn("last good", far.cells[6])
+        far = next(r for r in m.machines if r.cells[0] == "far"); self.assertEqual(far.cells[1], "UNREACHABLE"); self.assertEqual(far.cells[5], "4.0G"); self.assertIn("last good", far.cells[8])
         self.assertEqual(next(r for r in m.machines if r.cells[0] == "here").cells[1], "ok")
         self.assertEqual(len(m.rows["Board"]), 1)   # an unrelated source is untouched
         self.w.fail = set(); self.collect(); m = self.model()

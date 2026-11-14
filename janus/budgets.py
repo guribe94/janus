@@ -162,10 +162,8 @@ def budget_note(cfg, budget, spent=None, total=None, reload=0.0):
     """What a run is told about its money: this run's budget, what its unit has used, and the checkpoint rule."""
     used = ""
     if total: used = f" (your unit has used ${spent or 0:.2f} of its ${total:g}" + (f"; about ${reload:.2f} of this run goes to loading your context again" if reload else "") + ")"
-    return (f"Budget: this run is stopped without warning once it has spent ${budget:.2f}{used}. Work in small steps; after each one commit your work and "
-            f"write your state in the report (done, left, the next step), so a stop loses nothing. janus posts a budget checkpoint on the board at about "
-            f"{bset(cfg, 'warn_pct')} % of the budget: when you read it, commit, write your state, then park on your jobs or finish with your VERDICT line; "
-            f"start no new long step.")
+    return (f"Budget: this run stops without warning at ${budget:.2f}{used}. Commit and write your state in the report at each checkpoint; "
+            f"at the board's budget checkpoint (about {bset(cfg, 'warn_pct')} %), commit, record your state, then park on your jobs or finish.")
 
 def run_spend(cfg, u):
     """(dollars the unit's open run has used so far, that run's budget): its agent session's messages since the run started,

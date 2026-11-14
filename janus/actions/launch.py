@@ -5,10 +5,12 @@ from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_shipped
+from janus.branch import landing_branch
 from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost
-from janus.cap import FACTS, build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
+from janus import lane
+from janus.cap import FACTS, build_room, cap_call, cap_nums, capv, host_cap, record_history, tree_rss_mb
 from janus.context import EXCL, Err, LockLost, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, now, pq, qp, say, sh, ts
-from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
+from janus.ledger import ledger_done, model_ok, model_tool, read_secret, reserve_budget, run_cost
 from janus.memory import MEM_SECTIONS, mem_line, memory_read
 from janus.platform import herdr
 from janus.project import project_id, tag, tmux_name
@@ -17,42 +19,33 @@ from janus.templates import CLEAN_PUEUE
 from janus.transcripts import transcript_of
 from janus.units import TAB_SEP, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
 
-def model_qualified(cfg, m):
-    """Whether a model may do normal work: [models.<m>] qualified = false marks a free or new model unqualified until
-    `janus qualify <m>` records a pass (.janus/qualified.json). Unset means qualified (inert for a one-machine setup)."""
-    c = cfg.models.get(m, {}); q = cfg.jget("qualified.json").get(m, {})
-    return True if q.get("pass") else c.get("qualified", True) is not False
+def tool_argv(mc, prompt, session=None):
+    """The coding client's command line for a launch, or for continuing `session`. Each form was read from the installed client's
+    --help (claude 2.1: --model, --resume <id>; codex 0.169: `resume <id>`, -m; opencode 2.2: `run`, --model, --session): nothing here
+    is assumed. The model comes from [models.<m>] model, the rest from its args."""
+    k, m, a = mc["kind"], mc.get("model"), mc.get("args", [])
+    if k == "claude": return ["claude", *a, *(["--model", m] if m else []), *(["--resume", session] if session else []), prompt]
+    if k == "codex": return ["codex", *(["resume", session] if session else []), *a, *(["-m", m] if m else []), prompt]
+    if k == "opencode": return ["opencode", "run", *a, *(["--model", m] if m else []), *(["--session", session] if session else []), prompt]
+    raise Err(f"no verified command line for tool {k!r} (claude, codex, opencode)")
 
-def cmd_qualify(cfg, a):
-    """janus qualify <model> [--fail] "<what it did>": record that a model passed (or failed) a small real task before it is used
-    for real work. A model with [models.<m>] qualified = false is skipped by routing for normal work until this records a pass."""
-    if a.model not in cfg.models: raise Err(f"unknown model {a.model}")
-    q = cfg.jget("qualified.json"); q[a.model] = {"pass": not a.fail, "at": ts(), "note": a.note or ""}; cfg.jput("qualified.json", q)
-    return 0, [f"{a.model}: qualification {'failed' if a.fail else 'passed'} ({a.note or 'no note'})"]
-
-def model_tool(mc):
-    """The coding client a model runs in (config: tool, else kind when it is a client, else the vendor's)."""
-    return mc.get("tool") or (mc["kind"] if mc.get("kind") in ("claude", "codex", "opencode") else {"anthropic": "claude", "openai": "codex"}.get(mc.get("vendor"), mc.get("kind")))
-
-def pick_model(cfg, tier, kind, of_vendor, host=None, fallback=True, note=None):
-    """The first model of [routing] (tier, or review for a review) that is allowed and usable. Allowed is decided by the one config
-    (janus/ledger.model_ok: provider enabled, [routing] allow_tools / allow_auth, budget); a model that is not is never used. A later
-    entry replaces an unusable first one only when fallback is true, and then note (a list) gets the reason of each skipped entry
-    so the launch says it; unattended callers (fill) pass fallback=False and get the refusal instead."""
+def pick_model(cfg, tier, kind, host=None, note=None):
+    """The model of [routing] (tier, or review for a review) that is allowed and usable. Allowed is decided by the one config
+    (janus/ledger.model_ok: provider enabled, [routing] allow_tools / allow_auth, budget). Only the first entry is used: a later
+    one (another provider, another login) replaces an unusable first only when the human wrote `fallback = true` in [routing];
+    then note (a list) gets the reason of each skipped entry so the launch says it. Otherwise the refusal names why."""
     lst = cfg.route.get("review" if kind == "review" else tier, [])
     why = []
     for i, m in enumerate(lst):
         c = cfg.models.get(m, {})
-        if i and not fallback: break
+        if i and cfg.route.get("fallback") is not True: break
         if host and host not in c.get("hosts", list(cfg.hosts)): why.append(f"{m}: not allowed on {host}"); continue
-        if kind == "review" and of_vendor and c.get("vendor") == of_vendor: why.append(f"{m}: same vendor as implementer"); continue
-        if not model_qualified(cfg, m) and kind != "qualify": why.append(f"{m}: not qualified (janus qualify {m})"); continue
         ok, w = model_ok(cfg, m)
         if ok:
-            if why and note is not None: note.append(f"routed to {m}; skipped " + "; ".join(why))
+            if why and note is not None: note.append(f"routed to {m} ([routing] fallback = true); skipped " + "; ".join(why))
             return m
         why.append(f"{m}: {w}")
-    raise Err("no model available for " + tier + "/" + kind + " (" + "; ".join(why) + ")")
+    raise Err("no model available for " + tier + "/" + kind + " (" + ("; ".join(why) or "none configured") + ")" + ("" if cfg.route.get("fallback") is True or len(lst) < 2 else "; no fallback to the later entries unless [routing] fallback = true"))
 
 def agent_prompt(cfg, unit, brief, hn, report=None, budget=None):
     """The first prompt of a unit. It names the report path the unit must keep (row 26: a resumed unit continues its original
@@ -63,9 +56,9 @@ def agent_prompt(cfg, unit, brief, hn, report=None, budget=None):
     rc, o, e = board(cfg, "rule", unit, *([] if cfg.hosts[hn].get("local") else [hn]))
     rp = report or "REPORT.md (the path in the brief)"
     board_rule = f" {o.strip()}" if o.strip() else ""
-    return (f"Read {brief} (absolute path) and carry out every instruction exactly. Keep {rp} current after every step so a run "
-            f"stopped by its budget leaves its state: line 1 'VERDICT: PENDING' until done, then end with 'VERDICT: DONE' or "
-            f"'VERDICT: BLOCKED' and the real exit codes.{board_rule}" + (f" {budget_note(cfg, budget)}" if budget else ""))
+    return (f"Read {brief} (absolute path) and carry out its instructions. Report in {rp}, updated at checkpoints (a result, a decision, a "
+            f"blocker): line 1 'VERDICT: PENDING' until done, then 'VERDICT: DONE' or 'VERDICT: BLOCKED' with the real exit codes.{board_rule}"
+            + (f" {budget_note(cfg, budget)}" if budget else ""))
 
 def wait_shell(pane, unit):
     for _ in range(30):
@@ -186,10 +179,9 @@ def cmd_api_run(cfg, a):
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(s, fwd)
     # the agent's reservation on this host (runs/agent-<unit>.res) while it runs; its peak memory goes to the history (class agent)
     h = cfg.hosts.get(hn, {"_rd": str(cfg.f("runs"))}); rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True); t0 = now(); peak = 0
-    try: hist = (rd / "history.tsv").read_text().splitlines()
-    except OSError: hist = []
     n = cap_nums(cfg, h); resf = rd / f"agent-{name}.res"
-    atomic_write(resf, f"{p.pid} 0 {class_mb(hist, 'agent', n['agmb'], 0, n['hn'], n['margin'])} {int(t0)} agent\n")
+    mb = cap_call({**h, "local": True, "_rd": str(rd)}, f"cap_mb agent {n['agmb']} 0") if (rd / "cap.sh").exists() else ""   # the host's own rule (cap.sh)
+    atomic_write(resf, f"{p.pid} 0 {mb or n['agmb']} {int(t0)} agent\n")
     while True:
         try: rc = p.wait(timeout=10); break
         except subprocess.TimeoutExpired: peak = max(peak, tree_rss_mb(p.pid))
@@ -220,30 +212,50 @@ def clean_pueue_script(h):
     else: real = f"{h['bin']}/pueue" if h.get("bin") else "$HOME/.local/bin/pueue"
     return CLEAN_PUEUE % {"real": real}
 
-def lane_runner(cfg, hn, h, name, rcwd):
-    """<root>/run/<unit>.lane on host h: `lane <command>` runs the command in the agent's tree through this host's pueue jobs lane,
-    with janus's admission (runs/cap.sh: reservations) and MemoryMax, waits, prints the log and exits with its code (M9; fixes5 item 2).
-    `lane --detach <command>` queues it, prints <host>:<task> and returns at once (janus-fixes9: agents never wait)."""
-    a = argparse.Namespace(lane="jobs", subdir=None, usb=False, wt=rcwd)
-    rd = runs_dir(cfg, h); q = shlex.quote
-    crd = in_container(h, rd)   # the runs dir as the job sees it
-    js = job_script(cfg, hn, h, a, name, f"bash {qp(crd + '/__JID__.cmd')}", "__JID__", wd=rcwd, clsrc='"$(cat "$R.cmd")"')
-    return ("#!/bin/bash\n# janus lane runner for unit " + name + f" on {hn}: lane <command>\nRD={qp(rd)}; mkdir -p \"$RD\"\n"
-            f"det=; [ \"$1\" = --detach ] && {{ det=1; shift; }}\n"
-            f"jid={name}-$(date +%m%d-%H%M%S)-$$; R=\"$RD/$jid\"\nprintf '%s\\n' \"$*\" > \"$R.cmd\"\n"
-            f"cat > \"$R.sh\" <<'JANUS_JOB_EOF'\n{js}JANUS_JOB_EOF\nsed -i \"s/__JID__/$jid/g\" \"$R.sh\"\n"
-            f"{pueue(h)} group add -p 1 jobs >/dev/null 2>&1\n"
-            f"tid=$(env -i HOME=\"$HOME\" USER=\"$USER\" PATH=\"$PATH\" ${{XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"}} LANG=\"${{LANG:-C.UTF-8}}\" {pueue(h)} add -g jobs -l {tag(cfg, 'unit:' + name)} -w \"$RD\" --print-task-id -- \"bash $(printf %q \"$R.sh\")\") || exit 125\n"
-            f"echo \"lane: queued {hn}:$tid ($jid)\" >&2\n[ -n \"$det\" ] && {{ echo \"{hn}:$tid\"; exit 0; }}\n"
-            f"{pueue(h)} wait -q $tid; cat \"$R.log\"; exit $(cat \"$R.rc\" 2>/dev/null || echo 255)\n")
+def seed_repo(cfg, h, name, cwd, rcwd):
+    """Give a remote unit's copy (rsynced without .git) its repository identity, so it can commit, merge and publish on its own host
+    (janus land there): a git bundle of the landing branch and the unit's HEAD goes over rsync, the host fetches it into a new
+    .git in the copy, points HEAD at the unit's branch and resets the index to it (the copy's files, uncommitted changes included,
+    stay as sent). The origin url, user name and email are copied from the source repository so a plain push can work. Returns
+    {"branch", "landing", "base"} for the unit record, or (None, why) when cwd is no git tree: the copy then stays a snapshot."""
+    g = lambda *a: sh(["git", "-C", str(cwd), *a], timeout=120)
+    if g("rev-parse", "--git-dir")[0]: return None, f"{cwd} is not a git tree"
+    br = landing_branch(cfg, cwd)
+    if g("rev-parse", "-q", "--verify", f"refs/heads/{br}")[0]: return None, f"no branch {br} in {cwd} (set [landing] branch)"
+    head = g("symbolic-ref", "--short", "-q", "HEAD")[1].strip(); base = g("rev-parse", "HEAD")[1].strip()
+    ub = head if head and head != br else f"janus/{name}"
+    root = h["root"]; bf = f"{root}/run/{name}.bundle"
+    if cfg.run.dry: say(f"+ git bundle {br} HEAD -> {h['ssh']}:{bf}; fetch into {rcwd}/.git as {ub}"); return {"branch": ub, "landing": br, "base": base}, ""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        rc, o, e = g("bundle", "create", f"{td}/b", f"refs/heads/{br}", "HEAD")
+        if rc: return None, f"git bundle failed: {(e or o).strip()[-120:]}"
+        rc, o, e = sh(["rsync", "-a", "-e", " ".join(SSH), f"{td}/b", f"{h['ssh']}:{bf.replace('$HOME/', '')}"], timeout=900)
+        if rc: return None, f"sending the bundle failed: {(e or o).strip()[-120:]}"
+    cf = lambda k: g("config", "--get", k)[1].strip()
+    conf = "".join(f"git config {k} {shlex.quote(v)}; " for k, v in (("user.name", cf("user.name")), ("user.email", cf("user.email"))) if v)
+    rem = cfg.c.get("git", {}).get("remote") or "origin"; url = g("remote", "get-url", rem)[1].strip()
+    rc, o, e = hrun(h, f"set -e; cd {qp(rcwd)}; rm -rf .git; git init -q; git symbolic-ref HEAD refs/heads/janus-seed; "
+                       f"git fetch -q {qp(bf)} +refs/heads/{shlex.quote(br)}:refs/heads/{shlex.quote(br)} +HEAD:refs/heads/{shlex.quote(ub)}; "
+                       f"git symbolic-ref HEAD refs/heads/{shlex.quote(ub)}; git reset -q; {conf}"
+                       + (f"git remote add {shlex.quote(rem)} {shlex.quote(url)}; " if url else "") + f"rm -f {qp(bf)}", timeout=300)
+    if rc: return None, f"preparing the repository on the host failed: {(e or o).strip()[-160:]}"
+    return {"branch": ub, "landing": br, "base": base}, ""
 
-PARK_RULE = ("**Never wait for a build or test (janus rule).** Submit it with `{submit}`: it prints the job id (`<host>:<task>`) at once. "
-             "Then write a line `WAITING <job ids>` in your report ({report}) and end your turn. Do not poll, sleep or wait for a job: "
-             "janus resumes this same session with each job's exit code and log path when all of them have finished. A turn spent "
-             "waiting costs money and can end the run at its budget cap with nothing written. When you are finished, write the closing "
-             "`VERDICT:` line as the **last line** of the report: a park line after it that names a job janus knows (a `<host>:<task>` "
-             "for a host in this config, on the park line or the line after it) means the unit is parked, not finished; a park word "
-             "that names no such job does not park it, so the closing VERDICT line still stands.\n\n")
+def lane_runner(cfg, hn, h, name, rcwd):
+    """The unit's `lane` command on host h (<root>/run/<unit>.lane) and its settings (<unit>.lane.json): `lane [--detach] [--broad
+    REASON] <command>` is janus/lane.py (shipped to <root>/bin) run there. It applies the guard `janus run` applies and queues through
+    the same queue_job, with the job script this module generates (job_script: admission by the host's own cap.sh, history,
+    MemoryMax); it waits for the exit code unless --detach (agents never wait: janus-fixes9). Returns (shell text, json text)."""
+    a = argparse.Namespace(lane="jobs", subdir=None, usb=False, wt=rcwd)
+    crd = in_container(h, runs_dir(cfg, h))   # the runs dir as the job sees it
+    mk = lambda **k: job_script(cfg, hn, h, argparse.Namespace(**{**vars(a), **k}), name, f"bash {qp(crd + '/__JID__.cmd')}", "__JID__", wd=rcwd, clsrc='"$(cat "$R.cmd")"')
+    conf = {"host": hn, "unit": name, "wt": rcwd, "label": tag(cfg, "unit:" + name), "rd": h["_rd"], "pueue": pueue(h), "ensure": ensure_lanes(h, cfg),
+            "script": mk(), "script_broad": mk(broad="lane --broad"), "patterns": cfg.capc.get("broad_patterns", lane.BROAD_PATTERNS), "broad_min": capv(cfg, h, "broad_min")}
+    return (f"#!/bin/sh\nexec python3 {qp(h['root'] + '/bin/lane.py')} {qp(h['root'] + f'/run/{name}.lane.json')} \"$@\"\n", json.dumps(conf))
+
+PARK_RULE = ("**Builds and tests (janus):** submit with `{submit}`; it prints the job id (`<host>:<task>`) at once. Then write "
+             "`WAITING <job ids>` in your report ({report}) and end your turn: janus resumes this session with each result. Do not poll or sleep.\n\n")
 
 def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
     """What every agent gets at start besides its brief: the project memory IN FULL (binding instructions first, never cut), then
@@ -268,29 +280,30 @@ def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
 
 def report_block(report=None):
     """Run only the tests the change can affect, and the structured report janus reads before the prose."""
-    return ("**Tests (janus):** run only the tests your change can affect, through the lane; a whole-suite run needs the orchestrator's go.\n"
-            f"- Structured report: also write `report.json` beside {report or 'REPORT.md'} (verdict, files_changed, jobs with their exit codes, left); "
-            f"janus reads it before the prose.\n")
+    return ("**Tests (janus):** run only the tests your change can affect, through the lane (a whole-suite run needs `--broad <reason>`). "
+            f"Also write `report.json` beside {report or 'REPORT.md'} (verdict, files_changed, jobs with exit codes, left): janus reads it first.\n")
 
-def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None):
+def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None, repo=None):
     """The header every unit's brief gets: the absolute report path once, prominently (the one thing janus reads; a runtime that
     wrote it elsewhere lost its report), where it runs and how it submits builds and tests (detached, then WAITING), its report,
     the test rule, then the project memory and the shared-knowledge pointers (swarm_header)."""
     rep = report or "REPORT.md"
     head = (f"<!-- janus: unit {name} runs on {hn} -->\n"
-            f"**Write your report to `{rep}`.** That absolute path is the only report janus reads: keep it current after every "
-            f"step (line 1 'VERDICT: PENDING' until done, then end with 'VERDICT: DONE' or 'VERDICT: BLOCKED' and the real exit "
-            f"codes). Do not write the report anywhere else.\n")
+            f"**Report:** `{rep}` is the only report janus reads. Line 1 `VERDICT: PENDING`; update it at checkpoints; "
+            f"end with `VERDICT: DONE` or `VERDICT: BLOCKED` and the real exit codes.\n")
     if local:
         b = build or hn
         return (head + PARK_RULE.format(
             submit=f"janus run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=rep)
             + report_block(report) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
+    git = (f"**Git (janus):** `{rcwd}` is a git checkout on branch `{repo['branch']}`, cut from `{repo['landing']}` at {repo['base'][:9]}; commit your work "
+           f"there. `janus land {name}` merges the landing branch, squashes and publishes from this host (a plain, never forced push); "
+           f"you do not push or merge to `{repo['landing']}` yourself.\n" if repo else
+           "**No git here (janus):** your copy has no `.git`, so do not run git commands; list every file you changed in your report "
+           "(janus collects a patch of your changes).\n")
     return (head + f"**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
-            f"brings back a patch of your changes, your REPORT and logs). **No git here (janus):** your copy has no `.git` and no "
-            f"remote, so do not run git commands; write the code, and list every file you changed in your report (janus collects a "
-            f"patch of your changes). Run every build and test through this host's pueue lane: "
+            f"brings back a patch of your changes, your REPORT and logs). {git}Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
             f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=rep)
             + report_block(report) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
@@ -457,7 +470,7 @@ def cmd_launch(cfg, a):
         ok, w = model_ok(cfg, a.model)
         if not ok: raise Err(f"model {a.model}: {w}")
     route_note = []
-    mname = a.model or pick_model(cfg, a.tier, a.kind, of.get("vendor") if of else None, a.host, note=route_note)
+    mname = a.model or pick_model(cfg, a.tier, a.kind, a.host, note=route_note)
     for n_ in route_note: say(f"note: {n_}")
     mc = cfg.models[mname]
     hs = getattr(a, "probes", None)
@@ -549,12 +562,17 @@ def cmd_launch(cfg, a):
                     if rc: raise Err(f"rsync to {hn} failed (exit {rc}): {(e or o).strip()[-160:]}")
                 # base/<unit>: the tree as sent, so collect can bring back only the agent's changes as a patch (H9)
                 X(cfg, h, f"rm -rf {qp(f'{root}/base/{name}')} && cp -a {qp(rcwd)} {qp(f'{root}/base/{name}')}", timeout=300)
-                put_script(cfg, h, f"{root}/run/{name}.lane", lane_runner(cfg, hn, h, name, rcwd))
+                repo, why_repo = seed_repo(cfg, h, name, cwd, rcwd)   # the repository there: the unit commits, merges and lands on its own host
+                if repo: u.update(repo=repo)
+                else: say(f"note: {name}'s copy on {hn} is a snapshot without git ({why_repo}); its changes come back with janus collect")
+                if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane's admission and the agent's reservation use it
+                lsh, lcf = lane_runner(cfg, hn, h, name, rcwd)
+                put_script(cfg, h, f"{root}/run/{name}.lane", lsh); put_script(cfg, h, f"{root}/run/{name}.lane.json", lcf, "644")
+                put_script(cfg, h, f"{root}/bin/lane.py", (Path(lane.__file__)).read_text(), "644")   # the shared queueing core, run there
                 if not cfg.paths.get("board"):
                     for n, t in board_shipped(cfg): put_script(cfg, h, f"{root}/bin/{n}", t)   # the shipped board there (outbox)
-                if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane runner's admission and the agent's reservation use it
                 ship_context(cfg, h, name, bcopy)
-                put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + btext, "644")
+                put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred, repo=u.get("repo")) + btext, "644")
                 if start:   # a resumed unit starts from the report it continues; there it writes <root>/out/<unit>/REPORT.md, its own
                     put_script(cfg, h, f"{root}/out/{name}/REPORT.md", start.read_text(), "644")
                 else: X(cfg, h, f"[ -s {qp(env['JANUS_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['JANUS_REPORT'])}")
@@ -608,11 +626,9 @@ def cmd_launch(cfg, a):
                     agent_res(cfg, hn, h, name, u.get("pid"))
                 else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
             else:
-                cli = {"claude": "claude", "codex": "codex", "opencode": "opencode run"}[mc["kind"]]
                 e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-                if mc["kind"] == "opencode": e += " OPENCODE_CONFIG_CONTENT=" + shlex.quote(json.dumps({"model": mc["model"]}))
                 mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -- " if mm else ""   # fixes5 item 7
-                inner = f"cd {qp(rcwd)} && exec env {e} {sd}{cli} {shlex.join(mc.get('args', []))} {shlex.quote(prompt)}"
+                inner = f"cd {qp(rcwd)} && exec env {e} {sd}{shlex.join(tool_argv(mc, prompt))}"
                 pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
                 tm = tmux_name(cfg, name)
                 rc, o, er = X(cfg, h, pre + f"tmux new -d -s {shlex.quote(tm)} {shlex.quote(inner)} && tmux display -p -t {shlex.quote(tm)} '#{{pane_pid}}'")

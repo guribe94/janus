@@ -2,15 +2,18 @@
 
 The runtime compacts a long context on its own, lossily. janus resets it first, above [project] reset_tokens (default 120000),
 using what each tool supports and checking that it happened: Claude Code `/clear` and Codex `/new` start a new session (their
-SessionStart hook then registers it; the harness binaries' own command tables were read for this), and the reset counts as done
-only when the registered session id and transcript are new. Any other tool is reported unsupported: nothing is claimed.
+SessionStart hook then registers it), and OpenCode's TUI command `/new` does (it has no hook: the new session registers itself with
+`janus register`, from the OPENCODE_SESSION_ID that OpenCode puts in its command environment). All three were read from the installed
+binaries' own command tables. The reset counts as done only when a NEW session registers (for Claude and Codex also a new
+transcript); a token count that merely dropped proves nothing. OpenCode keeps no transcript janus can read, so it has no automatic
+size trigger: `janus watch --reset` is its explicit reset. Any other tool is reported unsupported: nothing is claimed.
 Before it, at the turn's Stop, the orchestrator is asked once to bring HANDOFF.md up to date (MEMORY.md is always current);
 after it the new session is told to read both."""
 import json, os, subprocess, sys, time
 from janus.context import JANUS_MARK, JANUS_SELF, atomic_write, clean_env, herdr, memory_path, handoff_path, now, ts, wake_clear
 
 # tool kind -> the slash command that starts a new session there (read from each binary's command table, not assumed)
-RESET_CMD = {"claude": "/clear", "codex": "/new"}
+RESET_CMD = {"claude": "/clear", "codex": "/new", "opencode": "/new"}
 
 def log_line(cfg, m): cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
 
@@ -92,12 +95,14 @@ def reset_now(cfg, wait_s=60, verify_s=90):
     old_tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
     atomic_write(cfg.f("session"), f"pending:{int(now())}:{pane}")   # the new session's SessionStart hook claims it (hooks.cmd_hook)
     herdr("agent", "prompt", pane, cmd)
+    if kind == "opencode":   # no SessionStart hook: the new session itself runs janus register (a prompt that reached the old one cannot pass the check)
+        time.sleep(3); herdr("agent", "prompt", pane, JANUS_MARK + "You are the orchestrator in a new session. Run janus register, then " + wake_clear(cfg, "the session was reset"))
     for _ in range(max(1, verify_s // 3)):
         time.sleep(3)
         cur = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
         tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
-        if cur and not cur.startswith("pending:") and cur != old and tr != old_tr:
-            herdr("agent", "prompt", pane, JANUS_MARK + wake_clear(cfg, "the session was reset"))
+        if cur and not cur.startswith("pending:") and cur != old and (tr != old_tr or kind == "opencode"):
+            if kind != "opencode": herdr("agent", "prompt", pane, JANUS_MARK + wake_clear(cfg, "the session was reset"))
             log_line(cfg, f"context reset verified: new session {cur[:12]} (was {old[:12]}), {kind} {cmd}"); return True
     atomic_write(cfg.f("session"), old)
     log_line(cfg, f"context reset NOT verified: no new session registered within {verify_s} s after {cmd}; the old registration is restored"); return False

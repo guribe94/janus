@@ -36,7 +36,9 @@ def cmd_ledger(cfg, a):
         return 0
     if a.action == "reconcile":   # runs whose agent is gone and that have no done row: done unknown, budget as the upper bound
         if not cfg.run.dry: refuse_agent("janus ledger reconcile")
-        units = Beads(cfg).units(); hs = probe_all(cfg); ag = herdr_agents(cfg)
+        units = Beads(cfg).units()
+        with cfg.unlocked(): hs = probe_all(cfg)   # never under the writer lock
+        ag = herdr_agents(cfg)
         for u in units: u["state"] = unit_state(u, hs, ag)
         for n, pv in pvs:
             rs = unreconciled(cfg, pv, units)

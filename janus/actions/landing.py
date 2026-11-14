@@ -67,7 +67,7 @@ def cmd_land(cfg, a):
     if hn and not cfg.hosts.get(hn, {}).get("local"):   # the unit's tree is on another host: its git, there
         if hn not in cfg.hosts: raise Err(f"unknown host {hn}")
         wt = Where(cfg.hosts[hn], u.get("rcwd") or u.get("cwd")); say(f"landing {a.unit} on {hn} ({wt}): merge, squash and push happen there")
-        if git(wt, "rev-parse", "--git-dir")[0]: raise Err(f"{wt} on {hn} is not a git worktree: land the collected patch here instead (janus collect, git apply --3way)")
+        if git(wt, "rev-parse", "--git-dir")[0]: raise Err(f"{wt} on {hn} is not a git worktree (a unit launched before copies carried their repository): land the collected patch here instead (janus collect, git apply --3way)")
     else:
         wt = Path(u.get("cwd", "/"))
         if not own_tree(cfg, u, [x for x in Beads(cfg).units()]) or not wt.is_dir(): raise Err(f"{a.unit} has no worktree of its own ({wt}): nothing to land")
@@ -76,7 +76,7 @@ def cmd_land(cfg, a):
                          f"git -C {wt} apply --3way {up}, commit, then janus land {a.unit} again; do not close it before (its work exists only in that patch)")
     rc, branch, e = git(wt, "symbolic-ref", "--short", "HEAD"); branch = branch.strip()
     if rc: raise Err(f"{wt} is not on a branch")
-    br = ld.get("branch") or (landing_branch(cfg, wt) if not isinstance(wt, Where) else "main")
+    br = ld.get("branch") or ((u.get("repo") or {}).get("landing") or "main" if isinstance(wt, Where) else landing_branch(cfg, wt))   # a remote copy: the branch its seed was cut from
     if branch == br: raise Err(f"{wt} is on {br} itself")
     if git(wt, "status", "--porcelain", "--untracked-files=no")[1].strip(): raise Err(f"{wt} has uncommitted changes: commit them first")
     if git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")[0] == 0: raise Err(f"{wt} has a merge in progress (MERGE_HEAD): finish or abort it")
@@ -117,7 +117,8 @@ def cmd_land(cfg, a):
                     err = move_local(wt, br, git(wt, "rev-parse", upref)[1].strip(), base)
                     if err: raise Err(err)
                     continue
-                raise Err(f"push of {new[:9]} to {rem} refused and {br} here cannot follow {upref}: reconcile by hand, then janus land {a.unit} again")
+                raise Err(f"NOT PUBLISHED: push of {new[:9]} to {rem} was refused ({(e or o).strip()[-100:]}) and {br} did not move there or here. The integrated result "
+                          f"stays on {branch} in {wt}; fix the cause (access, protection, a moved {br} that {br} here cannot follow), then janus land {a.unit} --push again")
             pushed = True
         err = move_local(wt, br, new, base)
         if err and not pushed:
@@ -125,6 +126,7 @@ def cmd_land(cfg, a):
             raise Err(f"{br} kept moving: {LAND_TRIES} attempts; run janus land {a.unit} again when it settles")
         if err: say(f"note: pushed to {rem}, but {br} here did not follow ({err}): fetch, then fast-forward it")
         say(f"landed {a.unit}: {br} {base[:9]} -> {new[:9]} ({len(subj)} commit(s) squashed)" + (f"; pushed to {rem}" if pushed else "; not pushed") + f"; close is separate (janus close {a.unit})")
+        if isinstance(wt, Where) and not pushed: say(f"note: {br} moved only in {wt} on {hn}: publish with `janus land {a.unit} --push` (the host needs access to {rem}), or fetch it: git fetch ssh://{wt.h['ssh']}{wt.path} {br}")
         if integrated: say(f"note: {br} had moved, so this integrated other work; the merge was clean, which does not prove the merged tree is right: run the tests that matter (janus run) if they do")
         if u.get("id"): Beads(cfg).comment(u["id"], f"{ts()} landed on {br} as {new[:9]}")
         return 0

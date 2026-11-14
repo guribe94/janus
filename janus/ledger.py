@@ -242,15 +242,28 @@ def read_secret(pv):
             tried.append(f"{p} (no {var}=)")
     raise Err(f"no API key: " + ("; ".join(tried) or "set key_keychain (macOS) or key_file (mode 600) in the provider's janus.toml table"))
 
-def model_ok(cfg, m):
+def model_tool(mc):
+    """The coding client a model runs in (config: tool, else kind when it is a client, else the vendor's)."""
+    return mc.get("tool") or (mc["kind"] if mc.get("kind") in ("claude", "codex", "opencode") else {"anthropic": "claude", "openai": "codex"}.get(mc.get("vendor"), mc.get("kind")))
+
+def route_ok(cfg, m):
+    """(ok, why not): may a unit use model m at all? The one place the human's restrictions are enforced (provider enabled, [routing]
+    allow_tools, allow_auth), for a launch and for a resume alike; nothing here picks another route."""
     c = cfg.models.get(m)
     if not c: return False, "unknown model"
     pv = cfg.prov.get(c["provider"], {})
     if not pv.get("enabled"): return False, f"provider {c['provider']} disabled"
-    r = cfg.route; tool = c.get("tool") or (c["kind"] if c.get("kind") in ("claude", "codex", "opencode") else {"anthropic": "claude", "openai": "codex"}.get(c.get("vendor"), c.get("kind")))
+    r = cfg.route; tool = model_tool(c)
     auth = pv.get("auth") or ("api_key" if c.get("kind") == "api" else "subscription")
     if r.get("allow_tools") is not None and tool not in r["allow_tools"]: return False, f"tool {tool} is not in [routing] allow_tools"
     if r.get("allow_auth") is not None and auth not in r["allow_auth"]: return False, f"auth {auth} (provider {c['provider']}) is not in [routing] allow_auth"
+    return True, ""
+
+def model_ok(cfg, m):
+    """route_ok, and the provider's ledger and budget for a new run."""
+    ok, why = route_ok(cfg, m)
+    if not ok: return ok, why
+    pv = cfg.prov.get(cfg.models[m]["provider"], {}); c = cfg.models[m]
     if "ledger" in pv:
         runs, bad, _ = ledger_read(cfg, pv)
         if bad: return False, f"{c['provider']} ledger malformed ({len(bad)} problem(s); janus ledger check)"
@@ -261,4 +274,4 @@ def model_ok(cfg, m):
 
 RECONCILED = "done unknown"   # a reconciled run: its agent is gone with no done row; its budget is counted as the upper bound
 
-__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_json", "run_time", "session_before", "run_cost", "keep_run_json", "settle_run", "recost_plan", "reconciled_plan", "left_cost", "row_time", "recost", "read_secret", "model_ok", "RECONCILED"]
+__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_json", "run_time", "session_before", "run_cost", "keep_run_json", "settle_run", "recost_plan", "reconciled_plan", "left_cost", "row_time", "recost", "read_secret", "model_tool", "route_ok", "model_ok", "RECONCILED"]

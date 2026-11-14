@@ -212,7 +212,7 @@ class PromptFixes(unittest.TestCase):
         f = d / ".janus/out/u/u.md"
         self.assertTrue(f.exists(), "the brief with the header was not written")
         hd = f.read_text(); rep = str(d / ".janus/out/u/REPORT.md")
-        self.assertIn(f"Write your report to `{rep}`", hd)     # the absolute path, once, prominently (the opencode path)
+        self.assertIn(f"`{rep}` is the only report janus reads", hd)     # the absolute path, once, prominently (the opencode path)
         self.assertIn(rep, hd)                                 # and the same path in the park rule and the quality block
 
 
@@ -381,7 +381,9 @@ class LaunchQuoting(unittest.TestCase):
         self.assertEqual(janus.busy_reasons(cfg, wt, hs=hs, ps=""), [])
         # a remote host whose root has the same characters: every generated script parses
         cfg.hosts["far"] = {"ssh": "nowhere", "root": "$HOME/o (`r) it's", "_rd": "$HOME/o (`r) it's/runs"}
-        for txt in (janus.lane_runner(cfg, "far", cfg.hosts["far"], "u", "$HOME/o (`r) it's/worktrees/u"),
+        lsh, lcf = janus.lane_runner(cfg, "far", cfg.hosts["far"], "u", "$HOME/o (`r) it's/worktrees/u")
+        self.assertEqual(json.loads(lcf)["unit"], "u")
+        for txt in (lsh, json.loads(lcf)["script"], json.loads(lcf)["script_broad"],
                     janus.job_script(cfg, "far", cfg.hosts["far"], r, "wt (`q) x", "cat x", "j-1")):
             self.assertEqual(subprocess.run(["bash", "-n"], input=txt, text=True, capture_output=True).returncode, 0, txt)
 
@@ -436,16 +438,18 @@ class Capacity(unittest.TestCase):
         (self.d / "rd/cap.sh").write_text(janus.cap_lib(self.cfg, "b", self.h))
     def sh(self, script, env=None):
         return subprocess.run(["sh", "-c", f'RD={self.d}/rd; . $RD/cap.sh\n' + script], capture_output=True, text=True, env={**os.environ, **(env or {})}).stdout
-    def test_class_and_learned_reservation_match_python(self):
+    def test_class_and_learned_reservation(self):
+        """Catches: the shell rule (the only one) mis-learning a class's reservation, or janus's view (cap_jmb/cap_amb/cls lines
+        from cap_report) disagreeing with what admission reserves."""
         self.assertEqual(self.sh('cap_class "cd processing && FOO=1 nice -n 10 cargo test -p x"').strip(), "cargo_test")
         self.assertEqual(self.sh('cap_mb cargo_test 2560 2560').strip(), "2560")              # nothing learned: job_gb
         hist = ["1\tcargo_test\t900\t60\t0", "2\tcargo_test\t1200\t300\t0", "3\tother\t9000\t5\t0"] + [f"{i}\tagent\t{v}\t9\t0" for i, v in enumerate((200, 700, 300))]
         (self.d / "rd/history.tsv").write_text("\n".join(hist) + "\n")
-        for cls in ("cargo_test", "other", "agent", "none"):
-            cap = 0 if cls == "agent" else 2560
-            self.assertEqual(int(self.sh(f'cap_mb {cls} 2560 {cap}')), janus.class_mb(hist, cls, 2560, cap), cls)
-        self.assertEqual(janus.class_mb(hist, "cargo_test", 2560, 2560), 1380)   # max 1200 + 15 %
-        self.assertEqual(janus.class_mb(hist, "agent", 1024, 0), 345)            # median 300 + 15 %
+        self.assertEqual(self.sh('cap_mb cargo_test 2560 2560').strip(), "1380")              # max 1200 + 15 %
+        self.assertEqual(self.sh('cap_mb agent 1024 0').strip(), "345")                       # median 300 + 15 %
+        rep = [l.split("=", 1) for l in self.sh("cap_summary").splitlines()]; one = dict(rep)
+        self.assertEqual((one["cap_jmb"], one["cap_amb"]), ("2560", "345"))                  # other: 9000 capped at job_gb
+        self.assertEqual([v for k, v in rep if k == "cls"][0], "cargo_test 2 300 2")   # runs, median seconds, cores_per_job without a measured CPU
     def test_reservations_admission_and_pause(self):
         holder = subprocess.Popen(["sleep", "60"])
         try:
@@ -515,7 +519,7 @@ class Capacity(unittest.TestCase):
         hn, b, why = janus.choose(cfg, a, d / ".janus/briefs/none.md", cfg.models["m"], [], hs)
         self.assertEqual((hn, b), ("here", "here"))
     def test_build_room_and_when(self):
-        p = host_probe(cap_rj="2", cap_rc="4", cap_rm="5000", hist=[f"{int(time.time()) - 100}\tcargo_test\t2000\t600\t0"],
+        p = host_probe(cap_rj="2", cap_rc="4", cap_rm="5000", cap_jmb="2300", cap_amb="1024", cls=["cargo_test 1 600 2"],
                        res=[f"1 2 2300 {int(time.time()) - 60} cargo_test a.res"])
         units = [{"name": "u1", "host": "b", "build": "b"}]
         hc = janus.host_cap(self.cfg, "b", p, units)

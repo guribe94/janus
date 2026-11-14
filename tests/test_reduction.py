@@ -28,8 +28,31 @@ class Reduction(unittest.TestCase):
     def test_a_denied_route_cannot_launch_or_be_substituted(self):
         d, cfg = project('[routing]\nallow_tools = ["claude"]\nallow_auth = ["api_key"]\nnormal = ["c", "m"]\n')
         self.assertFalse(janus.model_ok(cfg, "c")[0]); self.assertIn("allow_tools", janus.model_ok(cfg, "c")[1])
-        note = []; self.assertEqual(janus.pick_model(cfg, "normal", "implement", None, note=note), "m"); self.assertIn("skipped", note[0])   # said, not silent
-        with self.assertRaises(janus.Err): janus.pick_model(cfg, "normal", "implement", None, fallback=False)   # unattended: a refusal, not a substitute
+        with self.assertRaises(janus.Err) as e: janus.pick_model(cfg, "normal", "implement")    # the first entry is denied: refused, not a substitute
+        self.assertIn("fallback", str(e.exception))
+        cfg.route["fallback"] = True; note = []                                             # only the human's explicit setting allows the later entry
+        self.assertEqual(janus.pick_model(cfg, "normal", "implement", note=note), "m"); self.assertIn("skipped", note[0])
+
+    def test_a_denied_route_also_blocks_a_resume_and_each_tool_has_its_verified_command_line(self):
+        d, cfg = project('[routing]\nallow_tools = ["claude"]\n'); cfg.hosts["here"]["local"] = True
+        u = {"name": "u", "host": "here", "model": "c", "via": "herdr"}
+        with self.assertRaises(janus.Err) as e: janus.resume_unit(cfg, u, "go")
+        self.assertIn("allow_tools", str(e.exception))
+        self.assertEqual(janus.tool_argv({"kind": "claude", "model": "opus"}, "p", "s1"), ["claude", "--model", "opus", "--resume", "s1", "p"])
+        self.assertEqual(janus.tool_argv({"kind": "codex", "args": ["--x"]}, "p", "s1"), ["codex", "resume", "s1", "--x", "p"])
+        self.assertEqual(janus.tool_argv({"kind": "opencode", "model": "a/b"}, "p", "s1"), ["opencode", "run", "--model", "a/b", "--session", "s1", "p"])
+        with self.assertRaises(janus.Err): janus.tool_argv({"kind": "gemini"}, "p")           # no unverified guess
+        self.assertEqual(set(janus.RESET_CMD), {"claude", "codex", "opencode"})
+
+    def test_fill_uses_the_configured_nested_repository_and_never_a_parent_repository(self):
+        import subprocess
+        d, cfg = project('[fill]\nrepo = "app"\n'); subprocess.run(["git", "init", "-q", str(d / "app")], check=True)
+        self.assertEqual(janus.fill_repo(cfg, "u", d / "none.md"), str((d / "app").resolve()))      # the project folder is no Git root: the nested repo
+        d2, cfg2 = project(); subprocess.run(["git", "init", "-q", str(d2)], check=True)
+        self.assertEqual(janus.fill_repo(cfg2, "u", d2 / "none.md"), str(d2.resolve()))             # the folder is itself a repository's top
+        d3 = Path(tempfile.mkdtemp(prefix="janus-test-")); subprocess.run(["git", "init", "-q", str(d3)], check=True); (d3 / "ws").mkdir()
+        d4, cfg4 = project(); import shutil; shutil.move(str(d4 / ".janus"), str(d3 / "ws" / ".janus")); cfg4 = janus.Cfg(d3 / "ws")
+        self.assertIsNone(janus.fill_repo(cfg4, "u", d3 / "none.md"))                                # a parent's repository is not found by walking up
 
     def test_an_unknown_job_state_is_not_done(self):
         self.assertEqual(janus.job_state({"here": {"ok": False}}, "here:5")[0], "unknown")   # tend_parked resumes only on done or gone

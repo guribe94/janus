@@ -87,7 +87,9 @@ def watch_pass(cfg, log, pre=None):
     step("tend_tidy", tend_tidy, cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)
     step("sync", board_sync, cfg)   # push what this pass wrote to every host
     for r, why in step("orphan_jobs", orphan_jobs, cfg, hs, units) or []:   # nothing whose owner is gone keeps running or waiting
-        try: d = "; ".join(cancel_job(cfg, r)); log(f"orphan {r} ({why}): {d}")
+        try:
+            with cfg.unlocked(): d = "; ".join(cancel_job(cfg, r))   # the host's kill and file copy: not under the writer lock
+            log(f"orphan {r} ({why}): {d}")
         except Err as e: log(f"orphan {r} ({why}): not cancelled: {e}")
     # [fill] watcher = true (the owner's authorization): launch ready backlog units with briefs up to capacity, at most every
     # [fill] every_min (default 10) minutes, only when check found something that fits (idle-with-backlog)

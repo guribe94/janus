@@ -96,13 +96,13 @@ class CpuScheduling(unittest.TestCase):
     def sh(self, script):
         fake = 'cap_measure() { PSI=0; LOAD=0; DF=50; }\n'
         return subprocess.run(["bash", "-c", f"RD={self.rd}; . $RD/cap.sh\n{fake}{script}"], capture_output=True, text=True).stdout.strip()
-    def test_learned_cores_match_python(self):
+    def test_learned_cores(self):
         """Catches: every job reserving cores_per_job although its class used one core (idle reserved cores), or the shell
         admission and janus's view disagreeing on a class's cores."""
         hist = ["1\tlint\t300\t100\t0\t95\t3", "2\tsuite\t900\t100\t0\t190\t40", "3\told\t900\t100\t0", "4\tpod\t900\t100\t0\t0\t5"]
         (self.rd / "history.tsv").write_text("\n".join(hist) + "\n")
         for cls, want in (("lint", 1), ("suite", 2), ("old", 2), ("pod", 2), ("none", 2)):   # pod: CPU not measured
-            self.assertEqual(int(self.sh(f"cap_cores {cls}")), want, cls); self.assertEqual(janus.class_cores(hist, cls, 2), want, cls)
+            self.assertEqual(int(self.sh(f"cap_cores {cls}")), want, cls)
         self.assertEqual(self.sh("cap_secs suite"), "100"); self.assertEqual(self.sh("cap_secs none"), "")
     def test_short_job_goes_first_and_a_waiting_job_ages(self):
         """Catches: a long job taking the last cores while a short one waits (FIFO by poll order), and a long job starved forever."""

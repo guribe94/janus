@@ -7,6 +7,7 @@ invocation is (dry, read-only, what it read once), carried as cfg.run (section 7
 import contextlib, json, os, re, shlex, sys, time, tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from janus.lane import pq, qp   # shell quoting: one copy, shared with the remote lane runner
 from janus.platform import herdr, ps_table, run, secs   # re-exported: the OS/tool adapter (owner direction 2026-11-11)
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -226,21 +227,6 @@ class Locked:
     def __exit__(self, *e): self.f.close()
 
 FIXTURE_MARK = "janus-test-fixture"
-
-def pq(cmd):
-    """The command part of `pueue add -- <command>`, as one word of the caller's shell. pueue joins its arguments with spaces and
-    runs the result with sh -c, so a command must reach it already shell-quoted: cmd is a list of words (quoted here) or shell
-    text, and the whole is quoted once more for the caller's shell. Never `-- {words}` unquoted (a path with a space, a quote
-    or a backtick broke a launch, and is an injection)."""
-    return shlex.quote(cmd if isinstance(cmd, str) else shlex.join(cmd))
-
-def qp(p):
-    """A path as one shell word: shlex-quoted, except that a leading $HOME/ or ~/ (a remote root or worktree from janus.toml,
-    default $HOME/janus) still expands."""
-    p = str(p)
-    for pre in ("$HOME/", "~/", "${HOME}/"):
-        if p.startswith(pre): return '"$HOME"/' + (shlex.quote(p[len(pre):]) if p[len(pre):] else "")
-    return shlex.quote(p)
 
 def atomic_write(p, text, mode=0o644):
     p = Path(p); p.parent.mkdir(parents=True, exist_ok=True)

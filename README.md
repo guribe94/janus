@@ -25,4 +25,4 @@ janus doctor
 janus migrate OLD_ROOT --to PROJECT        # an existing project: dry run; add --apply
 ```
 Configuration: [example.janus.toml](example.janus.toml). Commands, routing, capacity, reset: [docs/REFERENCE.md](docs/REFERENCE.md). Design: [docs/DESIGN.md](docs/DESIGN.md).
-Also: [docs/HEARTBEAT.md](docs/HEARTBEAT.md) (a watchdog on another machine), [docs/SANDBOX.md](docs/SANDBOX.md) (optional write limits, not wired into launches).
+Also: [docs/HEARTBEAT.md](docs/HEARTBEAT.md) (a watchdog on another machine).

@@ -3,14 +3,14 @@ transcript; the watcher's tend_parked (resume a parked unit when its jobs finish
 import os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import collect_job, job_of, job_state, recorded_jid, runs_dir, save_task_log, task_rc, task_status, unit_jobs
-from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken
+from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken, tool_argv
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
 from janus.budgets import budget_note, finish_refusal, reload_usd, session_usage
 from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, now, pq, ps_table, qp, say,
     sh, ts)
 from janus.memory import memory_text
-from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, run_cost, settle_run
+from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, route_ok, run_cost, settle_run
 from janus.project import project_id, tag, unit_tmux
 from janus.probe import probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
@@ -86,7 +86,7 @@ def cmd_stop(cfg, a):
     left = kill_unit(h, u["name"], roots)
     if left: raise Err(f"{u['name']}: {left} process(es) still alive after TERM and KILL")
     for _ in range(10):
-        ps = probe(u["host"], h)
+        with cfg.unlocked(): ps = probe(u["host"], h)
         if ps["ok"] and unit_state(u, {u["host"]: ps}, herdr_agents(cfg)) in ("gone", "done", "failed", "idle", "unknown"): break
         time.sleep(1)
     else: raise Err(f"{u['name']} is still alive after stop")
@@ -274,7 +274,8 @@ def duplicate_check(cfg, u, units, orig):
     if not o: raise Err(f"--duplicate-of {orig}: no other open unit of that name")
     if u.get("relaunch_of") != orig and o.get("relaunched") != u["name"]: raise Err(f"{u['name']} is not a relaunch of {orig} (janus recorded none): close it by its verdict")
     if cfg.run.dry: return
-    st = unit_state(u, {u["host"]: probe(u["host"], cfg.hosts[u["host"]])}, herdr_agents(cfg))
+    with cfg.unlocked(): ps = probe(u["host"], cfg.hosts[u["host"]])
+    st = unit_state(u, {u["host"]: ps}, herdr_agents(cfg))
     if st in ("working", "queued", "blocked", "unknown"):
         raise Err(f"{u['name']}: its agent is " + (f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)") + f"; stop it first (janus stop {u['name']})")
 
@@ -385,9 +386,8 @@ def resume_message(cfg, hs, u, jobs):
             note = " (never admitted: its host's admission never freed within the job's wait limit, so the command never ran; the log says why)"
         elif rc == 124: note = " (the command hit its own timeout)"
         L.append(f"- {j}: exit {rc if rc is not None else 'unknown (the task is gone and left no exit code)'}{note}; log {log}")
-    L.append(f"Read only the logs you need, then continue the brief from where {report} stands. Same rules: submit builds and "
-             f"tests detached, write 'WAITING <job ids>' in the report and end your turn; finish with the VERDICT line and the "
-             f"real exit codes.")
+    L.append(f"Read only the logs you need, then continue from where {report} stands: detached jobs and `WAITING <job ids>` as before; "
+             f"finish with the VERDICT line and the real exit codes.")
     return "\n".join(L)
 
 class NoBudget(Err):
@@ -398,11 +398,22 @@ def resume_unit(cfg, u, msg, budget=None):
     same tree), instead of the unit's remaining budget (item 24: a capped unit with an unpushed commit can be continued). The
     caller saves u. Returns a line saying what was done."""
     name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); mem = memory_text(cfg); text = JANUS_MARK + msg + (f"\n\nProject memory (binding; it may have changed since you started):\n{mem}" if mem else "")
+    ok, why = route_ok(cfg, u["model"]) if u.get("model") in cfg.models else (True, "")   # the config's restrictions bind a resume as they bind a launch; no other route is tried
+    if not ok: raise Err(f"{name}: not resumed: model {u.get('model')} is not allowed now ({why})")
     if via == "herdr":
         if not cfg.run.dry: herdr("agent", "prompt", name, text)
         return f"{name}: " + ("prompted in its herdr pane" if not cfg.run.dry else "would prompt in its herdr pane")
     if via == "tmux":
-        tm = shlex.quote(unit_tmux(u)); X(cfg, h, f"tmux send-keys -t {tm} -l {shlex.quote(text)} && tmux send-keys -t {tm} Enter")
+        tm = shlex.quote(unit_tmux(u)); pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
+        if not cfg.run.dry and hrun(h, pre + f"tmux has-session -t {tm}")[0]:   # its session ended: start the client again on its own session, or say it cannot
+            sid = session_of(cfg, u) if mc.get("kind") == "claude" else None
+            if not sid: raise Err(f"{name}: its tmux session ended and its {mc.get('kind')} session id cannot be read here: resume it by hand in {u.get('rcwd')}")
+            env_ = " ".join(f"{k}={shlex.quote(v)}" for k, v in {"JANUS_ROLE": "agent", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root)}.items())
+            inner = f"cd {qp(u['rcwd'])} && exec env {env_} {shlex.join(tool_argv(mc, text, sid))}"
+            rc, o, er = hrun(h, pre + f"tmux new -d -s {tm} {shlex.quote(inner)}")
+            if rc: raise Err(f"{name}: tmux start failed: {er.strip()[:100]}")
+            return f"{name}: its session ended; started {mc['kind']} again on session {sid[:8]} in tmux {unit_tmux(u)} on {u['host']}"
+        X(cfg, h, f"tmux send-keys -t {tm} -l {shlex.quote(text)} && tmux send-keys -t {tm} Enter")
         return f"{name}: " + (f"resumed in tmux {unit_tmux(u)} on {u['host']}" if not cfg.run.dry else f"would resume in tmux {unit_tmux(u)} on {u['host']} (dry run)")
     if via != "pueue" or mc.get("kind") != "api": raise Err(f"{name}: a unit run via {via} cannot be resumed")
     pv = cfg.prov[mc["provider"]]; od = cfg.p("out", "out") / name
@@ -463,7 +474,8 @@ def cmd_park(cfg, a):
     """Stop a live agent's turn while its jobs wait or run (the remedy for waiting:<unit>); the watcher resumes it, same session,
     when they finish. API units: the run is ended (SIGTERM: its cost is still recorded); herdr and tmux agents: Escape."""
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; n = u["name"]
-    hs = probe_all(cfg); jobs = unit_jobs(cfg, hs, n)
+    with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers: never under the writer lock
+    jobs = unit_jobs(cfg, hs, n)
     if not jobs: raise Err(f"{n} has no queued or running job of its own: nothing to wait for (janus stop {n} to stop it)")
     say(f"park {n}: its jobs {', '.join(jobs)} keep running; it resumes when they finish")
     if cfg.run.dry: return
@@ -488,7 +500,8 @@ def cmd_resume(cfg, a):
     blocked herdr unit can be answered), and a review/audit unit may resume in the tree it reviews (the launch H9 exception).
     A still-running job is never marked handled, so the next park line still names it; --force overrides only the 'not finished'
     refusal."""
-    bd, u = get_unit(cfg, a.unit); hs = probe_all(cfg)
+    bd, u = get_unit(cfg, a.unit)
+    with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers: never under the writer lock
     jobs = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
     if a.message: msg = a.message
     elif jobs: msg = resume_message(cfg, hs, u, jobs)

@@ -125,7 +125,7 @@ else
   grep -qw memory /sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/cgroup.controllers 2>/dev/null && echo "feature=memory-max"
 fi
 d=%(root)s; [ -d "$d" ] || d=$HOME; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
-for t in pueue pueued podman docker systemd-run launchctl bwrap firejail sandbox-exec tmux herdr flock secret-tool pass security git rsync python3 uv cargo node npm pnpm sccache ccache nvidia-smi rustc go java gcc clang make cmake dotnet swift xcodebuild ruby gh; do
+for t in pueue pueued podman docker systemd-run launchctl tmux herdr flock secret-tool pass security git rsync python3 uv cargo node npm pnpm sccache ccache nvidia-smi rustc go java gcc clang make cmake dotnet swift xcodebuild ruby gh; do
   command -v "$t" >/dev/null 2>&1 && echo "tool=$t"
 done
 # the build and package caches already on the host (cache=<name> <dir>): what a job there can reuse instead of a cold start

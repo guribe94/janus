@@ -194,13 +194,26 @@ cap_seen() {  # row 221: the pause a job waiting for admission met in the last $
   [ $(($(date +%%s) - pt)) -le "${PAUSE_KEEP:-60}" ] && SEEN="$pw ($(($(date +%%s) - pt)) s ago, met by a job waiting for admission)"
   return 0
 }
+cap_summary() {  # what janus needs of the history, computed by the rules above and nowhere else: cap_jmb (a typical job: the largest
+  # reservation of the classes run lately, CAPMB without history), cap_amb (an agent), and per job class "cls=<class> runs median-s cores"
+  jm=0; ls=
+  if [ -f "$RD/history.tsv" ]; then
+    for c in $(tail -n 50 "$RD/history.tsv" | awk -F'\t' 'NF >= 3 && $2 != "agent" {print $2}' | sort -u); do
+      v=$(cap_mb "$c" $CAPMB $CAPMB); [ "${v:-0}" -gt "$jm" ] && jm=$v
+    done
+    ls=$(tail -n 300 "$RD/history.tsv" | awk -F'\t' '$2 != "agent" && $4 ~ /^[0-9]+$/ {n[$2]++} END {for (c in n) print n[c], c}' | sort -rn | head -8)
+  fi
+  [ "$jm" -gt 0 ] || jm=$CAPMB
+  echo "cap_jmb=$jm"; echo "cap_amb=$(cap_mb agent $AGMB 0)"
+  printf '%%s\n' "$ls" | while read -r n c; do [ -n "$c" ] && echo "cls=$c $n $(cap_secs "$c") $(cap_cores "$c")"; done
+}
 cap_report() {  # for janus's probe: the sums, the pause, each reservation, the last 300 history lines
   res_sum; cap_measure; cap_paused; cap_seen
   echo "cap_rj=$RJ"; echo "cap_rc=$RC"; echo "cap_rm=$RM"; echo "cap_ra=$RA"; echo "cap_ram=$RAM"; echo "cap_pause=${PAUSE:-$SEEN}"; echo "cap_psi=$PSI"
   admit_ok job >/dev/null 2>&1; [ -n "$SEEN" ] && case " $BLK " in *" paused "*) ;; *) BLK="paused${BLK:+ $BLK}";; esac
   echo "cap_admit=${BLK:-yes}"   # the admission's own verdict for one more job now (yes, or what blocks it)
   [ -n "$RL" ] && printf '%%s\n' "$RL" | sed '/^$/d'
-  [ -f "$RD/history.tsv" ] && tail -n 300 "$RD/history.tsv" | sed 's/^/hist=/'
+  cap_summary
   true
 }
 '''

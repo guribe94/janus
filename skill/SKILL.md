@@ -20,8 +20,8 @@ A message from the user is answered in the same turn, before housekeeping. If it
 - Board: `janus answer q<N> <text>` for questions; `board.sh send <agent> <text>` for one addressed message. No broadcasts.
 - An unreachable host is unknown: never cancel, move or relaunch its work because of it.
 
-## Never by hand
-No `rm -r`, `kill`, in-place edits of code, loops over worktrees, `pueue` writes, tests or builds yourself, agents outside `janus launch`. A denied command means: use the janus command it names, or brief an agent. Never print credentials.
+## Guarded operations
+The hook refuses what could destroy or cross another's work: `rm -r`, `kill`, `pueue` writes, history rewrites, edits of code outside the project's own folders. It names the janus command that does the job (a tracked agent, `janus run`, `janus cancel`, `janus stop`); use it. If the user explicitly asks for exactly the refused action, say what is blocked and why, and let them run it or authorize another way; do not work around the guard. Never print credentials.
 
 ## Handoff and reset
 Update `HANDOFF.md` (short, curated: objective, decisions, blockers, next actions, latest checkpoint) after a meaningful change of plan or decision, and before a reset. Not for acks, checks or ordinary transitions. A reset starts a new session with the tool's own command and is verified; if janus says it is unsupported or unverified, say so.

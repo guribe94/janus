@@ -24,7 +24,7 @@ EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "Bash|Ed
 OLD_EVENTS = ("UserPromptSubmit",)
 JANUS = HOME / ".local/bin/janus"
 SHARE = HOME / ".local/share/janus"; REL = SHARE / "releases"; CUR = SHARE / "current"
-PARTS = ["janus.py", "janus", "board.sh", "skill", "docs", "example.janus.toml", "launchd", "heartbeat", "sandbox", "tests"]
+PARTS = ["janus.py", "janus", "board.sh", "skill", "docs", "example.janus.toml", "launchd", "heartbeat", "tests"]
 KEEP = 5   # releases kept (current and the newest others)
 
 def say(m): print(("[dry-run] " if DRY else "") + m, flush=True)
@@ -86,11 +86,27 @@ def check_launcher():
     """Refuse BEFORE the release is switched (not after: current then pointed at a release whose links were refused)."""
     if JANUS.exists() and not JANUS.is_symlink() and not generated_launcher(JANUS): sys.exit(f"{JANUS} exists and is neither a symlink nor janus's own generated launcher: not replaced, nothing installed (move it away, then rerun)")
 
+def old_layout_projects():
+    """Registered projects still on the old layout (a janus.toml at the top, no .janus/janus.toml): the new janus cannot find their
+    state, so a switch of the live release must wait for `janus migrate` of each (or for the root agent to pin them)."""
+    pl = HOME / ".config/janus/projects"
+    return [x for x in (pl.read_text().split() if pl.is_file() else []) if (Path(x) / "janus.toml").is_file() and not (Path(x) / ".janus" / "janus.toml").is_file()]
+
+def refuse_old_layout():
+    old = old_layout_projects()
+    if not old: return
+    msg = ("refusing to activate: registered project(s) still on the old layout: " + ", ".join(old) + ". Activation would leave them without a working janus. "
+           "Migrate each first (janus migrate OLD_ROOT --to PROJECT, dry run, then --apply with no jobs or agents running), or pin them to the "
+           "current release; `install --stage-only` builds and checks a release without switching anything.")
+    if DRY: say("WOULD REFUSE: " + msg); return
+    sys.exit(msg)
+
 def release():
     """Build releases/<version> from this tree, test the copy, switch current to it atomically, point the links at current."""
     for part in PARTS[:3]:
         if not (HERE / part).exists(): sys.exit(f"{HERE / part} missing")
     check_launcher()
+    if not A.stage_only: refuse_old_layout()
     v, h = version()
     have = [d for d in REL.glob(f"*-{h}") if d.is_dir()] if REL.is_dir() else []
     d = have[0] if have else REL / v
@@ -106,7 +122,7 @@ def release():
         why = smoke(st)
         if why: shutil.rmtree(st, ignore_errors=True); sys.exit(f"release NOT installed: {why}")
         for f in st.rglob("*"):
-            if f.is_file(): f.chmod(0o555 if f.name == "janus.py" or os.access(f, os.X_OK) else 0o444)   # scripts (heartbeat/, sandbox/) stay runnable
+            if f.is_file(): f.chmod(0o555 if f.name == "janus.py" or os.access(f, os.X_OK) else 0o444)   # scripts (heartbeat/) stay runnable
         os.rename(st, d)
     else:
         why = smoke(d)
