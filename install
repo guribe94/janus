@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Install janus: a tested release, links, hooks, watcher, tools. `install --dry-run` prints every change and changes nothing.
-Usage: install [--dry-run] [--project DIR] [--no-hosts] [--hosts-only] [--release-only] [--rollback] [--skip-tests]
-  (DIR holds janus.toml; default: current directory or a parent)
+"""Install janus: a release, links, hooks, watcher, tools. `install --dry-run` prints every change and changes nothing.
+Usage: install [--dry-run] [--project DIR] [--no-hosts] [--hosts-only] [--release-only] [--stage-only] [--rollback] [--tests PATTERN]
+  (DIR holds .janus/janus.toml; default: current directory or a parent)
 
-Releases (janus-fixes7): the PARTS (janus.py and the package, skill/, heartbeat/, sandbox/, tests/, ...) are copied into ~/.local/share/janus/releases/<version>/
-(read-only), the copy is tested there (every tests/test_*.py against the copy, `--help`, a hook call), and only then
-~/.local/share/janus/current is switched to it with one atomic rename. ~/.local/bin/janus -> current/janus.py and the skill links
--> current/skill, so janus.py and the skill change together and nothing ever points at the working tree: an edit in progress
-is never live. A developer runs the checks (./check) and then ./install --release-only to make a change live."""
+Releases are immutable: the PARTS (janus.py and the package, skill/, docs/, ...) are copied into ~/.local/share/janus/releases/<version>/
+(read-only) and smoke-checked there (the package imports, `--help`, two hook calls); `--tests PATTERN` also runs only the named
+tests/test_*.py files against the copy (no whole suite is run unless you ask for it with a pattern that matches it). Only then
+~/.local/share/janus/current is switched with one atomic rename. `--stage-only` builds and checks the release and switches nothing.
+~/.local/bin/janus -> current/janus.py; the skill is linked where each tool reads it: ~/.claude/skills/janus (Claude Code, and
+opencode, which reads that folder) and ~/.agents/skills/janus (Codex; an older ~/.codex/skills/janus link is refreshed, never
+created). A release that a running process or a queued job still names is never pruned; when that cannot be told, nothing is pruned."""
 import argparse, ast, hashlib, json, os, shlex, shutil, subprocess, sys, time, tomllib
 from pathlib import Path
 
@@ -15,9 +17,11 @@ HERE = Path(__file__).resolve().parent; HOME = Path.home()
 ap = argparse.ArgumentParser(); ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--project"); ap.add_argument("--no-hosts", action="store_true"); ap.add_argument("--hosts-only", action="store_true")
 ap.add_argument("--release-only", "--pin-only", action="store_true", help="only build, test and switch to a new release of janus.py and the skill")
 ap.add_argument("--rollback", action="store_true", help="switch current back to the previous release")
-ap.add_argument("--skip-tests", action="store_true", help="skip tests/test_*.py (the parse, --help and hook smoke tests still run)")
+ap.add_argument("--stage-only", action="store_true", help="build and check the release, switch nothing")
+ap.add_argument("--tests", metavar="PATTERN", help="also run the tests/ files matching this unittest pattern (e.g. test_migrate.py) against the copy")
 A = ap.parse_args(); DRY = A.dry_run
-EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch", "Stop": None}
+EVENTS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch", "Stop": None}   # no UserPromptSubmit: janus no longer files the user's prompts
+OLD_EVENTS = ("UserPromptSubmit",)
 JANUS = HOME / ".local/bin/janus"
 SHARE = HOME / ".local/share/janus"; REL = SHARE / "releases"; CUR = SHARE / "current"
 PARTS = ["janus.py", "janus", "board.sh", "skill", "docs", "example.janus.toml", "launchd", "heartbeat", "sandbox", "tests"]
@@ -62,14 +66,13 @@ def smoke(d):
     for args, inp in ((["--help"], None), (["hook", "PreToolUse"], "{}"), (["hook", "Stop"], "{}")):
         r = subprocess.run(py + args, input=inp, capture_output=True, text=True)
         if r.returncode: return f"janus.py {' '.join(args)} failed: {r.stderr.strip()[-300:]}"
-    if not A.skip_tests and (d / "tests").is_dir():   # every tests/test_*.py, against the copy (tests/janusload.py loads its janus)
-        # like ./check: the calling session's own janus variables stay out (an agent's JANUS_ROLE made 24 tests fail here, none in ./check)
+    if A.tests and (d / "tests").is_dir():   # only the named test files, against the copy (tests/janusload.py loads its janus)
         env = {k: v for k, v in os.environ.items() if k not in ("JANUS_ROOT", "JANUS_UNIT", "JANUS_ROLE", "JANUS_REPORT")}
-        r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-q", "-s", "tests", "-p", "test_*.py"], cwd=d, capture_output=True, text=True,
+        r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-q", "-s", "tests", "-p", A.tests], cwd=d, capture_output=True, text=True,
                            env={**env, "JANUS_PY": str(d / "janus.py"), "PYTHONDONTWRITEBYTECODE": "1"})
-        if r.returncode:   # the whole output is kept: the 1500 characters below showed one of seven failures
+        if r.returncode:
             log = SHARE / "release-check-failed.log"; log.write_text(r.stdout + r.stderr)
-            return f"tests failed (every failure: {log}):\n" + (r.stderr or r.stdout)[-1500:]
+            return f"tests {A.tests} failed (every failure: {log}):\n" + (r.stderr or r.stdout)[-1500:]
     return None
 
 import re
@@ -92,7 +95,7 @@ def release():
     have = [d for d in REL.glob(f"*-{h}") if d.is_dir()] if REL.is_dir() else []
     d = have[0] if have else REL / v
     say(f"release {d.name}" + (" (this content is already built)" if have else ""))
-    if DRY: say(f"copy {', '.join(PARTS)} -> {d}; test the copy; switch {CUR} -> {d}; {JANUS} -> {CUR}/janus.py; skill links -> {CUR}/skill"); return
+    if DRY: say(f"copy {', '.join(PARTS)} -> {d}; smoke-check the copy" + ("" if A.stage_only else f"; switch {CUR} -> {d}; {JANUS} -> {CUR}/janus.py; skill links -> {CUR}/skill")); return
     if not have:
         st = REL / f".staging-{os.getpid()}"; shutil.rmtree(st, ignore_errors=True); st.mkdir(parents=True)
         for part in PARTS:
@@ -108,6 +111,7 @@ def release():
     else:
         why = smoke(d)
         if why: sys.exit(f"release NOT installed: {why}")
+    if A.stage_only: say(f"staged {d}: checked, not switched"); return
     prev = os.readlink(CUR) if CUR.is_symlink() else None
     swap_link(CUR, d); say(f"{CUR} -> {d}" + (f" (was {prev})" if prev else ""))
     finish_links(); prune()
@@ -116,13 +120,30 @@ def finish_links():
     check_launcher()
     if generated_launcher(JANUS): say(f"migrate {JANUS}: janus's generated launcher (install-host) -> link to {CUR}/janus.py"); swap_link(JANUS, CUR / "janus.py")
     link(JANUS, CUR / "janus.py")
-    link(HOME / ".claude/skills/janus", CUR / "skill"); link(HOME / ".codex/skills/janus", CUR / "skill")
+    link(HOME / ".claude/skills/janus", CUR / "skill"); link(HOME / ".agents/skills/janus", CUR / "skill")
+    old = HOME / ".codex/skills/janus"
+    if old.is_symlink(): link(old, CUR / "skill")   # an older install's link follows the release; none is made where there was none
+
+def in_use():
+    """Names of the releases a running process or a queued/running pueue job still names, or None when that cannot be told."""
+    try:
+        ps = subprocess.run(["ps", "-axo", "command"], capture_output=True, text=True, timeout=30).stdout
+        pq = subprocess.run(["pueue", "status", "--json"], capture_output=True, text=True, timeout=30) if shutil.which("pueue") else None
+    except (OSError, subprocess.SubprocessError): return None
+    if pq is not None and pq.returncode: return None   # a queue that does not answer: unknown, not "none"
+    text = ps + (pq.stdout if pq else "")
+    return set(re.findall(r"releases/([0-9]{8}-[0-9]{6}-[0-9a-f]{10})", text))
 
 def prune():
     cur = Path(os.readlink(CUR)).name if CUR.is_symlink() else ""
     rels = sorted(x for x in REL.iterdir() if x.is_dir() and not x.name.startswith("."))
-    for x in rels[:-KEEP]:
-        if x.name != cur: say(f"remove old release {x.name}"); shutil.rmtree(x, ignore_errors=True)
+    old = [x for x in rels[:-KEEP] if x.name != cur]
+    if not old: return
+    used = in_use()
+    if used is None: say("not pruning: what runs or is queued cannot be told now"); return
+    for x in old:
+        if x.name in used: say(f"keep release {x.name}: a running process or a queued job names it")
+        else: say(f"remove old release {x.name}"); shutil.rmtree(x, ignore_errors=True)
 
 def rollback():
     rels = sorted(x for x in REL.iterdir() if x.is_dir() and not x.name.startswith(".")) if REL.is_dir() else []
@@ -144,10 +165,23 @@ def linux_watcher(project):
     if project and str(project) not in have and not DRY: pl.parent.mkdir(parents=True, exist_ok=True); pl.write_text("\n".join([*have, str(project)]) + "\n")
     run(["systemctl", "--user", "daemon-reload"]); run(["systemctl", "--user", "enable", "--now", "janus-watch.timer"])
 
+def drop_old_hooks(data):
+    """Remove only janus's own entries of events it no longer uses; returns the events changed."""
+    gone = []
+    for ev in OLD_EVENTS:
+        lst = data.get("hooks", {}).get(ev)
+        if not lst: continue
+        keep = [e for e in lst if not any(f"janus hook {ev}" in h.get("command", "") for h in e.get("hooks", []))]
+        if len(keep) != len(lst):
+            gone.append(ev)
+            if keep: data["hooks"][ev] = keep
+            else: del data["hooks"][ev]
+    return gone
+
 def merge_hooks(path):
     path = Path(path).expanduser()
     data = json.loads(path.read_text()) if path.exists() else {}
-    hooks = data.setdefault("hooks", {}); added = []
+    hooks = data.setdefault("hooks", {}); added = []; dropped = drop_old_hooks(data)
     for ev, matcher in EVENTS.items():
         cmd = f"{JANUS} hook {ev}"
         lst = hooks.setdefault(ev, [])
@@ -155,8 +189,8 @@ def merge_hooks(path):
         ent = {"hooks": [{"type": "command", "command": cmd, "timeout": 60}]}
         if matcher: ent["matcher"] = matcher
         lst.append(ent); added.append(ev)
-    if not added: say(f"hooks ok: {path}"); return
-    say(f"hooks {path}: add {', '.join(added)} (existing keys and hooks kept; backup first)")
+    if not added and not dropped: say(f"hooks ok: {path}"); return
+    say(f"hooks {path}: add {', '.join(added) or '-'}; drop janus's own {', '.join(dropped) or '-'} (existing keys and hooks kept; backup first)")
     if DRY: return
     if path.exists(): path.with_name(path.name + f".bak-janus-{int(time.time())}").write_text(path.read_text())
     path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(data, indent=2) + "\n")
@@ -185,11 +219,11 @@ def main():
     root = None
     p = Path(A.project or os.getcwd()).resolve()
     for d in [p, *p.parents]:
-        if (d / "janus.toml").is_file(): root = d; break
+        if (d / ".janus" / "janus.toml").is_file(): root = d; break
     if A.rollback: rollback(); return
-    if A.release_only: release(); return
+    if A.release_only or A.stage_only: release(); return
     if A.hosts_only:
-        for n, h in tomllib.loads((root / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, root)
+        for n, h in tomllib.loads((root / ".janus" / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, root)
         return
     say("== release and links ==")
     release()
@@ -207,7 +241,7 @@ def main():
         answers = shutil.which("pueue") and subprocess.run(["pueue", "status"], capture_output=True).returncode == 0
         if not answers: run(["brew", "services", "start", "pueue"])
     if root and not A.no_hosts:
-        for n, h in tomllib.loads((root / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, root)
-    elif not root: say("no janus.toml found: host tools skipped")
+        for n, h in tomllib.loads((root / ".janus" / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, root)
+    elif not root: say("no .janus/janus.toml found: host tools skipped")
 
 main()

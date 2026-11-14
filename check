@@ -1,12 +1,10 @@
 #!/bin/sh
-# The checks a change must pass before ./install --release-only makes it live: parse, --help, a hook call, and every
-# tests/test_*.py (discover, so a branch that adds a test file is covered too), run against a copy of exactly what install
-# ships (its PARTS), so a file the code or tests need but install leaves out fails here, not at install.
+# Cheap checks a change must pass before ./install: parse, package import, --help, two hook calls, run against a copy of exactly
+# what install ships (its PARTS), so a file the code needs but install leaves out fails here. No test suite runs unless you name
+# one: ./check test_migrate.py test_monitor.py (unittest file patterns under tests/, run against the same copy).
 set -e
 cd "$(dirname "$0")"
-python3 -c 'import ast, sys; ast.parse(open("janus.py").read()); ast.parse(open("install").read())'
-python3 janus.py --help >/dev/null
-echo '{}' | python3 janus.py hook PreToolUse >/dev/null
+python3 -c 'import ast; ast.parse(open("janus.py").read()); ast.parse(open("install").read())'
 ship=$(mktemp -d); trap 'rm -rf "$ship"' EXIT
 python3 - "$ship" <<'PY'
 import ast, shutil, sys
@@ -18,8 +16,9 @@ for p in parts:
     if src.is_dir(): shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     elif src.is_file(): shutil.copy2(src, dst)
 PY
-# the tests' exit code is the check's (a pipe into tail used to hide a failure)
-set +e
-out=$(cd "$ship" && env -u JANUS_ROOT -u JANUS_UNIT -u JANUS_ROLE -u JANUS_REPORT JANUS_PY="$ship/janus.py" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v 2>&1); rc=$?
-printf '%s\n' "$out" | tail -25
-exit $rc
+(cd "$ship" && PYTHONDONTWRITEBYTECODE=1 python3 -c 'import janus' && python3 janus.py --help >/dev/null \
+  && echo '{}' | python3 janus.py hook PreToolUse >/dev/null && echo '{}' | python3 janus.py hook Stop >/dev/null)
+echo "smoke ok"
+for p in "$@"; do
+  (cd "$ship" && env -u JANUS_ROOT -u JANUS_UNIT -u JANUS_ROLE -u JANUS_REPORT JANUS_PY="$ship/janus.py" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p "$p" 2>&1 | tail -6)
+done

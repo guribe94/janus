@@ -1,4 +1,5 @@
-# janus.toml: one per project, in the project root; `janus` finds it from any subdirectory. Paths are relative to this file.
+# .janus/janus.toml: one per project, under PROJECT/.janus; `janus` finds it from any subdirectory of PROJECT. Relative paths are
+# relative to PROJECT. briefs, out, board and worktrees live under .janus by default.
 # `janus init` writes this file as a starter (this machine named after its host name); `janus doctor` checks the setup.
 # Everything project-specific lives here, never in janus.py.
 
@@ -6,28 +7,14 @@
 name = "myproject"
 # id = "myproject"        # the project id every job, tmux session and card janus creates carries (default: name); on a machine
                          # shared by several janus projects each sees and acts on its own items only. Unique per machine.
-beads = "."              # directory holding .beads/ (units, instructions, rules, backlog); `bd init` there once
-state = ".janus"          # HANDOFF.md, history.md and janus's bookkeeping
-cycle_min = 15           # a check/ack cycle is overdue after this
-deadline_min = 30        # an unacknowledged problem blocks Stop after this
+beads = "."              # directory holding .beads/ (units, backlog); `bd init` there once
 silent_min = 30          # an agent with no board post for this long is silent
-reset_tokens = 150000    # context size at which the watcher asks for notes, then /clear
+reset_tokens = 150000    # context size at which the Stop hook asks for the handoff and the session is reset
 unreachable_min = 20
 
-[paths]
-briefs = "briefs"        # <briefs>/<unit>.md
-out = "out"              # <out>/<unit>/REPORT.md, api.json, api.err
-worktrees = "worktrees"  # <worktrees>/<unit> is the unit's cwd when it exists
-# board = "bin/board.sh" # a project's own board script; unset: the board.sh shipped with janus (questions with ids, waiting,
-#                         # learned, broadcast, digest; synced to every [hosts.*] with ssh and root)
-# board_dir = "board"     # the board's files (cards, log, questions, peers.md, index.md); janus close never counts them as a
-#                         # unit's uncommitted changes (nor the state dir)
-gate_log = "out/gates.log"   # lines: 'YYYY-MM-DD HH:MM:SS <name> EXIT_x=0 ... RESULT: PASS|FAIL' (janus gate writes them)
-# gate_runner = "bin/run-gate.sh"   # a project script janus gate calls with <name>; default: janus runs out/<name>/tests.sh itself
-# gate_host_env = "JANUS_TEST_HOST"  # the variable `janus gate --host` sets
-# checklist = "STATUS.md"           # the project's status checklist: the orchestrator may edit it; `janus backlog import` reads it
-# state_docs = ["STATE.md"]         # old state docs: `janus init` turns them into a pointer to .janus/HANDOFF.md
-# lane_scripts = ["bin/test.sh"]    # project wrappers that already run tests through janus's lanes (not flagged as local tests)
+[paths]                  # all optional: briefs, out, board_dir and worktrees default to folders under .janus
+# checklist = "STATUS.md"           # the project's status checklist: `janus backlog import` reads it
+# board = "bin/board.sh"            # a project's own board script; unset: the board.sh shipped with janus
 # sync_require = ["fixtures"]       # paths that must arrive on a remote host when `janus run` syncs a worktree
 
 [herdr]
@@ -50,20 +37,9 @@ args = []
 # actor_col = "actor"    # optional column: who does the item (agent, owner, hardware, ...); `janus backlog set <id> actor=owner`
 #                        # sets it too. Only agent items (the default) count as idle backlog or are launched by janus fill.
 
-# [intents] stale_h = 2  # hours an open intent (janus intent) may have no running linked unit and no update before intent:<id>:stale
-# [landing]              # "finished, not landing" in janus check
-# kinds = ["implement"]  # unit kinds that land (reviews, audits and cleanups do not)
-# finished_min = 30      # a unit with VERDICT DONE this long ago needs a gate, or landing once its gates passed
-# gates_required = 1
-# gate_names = ["{unit}", "land-{unit}", "land-{unit}-*", "{unit}-*"]   # gate names that belong to a unit (plus janus gate --unit)
-# branch = "main"        # where landed work is; default origin's HEAD branch
-# scope_cmd = "bin/gate-steps.sh {unit} {tree}"   # janus gate-scope: prints the tree's gate steps, '[@host ]<step>: <command>'
-# known_failures = "out/known-failures.tsv"       # <test id cols...> TAB <cause> TAB <unit fixing it>; gates with only these pass
-# stall_min = 180         # a land at its final gate longer than this is land:<unit>:stalled
-# starve_min = 20         # ... or one whose gate waits this long on a paused host while a landing host is free
-# auto_recover = true     # OFF unless true: the watcher restarts a starved land on the free host when provably safe (land:<unit>:recovered)
-# gate_timeout_min = 120  # a gate's process group is stopped after this long (RESULT: FAIL, EXIT_timeout=124)
-# quick_gate_min = 15     # gates expected under this many minutes use the one-slot gates-quick group
+# [landing]
+# branch = "main"        # the landing branch (default: origin's HEAD branch)
+# push = false           # true: janus land also pushes the landing commit, never forced
 
 # [tidy]                 # janus tidy [--dry-run]: what orchestration leaves behind, each by a safe rule
 # branches = ["wk/*"]    # branch patterns it may delete when contained in the landing branch (and the remote one at the same commit)
@@ -149,7 +125,8 @@ key_file = "~/.config/janus/anthropic.env"   # elsewhere: ANTHROPIC_API_KEY=... 
 # JSON). Default with the default cmd: the same with --resume {session}. Needed when cmd is set, for example for Codex:
 # resume_cmd = ["codex", "exec", "resume", "{session}", "--json", "{prompt}"]
 [providers.codex]
-enabled = true
+enabled = false          # off: also outside allow_tools / allow_auth above
+auth = "subscription"
 
 # kind "api" = an API agent run by janus as a pueue task; claude|codex|opencode = a herdr agent (tmux on remote hosts).
 [models.claude]
@@ -165,10 +142,12 @@ vendor = "openai"
 kind = "codex"
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
-[routing]                # ordered; first model whose provider is enabled and within budget
+[routing]                # ordered; the first model that is allowed and usable (a later entry is printed when it replaces an unusable first one)
+allow_tools = ["claude"]     # machine-enforced: only models of these coding clients may launch
+allow_auth = ["api_key"]     # machine-enforced: only providers with these auth kinds ([providers.X] auth, default api_key for kind api)
 critical = ["claude"]
-review = ["codex", "claude"]   # skips the implementer's vendor
-normal = ["codex"]
+review = ["claude"]
+normal = ["claude"]
 
 # ---- shared build caches (skill-fix53; off unless this block is present): each job points the cache tools it finds where it
 # runs at one folder per host; every worktree keeps its own target/. Per host: [hosts.<h>] cache_dir = "...", caches = [...].
@@ -207,53 +186,16 @@ every_min = 10
 [budget]                 # an API unit's default budget: median cost of past runs of its kind and tier + margin_pct
 margin_pct = 30
 min_runs = 3             # fewer past runs: the provider's budget_per_unit
-warn_pct = 80            # check: budget80:<unit> at this share of its budget ...
-report_stale_min = 10    # ... while its report has not changed for this long
-overshoot_pct = 20       # each run holds its budget plus this in the ledger (runs overshoot their cap; worst seen 18 %)
-wrapup_usd = 0.5         # a run that ends at its budget cap without a final verdict is resumed once with this, to write its report
-resume_min_usd = 0.1     # a parked unit is resumed (same session) only while this much of its budget is left
-
-# [quality]                # quality enforcement; nothing here runs unless it is set
-# rules_file = "QUALITY.md"      # the project's quality rules: every brief header points at it (read where present)
-# brief_lint = false       # true: `janus launch` refuses a brief with no tier line, scope, report path or done-criteria
-#                          # (`DONE-WHEN:`/`PROOF:`); `janus quality lint <brief|unit>` runs the lint alone
-# review_model = "haiku"   # an api model that reviews a unit's diff (slop and test value) before `janus land`, into
-# review_budget_usd = 0.5  # out/<unit>/review.json; findings block the landing until fixed or `--override '<reason>'`
-# review_max_chars = 60000
-# review_timeout_s = 600
-# signal_runs = 5          # `janus check` raises test-signal:<gate> for a gate this long and never failed in this many runs
-# signal_min_min = 20
-# soak_every_s = 20        # `janus soak` repeats a read-only pass every this many seconds
-
-[report]                 # janus report (to the owner): backlog completeness, remaining work, spend by outcome
-every_h = 4              # check raises report-due at these checkpoints (every_h hours from midnight, and the times in at)
-# at = ["09:00", "18:00"]  # until `janus report --sent`
-waste_pause = 25         # launch and fill pause while runs capped without a verdict took over this % of the spend ...
-recent_h = 24            # ... of the last recent_h hours, until `janus ack waste-pause "<cause and fix>"`
+overshoot_pct = 20       # each run holds its budget plus this in the ledger
 
 [collect]                # remote units: the watcher saves out/<unit>/ and the agent's changes as out/<unit>/backup.patch this often;
 backup_min = 30          # stop and close refuse while a remote copy has work janus collect has not brought here (--force overrides)
 
-[enforce]                # warn first (a board direction), stop after grace_min
-grace_min = 5
-stop_burners = true      # a CPU burner's process group (never a group that holds the agent)
-stop_direct = false      # a build or test an agent runs outside the lanes on a remote host (flagged and warned either way)
-stop_api = false         # a Claude/Anthropic API process janus did not start, inside this project's unit trees (spend:proc:<host>:<pid>);
-                         # reported either way; another project's processes and the owner's terminal sessions are never flagged
-
-# [landing] final_gate_host = "<host>"; final_gate = "<command>"   # janus land gates the merged tree there before it squash-lands
-# [landing] gate_gen = "bin/gate-gen.sh {unit} {worktree}"   # optional: janus land runs it when out/land-<unit>/tests.sh is missing or older than the merge
-
 # [busy]                   # janus busy <wt>: exit 0 while a janus job, an open unit's own job or one of these processes uses the tree
 # patterns = ["mutants"]   # substrings of local command lines that edit a tree in place while they run (default: mutation testing)
 
-[memory]                 # .janus/MEMORY.md, the session memory every brief starts with (janus remember / forget)
-cap_lines = 30           # check raises memory-long over this many entries
-review_days = 14         # check raises memory-review:<n> for an entry older than this (janus memory --keep <n> re-dates it)
-agent_docs = ["AGENTS.md"]   # the project's agent instructions every brief points at (the root one and one per folder touched)
-
-[owner]                  # the owner's decision queue (.janus/owner-queue.md): janus ask "<question>", janus answer <n> "<answer>"
-# notify = "osascript -e 'display notification \"<question>\"'"   # run with the question on stdin when one is asked; unset: no notification
+[memory]                 # .janus/MEMORY.md: binding instructions and durable decisions (janus remember / forget)
+agent_docs = ["AGENTS.md"]   # the project's agent instructions every brief points at
 
 # [heartbeat]              # a watchdog on another machine alerts when the watcher stops (heartbeat/ scripts)
 # watchdog = "<host>"      # janus install-host <host> installs it there; each watcher pass beats to it
