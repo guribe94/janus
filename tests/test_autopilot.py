@@ -55,6 +55,72 @@ class ContextReset(unittest.TestCase):
         self.assertEqual(janus.stop_reset(self.cfg), "under the threshold")
 
 
+class ContextTokens(unittest.TestCase):
+    """context_tokens on synthetic Claude and Codex transcripts (the Codex shapes were read from a recorded rollout's keys and numbers)."""
+    def setUp(self): self.d, self.cfg = project(); self.tr = self.d / "t.jsonl"
+
+    def put(self, *recs, raw=""):
+        self.tr.write_text("".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in recs) + raw); return janus.context_tokens(self.tr)
+
+    @staticmethod
+    def tc(inp, cached=0, total=10**9, info=True):
+        u = lambda i, c: {"input_tokens": i, "cached_input_tokens": c, "output_tokens": 5, "total_tokens": i + 5}
+        return {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": u(total, total), "last_token_usage": u(inp, cached)} if info else None}}
+
+    @staticmethod
+    def rec(inp, cached=0):
+        u = {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": 5}
+        return {"type": "token_usage_record", "payload": {"usage": u, "turn_token_usage": {"input_tokens": 10**8}, "thread_token_usage": {"input_tokens": 10**9}}}
+
+    def test_codex_token_count_is_the_latest_request_not_the_file_size(self):
+        """Catches: a Codex rollout falling through to file bytes // 4 (a huge, wrong value that triggers resets)."""
+        filler = {"type": "response_item", "payload": {"type": "message", "text": "x" * 4000}}
+        self.assertEqual(self.put(filler, filler, self.tc(181673, 180224), filler), 181673)
+        self.assertLess(self.put(filler, self.tc(100)), 1000)
+
+    def test_codex_newest_record_wins_even_when_smaller_after_compaction(self):
+        """Catches: a max or a sum over the history keeping the context above the threshold after a compaction."""
+        self.assertEqual(self.put(self.tc(200000), self.tc(240000), {"type": "compacted", "payload": {}}, self.tc(30000)), 30000)
+
+    def test_codex_cached_inputs_are_a_subset_and_cumulative_totals_are_ignored(self):
+        """Catches: cached_input_tokens added to input_tokens, and total_token_usage (the whole session) read as the context."""
+        self.assertEqual(self.put(self.tc(184613, 181504, total=99_000_000)), 184613)
+        self.assertEqual(self.put(self.rec(184613, 181504)), 184613)
+
+    def test_token_usage_record_and_token_count_newest_of_either(self):
+        self.assertEqual(self.put(self.tc(100), self.rec(300)), 300)
+        self.assertEqual(self.put(self.rec(300), self.tc(100)), 100)
+
+    def test_codex_null_or_malformed_trailing_usage_falls_back_to_the_previous_valid_one(self):
+        """Catches: a crash (the Stop hook dying) or a 0 on a half-written last record."""
+        bad = [self.tc(0, info=False), {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": None}}},
+               {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": "lots"}}}},
+               {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": [1]}}}},
+               {"type": "event_msg", "payload": {"type": "token_count", "info": "x"}}, {"type": "token_usage_record", "payload": {"usage": None}},
+               {"type": "token_usage_record", "payload": {"usage": {"input_tokens": -5}}}, {"type": "token_usage_record", "payload": []},
+               {"type": "token_usage_record"}, [1, 2], None, 7, "usage", '{"type": "event_msg", "payload": {"type": "token_count", "info": {"last_']
+        self.assertEqual(self.put(self.tc(777), *bad), 777)
+        self.assertEqual(self.put(self.tc(777), raw='{"type": "token_usage_record", "payload": {"usage": {"input_tok'), 777)
+
+    def test_claude_semantics_preserved(self):
+        """Catches: the Claude sum (input + cache creation + cache read, newest assistant turn) changing."""
+        c = lambda **u: {"type": "assistant", "message": {"usage": u}}
+        self.assertEqual(self.put(c(input_tokens=1, cache_read_input_tokens=1000), c(input_tokens=3, cache_creation_input_tokens=20, cache_read_input_tokens=500, output_tokens=99)), 523)
+        self.assertEqual(self.put(c(input_tokens=50), c(input_tokens=None, cache_read_input_tokens="bad"), {"message": None}, {"message": {"usage": None}}), 50)
+
+    def test_no_usable_usage_falls_back_to_size_and_a_missing_file_is_zero(self):
+        self.assertEqual(self.put({"type": "x"}, {"message": {"usage": {}}}, self.tc(0)), self.tr.stat().st_size // 4)
+        self.assertEqual(self.put(), 0)
+        self.assertEqual(janus.context_tokens(self.d / "absent.jsonl"), 0)
+
+    def test_truncated_first_line_of_the_tail_read_is_skipped(self):
+        """Catches: a crash on the partial first line of the 1 MB tail; the newest usage is still found, and a lone partial line falls back."""
+        big = {"type": "response_item", "payload": {"text": "y" * 1_200_000}}
+        self.assertEqual(self.put(big, self.tc(4242)), 4242)
+        self.assertEqual(self.put(big), self.tr.stat().st_size // 4)
+        self.tr.write_text(("z" * 1_100_000) + '"usage": {"input_tokens": 9}}\n'); self.assertEqual(janus.context_tokens(self.tr), self.tr.stat().st_size // 4)
+
+
 class Enforce(unittest.TestCase):
     def test_agent_direct_test_warned_once_then_stopped(self):
         """Catches: an agent running a test by hand on this machine outside the lanes left running after its warning, and a
