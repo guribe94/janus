@@ -112,5 +112,3 @@ def related_names(text):
     """The unit names on a brief's RELATED: line (one line, comma or space separated); [] without one."""
     m = re.search(r"^RELATED:\s*(.*)$", text or "", re.M)
     return [n for n in re.split(r"[,\s]+", (m.group(1) if m else "").strip()) if NAME_RX.fullmatch(n)]
-
-

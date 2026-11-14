@@ -255,4 +255,3 @@ def run_outcomes(cfg):
             else: o = "no-verdict"
             out.append((pn, k, u["name"], float(cost or 0), o, t))
     return out
-
