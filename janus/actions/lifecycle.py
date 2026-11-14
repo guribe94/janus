@@ -1,13 +1,13 @@
 """A unit's life after launch: janus stop, collect, close, park, resume, board-close; saving its output, task log and
 transcript; the watcher's tend_parked (resume a parked unit when its jobs finished)."""
-import os, re, shlex, sys, time
+import contextlib, os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import collect_job, job_of, job_state, recorded_jid, runs_dir, save_task_log, task_rc, task_status, unit_jobs
 from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken, tool_argv
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
 from janus.budgets import budget_note, finish_refusal, reload_usd, session_usage
-from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, now, pq, ps_table, qp, say,
+from janus.context import (DIFF_X, Err, JANUS_MARK, LockLost, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, now, pq, ps_table, qp, say,
     sh, ts)
 from janus.memory import memory_text
 from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, route_ok, run_cost, settle_run
@@ -398,7 +398,7 @@ def resume_unit(cfg, u, msg, budget=None):
     same tree), instead of the unit's remaining budget (item 24: a capped unit with an unpushed commit can be continued). The
     caller saves u. Returns a line saying what was done."""
     name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); mem = memory_text(cfg); text = JANUS_MARK + msg + (f"\n\nProject memory (binding; it may have changed since you started):\n{mem}" if mem else "")
-    ok, why = route_ok(cfg, u["model"]) if u.get("model") in cfg.models else (True, "")   # the config's restrictions bind a resume as they bind a launch; no other route is tried
+    ok, why = route_ok(cfg, u.get("model"))   # the config's restrictions bind every resume as they bind a launch: a removed, unknown or disabled model fails closed; no other route is tried
     if not ok: raise Err(f"{name}: not resumed: model {u.get('model')} is not allowed now ({why})")
     if via == "herdr":
         if not cfg.run.dry: herdr("agent", "prompt", name, text)
@@ -492,6 +492,25 @@ def cmd_park(cfg, a):
     park_tab(cfg, u); u["parked"] = {"jobs": jobs, "since": int(now()), "by": "janus park"}; bd.save(u)
     bd.comment(u["id"], f"{ts()} parked on {', '.join(jobs)}"); say(f"parked {n}")
 
+def resume_outside_lock(cfg, bd, u, make_msg, budget=None):
+    """resume_unit with its host I/O outside the writer lock (the message's job logs, ssh, tmux, queueing, confirm_started take as long as
+    the host does). The unit is recorded busy first, under the lock, and saved: whoever meets that mark (another resume, the watcher, close,
+    stop, check) sees an operation in flight, so a second resume of the same session cannot start. The lock is let go for the body and
+    retaken after it; the mark is cleared when the resume ended (done or failed). Where the lock cannot be retaken (LockLost) the resume
+    ran but its record was not written: the mark stays and check names the unit interrupted."""
+    if cfg.run.dry: return resume_unit(cfg, u, make_msg(), budget=budget)
+    if u.get("busy"): raise Err(f"{u['name']}: a {u['busy'].get('op')} of it " + ("is running" if not busy_dead(u) else "was interrupted") + f" (pid {u['busy'].get('pid')}): no second resume beside it; janus check names it")
+    u["busy"] = busy_mark("resume"); bd.save(u)
+    try:
+        with cfg.unlocked(): line = resume_unit(cfg, u, make_msg(), budget=budget)
+    except LockLost: raise
+    except BaseException:
+        u.pop("busy", None)
+        with contextlib.suppress(Err): bd.save(u)
+        raise
+    u.pop("busy", None)
+    return line
+
 def cmd_resume(cfg, a):
     """Resume a unit's own session now: parked (its jobs' results, when they finished), or with --message.
 
@@ -500,11 +519,11 @@ def cmd_resume(cfg, a):
     blocked herdr unit can be answered), and a review/audit unit may resume in the tree it reviews (the launch H9 exception).
     A still-running job is never marked handled, so the next park line still names it; --force overrides only the 'not finished'
     refusal."""
+    with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers: never under the writer lock; the unit is read after it, so its record is current
     bd, u = get_unit(cfg, a.unit)
-    with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers: never under the writer lock
     jobs = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
-    if a.message: msg = a.message
-    elif jobs: msg = resume_message(cfg, hs, u, jobs)
+    if a.message: msg = lambda: a.message
+    elif jobs: msg = lambda: resume_message(cfg, hs, u, jobs)
     else: raise Err(f"{u['name']} is not parked: give --message")
     # finding 2: the tree is another open unit's cwd: never put a unit back into the tree its successor now works in (H9). A
     # review/audit unit may share a tree with the unit it reviews, exactly as launch allows (launch.py H9 exception); finding 6
@@ -532,7 +551,7 @@ def cmd_resume(cfg, a):
     if not a.force:
         left = [j for j in jobs if job_state(hs, j)[0] not in ("done", "gone")]
         if left: raise Err(f"{u['name']} waits on {', '.join(left)}, not finished (--force to resume now)")
-    say(resume_unit(cfg, u, msg, budget=getattr(a, "budget", None)))
+    say(resume_outside_lock(cfg, bd, u, msg, budget=getattr(a, "budget", None)))
     if cfg.run.dry: return
     done = [j for j in jobs if job_state(hs, j)[0] in ("done", "gone")]   # finding 2: a running job is never marked handled
     if done: u["handled_jobs"] = [*u.get("handled_jobs", []), *done]
@@ -660,8 +679,13 @@ def tend_parked(cfg, hs, units, log, fetched=None):
                     # record (bd) is saved best-effort after, so a failed save cannot start a second run on the same session
                     key, cause = f"parked:{u['name']}", f"resume:{','.join(jobs)}"
                     if (u.get("resume_error") or {}).get("n", 0) >= RESUME_TRIES: continue
+                    if not cfg.run.dry:   # an earlier unit's resume let the lock go: judge this unit on its record as it is now
+                        cur = next((x for x in bd.units() if x["id"] == u["id"]), None)
+                        if cur is None or cur.get("busy") or set(jobs) <= set(cur.get("handled_jobs", [])) or (cur.get("parked") or {}).get("jobs") != jobs:
+                            log(f"{u['name']}: changed or busy since this pass read it: left to the next pass"); continue
                     if cfg.run.dry or once(cfg, key, cause):
-                        try: log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs)))
+                        try: log(resume_outside_lock(cfg, bd, u, lambda: resume_message(cfg, hs, u, jobs)))
+                        except LockLost: raise   # the resume ran, its record is not written: the pass stops here, never on without the lock
                         except Err as e:   # nothing started: recorded on the unit, check reports it; the next pass tries again
                             if not cfg.run.dry: unonce(cfg, key, cause)
                             if not cfg.run.dry:   # bounded: after RESUME_TRIES failures the watcher leaves it (parked:<unit>:resume says so)
@@ -673,6 +697,7 @@ def tend_parked(cfg, hs, units, log, fetched=None):
                     if cfg.run.dry: continue
                     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); save_soft(bd, u, log)
                 continue
+        except LockLost: raise
         except Err as e: log(f"{u['name']}: {e}")
 
 def save_soft(bd, u, log):

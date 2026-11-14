@@ -12,6 +12,8 @@ each host, workers in any coding tool, verified context refresh, and a read-only
 - **Each host owns its work.** Admission, tests and merge preparation run where the tree is (`janus run`, `janus land` over ssh); the host's
   own admission (`runs/cap.sh`) is the final authority: janus reads its numbers from the probe (`cap_jmb`, `cap_amb`, `cls=` lines) and holds no copy of its history
   arithmetic. A remote unit's copy carries its repository (`launch.seed_repo`: bundle + `.git`), and its `lane` is `janus/lane.py`, the code `janus run` queues with.
+- **Short locks.** The project writer lock covers state steps only; host I/O runs with it let go (`cfg.unlocked`), guarded by the unit's busy mark, `once.json`
+  and the watcher's own `watch.lock` (`docs/REFERENCE.md`, Locks).
 - **Publication is protected, not gated.** `land` squashes from the tip it merged and moves the branch only from that tip (expected ref),
   pushes unforced, and re-merges a moved branch a bounded number of times. No test run is implied.
 - **Adapters only where tools differ:** launch (herdr/tmux/API run), resume, status, reset (`reset.RESET_CMD`, verified by a new session).

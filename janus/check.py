@@ -94,11 +94,11 @@ def run_check(cfg, cycle=True, writer=None, pre=None):
     own lock (the watcher)."""
     cfg.run.ro = not (writer if writer is not None else is_orchestrator(cfg))
     hs, fetched = pre if pre is not None else read_remote(cfg)   # the slow part, outside the lock
+    with cfg.unlocked(): ag = herdr_agents(cfg)   # herdr's socket: not under the writer lock (a watcher pass holds it here)
     with cfg.writer() if not cfg.run.ro else contextlib.nullcontext():   # one writer at a time; readers lock nothing
         bd_err = None; units = []; bd = None
         try: bd = Beads(cfg); units = bd.units()   # read again under the lock: the records the sync judges and saves are current
         except Err as e: bd_err = str(e)
-        ag = herdr_agents(cfg)
         F = collect_findings(cfg, hs, units, ag, bd_err, bd, fetched)
         if not cfg.run.ro:
             with cfg.unlocked(): tune_pueue(cfg, hs, units)   # ssh to every host: not under the state lock

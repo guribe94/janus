@@ -6,6 +6,7 @@ keep-build-output) nothing removed a closed worktree's rebuildable output, and n
 orchestrator. Standard library only.
 
 Run by ./check (it discovers tests/test_*.py)."""
+from unittest import mock
 import tempfile, unittest
 from pathlib import Path
 
@@ -53,8 +54,12 @@ class Auto(unittest.TestCase):
         calls = []
         janus.tidy_all = lambda *a, **k: [("worktree", "/x/w", "why", 0), ("container", "h:c", "why", 0)]
         janus.tidy_do = lambda cfg2, kind, t: (calls.append((kind, t)), (0, ""))[1]
-        janus.tend_tidy(cfg, {}, [], lambda m: None)
-        self.assertEqual(calls, [("worktree", "/x/w")])                                  # the container needs the orchestrator
+        B = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [{"name": "open", "cwd": "/x/open"}]})
+        with mock.patch.object(janus, "Beads", B): janus.tend_tidy(cfg, {}, [], lambda m: None)
+        self.assertEqual(calls, [("worktree", "/x/w")])                                  # the container needs the orchestrator; a tree an open unit uses now is never removed
+        calls.clear(); janus.tidy_all = lambda *a, **k: [("worktree", "/x/open", "why", 0)]
+        with mock.patch.object(janus, "Beads", B): janus.tend_tidy(cfg, {}, [], lambda m: None)
+        self.assertEqual(calls, [])
 
     def test_auto_off_removes_nothing(self):
         d, cfg = project("\n[tidy]\nevery_min = 0\n")

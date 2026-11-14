@@ -9,7 +9,7 @@ from janus.board import board
 from janus.cache import cache_key, input_hashes, lookup as cache_lookup, record as cache_record, settle as cache_settle
 from janus import lane
 from janus.cap import cap_call, cap_lib, cap_nums, capv, class_rows, host_cap
-from janus.context import Err, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
+from janus.context import Err, LockLost, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
 from janus.platform import ARCH, CACHE_ENV, MAXRSS_PY, cache_env_sh
 from janus.project import own_label, tag, untagged
 from janus.probe import host_facts, probe, probe_all, pueue
@@ -611,15 +611,18 @@ def tend_thrash(cfg, hs, units, log, dry=False):
         msg = f"{n} thrashing (memory PSI {psi} over {lim:g} for {mins:.0f} min): stop {ref} ({jid}, newest of {len(jobs)}), re-queue on {to}"
         if to == n: msg += " (no other host has room or meets it: re-queued on the SAME host, which is still over the limit)"
         if dry: out.append("would " + msg); continue
+        st = cfg.jget("thrash.json"); st[n] = int(now()); cfg.jput("thrash.json", st)   # claimed before the host is touched: finding 8's over-since clock restarts, so no other pass or command stops/re-queues this job or the next one meanwhile
         try:
-            done = cancel_job(cfg, ref, force=True); new = [requeue(cfg, spec, to)]
+            with cfg.unlocked(): done = cancel_job(cfg, ref, force=True); new = [requeue(cfg, spec, to)]   # the host's kill, the file copy, the re-queue: not under the writer lock (a cancelled task cannot be cancelled again, so the re-queue happens once)
             line = f"{msg}: {'; '.join(done)}; now {new[0]}"
             rec = cfg.jget("thrash-acts.json"); rec[str(int(now()))] = line; cfg.jput("thrash-acts.json", dict(list(rec.items())[-50:]))
             if spec.get("unit"): board(cfg, "direct", spec["unit"], f"your job {ref} was stopped on {n} (host thrashing) and re-queued as {new[0]}: wait on that id")
-            st = cfg.jget("thrash.json"); st[n] = int(now()); cfg.jput("thrash.json", st)   # finding 8: reset the over-since clock
-            try: thrash_log(cfg, cfg.hosts[n], jid, line)
+            try:
+                with cfg.unlocked(): thrash_log(cfg, cfg.hosts[n], jid, line)
+            except LockLost: raise
             except Err as e: out.append(f"{msg}: (its job log could not be written: {e})")
             out.append(line)
+        except LockLost: raise
         except Err as e: out.append(f"{msg}: failed: {e}")
         log(out[-1])
     return out

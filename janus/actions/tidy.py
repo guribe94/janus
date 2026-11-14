@@ -5,7 +5,7 @@ from pathlib import Path
 from janus.actions.lifecycle import uncollected
 from janus.beads import Beads
 from janus.board import board, board_rows
-from janus.context import FIXTURE_MARK, Err, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
+from janus.context import FIXTURE_MARK, Err, LockLost, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
 from janus.branch import landed, landing_branch
 from janus.project import own_card
 from janus.transcripts import card_fields
@@ -202,12 +202,16 @@ def tend_tidy(cfg, hs, units, log):
     """The watcher refreshes the reclaimable list every [tidy] every_min; with [tidy] auto = true it also removes the safe kinds
     (a clean landed worktree, a landed branch) itself, so the tidy:<n> finding does not keep firing for bookkeeping nobody does."""
     if now() - cfg.jget("tidy.json").get("at", 0) < tset(cfg, "every_min") * 60: return
-    try: P = apply_holds(cfg, tidy_all(cfg, units, hs))
+    try:
+        with cfg.unlocked(): P = apply_holds(cfg, tidy_all(cfg, units, hs))   # the hosts' scan (ssh) and git: not under the writer lock
+    except LockLost: raise
     except Exception as e: log(f"tidy pass failed: {e}"); return
     cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P]})
     if tset(cfg, "auto") and not cfg.run.dry and not cfg.run.ro:
+        try: taken = {str(Path(u["cwd"]).resolve()) for u in Beads(cfg).units() if u.get("cwd")}   # units read again: a tree launched into meanwhile is never removed
+        except Err: return
         for kind, t, why, mb in P:
-            if kind not in TIDY_AUTO_KINDS: continue
+            if kind not in TIDY_AUTO_KINDS or (kind == "worktree" and str(Path(t).resolve()) in taken): continue
             rc, e = tidy_do(cfg, kind, t); log(f"tidy auto {kind} {t}: {'removed' if rc == 0 else 'NOT removed ' + (e or '').strip()[:80]}")
 
 def tidy_do(cfg, kind, t):

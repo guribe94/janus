@@ -222,7 +222,7 @@ class Item10GiveUpResidues(unittest.TestCase):
 class Item8ResumeDryRun(unittest.TestCase):
     def test_dry_run_says_would_prompt(self):
         """Catches: janus resume --dry-run <herdr unit> printed '<unit>: prompted in its herdr pane' although nothing was prompted."""
-        d, cfg = project(); cfg.run.dry = True
+        d, cfg = project('[providers.sub]\nenabled = true\nauth = "subscription"\n[models.m]\nprovider = "sub"\nkind = "claude"\n'); cfg.run.dry = True
         u = {"id": "t-1", "name": "u1", "host": "here", "via": "herdr", "pane": "p1", "model": "m", "started": 0}
         called = []; real = janus.herdr; janus.herdr = lambda *a, **k: called.append(a)
         try: line = janus.resume_unit(cfg, u, "go")

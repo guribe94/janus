@@ -72,6 +72,14 @@ size trigger and no end-to-end live run was made. Otherwise it says why and rest
 Launch and resume command lines (`launch.tool_argv`) are the ones each client's `--help` shows: claude `--model/--resume`, codex `resume`/`-m`,
 opencode `run --model/--session`.
 
+## Locks
+Host and herdr I/O never runs under the project writer lock (`.janus/write.lock`). A watcher pass holds a separate `.janus/watch.lock` (a second
+pass is skipped, not queued) and takes the writer lock only for short state steps: probes, remote output copies, board sync, heartbeat, tidy scans,
+thrash cancels and re-queues, orphan cancels, herdr calls and a resume's message and delivery all run with it let go (`cfg.unlocked`). A resume
+records the unit busy (and `once.json` for the same finished jobs) before it lets go, so neither another pass, `janus resume`, `stop` nor `close`
+starts a second one; a thrash stop restarts the host's over-since clock before touching the host. If the lock cannot be retaken afterwards the pass
+ends and `check` names the unit interrupted. A resume refuses a removed, unknown or disabled model (`route_ok`) on every path.
+
 ## Findings
 | Family | Meaning |
 |---|---|
