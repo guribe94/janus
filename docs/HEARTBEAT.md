@@ -1,11 +1,12 @@
 # Heartbeat watchdog
 
-`janus watch` runs on the coordinating machine every few minutes. If that machine
+`janus watch` runs on the coordinating machine every 2 minutes. If that machine
 sleeps, crashes or loses its network, nothing notices: the watcher simply stops
 running and the work sits still. The heartbeat watchdog is a small, separate
 process on a second machine that notices the silence and raises an alert.
 
-It is three shell scripts and one test file:
+Optional. It needs a second host in `janus.toml` with ssh access and, for the installer, a Linux systemd user manager. It is three shell scripts
+and one test file:
 
 | File | Runs on | What it does |
 |---|---|---|
@@ -45,10 +46,25 @@ runs stay quiet. When beats resume, the watchdog posts recovery once
 (`<agent> status: heartbeat recovered: ...`) and clears the state. A missing
 heartbeat file counts as an outage.
 
-## Install
+## Set up with janus
 
-On the watchdog host, with the repository checked out and ssh access to the
-coordinating machine already working:
+Name the second host in `.janus/janus.toml` (it must be a `[hosts.<name>]` other than the local one) and run `janus install-host <name>`:
+
+```toml
+[heartbeat]
+watchdog = "<name>"       # a host of janus.toml, not this machine
+max_age_min = 15
+alert_cmd = "notify-send janus \"$1\""
+```
+
+`install-host` copies `heartbeat/` to `<root>/janus/heartbeat` on that host (`root` is the host's `root`, default `$HOME/janus`) and runs
+`install-watchdog` there with the settings above. The heartbeat file is `<root>/heartbeat`, the board outbox `<root>/board-outbox/outbox.log`, and the board
+agent name `janus-heartbeat`. From then on every watcher pass calls `beat` (see below). Nothing is sent until `[heartbeat] watchdog` is set.
+
+## Install by hand
+
+To run the installer yourself on the watchdog host, with the repository checked out and ssh access from
+the coordinating machine already working (run from the repository root):
 
 ```sh
 HEARTBEAT_FILE="$HOME/.local/state/janus/heartbeat" \
@@ -118,24 +134,21 @@ HEARTBEAT_ALERT_CMD='ntfy publish my-topic "$1"'
 HEARTBEAT_ALERT_CMD='curl -fsS -d "$1" https://example.invalid/hook'
 ```
 
-## How janus will call `beat`
+## How janus calls `beat`
 
-This round ships the scripts and the tests only; `janus.py` is not changed. In the
-improvements round the watcher will call `beat` at the end of each `janus watch`
-pass, after the check, with the check's exit code:
+When `[heartbeat] watchdog` is set, each `janus watch` pass runs `beat` (the `heartbeat_beat` step, with the project's writer lock let go):
 
 ```sh
-HEARTBEAT_FILE="$state/heartbeat" \
-HEARTBEAT_CHECK_EXIT="$check_rc" \
-HEARTBEAT_REMOTE="$watchdog_ssh" \
-HEARTBEAT_REMOTE_PATH="$watchdog_heartbeat" \
-  heartbeat/beat
+HEARTBEAT_FILE="PROJECT/.janus/heartbeat" \
+HEARTBEAT_REMOTE="<the watchdog host's ssh target>" \
+HEARTBEAT_REMOTE_PATH="<root>/heartbeat" \
+HEARTBEAT_SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5" \
+  heartbeat/beat 0
 ```
 
-`$state` is the project's state folder (`.janus` by default), so the record lives
-beside the rest of the watcher's state. The call is fire-and-forget: `beat` never
-fails the pass, and the copy is best-effort. The watchdog host needs only the
-heartbeat file and, optionally, a board outbox; it does not need the project.
+The recorded `check_exit` is always `0` from the watcher: the beat says the watcher ran, not that the check was clean. The step is bounded (60 s) and a
+failure is only logged in `watch.log`; `beat` never fails the pass, and the copy is best-effort. The watchdog host needs only the heartbeat file and,
+optionally, a board outbox; it does not need the project.
 
 ## Notes
 

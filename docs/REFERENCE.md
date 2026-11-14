@@ -43,14 +43,29 @@ after a meaningful change of plan, and before a reset (the Stop hook asks once o
 `[providers.X] enabled`, `auth = "api_key"|"subscription"`; `[models.M] tool`, `provider`, `hosts`; `[routing] allow_tools = [...]`,
 `allow_auth = [...]` and the ordered `critical`/`normal`/`review` lists. A model outside these is never launched. Only the first entry of a list is used; a later
 entry (another provider or login) is used only when you write `fallback = true` in `[routing]`, and then it is printed. The same restrictions bind a
-resume. No model qualification or vendor rule exists. Current operation: Claude through `ANTHROPIC_API_KEY` only (`allow_auth = ["api_key"]`,
-`allow_tools = ["claude"]`, the other providers disabled).
+resume. A list you leave out restricts nothing. janus has no built-in model, vendor or login rule: what is allowed is what you write here. For example,
+an API-key-only setup is `allow_auth = ["api_key"]`, `allow_tools = ["claude"]` with other providers disabled (the shipped `example.janus.toml`); add
+`"subscription"` or other tools to allow them. The key is read from a keychain item or a mode-600 file at run time and given only to the agent process.
 
 ## Capacity
 Admission is by reservations on the host that runs the job (cores, learned peak memory, disk floor, back-pressure); `janus capacity` and the
-host's own admission use one calculation. The first job on an idle host is exempt only from the agents' share: it must still fit the host alone.
+host's own admission use one calculation. Three things are kept apart:
+- **Configured resources** (`cores`, `ram_gb`, `services_gb`, `cores_per_job`, `job_gb`, `agent_gb`, `min_disk_gb`) are the budget reservations count against.
+  pueue's `jobs` group limit is derived from them alone (`cores // cores_per_job`); a reading never raises it.
+- **Currently measured state** (free memory, memory pressure, load, free disk, what runs now) decides what may start now: it can pause admission or
+  hold a job at the disk floor, and the `agents` group limit is set each watcher pass to the agents running plus the agents that fit now.
+  A job's memory figure is learned from its past peaks, not configured once.
+- **Owner caps** (`[caps] total`, `[caps.host]`) limit the number of agents and exist only when you set them; they lower the `agents` figure
+  and raise `cap:*` findings when exceeded. They are not a resource budget.
+ The first job on an idle host is exempt only from the agents' share: it must still fit the host alone.
 Pending authorized work fills every capable host with room; nothing is pinned to a default host. A host that does not answer is *unknown*:
 its jobs are not cancelled, moved or relaunched. SSH is retried only when the master connection refused the session (nothing ran).
+
+## Waiting for jobs
+`janus run` waits for its task in steps of at most 300 s (`WAIT_STEP`). Locally the wait is `exec pueue wait`, killed at 300 s. On a remote host it is
+`timeout 300 pueue wait -q ID` run there over ssh (the local ssh is a 330 s backstop), because killing only the local ssh left the remote wait
+running. A remote host therefore needs coreutils `timeout`; without it each wait fails at once and janus polls every few seconds. After a step
+that ran out, janus reports the host's admission reason if the job's own admission is holding it, and waits again.
 
 ## Remote units and git
 A unit on another host gets its copy by rsync (no `.git`) plus a git bundle of the landing branch and its HEAD, fetched into a new `.git` there:
@@ -119,6 +134,13 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 update the handoff over the context threshold. A worker's Stop hook blocks once if its report has no VERDICT and no WAITING line.
 
 ## Install
-`./check [test_file.py ...]` is a smoke check (and only the named tests). `./install --stage-only` builds an immutable release and checks it
-without switching; `./install --release-only` (and a full `./install`) switches `current` but refuses while a registered project is still on the old layout (migrate it first); `--rollback` goes back. Releases a running process or queued job names are
-never pruned. Skill links: `~/.claude/skills/janus` (Claude Code and opencode) and `~/.agents/skills/janus` (Codex).
+`./check [test_file.py ...]` is a smoke check (and only the named tests). `./install` options: `--dry-run` (print every change), `--project DIR`,
+`--stage-only` (build and check an immutable release, switch nothing), `--release-only` (release and links only: no hooks, no watcher),
+`--rollback` (back to the previous release), `--no-hosts`, `--hosts-only`, `--tests PATTERN` (also run only the matching test files against the copy).
+Both `--release-only` and a full `./install` switch `current` and refuse while a registered project is still on the old layout (migrate it first, with
+`python3 janus.py migrate` from the checkout or the staged release; see the README). A full `./install` also merges hooks into `~/.claude/settings.json`
+and `~/.codex/hooks.json` (backup first), activates the watcher (launchd agent or systemd user timer, every 2 minutes, over the projects listed in
+`~/.config/janus/projects`; the project found from the current directory or `--project` is added) and runs `janus install-host` per remote host.
+Because the watcher can start an orchestrator, set up and `janus register` first, then run the full install (README, Fresh setup).
+Releases a running process or queued job names are never pruned. Skill links: `~/.claude/skills/janus` (Claude Code and opencode) and
+`~/.agents/skills/janus` (Codex).
