@@ -731,6 +731,32 @@ class Board(unittest.TestCase):
             rc, o, e = janus.board(cfg, "post", bad, "status", "x"); self.assertEqual(rc, 2, bad); self.assertIn("bad agent name", e)
 
 
+    def alert_fixture(self, delivered):
+        """A project with a pane and one open question q42; the prompt appends to a file and answers delivered(n)."""
+        d, cfg = project(); cfg.run.ro = False; cfg.f("pane").write_text("p1\n"); log = d / "prompts"
+        def herdr(*a):
+            time.sleep(0.3); n = len(log.read_text().splitlines()) if log.exists() else 0
+            if delivered(n): log.open("a").write("sent\n"); return "ok"
+        return d, cfg, log, herdr
+
+    def test_concurrent_board_alerts_tell_a_question_once_and_a_failed_send_is_retried(self):
+        """Catches: watch --alert (no watcher lock) and the watcher pass both reading alerted.json before either wrote it, sending q42 more than once; a failed prompt marking the question told."""
+        d, cfg, log, herdr = self.alert_fixture(lambda n: True)
+        with mock.patch.object(janus, "board_questions", return_value=[("q42", "ann", "t", "which?")]), mock.patch.object(janus, "board_rows", return_value={}), mock.patch.object(janus, "herdr", herdr):
+            pids = []
+            for _ in range(4):   # processes, not threads: the writer lock is re-entrant within one process
+                pid = os.fork()
+                if not pid:
+                    try: janus.board_alerts(cfg, lambda m: None)
+                    finally: os._exit(0)
+                pids.append(pid)
+            for pid in pids: os.waitpid(pid, 0)
+        self.assertEqual(log.read_text().splitlines(), ["sent"]); self.assertIn("q:q42", cfg.jget("alerted.json"))
+        log_state = [False]; d, cfg, log, herdr = self.alert_fixture(lambda n: log_state[0])
+        with mock.patch.object(janus, "board_questions", return_value=[("q42", "ann", "t", "which?")]), mock.patch.object(janus, "board_rows", return_value={}), mock.patch.object(janus, "herdr", herdr):
+            self.assertIsNone(janus.board_alerts(cfg, lambda m: None)); self.assertNotIn("q:q42", cfg.jget("alerted.json"))   # failed: nothing recorded
+            log_state[0] = True; self.assertIn("q42", janus.board_alerts(cfg, lambda m: None)); self.assertIsNone(janus.board_alerts(cfg, lambda m: None))   # retried once, then told once
+
 class Thrash(unittest.TestCase):
     """fixes10 item 3: a shared host over thrash_psi for thrash_min: this project's newest admitted job is stopped and re-queued
     elsewhere; jobs not recorded by this project (or another task with the same script) are never touched."""

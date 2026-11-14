@@ -2,7 +2,7 @@
 
 board_script/board_dir/board, board_rows/board_questions, board_findings, board_files/board_alerts. A project may still
 override paths.board (board.sh stays a callable path). The board lives in .janus/board by default."""
-from janus.context import Err, JANUS_SELF, sh, now, herdr, atomic_write, JANUS_MARK
+from janus.context import Err, JANUS_SELF, sh, now, herdr, atomic_write, JANUS_MARK, writer_lock
 import hashlib, os, re, shlex, sys, time
 from pathlib import Path
 
@@ -83,7 +83,12 @@ def board_files(cfg):
     if not (bd / ".notify").exists() or (bd / ".notify").read_text() != nt: atomic_write(bd / ".notify", nt)
 
 def board_alerts(cfg, log):
-    """Prompt the orchestrator at once on a new board question or block (janus-swarm item 6): each is told once."""
+    """Prompt the orchestrator at once on a new board question or block (janus-swarm item 6): each is told once. Its own lock
+    (alert.lock, not the project's writer lock) makes the read of alerted.json, the prompt and the write one step for the watcher's
+    pass and every .notify call; a failed prompt writes nothing, so the next call retries. It takes no board lock while held."""
+    with writer_lock(cfg.f("alert.lock")): return _board_alerts(cfg, log)
+
+def _board_alerts(cfg, log):
     qs = board_questions(cfg)
     items = [(f"q:{q}", f"QUESTION [{q}] from {ag}: {tx[:200]}") for q, ag, at, tx in (qs or [])]
     items += [(f"b:{c}:{hashlib.md5(r['text'].encode()).hexdigest()[:8]}", f"BLOCKED {c}: {r['text'][:200]}") for c, r in board_rows(cfg).items()

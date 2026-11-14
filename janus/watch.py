@@ -88,7 +88,7 @@ def watch_pass(cfg, log, pre=None):
     t0 = now(); F, live, hs, units = run_check(cfg, cycle=False, writer=True, pre=pre); STEP_S["check"] = now() - t0
     F = [f for f in F if f.family != "machine"]   # machine state (no project id) never wakes or starts an orchestrator
     step("heartbeat_beat", outside, cfg, heartbeat_beat, cfg)   # the watchdog host sees this pass (inert until heartbeat/ ships and [heartbeat] watchdog is set)
-    step("board_alerts", board_alerts, cfg, log)
+    step("board_alerts", outside, cfg, board_alerts, cfg, log)   # the prompt and the alert lock wait never under the writer lock
     step("tend_parked", tend_parked, cfg, hs, units, log, pre[1] if pre else None)   # park, and resume when the jobs finished
     step("tend_thrash", tend_thrash, cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job
     step("tend_tidy", tend_tidy, cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)

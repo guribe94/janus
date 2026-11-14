@@ -315,6 +315,7 @@ class Interaction(Base):
         self.run_ui(scr)
         self.assertEqual(new_rows(scr.a), []); self.assertIn("[Board (4)]", scr.a)
         for kind in ("UPDATE", "QUESTION", "BLOCKER", "ANSWER"): self.assertIn(kind, scr.a)
+        self.assertIn("orchestrator -> ann", scr.a); self.assertIn("ann ", [l for l in scr.a.splitlines() if "started" in l][0])   # a directed message names its recipient; an ordinary post keeps its sender alone
         self.assertIn("Board (5, 1 new)", scr.b); self.assertEqual(len(new_rows(scr.b)), 1); self.assertIn("VERDICT: DONE", new_rows(scr.b)[0]); self.assertIn("no disk", [l for l in scr.b.splitlines() if l.startswith("> ")][0])
         self.assertEqual(new_rows(scr.c), []); self.assertIn("[Board (5)]", scr.c)   # selected: read
 

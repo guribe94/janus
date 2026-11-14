@@ -320,7 +320,7 @@ def source_note(label, s, now, limit):
 
 WORK_COLS = (("NAME", 24, 9, True), ("STATE", 22, 8, False), ("HOST", 10, 4, False), ("TOOL/MODEL", 20, 3, False), ("ELAPSED", 8, 6, False))
 OVERVIEW_COLS = (("ITEM", 14, 9, False), ("NOW", 60, 9, True))
-BOARD_COLS = (("NEW", 3, 7, False), ("TIME", 16, 5, False), ("KIND", 9, 8, False), ("AGENT", 16, 6, False), ("MESSAGE", 40, 9, True))
+BOARD_COLS = (("NEW", 3, 7, False), ("TIME", 16, 5, False), ("KIND", 9, 8, False), ("AGENT", 24, 6, False), ("MESSAGE", 40, 9, True))
 HOST_COLS = (("HOST", 12, 9, False), ("STATE", 11, 8, False), ("RUN/QUEUED", 10, 7, False), ("AGENTS", 6, 6, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False),
              ("ADMISSION", 22, 6, False), ("TOOLS (FACTS AGE)", 24, 3, False), ("NOTE", 30, 2, True))
 NOT_READ = {"err": "report not read yet"}   # a unit's report before its first read: unknown, never 'no verdict'
@@ -409,7 +409,7 @@ def message_rows(data, stale):
         style = {"QUESTION": "warn" if qstate in (None, "open") else "dim", "BLOCKER": "bad", "ANSWER": "ok", "DIRECTION": "ok"}.get(label, "")
         d = [f"Time:      {m['t']}", f"Kind:      {label}" + (f"  ({qstate})" if qstate else ""), f"From:      {m['who']}" + (f"  to {m['to']}" if m["to"] else ""), "", m["text"]]
         if q and q.get("answer"): d += ["", f"Answer ({q.get('answered')}): {q['answer']}"]
-        rows.append(Row(m["key"], ("", m["t"], label + ("*" if qstate == "open" else ""), m["who"], m["text"]), style, d, stale))
+        rows.append(Row(m["key"], ("", m["t"], label + ("*" if qstate == "open" else ""), m["who"] + (f" -> {m['to']}" if m["to"] else ""), m["text"]), style, d, stale))
     rows.reverse()   # newest first
     for qid, q in qs.items():   # an open question older than the log window is still open
         if qid not in shown and q.get("state") == "open":
