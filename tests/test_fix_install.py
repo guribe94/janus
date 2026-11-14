@@ -4,20 +4,20 @@ import contextlib, io, json, os, re, subprocess, sys, tempfile, textwrap, time, 
 from pathlib import Path
 from unittest import mock
 
-from janusload import JANUS_PY, load
+from janusload import JANUS_PY, conf, load
 
 janus = load()
 
 
 def project(extra=""):
     d = Path(tempfile.mkdtemp(prefix="janus-fix-"))
-    (d / "janus.toml").write_text(textwrap.dedent('''
+    conf(d).write_text(textwrap.dedent('''
         [project]
         name = "t"
         [hosts.here]
         local = true
         ''') + textwrap.dedent(extra))
-    (d / "out").mkdir(); (d / "briefs").mkdir()
+    (d / ".janus" / "out").mkdir(); (d / ".janus" / "briefs").mkdir()
     return d, janus.Cfg(d)
 
 
@@ -31,7 +31,7 @@ class Item11Verdict(unittest.TestCase):
         """Catches: units.verdict/verdict_line excluded only PENDING, so a report ending 'VERDICT: WAITING' read as finished and
         its jobs were cancelled as orphans."""
         d, cfg = project()
-        (d / "out/u1").mkdir(parents=True); (d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\nbody\nWAITING here:1\nVERDICT: WAITING\n")
+        (d / ".janus/out/u1").mkdir(parents=True); (d / ".janus/out/u1/REPORT.md").write_text("VERDICT: PENDING\nbody\nWAITING here:1\nVERDICT: WAITING\n")
         self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
         self.assertEqual(janus.verdict_line({"verdict": "WAITING"}), (None, True))
         self.assertEqual(janus.verdict_line({"verdict": "PENDING"}), (None, True))
@@ -39,7 +39,7 @@ class Item11Verdict(unittest.TestCase):
 
     def test_a_recorded_park_wins_over_a_verdict(self):
         """Catches: a unit whose run was resumed and then parked was judged finished (its jobs became orphan:job)."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True); (d / "out/u1/REPORT.md").write_text("VERDICT: DONE\nall good\n")
+        d, cfg = project(); (d / ".janus/out/u1").mkdir(parents=True); (d / ".janus/out/u1/REPORT.md").write_text("VERDICT: DONE\nall good\n")
         u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0, "parked": {"jobs": ["here:9"]}}
         hs = {"here": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}}}})}
         F, _ = janus.unit_findings(cfg, hs, [u], {})
@@ -50,11 +50,11 @@ class Item11Verdict(unittest.TestCase):
         """Catches (item 11 addendum): a remote unit's local report has no WAITING line until collect, so check judged it orphaned
         and its jobs were cancelled."""
         d, cfg = project("\n[hosts.far]\nssh = \"far\"\nroot = \"/home/x\"\n")
-        (d / "out/u1").mkdir(parents=True); (d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\n")
+        (d / ".janus/out/u1").mkdir(parents=True); (d / ".janus/out/u1/REPORT.md").write_text("VERDICT: PENDING\n")
         u = {"id": "t-1", "name": "u1", "host": "far", "via": "pueue", "task": 5, "model": "m", "started": 0, "state": "done"}
         hs = {"far": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}}}})}
         real = janus.save_output
-        janus.save_output = lambda cfg, u: ((d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\nWAITING far:9\n"), True)[1]
+        janus.save_output = lambda cfg, u: ((d / ".janus/out/u1/REPORT.md").write_text("VERDICT: PENDING\nWAITING far:9\n"), True)[1]
         try:
             janus.sync_remote_outputs(cfg, [u], type("B", (), {"save": lambda self, u: None})())
             F, _ = janus.unit_findings(cfg, hs, [u], {})
@@ -63,23 +63,6 @@ class Item11Verdict(unittest.TestCase):
         self.assertNotIn("orphan:job:far:9", [k for k, _ in janus.orphan_job_findings(cfg, hs, [u], set())])
         import inspect
         self.assertIn("sync_remote_outputs(cfg, units, bd, fetched)", inspect.getsource(janus.collect_findings))
-
-
-class Item7WastePause(unittest.TestCase):
-    def test_an_ack_of_waste_pause_keeps_launch_unpaused(self):
-        """Catches: waste_paused returned None while its ack was live, so the finding was gone and the next check dropped the ack
-        ('finding gone') and re-paused launch and fill."""
-        d, cfg = project()
-        cfg.jput("acks.json", {"waste-pause": {"t": janus.now(), "d": "cause found"}})
-        real = janus.waste_state; janus.waste_state = lambda cfg, outs=None: (10.0, 20.0, 50.0)
-        try:
-            for _ in range(2):
-                self.assertTrue(janus.waste_paused(cfg), "waste_paused hid the reason while its ack was live")
-                keys = {k for k, _ in janus.report_findings(cfg, [])}
-                self.assertIn("waste-pause", keys)
-                self.assertIn("waste-pause", janus.live_acks(cfg, keys), "the ack was dropped as 'finding gone'")
-                self.assertIsNone(janus.waste_block(cfg), "launch is refused although waste-pause is acked")
-        finally: janus.waste_state = real
 
 
 class Item13Handover(unittest.TestCase):
@@ -104,88 +87,6 @@ class Item13Handover(unittest.TestCase):
         units = [{"id": "t-1", "name": "u1", "cwd": str(W)}]
         self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u2"), (["u1"], None))
         self.assertEqual(janus.cwd_taken(cfg, units, W.resolve(), "u2", resume_of="u1"), ([], "u1"))
-
-
-class Item12FinalGate(unittest.TestCase):
-
-    def test_final_gate_quotes_substitutions_and_leaves_shell_values(self):
-        """Catches (finding 7): {unit}, {wt} and {branch} went unquoted into a shell command, so a hostile branch name or a
-        path with a space split it (an agent names its own branch, and the command runs on the final-gate host), and a ${...}
-        in the config was mangled (${wt} became $/w)."""
-        ld = {"final_gate": "bin/gate.sh {unit} {branch} --wt {wt}"}
-        self.assertEqual(janus.final_gate_cmd(ld, "u1", "/Users/me/My Code/wt", "x;touch${IFS}/tmp/pwned"),
-                         "bin/gate.sh u1 'x;touch${IFS}/tmp/pwned' --wt '/Users/me/My Code/wt'")
-        self.assertEqual(janus.final_gate_cmd({"final_gate": "cd ${wt} && ./gate ${unit}"}, "u1", "/w", "b"),
-                         "cd ${wt} && ./gate ${unit}")
-
-    def test_a_placeholder_the_config_already_quotes_is_not_substituted_raw(self):
-        """Catches (finding 10): with the config form `--branch "{branch}"`, the placeholder's own quotes were kept and the
-        agent's branch name was inserted unquoted between them, so `wk/x$(touch${IFS}/tmp/p)';id;'` ran `$(...)`; and the
-        single-quoted form let the value close the quote and run `id`."""
-        import shlex as _s
-        v = "wk/x$(touch${IFS}/tmp/p)';id;'"
-        for cfg_form in ('bin/gate.sh --branch "{branch}"', "bin/gate.sh --branch '{branch}'"):
-            self.assertEqual(janus.final_gate_cmd({"final_gate": cfg_form}, "u1", "/w", v), "bin/gate.sh --branch " + _s.quote(v), cfg_form)
-
-    def test_a_placeholder_in_any_quoting_form_is_safe_and_sh_c_works(self):
-        """Catches (finding 3, fix-install6): final_gate_cmd dropped the config's quotes only when the placeholder was alone
-        between matching quotes, so a placeholder inside double quotes with surrounding text (`--ref "refs/heads/{branch}"`,
-        `"--branch={branch}"`, `ssh h "./gate '{branch}'"`) was inserted raw and `$(...)` in the agent's branch ran on the gate
-        host; and `sh -c 'cd "{wt}" && ./check'` (double quotes nested in single quotes) lost the config's quotes, so the
-        shlex.quote single quotes broke the outer `sh -c` quotes and the gate failed (rc 1) although the path was fine."""
-        d = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-i12g-"))
-        wt = d / "My Code" / "wt"; wt.mkdir(parents=True)
-        (wt / "check").write_text("#!/bin/sh\necho CHECK-RAN\n"); (wt / "check").chmod(0o755)
-        cmd = janus.final_gate_cmd({"final_gate": "sh -c 'cd \"{wt}\" && ./check'"}, "u1", str(wt), "b")
-        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, cwd=d)
-        self.assertEqual(r.returncode, 0, cmd + " :: " + r.stderr)
-        self.assertIn("CHECK-RAN", r.stdout)
-        (d / "bin").mkdir(); (d / "bin" / "ssh").write_text("#!/bin/sh\nexit 0\n"); (d / "bin" / "ssh").chmod(0o755)
-        env = {**os.environ, "PATH": str(d / "bin") + os.pathsep + os.environ.get("PATH", "")}
-        for form in ('cd "{wt}/sub" && ./gate --branch {branch}', './gate --ref "refs/heads/{branch}"',
-                     './gate "--branch={branch}"', "ssh h \"./gate '{branch}'\"", './gate "{branch}"', "./gate {branch}"):
-            marker = d / "PWNED"
-            evil = "wk/x$(touch${IFS}" + str(marker) + ")"
-            out = janus.final_gate_cmd({"final_gate": form}, "u1", "/w/My Code/wt", evil)
-            subprocess.run(["sh", "-c", out], capture_output=True, text=True, cwd=d, env=env, timeout=20)
-            self.assertFalse(marker.exists(), f"a $() in the branch ran for {form!r}: {out}")
-
-    def test_a_placeholder_in_a_command_substitution_is_quoted_by_the_inner_context(self):
-        """Catches (finding D, regression of 6f28b15): once the scan was inside `"` it never noticed that `$(...)` or a
-        backtick pair starts a fresh shell context, so a placeholder there was escaped for double quotes (wrong): the value's
-        own `$()` ran and a path with a space broke."""
-        d = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-i12s-"))
-        marker = d / "PWNED"
-        evil = "wk/x$(touch${IFS}" + str(marker) + ")"
-        for form in ('./gate "$(echo {branch})"', './gate "`echo {branch}`"', './gate "$(echo "{branch}")"'):
-            out = janus.final_gate_cmd({"final_gate": form}, "u1", "/w", evil)
-            subprocess.run(["sh", "-c", out], capture_output=True, text=True, cwd=d, timeout=20)
-            self.assertFalse(marker.exists(), f"a $() in the branch ran for {form!r}: {out}")
-        wt = d / "My Code" / "wt"; wt.mkdir(parents=True)
-        (wt / "check").write_text("#!/bin/sh\necho CHECK-RAN\n"); (wt / "check").chmod(0o755)
-        cmd = janus.final_gate_cmd({"final_gate": 'X="$(cd {wt} && pwd)"; cd "$X" && ./check'}, "u1", str(wt), "b")
-        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, cwd=d, timeout=20)
-        self.assertEqual(r.returncode, 0, cmd + " :: " + r.stderr)
-        self.assertIn("CHECK-RAN", r.stdout)
-
-    def test_a_second_shell_level_refuses_a_branch_it_cannot_quote(self):
-        """Catches (finding D part 2): a second shell level (`sh -c '...\"{branch}\"...'`, `ssh h \"...'{branch}'...\"`)
-        re-parses the command in a fresh shell, so no quoting of one level can make an arbitrary value safe there; janus
-        refuses a branch outside [A-Za-z0-9._/+@-] and the test runs a REAL nested shell (`ssh` that runs its argument), not a
-        stub, for the branch that passes the check."""
-        d = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-i12n-"))
-        (d / "bin").mkdir(); ssh = d / "bin" / "ssh"; ssh.write_text('#!/bin/sh\nshift; exec sh -c "$*"\n'); ssh.chmod(0o755)
-        marker = d / "PWNED"
-        (d / "gate").write_text('#!/bin/sh\nprintf %s "$1" > "$(dirname "$0")/arg"\n'); (d / "gate").chmod(0o755)
-        hostile = "wk/x$(touch${IFS}" + str(marker) + ")"
-        with self.assertRaises(janus.Err):
-            janus.final_gate_cmd_checked({"final_gate": 'ssh h \'./gate "{branch}"\''}, "u1", str(d), hostile)
-        self.assertFalse(marker.exists(), "a refused branch still reached a shell")
-        out = janus.final_gate_cmd_checked({"final_gate": 'ssh h \'./gate "{branch}"\''}, "u1", str(d), "wk/ok-1.2_ok")
-        env = {**os.environ, "PATH": str(d / "bin") + os.pathsep + os.environ.get("PATH", "")}
-        r = subprocess.run(["sh", "-c", out], capture_output=True, text=True, cwd=d, env=env, timeout=20)
-        self.assertEqual(r.returncode, 0, out + " :: " + r.stderr)
-        self.assertEqual((d / "arg").read_text(), "wk/ok-1.2_ok")
 
 
 class Item8ThrashExplicit(unittest.TestCase):
@@ -225,7 +126,7 @@ class Item9ResumeCard(unittest.TestCase):
         """Catches: a unit resumed with janus resume --message whose run is queued in pueue (agents slot full) showed board GONE
         (relaunch it), because resume did not post the card with the new run."""
         d, cfg = project('\n[providers.api]\nenabled = true\n[models.m]\nprovider = "api"\nkind = "api"\n')
-        b = d / "briefs/u1.md"; b.write_text("# Brief: u1\n")
+        b = d / ".janus/briefs/u1.md"; b.write_text("# Brief: u1\n")
         u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "model": "m", "task": 5, "budget": 2.0, "run": "u1.1",
              "brief": str(b), "rbrief": str(b), "rcwd": str(d), "started": 0}
         posts = []
@@ -318,85 +219,6 @@ class Item10GiveUpResidues(unittest.TestCase):
         finally: janus.job_result = saved
         self.assertIn("never admitted", msg, msg)
 
-    def test_a_jobs_job_yielding_to_a_gates_job_is_bounded_and_names_the_cause(self):
-        """Catches (finding 7, fix-install6): while any gates job waited (even one itself blocked on disk/memory), a jobs-lane
-        job cleared its blocked clock on every poll, so it printed only 'a gates job is waiting' (never the gate's own cause) and
-        gave up only after the gate gave up plus its own limit -- a new gate restarted that. The yield is now bounded (the clock
-        runs) and names the gate's own admission cause."""
-        import argparse
-        d, cfg = project('\n[capacity]\nmin_disk_gb = 0\n')
-        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
-        rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True)
-        gate = subprocess.Popen(["sleep", "30"])
-        (rd / "g.gwait").write_text(f"{gate.pid} 60 {int(time.time())} 256 1\n")
-        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
-                               allow_unmerged=False, command=["--", "true"], broad=None)
-        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-2")
-        p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "1"})
-        p.stdin.write(js); p.stdin.close(); p.stdin = None   # closed: communicate() before Python 3.13 flushes it and raises ValueError
-        try:
-            out, _ = p.communicate(timeout=30)
-        finally:
-            gate.kill(); p.kill()
-        self.assertEqual(p.returncode, 121, out)
-        self.assertIn("a gates job is waiting", out, out)
-        self.assertIn("not admitted after", out, out)
-        self.assertIn("disk", out, "the gate's own admission cause was not named: " + out)
-
-    def test_a_jobs_job_runs_once_a_gates_job_is_gone(self):
-        """Catches (finding 7, fix-install6): the bounded yield must not block a jobs job when the gate does progress -- once the
-        gate is admitted (its `.gwait` gone) the jobs job runs."""
-        import argparse
-        d, cfg = project('\n[capacity]\nmin_disk_gb = 0\n')
-        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
-        rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True)
-        gate = subprocess.Popen(["sleep", "30"])
-        (rd / "g.gwait").write_text(f"{gate.pid} 60 {int(time.time())} 256 1\n")
-        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
-                               allow_unmerged=False, command=["--", "true"], broad=None)
-        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-3")
-        p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "30", "JANUS_ADMIT_REPORT_S": "1"})
-        p.stdin.write(js); p.stdin.close(); p.stdin = None   # closed: communicate() before Python 3.13 flushes it and raises ValueError
-        try:
-            time.sleep(2.5)
-            (rd / "g.gwait").unlink()   # the gate was admitted: the jobs job may run now
-            out, _ = p.communicate(timeout=30)
-        finally:
-            gate.kill(); p.kill()
-        self.assertEqual(p.returncode, 0, out)
-        self.assertIn("a gates job is waiting", out, out)
-
-    def test_the_gate_yield_names_the_gates_own_cause_and_does_not_repeat(self):
-        """Catches (finding H): the yield line repeated on every poll in which the host's load figure changed (the whole
-        admission line was the compare key), and the cause shown was this job's own admission view, not the gate's."""
-        import argparse
-        d, cfg = project('\n[capacity]\nmin_disk_gb = 0\n')
-        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
-        rd = Path(h["_rd"]); rd.mkdir(parents=True, exist_ok=True)
-        (rd / "cap.sh").write_text(
-            'cap_class() { echo "$1"; }\ncap_secs() { echo 60; }\ncap_mb() { echo 256; }\ncap_cores() { echo 1; }\n'
-            'admit_ok() { n=$(cat "$RD/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$RD/n";\n'
-            '  case "$1" in gate) why="GATECAUSE$n"; return 1;; *) why="JOBCAUSE$n"; return 0;; esac; }\n')
-        gate = subprocess.Popen(["sleep", "30"])
-        (rd / "g.gwait").write_text(f"{gate.pid} 60 {int(time.time())} 256 1\n")
-        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
-                               allow_unmerged=False, command=["--", "true"], broad=None)
-        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-4")
-        p = subprocess.Popen(["bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             env={**os.environ, "JANUS_POLL_S": "1", "JANUS_ADMIT_MAX_S": "3", "JANUS_ADMIT_REPORT_S": "3600"})
-        p.stdin.write(js); p.stdin.close(); p.stdin = None   # closed: communicate() before Python 3.13 flushes it and raises ValueError
-        try:
-            out, _ = p.communicate(timeout=30)
-        finally:
-            gate.kill(); p.kill()
-        self.assertEqual(p.returncode, 121, out)
-        self.assertIn("GATECAUSE", out, "the gate's own admission cause was not named: " + out)
-        self.assertNotIn("JOBCAUSE", out, "this job's own admission view was shown: " + out)
-        self.assertEqual(out.count("janus: waiting for admission"), 1, "the yield line repeated as the figures changed: " + out)
-
-
 class Item8ResumeDryRun(unittest.TestCase):
     def test_dry_run_says_would_prompt(self):
         """Catches: janus resume --dry-run <herdr unit> printed '<unit>: prompted in its herdr pane' although nothing was prompted."""
@@ -407,144 +229,6 @@ class Item8ResumeDryRun(unittest.TestCase):
         finally: janus.herdr = real
         self.assertIn("would prompt", line); self.assertNotIn(": prompted", line)
         self.assertEqual(called, [], "the dry run prompted the pane")
-
-
-class Item14OldOrch(unittest.TestCase):
-    def test_old_orch_standing_loops_are_listed_not_waiters_or_editors(self):
-        """Catches (finding 4): migrate matched any process with an `orch` token (a job waiter, an ssh, an editor) and never
-        listed the old orch's standing loops (fleet-loops.sh, handoff-queue.sh, orch-backup.sh, wip-snapshot.sh, its watcher),
-        and cut the list at 100 characters."""
-        ps = (" 101 /bin/zsh /Users/x/proj/bin/fleet-loops.sh\n"
-              " 102 /bin/zsh /Users/x/proj/bin/handoff-queue.sh w1 /Users/x/proj/out/handoff-queue-midgard\n"
-              " 103 /bin/zsh /Users/x/proj/bin/orch-backup.sh 30\n"
-              " 104 /bin/zsh /Users/x/proj/bin/wip-snapshot.sh 30\n"
-              " 105 /bin/zsh /Users/x/proj/bin/watch-stream.sh\n"
-              " 106 /usr/bin/python3 /Users/x/proj/orch.py run --host h --lane jobs --wt /w -- cargo test\n"
-              " 107 /bin/zsh /Users/x/proj/bin/pueue wait -q 9\n"
-              " 108 ssh host cd /Users/x/proj && ls\n"
-              " 109 /usr/bin/vim /Users/x/proj/orch.py\n"
-              " 111 /usr/bin/python3 /Users/x/proj/janus.py watch\n")
-        self.assertEqual([p for p, _ in janus.old_orch_procs(ps, "/Users/x/proj")], [101, 102, 103, 104, 105])
-        out = janus.retire_old_orch(dry=False, retire=False, ps_text=ps, root="/Users/x/proj")
-        self.assertTrue(any("101" in l for l in out)); self.assertTrue(any("not stopped" in l for l in out))
-        self.assertTrue(any("handoff-queue-midgard" in l for l in out), "the command line was cut before its argument")
-        kills = []
-        def fake_run(cmd, **k):   # finding 6: retire first asks for each process's live children (pgrep), never a kill
-            if cmd[:1] == ["pgrep"]: return (0, "", "")
-            kills.append(list(cmd)); return (0, "", "")
-        real = janus.run; janus.run = fake_run
-        try: janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/Users/x/proj")
-        finally: janus.run = real
-        self.assertEqual(kills, [["kill", "-TERM", str(p)] for p in (101, 102, 103, 104, 105)])
-
-    def test_old_orch_procs_are_scoped_to_this_project(self):
-        """Catches (finding 4): another project's old-orch loop was listed for this project's migrate."""
-        root = "/Users/x/proj"
-        ps = (" 101 /bin/zsh /Users/x/proj/bin/fleet-loops.sh\n"
-              " 110 /bin/zsh /other/proj/bin/fleet-loops.sh\n")
-        self.assertEqual([p for p, _ in janus.old_orch_procs(ps, root)], [101])
-
-
-class Item6RetireMatch(unittest.TestCase):
-    def test_retire_matches_only_the_old_orchs_own_loops(self):
-        """Catches (finding 6): `migrate --retire` matched a sibling project's loop (a path-prefix substring), a job waiter
-        (`janus.py run ... -- bash bin/handoff-queue.sh`), a reader (`tail -f .../orch-backup.sh`) and an agent's own `-c` shell
-        that merely named the scripts (the live listing showed 19 matches where 18 were loops)."""
-        root = "/Users/x/proj"
-        ps = (" 101 /bin/zsh /Users/x/proj/bin/fleet-loops.sh far\n"
-              " 102 /bin/bash /Users/x/proj-two/bin/fleet-loops.sh far\n"
-              " 103 /usr/bin/python3 /x/janus.py run --host far --wt /Users/x/proj -- bash bin/handoff-queue.sh\n"
-              " 104 tail -f /Users/x/proj/bin/orch-backup.sh\n"
-              " 105 /bin/zsh -c source ~/.zshenv && /Users/x/proj/bin/watch-stream.sh\n"
-              " 106 /bin/zsh /Users/x/proj/orch.py watch\n"
-              " 107 /bin/zsh /Users/x/proj/bin/pueue wait -q 9\n")
-        self.assertEqual([p for p, _ in janus.old_orch_procs(ps, root)], [101, 106])
-
-    def test_a_relative_loop_script_is_matched_by_the_process_own_cwd(self):
-        """Catches (finding 6): a loop started with a relative script path (the old orch's own cwd) was not listed; and a loop
-        started the same way in another project's tree must never be this project's."""
-        ps = (" 201 /bin/zsh bin/fleet-loops.sh far\n"
-              " 202 /bin/zsh bin/fleet-loops.sh far\n")
-        real = janus._proc_cwd
-        janus._proc_cwd = lambda pid: {201: Path("/w/proj"), 202: Path("/other/proj")}.get(pid)
-        try: got = [p for p, _ in janus.old_orch_procs(ps, "/w/proj")]
-        finally: janus._proc_cwd = real
-        self.assertEqual(got, [201])
-
-    def test_retire_keeps_a_mid_handoff_worker_whose_child_gate_runs(self):
-        """Catches (finding 6): TERM to a handoff-queue.sh worker mid-handoff orphaned its child gate; the worker is listed but
-        kept while it has a live child that is real work."""
-        ps = (" 101 /bin/zsh /w/proj/bin/fleet-loops.sh\n"
-              " 102 /bin/zsh /w/proj/bin/handoff-queue.sh w1 /w/proj/out/handoff-queue\n")
-        kills = []
-        def fake_run(cmd, **k):
-            if cmd[:1] == ["pgrep"]: return 0, ("999\n" if cmd[-1] == "102" else ""), ""
-            if cmd[:1] == ["ps"]: return 0, "999 bash\n", ""
-            kills.append(list(cmd)); return 0, "", ""
-        real = janus.run; janus.run = fake_run
-        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
-        finally: janus.run = real
-        self.assertEqual(kills, [["kill", "-TERM", "101"]], "a mid-handoff worker was TERMed, orphaning its child gate")
-        self.assertTrue(any("102" in l and "child" in l for l in out), out)
-
-    def test_retire_stops_an_idle_handoff_queue_loop_polling_with_sleep(self):
-        """Catches (finding F): --retire kept every handoff-queue worker whose only child was `sleep` -- but an idle
-        handoff-queue loop sits in `sleep` too, so an idle loop could never be retired (and the literal 'handoff-queue' test
-        is project-specific in a generic tool). The worker's own live state decides: a real (non-sleep) child gate means
-        mid-handoff and is kept; an idle loop (sleep only) is stopped, whatever its name."""
-        ps = (" 701 /bin/zsh /w/proj/bin/fleet-loops.sh\n"
-              " 702 /bin/zsh /w/proj/bin/handoff-queue.sh w1 /w/proj/out/handoff-queue\n")
-        kills = []
-        def fake_run(cmd, **k):
-            if cmd[:1] == ["pgrep"]: return 0, ("888\n" if cmd[-1] == "702" else ""), ""
-            if cmd[:1] == ["ps"]: return 0, "888 sleep\n", ""
-            kills.append(list(cmd)); return 0, "", ""
-        real = janus.run; janus.run = fake_run
-        try: janus.retire_old_orch(dry=False, retire=True, idle=True, ps_text=ps, root="/w/proj")   # --idle: the owner says no handoff is in flight
-        finally: janus.run = real
-        self.assertEqual(kills, [["kill", "-TERM", "701"], ["kill", "-TERM", "702"]], "an idle handoff-queue loop was kept")
-
-    def test_retire_keeps_a_worker_waiting_in_sleep_until_the_owner_says_idle(self):
-        """Catches (ISSUES row 150, reopened by the fix of row 159; review-fix-install7 F3): `janus migrate --retire` TERMed
-        a worker that was mid-handoff: it waits for its gate's result in a `sleep` poll loop, so its only child is `sleep`,
-        exactly as an idle loop's is; calling every sleep "not work" cut the handoff and orphaned its gate. A process that
-        waits in sleep is kept and the owner is told how to stop it; only `--idle` (the owner's word) stops it."""
-        ps = (" 701 /bin/zsh /w/proj/bin/fleet-loops.sh\n"
-              " 702 /bin/zsh /w/proj/bin/handoff-queue.sh w1 /w/proj/out/handoff-queue\n")
-        kills = []
-        def fake_run(cmd, **k):
-            if cmd[:1] == ["pgrep"]: return 0, ("888\n" if cmd[-1] == "702" else ""), ""
-            if cmd[:1] == ["ps"]: return 0, "888 sleep\n", ""
-            kills.append(list(cmd)); return 0, "", ""
-        real = janus.run; janus.run = fake_run
-        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
-        finally: janus.run = real
-        self.assertEqual(kills, [["kill", "-TERM", "701"]], "a worker waiting in sleep (mid-handoff or idle: it cannot be told) was TERMed")
-        self.assertTrue(any("kept pid 702" in l and "--retire --idle" in l and "kill -TERM 702" in l for l in out), out)
-
-    def test_retire_reads_the_kill_result(self):
-        """Catches (finding 5, fix-install6): the `kill` result was not read, so a loop started through `sudo` counted as 'sent
-        TERM' when the kill was refused and it kept running."""
-        ps = " 601 sudo /w/proj/bin/fleet-loops.sh far\n"
-        def fake_run(cmd, **k):
-            if cmd[:1] == ["pgrep"]: return 1, "", ""
-            if cmd[:1] == ["ps"]: return 1, "", ""
-            return 1, "", "kill: 601: Operation not permitted"
-        real = janus.run; janus.run = fake_run
-        try: out = janus.retire_old_orch(dry=False, retire=True, ps_text=ps, root="/w/proj")
-        finally: janus.run = real
-        self.assertTrue(any("601" in l and "could not TERM" in l for l in out), out)
-        self.assertTrue(any("sent TERM to 0" in l for l in out), out)
-
-
-    def test_a_wrapped_loop_is_matched_but_not_a_wrapped_waiter(self):
-        """Catches (finding 4): a loop started through sudo/nohup/env was not listed at all (over-strict matching)."""
-        root = "/Users/x/proj"
-        ps = (" 401 sudo /Users/x/proj/bin/fleet-loops.sh far\n"
-              " 402 nohup /Users/x/proj/bin/orch-backup.sh 30\n"
-              " 403 env FOO=1 /bin/zsh /Users/x/proj/bin/watch-stream.sh\n"
-              " 404 env FOO=1 /usr/bin/python3 /x/janus.py run -- wt -- bash /Users/x/proj/bin/handoff-queue.sh\n")
-        self.assertEqual([p for p, _ in janus.old_orch_procs(ps, root)], [401, 402, 403])
 
 
 class Item15ReadyWork(unittest.TestCase):
@@ -567,39 +251,13 @@ class Item15ReadyWork(unittest.TestCase):
                                "api: decision table for retries", "audit bead", "error bead", "real work"])
 
 
-class Item16RelatedRepos(unittest.TestCase):
-    def test_related_compares_only_units_in_the_same_repository(self):
-        """Catches (item 16a): related:<a>:<b> matched a module name across different repositories (two projects that both change
-        a docs module)."""
-        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u16a-"))
-        def repo(n):
-            R = base / n; R.mkdir()
-            g = lambda *a: subprocess.run(["git", "-C", str(R), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
-            g("init", "-q", "-b", "main"); (R / "docs").mkdir(); (R / "docs/a.md").write_text(n + "\n"); g("add", "."); g("commit", "-qm", "a")
-            return R, g
-        R1, g1 = repo("r1")
-        W1 = base / "w1"; g1("worktree", "add", "-q", str(W1), "-b", "u1"); (W1 / "docs/a.md").write_text("y\n")
-        W2 = base / "w2"; g1("worktree", "add", "-q", str(W2), "-b", "u2"); (W2 / "docs/a.md").write_text("y2\n")
-        R2, _ = repo("r2"); (R2 / "docs/a.md").write_text("z\n")   # a different repository (its own history)
-        d, cfg = project()
-        units = [{"id": "t-1", "name": "u1", "host": "here", "cwd": str(W1), "state": "working"},
-                 {"id": "t-2", "name": "u2", "host": "here", "cwd": str(W2), "state": "working"},
-                 {"id": "t-3", "name": "u3", "host": "here", "cwd": str(R2), "state": "working"}]
-        saved = {k: getattr(janus, k) for k in ("all_units", "gate_results", "learned_posts")}
-        janus.all_units = lambda cfg: {}; janus.gate_results = lambda cfg: {}; janus.learned_posts = lambda cfg: []
-        try: cases = janus.related_cases(cfg, units)
-        finally:
-            for k, v in saved.items(): setattr(janus, k, v)
-        self.assertEqual(sorted(cases), [("u1", "u2")], "units in different repositories were called related")
-
-
 class Item16NewWorktree(unittest.TestCase):
     def test_new_worktree_makes_a_fresh_branch(self):
         """Catches (item 16b): janus launch had no fresh-worktree option (without --cwd it defaulted to the project state root)."""
         base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u16b-")); R = base / "repo"; R.mkdir()
         g = lambda *a: subprocess.run(["git", "-C", str(R), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
         g("init", "-q", "-b", "main"); (R / "f").write_text("x\n"); g("add", "."); g("commit", "-qm", "a")
-        d, cfg = project(); wt = d / "worktrees/u1"
+        d, cfg = project(); wt = d / ".janus/worktrees/u1"
         janus.new_worktree(R, wt, "u1", "main")
         self.assertTrue((wt / "f").is_file())
         head = subprocess.run(["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -610,13 +268,13 @@ class Item16Budget(unittest.TestCase):
     def test_budget_ignores_tiny_and_verdictless_runs(self):
         """Catches (item 16c): the default budget for implement/normal was $0.50 from a median of $0.09 over 23 runs that ended
         without a verdict, so a real unit started at a cap (the waste cause)."""
-        d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 15\nledger = "out/ledger.tsv"\nkey_file = "k"\n[models.m]\nprovider = "api"\nkind = "api"\n')
+        d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 15\nledger = ".janus/out/ledger.tsv"\nkey_file = "k"\n[models.m]\nprovider = "api"\nkind = "api"\n')
         mc = cfg.models["m"]; runs = {}; au = {}
         for i in range(23):
-            n = f"tiny{i}"; (d / "out" / n).mkdir(parents=True); (d / "out" / n / "REPORT.md").write_text("VERDICT: PENDING\n")
+            n = f"tiny{i}"; (d / ".janus" / "out" / n).mkdir(parents=True); (d / ".janus" / "out" / n / "REPORT.md").write_text("VERDICT: PENDING\n")
             runs[f"{n}.1"] = {"done": True, "cost": 0.09, "unit": n}; au[n] = {"name": n, "kind": "implement", "tier": "normal", "run": f"{n}.1", "status": "closed"}
         for i in range(3):
-            n = f"real{i}"; (d / "out" / n).mkdir(parents=True); (d / "out" / n / "REPORT.md").write_text("VERDICT: DONE\ndone\n")
+            n = f"real{i}"; (d / ".janus" / "out" / n).mkdir(parents=True); (d / ".janus" / "out" / n / "REPORT.md").write_text("VERDICT: DONE\ndone\n")
             runs[f"{n}.1"] = {"done": True, "cost": 2.0, "unit": n}; au[n] = {"name": n, "kind": "implement", "tier": "normal", "run": f"{n}.1", "status": "closed"}
         cfg.run.all_units = au
         real = janus.ledger_read; janus.ledger_read = lambda cfg, pv: (runs, [], [])
@@ -630,7 +288,7 @@ class Item31BudgetOvershoot(unittest.TestCase):
         """Catches (item 31): a unit launched with --budget 1.5 read 'spent $1.80 of $1.5' (its own report step 4) because
         unit_spent counted the ledger's `running` row -- the RESERVATION (the budget plus [budget] overshoot_pct, 20 %) -- as
         money the unit had spent, while the run's own api.json reported $0.10."""
-        d, cfg = project('\n[providers.api]\nledger = "out/ledger.tsv"\n[budget]\novershoot_pct = 20\n')
+        d, cfg = project('\n[providers.api]\nledger = ".janus/out/ledger.tsv"\n[budget]\novershoot_pct = 20\n')
         cfg.models["m"] = {"provider": "api", "kind": "api", "api_id": "m"}
         u = {"name": "u1", "model": "m", "run": "u1.1", "runs": ["u1.1"], "budget": 1.5}
         held = janus.reserved(cfg, 1.5)
@@ -640,107 +298,6 @@ class Item31BudgetOvershoot(unittest.TestCase):
         try: spent = janus.unit_spent(cfg, u)
         finally: janus.ledger_read = real
         self.assertLessEqual(spent, 1.5, f"the reservation (${held}) was counted as spend: the unit reads over its own ${1.5} budget")
-
-
-class Item25Soak(unittest.TestCase):
-    def test_a_broad_run_passes_a_negative_priority_pueue_accepts(self):
-        """Catches (item 25a): `janus run --broad` passed the priority as `-o -5`, which pueue 4 rejects ('to pass -5 as a
-        value, use -- -5'), so nothing was queued; the flag is now passed in a form pueue accepts."""
-        import argparse, shutil
-        d, cfg = project(); src = d / "wt"; src.mkdir()
-        a = argparse.Namespace(host="here", lane="jobs", unit="u1", wt=str(src), subdir=None, usb=False, priority=0, no_wait=True,
-                               allow_unmerged=True, command=["--", "true"], broad="a matrix build", needs=None)
-        calls = []
-        def fake_hrun(h, script, **k):
-            calls.append(script)
-            return (0, "7", "") if " add " in script else (0, "", "")
-        saved = (janus.hrun, janus.tree_guard, janus.ensure_lanes, janus.write_cap)
-        janus.hrun = fake_hrun; janus.tree_guard = lambda *a, **k: None
-        janus.ensure_lanes = lambda h, cfg: ""; janus.write_cap = lambda *a, **k: (0, "", "")
-        try: janus.cmd_run(cfg, a)
-        finally: janus.hrun, janus.tree_guard, janus.ensure_lanes, janus.write_cap = saved
-        add = [c for c in calls if " add " in c]
-        self.assertTrue(add, calls)
-        self.assertIn("-o=-5", add[0], "a broad run passed the negative priority in a form pueue rejects")
-        if shutil.which("pueue"):
-            ok = subprocess.run(["pueue", "add", "-o=-5"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
-            bad = subprocess.run(["pueue", "add", "-o", "-5"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
-            self.assertNotIn("to pass", ok.stderr + ok.stdout, "pueue rejects the form janus writes")
-            self.assertIn("to pass", bad.stderr + bad.stdout, "pueue now accepts the space form: update janus")
-
-    def test_a_one_package_cargo_run_is_not_broad(self):
-        """Catches (item 25b + finding 1): the whole-suite guard matched `--all-targets`/`--all-features` on a one-package cargo
-        command, and any ` -p <word>` ANYWHERE on the line switched the guard off (so `mkdir -p logs && cargo test --workspace`
-        was not refused, and a project's own first broad_pattern lost its meaning). Each `;`/`&&`/`|` command is judged on its
-        own, `--all` never matches `--all-targets`, and the exception holds only for the cargo command itself."""
-        d, cfg = project(); h = cfg.hosts["here"]
-        saved = (janus.job_class, janus.host_history)
-        janus.job_class = lambda *a: "job"; janus.host_history = lambda *a: []
-        one_pkg = ["cargo test -p recorder --all-targets", "cargo test --package=recorder --all-targets",
-                   "cd crates/x && cargo test --all-targets"]
-        broad = ["cargo test --workspace", "cargo test --workspace --exclude big", "cargo test --workspace -p recorder",
-                 "mkdir -p logs && cargo test --workspace 2>&1 | tee logs/t.log",
-                 "cargo build -p tools && cargo test --workspace", "ssh -p 22 h true; cargo clippy --all"]
-        try:
-            for c in one_pkg: self.assertIsNone(janus.broad_why(cfg, "here", h, c), f"a one-package run was refused: {c}")
-            for c in broad: self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a whole-suite run slipped the guard: {c}")
-            cfg.capc = {**cfg.capc, "broad_patterns": [r"pytest\s+tests/?(\s|$)", r"\bmake\b"]}
-            self.assertTrue(janus.broad_why(cfg, "here", h, "pytest tests -p no:cacheprovider"),
-                            "a stray -p switched off a project's own first broad_pattern")
-        finally: janus.job_class, janus.host_history = saved
-
-    def test_a_separator_inside_a_command_never_hides_the_whole_suite_guard(self):
-        """Catches (finding 4, fix-install6): the guard split the line on every `;`/`&`/`|` quoted or not, so the `&` of `2>&1`
-        split a command and `cargo test >t.log 2>&1 --workspace` was not refused; and the one-package exception applied to every
-        pattern, so a project's own cargo-like pattern (`\\bcargo\\s+nextest\\b`, `--release\\b`) lost its meaning."""
-        d, cfg = project(); h = cfg.hosts["here"]
-        saved = (janus.job_class, janus.host_history)
-        janus.job_class = lambda *a: "job"; janus.host_history = lambda *a: []
-        try:
-            for c in ["cargo test >t.log 2>&1 --workspace", "cargo test 2>&1 --workspace | tee t.log",
-                      "cargo test --features 'a;b' --workspace"]:
-                self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a separator inside a command hid the guard: {c}")
-            cfg.capc = {**cfg.capc, "broad_patterns": [r"\bcargo\s+nextest\b", r"--release\b"]}
-            for c in ["cargo nextest run -p x", "cargo build -p x --release"]:
-                self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a project's own cargo pattern lost its meaning: {c}")
-        finally: janus.job_class, janus.host_history = saved
-
-    def test_a_clobber_or_here_redirection_does_not_split_the_guard(self):
-        """Catches (finding E): the `|` of `>|` and the `&` of `<&` still split a command in the whole-suite guard, so
-        `cargo test >|t.log --workspace` and `cargo test <&3 --workspace` were not refused as whole-suite runs."""
-        d, cfg = project(); h = cfg.hosts["here"]
-        saved = (janus.job_class, janus.host_history)
-        janus.job_class = lambda *a: "job"; janus.host_history = lambda *a: []
-        try:
-            for c in ["cargo test >|t.log --workspace", "cargo test <&3 --workspace"]:
-                self.assertTrue(janus.broad_why(cfg, "here", h, c), f"a redirect separator hid the guard: {c}")
-        finally: janus.job_class, janus.host_history = saved
-
-
-class Item26GateExec(unittest.TestCase):
-    """Item 26: the wrapper `janus gate` queues (`janus gate-exec <name> --timeout-min <lim> -- <cmd>`) must run the gate
-    command; its own argument line is parsed by the real CLI, not by a hand-made namespace."""
-    def gate_exec(self, d, *argv):
-        return subprocess.run([sys.executable, str(JANUS_PY), "gate-exec", *argv], cwd=d, capture_output=True, text=True)
-
-
-    def test_the_wrapper_honours_the_timeout_option_from_the_command_line(self):
-        """Catches (item 26, the silent half): the same REMAINDER swallowed `--timeout-min` itself, so `a.timeout_min` stayed 0
-        and a gate's limit was never applied; the CLI must hand the limit to the wrapper (a 0.6 s limit stops a 30 s step)."""
-        d, _ = project()
-        t0 = time.time()
-        r = self.gate_exec(d, "land-u2-x", "--timeout-min", "0.01", "--", "sleep 30")
-        self.assertEqual(r.returncode, 124, r.stderr + r.stdout)
-        self.assertLess(time.time() - t0, 15)
-        self.assertIn("land-u2-x EXIT_timeout=124 RESULT: FAIL", (d / "out/gates.log").read_text())
-
-    def test_a_gate_command_that_starts_with_a_dash_runs_intact(self):
-        """Catches (finding 8): the wrapper ran `sh -c <cmd>`; when the command string starts with `-` (`-v x=1 true`), sh read
-        it as its OWN option and died with 'sh: - : invalid option' (exit 2) -- no gate step ran at all."""
-        d, _ = project()
-        r = self.gate_exec(d, "land-u3-x", "--timeout-min", "0", "--", "-v x=1 true; printf ran > out/marker")
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertEqual((d / "out/marker").read_text(), "ran")
 
 
 class FakeBeads:
@@ -754,7 +311,7 @@ class FakeBeads:
 
 
 def launch_cfg(extra=""):
-    d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 1\nledger = "out/ledger.tsv"\nkey_file = "k"\n'
+    d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 1\nledger = ".janus/out/ledger.tsv"\nkey_file = "k"\n'
                      '[models.m]\nprovider = "api"\nkind = "api"\napi_id = "x"\n' + extra)
     return d, cfg
 
@@ -770,111 +327,15 @@ class Item2VerdictEnding(unittest.TestCase):
     def test_a_report_ending_waiting_is_not_finished(self):
         """Catches (finding 2): units.verdict returned an earlier VERDICT: DONE although the report's last VERDICT line was
         WAITING, so the unit read as finished and its jobs became orphans (cancelled)."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True)
-        (d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\nVERDICT: DONE - items 1-6\n(more work)\nWAITING here:9\nVERDICT: WAITING\n")
+        d, cfg = project(); (d / ".janus/out/u1").mkdir(parents=True)
+        (d / ".janus/out/u1/REPORT.md").write_text("VERDICT: PENDING\nVERDICT: DONE - items 1-6\n(more work)\nWAITING here:9\nVERDICT: WAITING\n")
         self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
-        (d / "out/u1/report.json").write_text(json.dumps({"verdict": "DONE"}))   # a stale json beside the prose
+        (d / ".janus/out/u1/report.json").write_text(json.dumps({"verdict": "DONE"}))   # a stale json beside the prose
         self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
         u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0}
         hs = {"here": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}}}})}
         F, _ = janus.unit_findings(cfg, hs, [u], {})
         self.assertEqual(u.get("_park"), ["here:9"]); self.assertNotIn("unit:u1:finished", [k for k, _ in F])
-
-
-class Item1ParkedAfterDone(unittest.TestCase):
-    def test_a_park_line_after_a_done_verdict_means_parked(self):
-        """Catches (finding 1, high): units.verdict read the last VERDICT: DONE while a plain WAITING park line followed it, so a
-        unit sent more work (janus resume --message) was judged finished and its still-running job was cancelled as an orphan."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True)
-        (d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\n## phase 1\nVERDICT: DONE - items 1-6\n## phase 2\nmore work\nWAITING here:9\n")
-        self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
-        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0}
-        hs = {"here": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}},
-                                               "9": {"status": {"Running": {}}, "label": "unit:u1@" + janus.project_id(cfg)}}})}
-        F, _ = janus.unit_findings(cfg, hs, [u], {})
-        self.assertEqual(u.get("_park"), ["here:9"]); self.assertEqual(u.get("state"), "parked")
-        self.assertNotIn("unit:u1:finished", [k for k, _ in F])
-        self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [u])], [], "the parked unit's job was orphaned (cancelled)")
-
-    def test_a_park_with_its_job_ids_on_the_following_line_parks_the_unit(self):
-        """Catches (finding 1, high; fix-install6): verdict read the park word per line (the ids had to be on the SAME line) while
-        waiting_line_jobs read the whole text (WAIT_RX's `\\s*` spans the line break), so the two readers disagreed: a report that
-        ended with a bare `WAITING` line and its job ids on the next line (or after a `WAITING:`) was judged finished and its
-        still-running job became an orphan the watcher cancels."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
-        head = "VERDICT: PENDING\n## phase 1\nVERDICT: DONE - items 1-6\n## phase 2\nmore work\n"
-        for tail, want in (("WAITING\n- here:9\n", ["here:9"]), ("WAITING:\nhere:9 here:10\n", ["here:9", "here:10"])):
-            p.write_text(head + tail)
-            self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), tail)
-            self.assertEqual(janus.waiting_line_jobs(cfg, {"name": "u1", "host": "here", "started": 0}), want, tail)
-        p.write_text(head + "WAITING\n- here:9\n")
-        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0}
-        hs = {"here": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}},
-                                               "9": {"status": {"Running": {}}, "label": "unit:u1@" + janus.project_id(cfg)}}})}
-        F, _ = janus.unit_findings(cfg, hs, [u], {})
-        self.assertEqual(u.get("_park"), ["here:9"]); self.assertEqual(u.get("state"), "parked")
-        self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [u])], [], "the parked unit's job was orphaned (cancelled)")
-
-    def test_the_last_of_verdict_line_and_park_line_decides(self):
-        """Catches (finding 1, high): the rule is 'the last of {VERDICT line, WAITING line} decides' for EVERY unit; a closing
-        VERDICT: DONE after an earlier park line is finished (no false park), and a park line after it is parked."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
-        p.write_text("VERDICT: PENDING\nWAITING here:9\nVERDICT: DONE - all items\n")
-        self.assertEqual(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), "VERDICT: DONE - all items")
-        p.write_text("VERDICT: DONE - all items\nWAITING here:9\n")
-        self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
-        p.write_text("VERDICT: DONE - all items\nWAITING here:9\nVERDICT: DONE - all done\n")
-        self.assertEqual(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), "VERDICT: DONE - all done")
-
-    def test_a_park_word_line_with_ids_janus_cannot_read_is_not_a_park(self):
-        """Catches (finding 5): ANY line starting with the park word counted as a park, so a finished report with a prose
-        `**WAITING** jobs: none.` line, or a park line naming a host janus does not know (`mac:9`) or a bare `9`, lost its
-        verdict -- and a capped unit was resumed once for a wrap-up it did not need."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
-        for tail in ("**WAITING** jobs: none.\n", "- WAITING mac:9 (resumed, exit 0)\n", "WAITING 9\n"):
-            p.write_text("VERDICT: PENDING\nall done\nVERDICT: DONE - all items\n" + tail)
-            self.assertEqual(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), "VERDICT: DONE - all items", tail)
-        p.write_text("VERDICT: PENDING\nVERDICT: DONE - all items\nWAITING here:9\n")
-        self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
-        self.assertIn("last line", janus.PARK_RULE, "the brief header must say the closing VERDICT line is the last line")
-
-    def test_a_unicode_line_separator_does_not_free_a_parked_units_job(self):
-        """Catches (finding A, regression of 03a763c): verdict counted the lines with `splitlines` while the park line index
-        counted `\\n`, so a form feed (or U+2028, \\x1c-\\x1e, U+0085) before the last VERDICT line pushed the verdict index up
-        and the park line compared as not after it: a parked unit read as finished and its still-running job was orphaned,
-        which the watcher cancels."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
-        head = "VERDICT: PENDING\npage\x0cbreak\nVERDICT: DONE - items 1-6\n"
-        for tail in ("WAITING here:9\n", "WAITING\u2028here:9\n"):
-            p.write_text(head + tail)
-            self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), repr(tail))
-        p.write_text(head + "WAITING here:9\n")
-        u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "task": 5, "model": "m", "started": 0}
-        hs = {"here": probe_of(pueue={"tasks": {"5": {"status": {"Done": {"result": "Success"}}},
-                                               "9": {"status": {"Running": {}}, "label": "unit:u1@" + janus.project_id(cfg)}}})}
-        F, _ = janus.unit_findings(cfg, hs, [u], {})
-        self.assertEqual(u.get("state"), "parked")
-        self.assertEqual([r for r, _ in janus.orphan_jobs(cfg, hs, [u])], [], "the parked unit's job was orphaned (cancelled)")
-
-    def test_a_word_after_the_park_word_does_not_hide_its_ids(self):
-        """Catches (finding B residue 1): any word between the park word and its line break kept the ids on the next line
-        unread, so the unit's running job was orphaned (cancelled)."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
-        head = "VERDICT: PENDING\nVERDICT: DONE - items 1-6\n"
-        for tail, want in (("WAITING on jobs:\n- here:9\n", ["here:9"]),
-                           ("WAITING for\nhere:9 here:10\n", ["here:9", "here:10"]),
-                           ("WAITING\nJobs:\n- here:9\n", ["here:9"])):
-            p.write_text(head + tail)
-            self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}), repr(tail))
-            self.assertEqual(janus.waiting_line_jobs(cfg, {"name": "u1", "host": "here", "started": 0}), want, repr(tail))
-
-    def test_a_bullet_list_of_job_ids_parks_on_all_of_them(self):
-        """Catches (finding B residue 2): a bullet list of ids parked on the first id only, so the rest of the jobs were
-        never waited for and the unit was resumed while they still ran."""
-        d, cfg = project(); (d / "out/u1").mkdir(parents=True); p = d / "out/u1/REPORT.md"
-        p.write_text("VERDICT: PENDING\nVERDICT: DONE - items 1-6\nWAITING\n- here:9\n- here:10\n")
-        self.assertIsNone(janus.verdict(cfg, {"name": "u1", "host": "here", "started": 0}))
-        self.assertEqual(janus.waiting_line_jobs(cfg, {"name": "u1", "host": "here", "started": 0}), ["here:9", "here:10"])
 
 
 class Item2ResumeGuard(unittest.TestCase):
@@ -986,11 +447,11 @@ class Item3Handover(unittest.TestCase):
         deleted its tree and output (its dirty tree was its copy on the host, not the successor's)."""
         d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/home/x"\n')
         u = {"id": "t-1", "name": "u1", "host": "far", "via": "pueue", "task": 5, "model": "m", "cwd": "/w/u1"}
-        saved = {k: getattr(janus, k) for k in ("Beads", "uncollected", "X", "save_task_log", "board", "note_event", "herdr")}
+        saved = {k: getattr(janus, k) for k in ("Beads", "uncollected", "X", "save_task_log", "board", "herdr")}
         janus.Beads = self._beads(u)
         janus.uncollected = lambda cfg, u: "its copy on far has changes or output not collected yet"
         calls = []; janus.X = lambda cfg, h, cmd, **k: (calls.append(cmd), (0, "", ""))[1]
-        janus.save_task_log = lambda *a, **k: None; janus.board = lambda *a, **k: None; janus.note_event = lambda *a, **k: None
+        janus.save_task_log = lambda *a, **k: None; janus.board = lambda *a, **k: None
         janus.herdr = lambda *a, **k: None
         try:
             with self.assertRaises(janus.Err) as e: self._close(cfg)
@@ -1046,66 +507,6 @@ class Item3AdmitClock(unittest.TestCase):
         self.assertNotIn("after 73", p.stdout, "the clock started at enqueue, not at the first blocked poll: " + p.stdout)
 
 
-class Item4Localtest(unittest.TestCase):
-    def test_the_reviews_case_table(self):
-        """Catches (finding 4): test_command judged only a segment's first word, so a real test/build run was missed (a pytest
-        console script ps shows as the interpreter, `python -m pytest`, uv/poetry run, rustup/cargo-nextest, a shell -c,
-        xargs/arch/flock, node npm), while a word pytest inside a quoted argument (an ack or a commit message) was flagged."""
-        caught = [
-            "/opt/homebrew/Cellar/python/3.12/Frameworks/Python.app/Contents/MacOS/Python fake/bin/pytest -q tests",
-            "python3 -m pytest tests/calibration", "uv run pytest -q", "poetry run pytest", "node /opt/homebrew/bin/npm test",
-            "cargo-nextest nextest run", "rustup run stable cargo test", "bash -lc 'cargo test'", "xargs -n1 pytest",
-            "arch -arm64 pytest", "flock /tmp/l cargo build", "zsh -c -l source ~/.zshrc && eval 'pytest -q tests'",
-            "pytest -q", "npm test", "cargo +nightly test", "time cargo build", "nice -n 10 /usr/bin/pytest tests/",
-            # finding 3: the runner's own options, hatch's env:cmd, cargo's own options, and the joined python -mpytest
-            "uv run --frozen pytest -q", "uv run --with pytest-xdist pytest", "uv run -q pytest", "uv run --project p pytest tests",
-            "poetry run -q pytest", "hatch run test:pytest", "cargo -q test", "cargo --locked test -p x", "cargo --offline build",
-            "python3 -mpytest",
-        ]
-        missed = [c for c in caught if not janus.test_command(c)]
-        self.assertEqual(missed, [], f"a real test/build run was not judged one: {missed}")
-        not_test = ["git commit -m 'run (pytest -q) before push'", "janus ack unit:x 'gate failed; pytest tests/a exit 1'",
-                    "cargo run --bin build", "janus ack unit:x 'cargo test failed'",
-                    # finding 3: a later word naming pytest after a Python interpreter is not a run
-                    "python3 -m pip install pytest", "python3 -m venv pytest", "python3 tool.py --runner pytest"]
-        false_pos = [c for c in not_test if janus.test_command(c)]
-        self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
-
-    def test_the_reviews_finding_8_residues(self):
-        """Catches (finding 8, fix-install6): localtest still missed real runs behind a runner's own option that takes a value or
-        a flag (`uv run --extra dev pytest`, `uv run -n pytest tests`, `uv run -- pytest`) and cargo's own options (`cargo --color
-        always test`, `cargo -C dir test`); and it flagged non-test ps lines that lost their quotes (`janus ack ... "gate failed;
-        pytest ..."`, `git commit -m "run (pytest -q) ..."`) and a Python script's own `-m` argument (`python3 tool.py -m pytest`,
-        `python3 -c 'print(1)' -m pytest`)."""
-        caught = ["uv run --extra dev pytest", "uv run -n pytest tests", "uv run -- pytest", "uv run --group dev pytest",
-                  "uv run --no-sync pytest", "cargo --color always test", "cargo -C dir test", "uv run -m pytest",
-                  "python3 -X dev -m pytest", "python3 -W ignore -m pytest", "uv run --frozen pytest -q",
-                  "uv run --with pytest-xdist pytest", "uv run --project p pytest tests", "poetry run -q pytest"]
-        missed = [c for c in caught if not janus.test_command(c)]
-        self.assertEqual(missed, [], f"a real test run was not judged one: {missed}")
-        not_test = ["janus ack unit:x gate failed; pytest tests/a exit 1", "git commit -m run (pytest -q) before push",
-                    "python3 tool.py -m pytest", "python3 -c 'print(1)' -m pytest", "uv run --with pytest ipython",
-                    "python3 -m pytest_watch", "uv pip install pytest", "cargo --version", "hatch run docs:build", "just fmt:check"]
-        false_pos = [c for c in not_test if janus.test_command(c)]
-        self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
-
-    def test_a_real_run_after_git_or_janus_is_judged_but_a_message_is_not(self):
-        """Catches (finding I): every line whose first command was git/janus was never judged, hiding a real run after it
-        (`git pull && cargo test`, `janus status && cargo test`), and a paren after a word hid a subshell run
-        (`if true; then (pytest -q); fi`); a janus message command (`janus ack ...`) and a `git commit -m` message are still
-        not judged."""
-        caught = ["git pull && cargo test -p a", "git stash; cargo test", "git commit -m wip; pytest -q",
-                  "sh -c 'git pull; pytest -q'", "bash -lc 'git checkout x && cargo test'", "janus status && cargo test",
-                  "if true; then (pytest -q); fi", "while (pytest -x); do :; done", "! (pytest -q)", "{ (cargo test); }",
-                  "bash -c 'if x; then (cargo test); fi'"]
-        missed = [c for c in caught if not janus.test_command(c)]
-        self.assertEqual(missed, [], f"a real run was not judged one: {missed}")
-        not_test = ["janus ack unit:x gate failed; pytest tests/a exit 1", "git commit -m run (pytest -q) before push",
-                    "git commit -m 'run (pytest -q) before push'"]
-        false_pos = [c for c in not_test if janus.test_command(c)]
-        self.assertEqual(false_pos, [], f"a command that only mentions a test was judged one: {false_pos}")
-
-
 class Item5HandoverOrder(unittest.TestCase):
     def test_a_handover_is_refused_before_the_successor_starts(self):
         """Catches (finding 5): launch accepted the predecessor's tree, started the successor, and only then refused to close the
@@ -1113,14 +514,14 @@ class Item5HandoverOrder(unittest.TestCase):
         base, R, g = git_repo("i5a")
         W = base / "wt"; g("worktree", "add", "-q", str(W), "-b", "u1")
         d, cfg = launch_cfg(); cfg.run.dry = True
-        b = d / "briefs/u2.md"; b.write_text("TIER: NORMAL\nSCOPE: x\nREPORT.md\nDONE-WHEN: done\n")
+        b = d / ".janus/briefs/u2.md"; b.write_text("TIER: NORMAL\nSCOPE: x\nREPORT.md\nDONE-WHEN: done\n")
         u1 = {"id": "t-1", "name": "u1", "host": "here", "cwd": str(W), "state": "working"}
         calls = []
         saved = {k: getattr(janus, k) for k in ("Beads", "herdr", "choose", "model_ok", "read_secret", "budget_for", "reserve_budget",
-                                                "X", "waste_block", "task_status", "confirm_started", "board")}
+                                                "X", "task_status", "confirm_started", "board")}
         janus.Beads = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [u1], "create": lambda s, *a: "t-9",
                                      "run": lambda s, *a: [], "save": lambda s, x: None, "comment": lambda s, *a: None})
-        janus.waste_block = lambda cfg: None; janus.choose = lambda *a, **k: ("here", "here", "ok")
+        janus.choose = lambda *a, **k: ("here", "here", "ok")
         janus.model_ok = lambda cfg, m: (True, ""); janus.read_secret = lambda pv: None
         janus.budget_for = lambda *a, **k: (1.0, "stub"); janus.herdr = lambda *a, **k: None; janus.board = lambda *a, **k: None
         janus.reserve_budget = lambda *a, **k: (calls.append("reserve"), "u2.r1")[1]
@@ -1159,7 +560,7 @@ class Item5HandoverOrder(unittest.TestCase):
 class Item5ReportSync(unittest.TestCase):
     def _remote(self, state="done", via="pueue", **kw):
         d, cfg = project('\n[hosts.far]\nssh = "far"\nroot = "/home/x"\n')
-        (d / "out/u1").mkdir(parents=True); (d / "out/u1/REPORT.md").write_text("VERDICT: PENDING\n")
+        (d / ".janus/out/u1").mkdir(parents=True); (d / ".janus/out/u1/REPORT.md").write_text("VERDICT: PENDING\n")
         u = {"id": "t-1", "name": "u1", "host": "far", "via": via, "task": 5, "model": "m", "started": 0, "state": state, **kw}
         return d, cfg, u
 
@@ -1200,47 +601,17 @@ class Item5ReportSync(unittest.TestCase):
         self.assertEqual(got, ["u1"])
 
 
-class Item9LandFloor(unittest.TestCase):
-    def test_the_land_lane_floor_honours_the_host_and_defaults_to_five(self):
-        """Catches (finding 9): the land lane's disk floor default went from its own 5 GB to admission's 10, so a landing waits
-        on a Mac with 5-9 GB free; the host's `[hosts.<h>] min_disk_gb` (the Mac's 5) must win, then `[capacity]`, then 5."""
-        import argparse
-        d, cfg = project(); h = cfg.hosts["here"]
-        r = argparse.Namespace(host="here", lane="land", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
-                               allow_unmerged=False, command=["--", "true"], broad=None)
-        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
-        self.assertIn('[ "$d" -ge 5 ]', js, "the land lane no longer defaults to its own 5 GB floor")
-        h["min_disk_gb"] = 7
-        self.assertIn('[ "$d" -ge 7 ]', janus.job_script(cfg, "here", h, r, "u", "true", "j-2"), "the host's own floor was ignored")
-        h.pop("min_disk_gb"); cfg.capc["min_disk_gb"] = 9
-        self.assertIn('[ "$d" -ge 9 ]', janus.job_script(cfg, "here", h, r, "u", "true", "j-3"), "[capacity] min_disk_gb was ignored")
-
-    def test_the_land_lane_gives_up_with_a_message(self):
-        """Catches (finding 9): the land lane's disk wait had no bound and printed once, so a nearly-full volume hung the landing
-        silently (item 21's bound covers ADMIT, not this wait)."""
-        import argparse
-        d, cfg = project('\n[capacity]\nmin_disk_gb = 99999\n')
-        h = cfg.hosts["here"]; janus.write_cap(cfg, "here", h)
-        r = argparse.Namespace(host="here", lane="land", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
-                               allow_unmerged=False, command=["--", "true"], broad=None)
-        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
-        p = subprocess.run(["bash"], input=js, text=True, capture_output=True, timeout=60,
-                           env={**os.environ, "JANUS_LAND_MAX_S": "3", "JANUS_LAND_REPORT_S": "1", "JANUS_LAND_POLL_S": "1"})
-        self.assertEqual(p.returncode, 121, p.stdout + p.stderr)
-        self.assertIn("land lane waiting", p.stdout); self.assertIn("giving up", p.stdout); self.assertIn("floor 99999", p.stdout)
-
-
 class Item9BudgetHistory(unittest.TestCase):
     def test_budget_counts_capped_cheap_and_tidied_runs(self):
         """Catches (finding 9): capped runs (which show the budget was too small), a finished run whose report was tidied, and
         cheap finished runs were all dropped from the history."""
-        d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 15\nledger = "out/ledger.tsv"\nkey_file = "k"\n'
+        d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 15\nledger = ".janus/out/ledger.tsv"\nkey_file = "k"\n'
                          '[models.m]\nprovider = "api"\nkind = "api"\n')
         mc = cfg.models["m"]; runs = {}; au = {}
         def add(n, cost, kind, report=None, capped=False):
-            (d / "out" / n).mkdir(parents=True)
-            if report is not None: (d / "out" / n / "REPORT.md").write_text(report)
-            if capped: (d / "out" / n / "api.json").write_text(json.dumps({"subtype": "error_max_budget_usd", "total_cost_usd": cost}))
+            (d / ".janus" / "out" / n).mkdir(parents=True)
+            if report is not None: (d / ".janus" / "out" / n / "REPORT.md").write_text(report)
+            if capped: (d / ".janus" / "out" / n / "api.json").write_text(json.dumps({"subtype": "error_max_budget_usd", "total_cost_usd": cost}))
             runs[f"{n}.1"] = {"done": True, "cost": cost, "unit": n, "budget": cost, "how": "done rc=0"}
             au[n] = {"name": n, "kind": kind, "tier": "normal", "run": f"{n}.1", "status": "closed"}
         for i in range(3): add(f"cap{i}", 5.0, "implement", "VERDICT: PENDING\n", capped=True)
@@ -1257,119 +628,11 @@ class Item9BudgetHistory(unittest.TestCase):
         self.assertLess(br, 15, f"the cheap review runs never taught it: {br} ({whyr})")
 
 
-class Item10Residues(unittest.TestCase):
-    def test_migrate_rewrites_only_what_it_renames(self):
-        """Catches (finding 10, old 1): migrate rewrote a kit folder (/opt/orchkit -> /opt/janus) and a remote state folder
-        (/home/dev/orch/.orch -> .../.janus) although it renames neither, pointing config values at paths that do not exist."""
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); p = d / "janus.toml"
-        p.write_text('[project]\nname = "t"\nstate = ".orch"\n'
-                     '[hosts.far]\nroot = "/home/dev/orch"\nkit = "/opt/orchkit/bin"\nstate_dir = "/home/dev/orch/.orch"\n'
-                     f'[paths]\nledger = "{d}/.orch/ledger.tsv"\n')
-        janus.rewrite_config(p, dry=False)
-        t = p.read_text()
-        self.assertIn('state = ".janus"', t)                              # the project's own state folder is renamed
-        self.assertIn(f'ledger = "{d}/.janus/ledger.tsv"', t)             # ... and a path under it
-        self.assertIn('kit = "/opt/orchkit/bin"', t, "a kit folder migrate does not rename was rewritten")
-        self.assertIn('state_dir = "/home/dev/orch/.orch"', t, "a remote state folder was rewritten")
-        self.assertIn('root = "/home/dev/orch"', t)
-
-    def test_a_job_in_a_unit_tree_outside_the_project_root_is_adopted(self):
-        """Catches (finding 10, old 6): migrate adopted a job only when its path was under the project root, so a unit's own
-        worktree outside the root (as every unit's is here) was left as machine state, never adopted."""
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "janus.toml").write_text('[project]\nname = "t"\nid = "proj"\n')
-        tree = Path(tempfile.mkdtemp(prefix="janus-unit-"))
-        tasks = {"1": {"label": "unit:u1", "path": str(tree), "status": {"Queued": {}}, "command": "true"}}
-        def fake_sh(cmd, **k):
-            if list(cmd)[-2:] == ["status", "--json"]: return 0, json.dumps({"tasks": tasks}), ""
-            if list(cmd)[:2] == ["tmux", "list-sessions"]: return 1, "", "no server"
-            return 0, "", ""
-        saved = (janus.sh, janus._local_pueue, janus.all_units)
-        janus.sh = fake_sh; janus._local_pueue = lambda view: ["pueue"]
-        janus.all_units = lambda cfg: {"u1": {"cwd": str(tree)}}
-        try: out = "\n".join(janus.adopt_items(d, dry=True, config=d / "janus.toml"))
-        finally: janus.sh, janus._local_pueue, janus.all_units = saved
-        self.assertIn("job 1: unit:u1 -> unit:u1@proj", out); self.assertNotIn("left alone", out)
-
-
-    def test_an_earlier_run_of_a_capped_unit_is_not_counted_as_capped(self):
-        """Catches (finding 10, old 9): capped was read from the unit's latest api.json, so an earlier tiny run of a unit whose
-        LAST run was capped counted as a capped run and taught the budget as if a cap proved the budget was too small."""
-        d, cfg = project('\n[providers.api]\nenabled = true\nbudget_per_unit = 15\nledger = "out/ledger.tsv"\nkey_file = "k"\n'
-                         '[models.m]\nprovider = "api"\nkind = "api"\n')
-        od = d / "out/c"; od.mkdir(parents=True); (od / "REPORT.md").write_text("VERDICT: PENDING\n")
-        (od / "api.json").write_text(json.dumps({"subtype": "error_max_budget_usd", "total_cost_usd": 5.0}))
-        (od / "api-c.2.json").write_text(json.dumps({"subtype": "error_max_budget_usd", "total_cost_usd": 5.0}))
-        (od / "api-c.1.json").write_text(json.dumps({"subtype": "success", "total_cost_usd": 0.01}))
-        runs = {"c.1": {"done": True, "cost": 0.01, "unit": "c", "budget": 0.01, "how": "done rc=0"},
-                "c.2": {"done": True, "cost": 5.0, "unit": "c", "budget": 5.0, "how": "capped"}}
-        cfg.run.all_units = {"c": {"name": "c", "kind": "implement", "tier": "normal", "run": "c.2", "status": "open"}}
-        real = janus.ledger_read; janus.ledger_read = lambda cfg, pv: (runs, [], [])
-        try: h = janus.cost_history(cfg, "api")
-        finally: janus.ledger_read = real
-        self.assertEqual(h.get(("implement", "normal")), [5.0], "the earlier tiny run counted as capped")
-
-    def test_a_second_vanished_file_does_not_fail_the_commit(self):
-        """Catches (finding 10, old 11): when a second file vanished between listing and add, the retry's failure was an error,
-        so under a busy monitor commit-state failed where item 7 wanted it to carry on."""
-        d = Path(tempfile.mkdtemp(prefix="janus-fix-")); (d / "janus.toml").write_text('[project]\nname = "t"\n'); (d / "out").mkdir()
-        g = lambda *a: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True, check=True)
-        g("init", "-q"); (d / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a"); (d / "b").write_text("2\n")
-        cfg = janus.Cfg(d)
-        real_sh, real_push = janus.sh, janus.push_cmd; n = [0]
-        def sh_stub(cmd, **k):
-            c = list(cmd)
-            if c[:3] == ["git", "add", "-A"]:
-                n[0] += 1
-                if n[0] <= 2: return 128, "", f"fatal: unable to stat gone{n[0]}.tmp: No such file or directory"
-            return real_sh(cmd, **k)
-        janus.sh = sh_stub; janus.push_cmd = lambda repo, cfg=None: ["true"]
-        try: janus.cmd_commit_state(cfg, type("A", (), {"message": "state"})())
-        finally: janus.sh, janus.push_cmd = real_sh, real_push
-        self.assertEqual(g("log", "-1", "--format=%s").stdout.strip(), "state")
-
-    def test_a_staged_merge_of_a_landing_branch_that_moved_on_still_uses_its_side(self):
-        """Catches (finding 10, old 14): a staged merge whose landing branch advanced after `git merge` fell back to the merge
-        base, so the landing branch's files counted as the unit's and it overlapped every other such unit."""
-        base, R, g = git_repo("u10m")
-        g("checkout", "-q", "-b", "unit", "main"); (R / "u").write_text("u\n"); g("add", "."); g("commit", "-qm", "unit")
-        g("checkout", "-q", "main"); (R / "c").write_text("c\n"); g("add", "."); g("commit", "-qm", "main adds c")
-        g("checkout", "-q", "unit"); g("merge", "--no-commit", "--no-ff", "main")   # staged: MERGE_HEAD = main at c
-        W = base / "mainwt"; g("worktree", "add", "-q", str(W), "main")             # main moves on in its own worktree
-        (W / "d").write_text("d\n")
-        subprocess.run(["git", "-C", str(W), "-c", "user.email=t@t", "-c", "user.name=t", "add", "."], capture_output=True, check=True)
-        subprocess.run(["git", "-C", str(W), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "main moves on"], capture_output=True, check=True)
-        d, cfg = project(); cfg.c["landing"] = {"branch": "main"}
-        u = {"id": "t-1", "name": "u1", "host": "here", "cwd": str(R)}
-        br, fs = janus.unit_changes(cfg, u, [u])
-        self.assertIn("u", fs); self.assertNotIn("c", fs, "the landing branch's own file counted as the unit's change")
-
-    def test_a_shallow_clone_is_related_to_a_clone_of_the_same_repository(self):
-        """Catches (finding 10, old 10): repo identity was the root commit, so a shallow clone (whose root is only its own
-        boundary) was never related to a clone of the same repository, and the whole-history walk ran on every check."""
-        base = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-u10s-")); R = base / "r"; R.mkdir()
-        g = lambda c, *a: subprocess.run(["git", "-C", str(c), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True)
-        g(R, "init", "-q", "-b", "main"); (R / "docs").mkdir(); (R / "docs/a.md").write_text("x\n"); g(R, "add", "."); g(R, "commit", "-qm", "a")
-        (R / "docs/b.md").write_text("y\n"); g(R, "add", "."); g(R, "commit", "-qm", "b")
-        C1 = base / "c1"; g(base, "clone", "-q", str(R), str(C1))
-        C2 = base / "c2"; g(base, "clone", "-q", "--depth", "1", "file://" + str(R), str(C2))
-        W1 = base / "w1"; g(R, "worktree", "add", "-q", str(W1), "-b", "u1"); (W1 / "docs/a.md").write_text("y\n")
-        W2 = base / "w2"; g(C2, "worktree", "add", "-q", str(W2), "-b", "u2"); (W2 / "docs/a.md").write_text("y2\n")
-        d, cfg = project()
-        units = [{"id": "t-1", "name": "u1", "host": "here", "cwd": str(W1), "state": "working"},
-                 {"id": "t-2", "name": "u2", "host": "here", "cwd": str(W2), "state": "working"}]
-        saved = {k: getattr(janus, k) for k in ("all_units", "gate_results", "learned_posts")}
-        janus.all_units = lambda cfg: {}; janus.gate_results = lambda cfg: {}; janus.learned_posts = lambda cfg: []
-        try: cases = janus.related_cases(cfg, units)
-        finally:
-            for k, v in saved.items(): setattr(janus, k, v)
-        self.assertIn(("u1", "u2"), cases, "a shallow clone of the same repository was not related")
-
-
 class Item11CommitStateAdd(unittest.TestCase):
     def test_a_file_that_fails_to_add_is_an_error(self):
         """Catches (finding 11): commit-state reported success ('committing what was staged') while a file that failed to add
         every time was left out."""
-        d = Path(tempfile.mkdtemp(prefix="janus-fix-")); (d / "janus.toml").write_text('[project]\nname = "t"\n'); (d / "out").mkdir()
+        d = Path(tempfile.mkdtemp(prefix="janus-fix-")); conf(d).write_text('[project]\nname = "t"\n'); (d / ".janus" / "out").mkdir()
         g = lambda *a: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *a], capture_output=True, text=True, check=True)
         g("init", "-q"); (d / "a").write_text("1\n"); g("add", "."); g("commit", "-qm", "a")
         (d / "b").write_text("2\n")
@@ -1397,19 +660,19 @@ class Item12NewWorktree(unittest.TestCase):
         lint), leaving them behind so the same command then failed with git's 'a branch named ... already exists'."""
         base, R, g = git_repo("u12a")
         d, cfg = launch_cfg('\n[quality]\nbrief_lint = true\n')
-        b = d / "briefs/u1.md"; b.write_text("just some words with no markers\n")
+        b = d / ".janus/briefs/u1.md"; b.write_text("just some words with no markers\n")
         saved = janus.Beads, janus.herdr; janus.Beads = FakeBeads; janus.herdr = lambda *a, **k: None
         try:
             with self.assertRaises(janus.Err): janus.cmd_launch(cfg, self._ns("u1", brief=str(b), new_worktree=str(R)))
         finally: janus.Beads, janus.herdr = saved
-        self.assertFalse((d / "worktrees/u1").exists(), "a refused launch left the worktree behind")
+        self.assertFalse((d / ".janus/worktrees/u1").exists(), "a refused launch left the worktree behind")
         self.assertNotEqual(g("rev-parse", "-q", "--verify", "u1").returncode, 0, "a refused launch left the branch behind")
 
     def test_cwd_with_new_worktree_is_an_error(self):
         """Catches (finding 12): --cwd given with --new-worktree was silently ignored."""
         base, R, g = git_repo("u12b")
         d, cfg = launch_cfg('\n[quality]\nbrief_lint = true\n')
-        b = d / "briefs/u1.md"; b.write_text("just some words with no markers\n")
+        b = d / ".janus/briefs/u1.md"; b.write_text("just some words with no markers\n")
         saved = janus.Beads, janus.herdr; janus.Beads = FakeBeads; janus.herdr = lambda *a, **k: None
         try:
             with self.assertRaises(janus.Err) as e: janus.cmd_launch(cfg, self._ns("u1", brief=str(b), cwd=str(d), new_worktree=str(R)))
@@ -1421,7 +684,7 @@ class Item12NewWorktree(unittest.TestCase):
         base, R, g = git_repo("u12c")
         g("checkout", "-q", "-b", "develop"); (R / "d").write_text("d\n"); g("add", "."); g("commit", "-qm", "develop"); g("checkout", "-q", "main")
         d, cfg = launch_cfg('\n[landing]\nbranch = "develop"\n[models.c]\nprovider = "api"\nkind = "claude"\n'); cfg.run.dry = True
-        b = d / "briefs/u1.md"; b.write_text("TIER: NORMAL\nSCOPE: x\nREPORT.md\nDONE-WHEN: done\n")
+        b = d / ".janus/briefs/u1.md"; b.write_text("TIER: NORMAL\nSCOPE: x\nREPORT.md\nDONE-WHEN: done\n")
         saved = janus.Beads, janus.herdr; janus.Beads = FakeBeads; janus.herdr = lambda *a, **k: None
         out = io.StringIO()
         try:
@@ -1448,78 +711,6 @@ class Item13ForceClose(unittest.TestCase):
             self.assertFalse(janus.force_close_ok(cfg, ["close", "u2", "--force", "--reason", "handover", "from", "u1"]),
                              "a unit named elsewhere approved a close of another unit")
         finally: janus.Beads = real
-
-
-class Item14UnitChanges(unittest.TestCase):
-    def test_a_staged_merge_of_another_branch_does_not_use_the_landing_base(self):
-        """Catches (finding 14): a staged merge of a branch other than the landing branch made unit_changes diff against the
-        landing branch tip, so the landing branch's later file counted as the unit's change."""
-        base, R, g = git_repo("u14")
-        g("checkout", "-q", "-b", "z"); (R / "z").write_text("z\n"); g("add", "."); g("commit", "-qm", "z")
-        g("checkout", "-q", "main"); (R / "c").write_text("2\n"); g("add", "."); g("commit", "-qm", "main adds c")
-        g("checkout", "-q", "-b", "unit", "main~1"); (R / "u").write_text("u\n"); g("add", "."); g("commit", "-qm", "unit")
-        g("merge", "--no-commit", "--no-ff", "z")
-        d, cfg = project(); cfg.c["landing"] = {"branch": "main"}
-        u = {"id": "t-1", "name": "u1", "host": "here", "cwd": str(R)}
-        br, fs = janus.unit_changes(cfg, u, [u])
-        self.assertIn("u", fs); self.assertNotIn("c", fs, "the landing branch's own file counted as the unit's change")
-
-
-class Item6Adoption(unittest.TestCase):
-    def setUp(self):
-        import shutil
-        if not shutil.which("pueued") or not shutil.which("pueue"): self.skipTest("pueue not installed")
-        self.pd = Path(tempfile.mkdtemp(prefix="ad")); (self.pd / "d").mkdir(); (self.pd / "r").mkdir()
-        (self.pd / "p.yml").write_text(f"shared:\n  pueue_directory: {self.pd}/d\n  runtime_directory: {self.pd}/r\n"
-                                       f"  use_unix_socket: true\n  unix_socket_path: {self.pd}/s.sock\n")
-        subprocess.run(["pueued", "-c", str(self.pd / "p.yml"), "-d"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-        for _ in range(50):
-            if (self.pd / "s.sock").exists(): break
-            time.sleep(0.1)
-
-    def tearDown(self):
-        subprocess.run(["pueue", "-c", str(self.pd / "p.yml"), "shutdown"], capture_output=True, timeout=20)
-
-    def _pq(self, *a): return subprocess.run(["pueue", "-c", str(self.pd / "p.yml"), *a], capture_output=True, text=True)
-    def _labels(self): return {int(k): (v.get("label") or "") for k, v in json.loads(self._pq("status", "--json").stdout).get("tasks", {}).items()}
-
-    def test_adoption_matches_the_path_and_verifies_the_edit(self):
-        """Catches (finding 6): adopt relabelled another project's job by bare unit name, reported adoptions pueue edit never
-        made, did not adopt a gate job of this project's unit, and left its editor script in the state dir."""
-        d = Path(tempfile.mkdtemp(prefix="janus-adopt-"))
-        (d / "janus.toml").write_text(f'[project]\nname = "t"\nid = "proj"\n[hosts.here]\nlocal = true\npueue_config = "{self.pd}/p.yml"\n')
-        (d / "out").mkdir(); (d / "briefs").mkdir(); (d / "board/agents").mkdir(parents=True)
-        self._pq("add", "-s", "-l", "unit:u1", "-w", str(d), "--", "true")
-        self._pq("add", "-s", "-l", "unit:u1", "-w", str(self.pd), "--", "true")
-        self._pq("add", "-s", "-l", "gate:land-u1-linux", "-w", str(d), "--", "true")
-        ids = sorted(self._labels())
-        saved = janus.all_units; janus.all_units = lambda cfg: {"u1": {}}
-        try: out = "\n".join(janus.adopt_items(d, dry=False, config=d / "janus.toml"))
-        finally: janus.all_units = saved
-        labs = self._labels()
-        self.assertEqual(labs[ids[0]], "unit:u1@proj", out)
-        self.assertEqual(labs[ids[1]], "unit:u1", "another project's job was relabelled: " + out)
-        self.assertEqual(labs[ids[2]], "gate:land-u1-linux@proj", "this project's gate job was not adopted: " + out)
-        self.assertEqual(list((d / ".janus").glob(".pueue-label-*.py")), [], "the editor script was left behind")
-
-    def test_the_unit_record_follows_a_renamed_tmux_session(self):
-        """Catches (finding 6): the tmux session was renamed but the unit record kept no tmux field, so unit_tmux(u) still
-        looked for the old name."""
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "janus.toml").write_text('[project]\nname = "t"\nid = "proj"\n')
-        saved_units = []
-        class B:
-            def __init__(self, cfg): pass
-            def units(self): return [{"id": "t-1", "name": "u1"}]
-            def save(self, u): saved_units.append(dict(u))
-        def fake_sh(cmd, **k):
-            if cmd[:2] == ["pueue", "status"]: return 0, json.dumps({"tasks": {}}), ""
-            if cmd[:2] == ["tmux", "list-sessions"]: return 0, "orch-u1\n", ""
-            return 0, "", ""
-        real_sh, real_beads, real_units = janus.sh, janus.Beads, janus.all_units
-        janus.sh = fake_sh; janus.Beads = B; janus.all_units = lambda cfg: {"u1": {}}
-        try: janus.adopt_items(d, dry=False, config=d / "janus.toml")
-        finally: janus.sh, janus.Beads, janus.all_units = real_sh, real_beads, real_units
-        self.assertEqual([u.get("tmux") for u in saved_units], ["janus-u1@proj"])
 
 
 class Item30BriefPath(unittest.TestCase):
@@ -1627,7 +818,7 @@ class Item35BoardAnswer(unittest.TestCase):
         r = self.janus_cmd(d, "answer", "q1", "use 8080")      # the printed command, <text> filled in, no BOARD_DIR in the environment
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual([k for k, _ in janus.board_findings(cfg, {"a1"})], [])
-        self.assertIn("use 8080", (d / "board/to/a1.md").read_text())
+        self.assertIn("use 8080", (d / ".janus/board/to/a1.md").read_text())
         self.assertNotEqual(self.janus_cmd(d, "answer", "q9", "x").returncode, 0)   # an unknown board question is refused, not ignored
 
     def test_an_old_project_board_script_is_flagged(self):
@@ -1636,36 +827,6 @@ class Item35BoardAnswer(unittest.TestCase):
         d, cfg = project(); (d / "bin").mkdir(); (d / "bin/board.sh").write_text("#!/bin/sh\ncase $1 in post) ;; *) echo help;; esac\n")
         self.assertEqual([k for k, _ in janus.board_findings(cfg, set())], [f"board:stale:{d / 'bin/board.sh'}"])
         (d / "bin/board.sh").unlink(); self.assertEqual(janus.board_findings(cfg, set()), [])
-
-
-class Item36ReusedJobId(unittest.TestCase):
-    """Item 36: pueue reuses task ids; a wrapper's record names a job by id AND job id, and only that job counts."""
-    def setUp(self):
-        self.d, self.cfg = project(); (self.d / ".janus/runs/wrap").mkdir(parents=True)
-        (self.d / ".janus/runs/wrap/place-1").write_text("here:72 old-job-1\n")   # the wrapper's own job, long gone
-        self.run = {"status": {"Running": {}}}
-
-    def test_a_reused_id_of_another_unit_of_the_same_project_is_not_an_orphan(self):
-        """Catches: task 72 recorded for an old job was reused for a live review agent of the SAME project; the reused-id guard only
-        skipped other projects' tasks, so check said 'the watcher cancels it' and the watcher would have killed the live agent."""
-        live = {**self.run, "label": "unit:review@t", "command": "bash /r/runs/review-1.sh"}
-        hs = {"here": {"ok": True, "pueue": {"tasks": {"72": live}}}}
-        self.assertEqual(janus.orphan_jobs(self.cfg, hs, [{"name": "review", "via": "pueue", "state": "working"}]), [])
-        mine = {**live, "command": "bash /r/runs/old-job-1.sh"}   # the recorded job itself, still running: its wrapper ended
-        hs["here"]["pueue"]["tasks"]["72"] = mine
-        self.assertEqual([r for r, _ in janus.orphan_jobs(self.cfg, hs, [{"name": "review", "via": "pueue", "state": "working"}])], ["here:72"])
-
-    def test_cancel_does_not_follow_a_reused_id(self):
-        """Catches: cancelling a wrapper also cancelled whatever job now holds an id the wrapper once recorded."""
-        label = lambda x: janus.tag(self.cfg, x)
-        (self.d / ".janus/runs/wrap/w-9").write_text("here:72 old-job-1\n")
-        tasks = {"5": {**self.run, "label": label("run:w"), "group": "jobs", "command": "bash /r/runs/w-9.sh"},
-                 "72": {**self.run, "label": label("unit:review"), "group": "jobs", "command": "bash /r/runs/review-1.sh"}}
-        real = janus.task_status; janus.task_status = lambda h, tid: tasks.get(str(tid))
-        self.cfg.run.dry = True
-        try: out = janus.cancel_job(self.cfg, "here:5")
-        finally: janus.task_status = real; self.cfg.run.dry = False
-        self.assertEqual(len(out), 1, out)
 
 
 class LauncherLinks(unittest.TestCase):

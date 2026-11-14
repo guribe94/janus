@@ -1,279 +1,24 @@
-"""Findings about hosts and processes: CPU burners and tests outside the lanes on this machine, changed running scripts,
-lane stalls, idle slots and job ages, thrash acts, tidy and disk; enforce (warn, then stop a burner or a direct build)."""
-import os, re, time, tomllib
-from pathlib import Path
-from janus.actions.jobs import LANES, job_of, lane_age, lane_stall, lane_wait, orphan_jobs, slots, wrap_token, wrapper_busy
-from janus.findings.stall import live_lands, queue_waits
+"""Findings about hosts: unreachable, margins, admission blocked or paused, lane stalls, idle slots and job ages, orphans, thrash
+acts, tidy and disk. Observations only: each clears when the condition does; nothing is stopped from here."""
+import time
+from janus.actions.jobs import LANES, job_of, lane_age, lane_stall, lane_wait, orphan_jobs, slots
 from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
 from janus.backlog import ready_work
-from janus.beads import Beads
-from janus.board import board, board_script
+from janus.board import board_script
 from janus.msgboard import STALE_MIN
 from janus.cap import capv, host_cap
-from janus.context import AGENT_RX, Err, FIXTURE_MARK, ancestors, fl, hrun, now, projects, sh, ts
-from janus.platform import env_janus, secs
+from janus.context import Err, fl, projects, ts, now
 from janus.probe import margins, room
-from janus.templates import STOP_GROUP
-from janus.units import all_units, orphan_tabs, ws_id
+from janus.units import orphan_tabs, ws_id
 
-# Test fixtures never trip live findings (janus-fixes10 item 6): the test suite runs every process fixture under a temporary root
-# whose name holds FIXTURE_MARK (and sets JANUS_IN_TESTS for itself); the live checks skip a process whose command line holds the
-# mark, unless the checker is the test suite (which must see its own fixtures).
-def fixture_proc(cmd): return FIXTURE_MARK in (cmd or "") and not os.environ.get("JANUS_IN_TESTS")
-
-TEST_WRAP = {"nice", "env", "timeout", "nohup", "time", "command", "exec", "ionice", "stdbuf", "caffeinate", "setsid",
-             "doas", "sudo", "xargs", "arch", "node"}
-TEST_SUB = ("test", "nextest", "build", "clippy", "bench")
-TEST_RUN = re.compile(r"^(?:pytest[\d.]*|py\.test)$")
-PY_RUN = re.compile(r"^(?:python|python\d+(?:\.\d+)?|Python)$")
-SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
-OPTS_WITH_ARG = {"-n", "-u", "-g", "-p", "-c", "-o", "-e", "-t", "-s", "-k", "-C", "-L", "-P", "-I", "-d", "-a", "-i",
-                 "--signal", "--kill-after", "--user", "--group", "--max-args", "--max-procs", "--delimiter", "--arg-file",
-                 "--replace", "--eof", "--lines", "--with", "--project", "--python", "--directory"}
-CARGO_OPT_ARG = {"--config", "--target", "--target-dir", "--features", "--manifest-path", "--profile", "--jobs", "-j", "-Z", "--color", "-C"}
-# The runner's OWN options that take a value, after `uv run`/`poetry run` (finding 8, fix-install6): `-n`/`-q`/`-v`/`--frozen`/...
-# are flags for these runners, so they are NOT in this set (the generic OPTS_WITH_ARG's `-n` would swallow the command word).
-RUN_OPT_ARG = {"--extra", "--group", "--with", "--project", "--python", "--directory", "--env-file", "--config-file",
-               "--index", "--index-url", "--extra-index-url", "--find-links", "--constraint", "--override", "--resolution",
-               "--prerelease", "--no-binary", "--only-binary", "--package", "--script", "-p"}
-
-def _segments(c):
-    """The commands in c, each a list of words: quoting and backslash escapes are honoured, so a ; or | inside a quoted
-    argument (an ack or a commit message) never starts a new command (finding 4), and the `&` of a redirect (`2>&1`, `&>log`,
-    `<&3`) and the `|` of a clobber redirect (`>|`) are part of their word, never a separator (finding 4, fix-install6, finding E)."""
-    segs, cur, w, q, esc = [], [], "", None, False
-    for i, ch in enumerate(c):
-        if esc: w += ch; esc = False; continue
-        if q:
-            if ch == q: q = None
-            elif ch == "\\" and q == '"': esc = True
-            else: w += ch
-        elif ch in "'\"": q = ch
-        elif ch == "\\": esc = True
-        elif ch in ";&|()\n":
-            if ch in "()" and not w and cur:
-                continue   # a paren inside a command (an unquoted ps rendering of a quoted message): not a subshell, not a separator
-            if ch == "&" and (i > 0 and c[i - 1] in "<>" or i + 1 < len(c) and c[i + 1] == ">"):
-                w += ch   # the `&` of a redirect (`2>&1`, `&>log`, `<&3`), not a separator
-            elif ch == "|" and i > 0 and c[i - 1] == ">":
-                w += ch   # the `|` of a clobber redirect (`>|`), not a pipe (finding E)
-            else:
-                if w: cur.append(w); w = ""
-                if cur: segs.append(cur); cur = []
-        elif ch.isspace():
-            if w: cur.append(w); w = ""
-        else: w += ch
-    if w: cur.append(w)
-    if cur: segs.append(cur)
-    return segs
-
-def _after_opts(w, i):
-    """The index after w[i] (a command word) and its options, assignments and a bare duration (a wrapper's own arguments)."""
-    i += 1
-    while i < len(w):
-        x = w[i]
-        if x.startswith("-") and x not in ("-", "--"): i += 2 if x in OPTS_WITH_ARG and i + 1 < len(w) else 1; continue
-        if re.match(r"^[A-Za-z_]\w*=", x) or re.fullmatch(r"[\d.]+[smhd]?", x): i += 1; continue
-        break
-    return i
-
-# A shell keyword at the start of a segment (after a paren was dropped: `then (pytest -q)` -> `then pytest -q`) is not the
-# command; the command follows it (finding I). Only a leading keyword is skipped, like the wrappers below.
-SHELL_KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "done", "fi", "!", "{", "}"}
-
-
-def _test_argv(w, depth):
-    """True when the words w (one command, quotes already removed) are a test or build run (finding 4: the review's cases;
-    finding 3: uv/poetry/pdm `run`'s OWN options, hatch's `env:cmd`, cargo's own options before its subcommand, and the joined
-    `python -mpytest`, while a later word that merely names pytest (`python tool.py --runner pytest`) is not a run)."""
-    if depth > 6: return False
-    i = 0
-    while i < len(w) and re.match(r"^[A-Za-z_]\w*=", w[i]): i += 1   # leading assignments
-    while i < len(w):
-        b = os.path.basename(w[i])
-        if b in SHELLS:   # a shell shim: the -c (or -lc, -cl) string is the command (recurse)
-            j = next((k for k in range(i + 1, len(w)) if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", w[k])), None)
-            return j is not None and test_command(" ".join(w[j + 1:]), depth + 1)
-        if b == "eval": return test_command(" ".join(w[i + 1:]), depth + 1)
-        if PY_RUN.match(b):   # python -m pytest / python -mpytest, or a Python-app console script (.../Python .../bin/pytest)
-            rest = w[i + 1:]; k = 0
-            while k < len(rest) and rest[k].startswith("-"):
-                x = rest[k]
-                if x == "-c": return False   # python -c <code>: the rest are the code's arguments (finding 8)
-                if x == "-m": return bool(k + 1 < len(rest) and TEST_RUN.match(os.path.basename(rest[k + 1])))
-                if re.fullmatch(r"-m\S+", x): return bool(TEST_RUN.match(os.path.basename(x[2:])))
-                k += 2 if x in ("-X", "-W", "-Q") and k + 1 < len(rest) else 1   # these take a value before the script
-            first = rest[k] if k < len(rest) else None   # the script, never a later word (finding 3/8: `python3 tool.py -m pytest`)
-            return bool(first and TEST_RUN.match(os.path.basename(first)))
-        if b in ("uv", "poetry", "pipenv", "pdm", "hatch", "rye", "bundle", "just"):
-            j = _after_opts(w, i)   # the runner and its own options (`uv --no-cache run ...`)
-            if j < len(w) and w[j] in ("run", "exec", "x"):
-                rest = w[j + 1:]; k = 0   # `run`'s OWN options too (finding 3/8: `uv run --extra dev pytest`, `uv run -n pytest`)
-                while k < len(rest):
-                    x = rest[k]
-                    if x == "--": k += 1; break
-                    if x in ("-m", "--module"):   # `uv run -m pytest`: the module is the command
-                        return bool(k + 1 < len(rest) and TEST_RUN.match(os.path.basename(rest[k + 1])))
-                    if x.startswith("-"): k += 2 if x in RUN_OPT_ARG and k + 1 < len(rest) else 1; continue
-                    break
-                if k < len(rest):
-                    c0 = os.path.basename(rest[k])
-                    return _test_argv([c0.split(":", 1)[1], *rest[k + 1:]], depth + 1) if ":" in c0 else _test_argv(rest[k:], depth + 1)
-            i = j; continue
-        if b == "rustup":
-            j = _after_opts(w, i)
-            if j < len(w) and w[j] == "run": j += 1
-            i = j + 1 if j < len(w) else j; continue   # the toolchain name
-        if b == "flock": i = _after_opts(w, i) + 1; continue   # the lock file
-        if b in SHELL_KEYWORDS: i += 1; continue   # finding I: a shell keyword does not hide the command after it
-        if b in TEST_WRAP: i = _after_opts(w, i); continue
-        if b == "cargo" or b.startswith("cargo-"):
-            rest = w[i + 1:]   # cargo's own options and a `+toolchain` come before its subcommand (finding 3: `cargo -q test`)
-            while rest and (rest[0].startswith("+") or rest[0].startswith("-")):
-                rest = rest[2:] if rest[0] in CARGO_OPT_ARG and len(rest) > 1 else rest[1:]
-            return bool(rest) and rest[0] in TEST_SUB
-        if b in ("npm", "pnpm", "yarn", "bun"): return "test" in w[i + 1:]
-        if b == "xcodebuild": return "test" in w[i + 1:]
-        return bool(TEST_RUN.match(b))
-    return False
-
-def test_command(c, depth=0):
-    """True when a command *in* c is a test or build command: its command word (after wrappers and assignments, a shell -c, an
-    interpreter's -m or console script) is cargo/a cargo subcommand, pytest, npm/pnpm test or xcodebuild ... test. Item 23: a
-    line that merely *mentions* pytest (an orchestrator's `janus ack ... "pytest"`, a commit message) is not a test run.
-    Finding 4: a word inside a quoted argument never starts a command, and a real run behind uv/poetry/rustup/xargs/arch/flock/
-    node/a shell shim is judged one. Finding 8 (fix-install6): a ps line that lost its quotes (`janus ack ... "gate failed;
-    pytest ..."`) is not judged. Finding I: only a janus command that carries a free-text MESSAGE (`janus ack`, `janus post`,
-    ...) hides the rest of its line; every other line -- a `git pull && cargo test`, a `janus status && cargo test`, a subshell
-    run whose paren the tokenizer dropped (`if true; then (pytest -q); fi`) -- is judged on its own commands."""
-    segs = _segments(c)
-    if segs and _janus_message(segs[0]): return False
-    return any(_test_argv(w, depth) for w in segs)
-
-# finding I: a janus subcommand whose trailing argument is free text (an ack/post/note); its unquoted ps rendering can look like a
-# chain of commands, so only THIS shape hides the rest of the line (a `git commit -m run (pytest -q)` line is judged normally and
-# never matches a test command because its first word is `git`).
-JANUS_MSG_SUB = {"ack", "post", "question", "learned", "note", "board", "comment", "ask", "answer"}
-
-def _janus_message(w):
-    return bool(w) and os.path.basename(w[0]) in ("janus", "janus.py") and len(w) > 1 and w[1] in JANUS_MSG_SUB
-
-VIA_LANE = re.compile(r"janus(\.py)? (run|gate)\b|\bssh\b|\bpueue\b|\bgrep\b|\brg\b")   # plus paths.lane_scripts (project wrappers)
-
-def via_lane(cfg, c):
-    return bool(VIA_LANE.search(c)) or any(os.path.basename(x) in c for x in cfg.paths.get("lane_scripts", []))
-
-def proc_findings(cfg, ps_text=None, viol=None):
-    """On this machine (the Mac): CPU burners an agent started (busy over 10 min, under an agent or orphaned from one), and test
-    or build runs outside the pueue lanes (janus run / janus gate put them in a lane). ps_text: a ps table (tests). viol: a list
-    that gets each burner's process data for enforce."""
-    o = ps_text if ps_text is not None else sh(["ps", "-Aww", "-o", "pid=,ppid=,pgid=,pcpu=,etime=,command="], timeout=10)[1]
-    t, pg = {}, {}
-    for l in o.splitlines():
-        f = l.split(None, 5)
-        if len(f) == 6 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), fl(f[3]), f[4], f[5]); pg[int(f[0])] = int(f[2])
-    up = lambda p: [q for q in ancestors({k: (v[0],) for k, v in t.items()}, p)[1:]]
-    kids = {}
-    for k, v in t.items(): kids.setdefault(v[0], []).append(k)
-    def lane_below(p, depth=0):   # a descendant runs janus run/gate: the build goes through a lane (a shim, a wrapper script)
-        return depth < 6 and any(re.search(r"janus(\.py)? (run|gate)\b", t[c][3]) or lane_below(c, depth + 1) for c in kids.get(p, []))
-    F = []
-    for p, (pp, cpu, et, c) in t.items():
-        if AGENT_RX.search(c) or "pueued" in c or fixture_proc(c): continue
-        anc = up(p); agent = next((q for q in anc if AGENT_RX.search(t[q][3]) or "janus.py api-run" in t[q][3]), None)
-        lane = any("pueued" in t[q][3] for q in anc)
-        if cpu >= 80 and secs(et) >= 600 and not lane and (agent or pp == 1) and not re.search(r"^/(System|usr/libexec|usr/sbin)|\.app/", c):
-            # cross-project safety (re-check N3): whose burner it is, by project id (its own environment, else its agent's);
-            # another project's is neither shown nor touched; one without an id (an agent janus did not start, an orphan) is
-            # reported only; only a burner under this project's own agents is warned and stopped
-            e = env_janus(p); e = e if e.get("JANUS_PROJECT") else env_janus(agent) if agent else {}
-            proj = e.get("JANUS_PROJECT"); mine = proj == project_id(cfg)
-            if proj and not mine: continue
-            F.append((f"burner:{p}", f"CPU burner pid {p} ({cpu:.0f}% for {et}) {'started by agent pid ' + str(agent) if agent else 'orphaned'}: {c[:70]}; "
-                      + ("it is stopped after [enforce] grace_min unless it moves to a lane (janus run)" if mine else "reported only (not under this project's agents)")))
-            if viol is not None and mine: viol.append({"key": f"burner:{p}", "kind": "burner", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
-                              "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": e.get("JANUS_UNIT")})
-        if test_command(c) and not lane and not via_lane(cfg, c) and not any(test_command(t[q][3]) or via_lane(cfg, t[q][3]) for q in anc) and not lane_below(p):
-            e = env_janus(p) if viol is not None else {}   # an agent's (JANUS_UNIT): warned once, then stopped (enforce)
-            if e.get("JANUS_PROJECT") and e["JANUS_PROJECT"] != project_id(cfg): continue   # another project's: not shown, not touched
-            u = e.get("JANUS_UNIT") if e.get("JANUS_PROJECT") == project_id(cfg) else None
-            F.append((f"localtest:{p}", f"test/build run on this machine outside the pueue lanes (pid {p}, {et}){' by ' + u if u else ''}: {c[:70]}; use janus run"
-                      + ("; it is stopped after [enforce] grace_min" if u else "")))
-            if u: viol.append({"key": f"localtest:{p}", "kind": "direct", "host": next((n for n, h in cfg.hosts.items() if h.get("local")), "local"),
-                               "pid": p, "pgid": pg.get(p, 0), "agent_pgid": pg.get(agent or -1), "unit": u})
-    return F
-
-# Stop a process group after one warning (register item 23): TERM the group, KILL what is left after 5 s. When the group also
-# holds an agent (claude, codex) or pueued, only the process and its descendants are stopped, never the agent.
-def enforce(cfg, F, viol):
-    """Warn, then stop (janus-fixes8; register items 22, 23). The first time a violation is seen its unit gets a board direction;
-    when it is still there [enforce] grace_min (default 5) later, its process group is stopped: a CPU burner's (stop_burners,
-    default true), an agent's direct build or test, here or on a remote host (stop_direct, default true since imp-autopilot), and
-    a Claude/Anthropic API process janus did not start inside this project's unit trees (stop_api, default false: report only).
-    One warning per unit: a unit warned in the last day gets no second one, its next violation is stopped at once.
-    Running lane jobs are never touched. Only the registered orchestrator's check and the watcher act; anyone else only reports."""
-    ec = cfg.c.get("enforce", {}); grace = ec.get("grace_min", 5) * 60; st = cfg.jget("enforce.json"); new = {}; notes = {}
-    wu = {k: t for k, t in (st.get("_units") or {}).items() if now() - t < 86400}   # unit -> when it got its one warning
-    for v in viol:
-        s = st.get(v["key"]) or {}; stop_ok = ec.get({"burner": "stop_burners", "api": "stop_api"}.get(v["kind"], "stop_direct"), v["kind"] != "api") and v.get("stop", True)
-        u = v.get("unit")
-        if not s.get("warned") and u in wu and stop_ok:   # already warned once: no second warning, stopped at once
-            s = {"warned": wu[u] - grace, "unit": u}
-        if not s.get("warned"):
-            if u: board(cfg, "direct", u, f"janus: your process {v['pid']} ({v['kind']}) on {v['host']} breaks the lane rule: "
-                      + ("stop it now and run builds and tests through the lane" if v["kind"] == "direct" else "stop this CPU burner now") +
-                      (f"; janus stops it at {ts(now() + grace)}" if stop_ok else ""))
-            s = {"warned": now(), "unit": u}
-            if u: wu[u] = now()
-            notes[v["key"]] = f"warned {u or 'no unit'} at {ts()}" + (f"; stops at {ts(now() + grace)}" if stop_ok else "")
-        elif stop_ok and not s.get("stopped") and now() - s["warned"] >= grace:
-            h = cfg.hosts[v["host"]]
-            rc, o, e = hrun(h, STOP_GROUP % {"pid": v["pid"], "pgid": v["pgid"] if v["pgid"] != v.get("agent_pgid") else 0}, timeout=30)
-            s["stopped"] = now(); notes[v["key"]] = f"STOPPED after the warning at {ts(s['warned'])}: {o.strip() or e.strip()[:80]}"
-            try: cfg.f("watch.log").open("a").write(f"{ts()} enforce: {v['key']} {notes[v['key']]}\n")
-            except OSError: pass
-            if u:
-                x = all_units(cfg).get(u)
-                if x and x.get("id"): Beads(cfg).comment(x["id"], f"{ts()} janus stopped {v['kind']} pid {v['pid']} on {v['host']} after one warning")
-        else: notes[v["key"]] = (f"warned at {ts(s['warned'])}" + (f"; stopped at {ts(s['stopped'])}" if s.get("stopped") else f"; stops at {ts(s['warned'] + grace)}" if stop_ok else ""))
-        new[v["key"]] = s
-    cfg.jput("enforce.json", {**new, "_units": wu})
-    return [(k, t + (f" [{notes[k]}]" if k in notes else "")) for k, t in F]
-
-SCRIPT_RX = re.compile(r"^(?:\S*/)?(?:bash|sh|zsh|dash|ksh)\s+(?:-\S+\s+)*(/\S+)")
-
-def held_inodes(pid):
-    """Inodes of the files process pid has open (Linux /proc, else lsof); None when it cannot be told."""
-    fd = Path(f"/proc/{pid}/fd")
-    if fd.is_dir():
-        out = set()
-        for x in fd.iterdir():
-            try: out.add(x.stat().st_ino)
-            except OSError: pass
-        return out
-    rc, o, e = sh(["lsof", "-n", "-P", "-a", "-p", str(pid), "-Fi"], timeout=10)
-    return {int(l[1:]) for l in o.splitlines() if l.startswith("i") and l[1:].isdigit()} if rc in (0, 1) and o else None
-
-def script_findings():
-    """Running shell scripts whose file was changed after they started (janus-fixes7, failure class 26): a shell reads its script
-    as it goes, so an in-place edit makes it run from the old byte offset of the new text (a loop of 49,000 ledger rows). A
-    file replaced by write-then-rename is safe (the shell keeps the old inode); only an edit of the inode it holds is flagged."""
-    rc, o, e = sh(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,lstart=,command="], timeout=10)
-    F = []
-    for l in o.splitlines():
-        f = l.split(None, 6)
-        if len(f) < 7 or not f[0].isdigit(): continue
-        m = SCRIPT_RX.match(f[6])
-        if not m or fixture_proc(f[6]): continue
-        try: start = time.mktime(time.strptime(" ".join(f[1:6]), "%a %b %d %H:%M:%S %Y")); st = os.stat(m.group(1))
-        except (ValueError, OSError): continue
-        if st.st_mtime <= start + 1: continue
-        held = held_inodes(int(f[0]))
-        if held is not None and st.st_ino not in held: continue   # replaced by rename: the old text keeps running, safe
-        F.append((f"script:{f[0]}:{int(st.st_mtime)}", f"running script {m.group(1)} (pid {f[0]}) was changed after it started"
-                  f" ({ts(st.st_mtime)}){' in place' if held else ''}: the shell may run from a wrong offset of the new text; stop it and relaunch,"
-                  " and replace scripts by write-then-rename, never in place"))
-    return F
+def queue_waits(cfg, n, p, lands=(), most=8):
+    """What host n's unfinished lane jobs are, lane by lane in queue order ('jobs: n:5 unit:a running, ...')."""
+    out = []
+    tasks = sorted(((p.get("pueue") or {}).get("tasks") or {}).values(), key=lambda t: t.get("id", 0))
+    for lane in LANES:
+        rows = [t for t in tasks if t.get("group") == lane and (t.get("status") if isinstance(t.get("status"), str) else next(iter(t.get("status") or {}), "")) in ("Queued", "Running")]
+        if rows: out.append(f"{lane}: " + ", ".join(f"{n}:{t.get('id')} {t.get('label') or '?'}" for t in rows[:most]))
+    return "; ".join(out) or "no queued work"
 
 def tidy_findings(cfg):
     """disk:<host> (over its disk budget) and tidy:<n> (what tidy can reclaim), from the watcher's last tidy pass."""
@@ -315,10 +60,10 @@ def lane_findings(cfg, hs, units=()):
                 why = why or adm or "admission blocked"
                 F.append((f"blocked:{n}:{lane}", f"{n} {lane}: {wt} job(s) waiting in admission ({why}; jobs hold {p.get('cap_rc', '?')} cores "
                           f"and {p.get('cap_rm', '?')} MB, agents {p.get('cap_ram', '?')} MB, PSI {p.get('cap_psi', '?')}): free the cause "
-                          f"(janus tidy for disk, or wait for the load/PSI to fall), or cancel and re-queue elsewhere"))
+                          f"(janus tidy for disk, or wait for the load/PSI to fall)"))
             if q and (g.get("status") != "Running" or len(r) < par):
                 F.append((f"stalled:{n}:{lane}", f"{n} {lane} STALLED: {len(q)} queued, {len(r)} of {par} slots running, group {g.get('status')}: janus check retunes the group; a paused group needs its cause fixed"))
-            elif q and not wt and lane != "land" and len(r) < (h.get("gate_slots", slots(h, cfg)) if lane == "gates" else 1 if lane == "gates-quick" else slots(h, cfg)) and \
+            elif q and not wt and len(r) < slots(h, cfg) and \
                     (p["cap_admit"].strip() == "yes" if "cap_admit" in p else host_cap(cfg, n, p, list(units))["free"] > 0):
                 # idle by the admission's own verdict (row 48): work queued in pueue, none held by admission, and admission would
                 # take one more now; jobs waiting inside their scripts are held by admission, never idle
@@ -336,13 +81,13 @@ def lane_findings(cfg, hs, units=()):
                 waits = st(x) == "Queued" or job_of(x) in p.get("waitjob", []); ref = f"{n}:{x['id']}"
                 try: since = time.mktime(time.strptime(((not waits and info.get("start")) or info.get("enqueued_at", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
                 except ValueError: continue
-                mins = int((now() - since) / 60); tok = wrap_token(x); quiet = fl(live.get(tok)) if live.get(tok) is not None else None
+                mins = int((now() - since) / 60); tok = job_of(x); quiet = fl(live.get(tok)) if live.get(tok) is not None else None
                 if waits:
                     if mins > lane_wait(cfg, lane):
                         F.append((f"age:{ref}", f"{ref} {lane} {x.get('label')} waiting {mins} min ({'queued' if st(x) == 'Queued' else 'held by admission'}), over the "
                                   f"{lane_wait(cfg, lane)} min wait limit ([lanes.{lane}] wait_min): janus queue {n} says what holds it; janus cancel {ref} and re-queue it "
                                   "where there is room, or ack with why it is right"))
-                elif mins > lane_age(cfg, lane) and quiet is not None and quiet >= lane_stall(cfg, lane) * 60 and not wrapper_busy(cfg, hs, tok):
+                elif mins > lane_age(cfg, lane) and quiet is not None and quiet >= lane_stall(cfg, lane) * 60:
                     F.append((f"age:{ref}", f"{ref} {lane} {x.get('label')} STUCK: running {mins} min (limit {lane_age(cfg, lane)}) with no progress for {int(quiet / 60)} min "
                               f"(no output, no CPU; stall limit {lane_stall(cfg, lane)}): janus cancel {ref} and re-queue it, or ack with why it is right"))
         if int(p.get("old_rule", 0) or 0):
@@ -353,7 +98,7 @@ def lane_findings(cfg, hs, units=()):
             F.append((f"stalled:{n}:legacy", f"{n} old-script queue STALLED: {lg} waiting, {lr} of {h.get('legacy_slots', 3)} running (its own admission holds them): move them to janus run"))
     for lane, ns in backlog.items():
         for f in free.get(lane, []):
-            if cfg.hosts[f].get("local") == cfg.hosts[ns[0]].get("local") and not (lane == "land"):
+            if cfg.hosts[f].get("local") == cfg.hosts[ns[0]].get("local"):
                 F.append((f"idle:{f}:{lane}:vs", f"{f} has free {lane} slots while {', '.join(ns)} has a backlog: re-queue waiting jobs on {f} (janus cancel, janus run --host {f})"))
     return F
 
@@ -362,14 +107,13 @@ def other_projects(cfg):
     out = []
     for r in projects():
         if r.resolve() == cfg.root.resolve(): continue
-        try: st = r / tomllib.loads((r / "janus.toml").read_text()).get("project", {}).get("state", ".janus"); o = ((st / "session_pid").read_text().split() or [""])[0]
+        try: o = ((r / ".janus" / "session_pid").read_text().split() or [""])[0]
         except (OSError, ValueError): o = ""
         out.append((str(r.resolve()), o))
     return out
 
-def host_findings(cfg, hs, units, viol):
-    """host:, margin:, idle:<host>, pressure:, scheduler:, direct: (each also goes to viol for enforce), orphan:job: and
-    orphan:tmux: from each host's probe."""
+def host_findings(cfg, hs, units):
+    """host:, margin:, idle:<host>, pressure:, scheduler:, orphan:job: and orphan:tmux: from each host's probe."""
     F = []; names = {u["name"] for u in units}; un = cfg.jget("hosts.json")
     orch_pid = (cfg.f("session_pid").read_text().split() or [""])[0] if cfg.f("session_pid").exists() else ""   # the orchestrator is not flagged
     others = other_projects(cfg); orch = {orch_pid, *(o for _, o in others)} - {""}; pid_self = project_id(cfg)
@@ -396,7 +140,7 @@ def host_findings(cfg, hs, units, viol):
             F.append((f"idle:{n}", f"host {n} takes no work while its admission is paused ({p['cap_pause'].strip()}), and {work}: launch on another host, or when it clears"))
         hc = host_cap(cfg, n, p, units)
         if hc["pause"]:   # back-pressure (janus-fixes8 item 2): reported, never acted on by killing
-            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile; it holds " + queue_waits(cfg, n, p, [r["unit"] for r in live_lands(cfg)])))
+            F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile; it holds " + queue_waits(cfg, n, p)))
         # one scheduler per host (item 1): any other job-running process, or an old queue that still runs or holds work
         sch = list(p.get("sched", []))
         lg, lr = int(fl(p.get("legacy_wait"))), int(fl(p.get("legacy_run")))
@@ -405,12 +149,6 @@ def host_findings(cfg, hs, units, viol):
         if unt: sch.append(f"{len(unt)} job(s) running without a janus reservation ({', '.join(x.split()[-1] for x in unt[:3])})")
         if sch: F.append((f"scheduler:{n}", f"host {n} has job-running work outside its janus lanes, which must be the only admission: "
                           + "; ".join(sch[:4])[:300] + ": retire the old queue (or move its jobs to janus run)"))
-        for d in p.get("direct", []):   # remote lane enforcement (register item 22)
-            f = d.split(None, 4)
-            if len(f) < 4 or not f[0].isdigit(): continue
-            F.append((f"direct:{n}:{f[0]}", f"agent {f[2]} runs a build or test directly on {n} (pid {f[0]}, {int(fl(f[3])) // 60} min, outside the lanes): "
-                      f"{(f[4] if len(f) > 4 else '')[:80]}; it must use {cfg.hosts[n].get('root', '~')}/run/{f[2]}.lane"))
-            viol.append({"key": f"direct:{n}:{f[0]}", "kind": "direct", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": f[2]})
         info = {x.split()[0]: x.split(None, 3)[1:] for x in p.get("apiinfo", []) if x.split()}   # pid -> [tty, owner, root]
         for a in p.get("apiproc", []):   # spend safety: an API process janus did not start spends outside the ledger
             f = a.split(None, 3)
@@ -423,8 +161,7 @@ def host_findings(cfg, hs, units, viol):
             if not mine and (owner not in ("", "-") or tty not in ("", "-", "?", "??") or other_root(root)): continue
             F.append((f"spend:proc:{n}:{f[0]}", f"Claude/Anthropic API process pid {f[0]} on {n} ({f[2]}) was not started by janus (an API key, no JANUS_UNIT): "
                       f"it spends outside the ledger and the caps: {(f[3] if len(f) > 3 else '')[:70]}; launch API work through janus"
-                      + ("; it is in a unit's tree: stopped after [enforce] grace_min when [enforce] stop_api = true" if mine else "; reported only (not in this project's unit trees)")))
-            viol.append({"key": f"spend:proc:{n}:{f[0]}", "kind": "api", "host": n, "pid": int(f[0]), "pgid": int(fl(f[1])), "unit": None, "stop": mine})
+                      + ("" if mine else "; reported only (not in this project's unit trees)")))
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
             if k not in ("Running", "Queued"): continue

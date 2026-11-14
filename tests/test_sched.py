@@ -2,14 +2,14 @@
 import os, subprocess, sys, tempfile, textwrap, time, unittest
 from pathlib import Path
 
-from janusload import load
+from janusload import conf, load
 
 janus = load()
 FIX = Path(tempfile.mkdtemp(prefix=janus.FIXTURE_MARK + "-sched-", dir="/tmp"))
 
 def project(extra=""):
     d = Path(tempfile.mkdtemp(prefix="janus-sched-", dir=FIX))
-    (d / "janus.toml").write_text(textwrap.dedent('[project]\nname = "t"\n[hosts.here]\nlocal = true\n') + textwrap.dedent(extra))
+    conf(d).write_text(textwrap.dedent('[project]\nname = "t"\n[hosts.here]\nlocal = true\n') + textwrap.dedent(extra))
     return d, janus.Cfg(d)
 
 class Discovery(unittest.TestCase):
@@ -218,26 +218,6 @@ class CpuScheduling(unittest.TestCase):
         self.assertEqual(f[7], want, "the recorded shape is not the command's signature")
         (self.rd / "w-9.res").write_text(f"{os.getpid()} 2 500 {int(time.time())} cargo_test\n"); (self.rd / "w-9.cmd").write_text(cmd)
         self.assertIn(want, self.sh('res_sum; echo "$RL"'), "the reservation line the probe reports carries no shape")
-    def test_overrun_uses_comparable_jobs_not_the_class_median(self):
-        """Catches (item 32): the expected run time was the median of EVERY job of the class on the host, so a 3-crate
-        `cargo test` with a 20-minute test binary was flagged as stuck (121x) against a cargo_test median of 1 min."""
-        t = int(time.time())
-        hist = [f"{i}\tcargo_test\t500\t60\t0\t50\t1\t111" for i in range(5)]      # five 1-minute runs of one command (shape 111)
-        hist += ["9\tcargo_test\t900\t1200\t0\t1100\t1\t222"]                      # one 20-minute run of another command (shape 222)
-        p = probe_of(hist=hist, res=[f"1 2 500 {t - 1200} cargo_test w-1.res 222",   # comparable: 1200 s expected -> not stuck
-                                     f"2 2 500 {t - 1200} cargo_test w-2.res 111",   # its own command takes 60 s -> stuck
-                                     f"3 2 500 {t - 1200} cargo_test w-3.res 333"])  # no comparable run: not judged
-        F = janus.overrun_findings(self.cfg, {"here": p})
-        self.assertEqual([k for k, _ in F], ["overrun:here:w-2"])
-        self.assertIn("comparable", F[0][1])
-    def test_overrun_flagged_from_class_history(self):
-        """Catches: a job stuck for hours unnoticed although its class normally takes minutes."""
-        t = int(time.time())
-        hist = [f"{i}\tcargo_test\t500\t300\t0" for i in range(3)]
-        p = probe_of(hist=hist, res=[f"1 2 500 {t - 7200} cargo_test w-1.res", f"2 2 500 {t - 7200} newclass w-2.res", f"3 2 500 {t - 600} cargo_test w-3.res"])
-        F = janus.overrun_findings(self.cfg, {"here": p})
-        self.assertEqual([k for k, _ in F], ["overrun:here:w-1"]); self.assertIn("24x", F[0][1])
-
 class InstallHost(unittest.TestCase):
     def test_steps_follow_the_discovered_host(self):
         """Catches: a pueue build for the wrong arch (macOS calls it arm64), a download over a pueue that is there, a shared

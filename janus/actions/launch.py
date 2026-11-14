@@ -4,18 +4,17 @@ import argparse, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
 from janus.beads import Beads, UNIT_V
-from janus.board import board, board_dir, board_script, board_shipped
-from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost, waste_block
+from janus.board import board, board_dir, board_shipped
+from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost
 from janus.cap import FACTS, build_room, cap_nums, class_mb, host_cap, record_history, tree_rss_mb
-from janus.context import EXCL, Err, LockLost, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, note_event, now, pq, qp, say, sh, ts
+from janus.context import EXCL, Err, LockLost, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, read_secret, reserve_budget, run_cost
-from janus.memory import MEM_SECTIONS, mem_line, memory_read, mset
+from janus.memory import MEM_SECTIONS, mem_line, memory_read
 from janus.platform import herdr
 from janus.project import project_id, tag, tmux_name
 from janus.probe import probe_all, pueue, room
-from janus.quality import qset
 from janus.templates import CLEAN_PUEUE
-from janus.transcripts import predecessor_name, related_pointers, transcript_of
+from janus.transcripts import transcript_of
 from janus.units import TAB_SEP, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
 
 def model_qualified(cfg, m):
@@ -31,29 +30,27 @@ def cmd_qualify(cfg, a):
     q = cfg.jget("qualified.json"); q[a.model] = {"pass": not a.fail, "at": ts(), "note": a.note or ""}; cfg.jput("qualified.json", q)
     return 0, [f"{a.model}: qualification {'failed' if a.fail else 'passed'} ({a.note or 'no note'})"]
 
-def deferred_block(cfg, name, item=None):
-    """Why a launch of this unit is refused (None when it is not): an open owner instruction labelled `deferral` names the unit
-    or its backlog item. The owner deferred that work (S3 first-collection-means-working: a deferral is not silently started), so
-    ask before starting it."""
-    try: ins = Beads(cfg).issues("instruction")
-    except Exception: return None   # beads unavailable (or a test double): no deferral to enforce
-    for i in ins:
-        if "deferral" not in (i.get("labels") or []): continue
-        t = (i.get("title") or "")
-        if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", t) or (item and re.search(rf"(?<![\w-]){re.escape(str(item))}(?![\w-])", t)):
-            return f"deferred by the owner: {t.strip()[:160]} (finish what it waits on, or ask the owner to lift it)"
-    return None
+def model_tool(mc):
+    """The coding client a model runs in (config: tool, else kind when it is a client, else the vendor's)."""
+    return mc.get("tool") or (mc["kind"] if mc.get("kind") in ("claude", "codex", "opencode") else {"anthropic": "claude", "openai": "codex"}.get(mc.get("vendor"), mc.get("kind")))
 
-def pick_model(cfg, tier, kind, of_vendor, host=None):
+def pick_model(cfg, tier, kind, of_vendor, host=None, fallback=True, note=None):
+    """The first model of [routing] (tier, or review for a review) that is allowed and usable. Allowed is decided by the one config
+    (janus/ledger.model_ok: provider enabled, [routing] allow_tools / allow_auth, budget); a model that is not is never used. A later
+    entry replaces an unusable first one only when fallback is true, and then note (a list) gets the reason of each skipped entry
+    so the launch says it; unattended callers (fill) pass fallback=False and get the refusal instead."""
     lst = cfg.route.get("review" if kind == "review" else tier, [])
     why = []
-    for m in lst:
+    for i, m in enumerate(lst):
         c = cfg.models.get(m, {})
+        if i and not fallback: break
         if host and host not in c.get("hosts", list(cfg.hosts)): why.append(f"{m}: not allowed on {host}"); continue
         if kind == "review" and of_vendor and c.get("vendor") == of_vendor: why.append(f"{m}: same vendor as implementer"); continue
         if not model_qualified(cfg, m) and kind != "qualify": why.append(f"{m}: not qualified (janus qualify {m})"); continue
         ok, w = model_ok(cfg, m)
-        if ok: return m
+        if ok:
+            if why and note is not None: note.append(f"routed to {m}; skipped " + "; ".join(why))
+            return m
         why.append(f"{m}: {w}")
     raise Err("no model available for " + tier + "/" + kind + " (" + "; ".join(why) + ")")
 
@@ -249,47 +246,36 @@ PARK_RULE = ("**Never wait for a build or test (janus rule).** Submit it with `{
              "that names no such job does not park it, so the closing VERDICT line still stands.\n\n")
 
 def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
-    """What every agent gets at start besides its brief (janus-swarm item 2): the session memory, then pointers (never content)
-    to the project's agent instructions, the reports index, the peers file and how to read another agent's transcript; then the
-    RELATED: names and the predecessor's report path and transcript command (imp-awareness)."""
+    """What every agent gets at start besides its brief: the project memory IN FULL (binding instructions first, never cut), then
+    pointers (never content) to the project's agent instructions, the reports index and the board's addressed messages."""
     es = memory_read(cfg); L = []
     if es:
-        L.append("## Session memory (curated by the orchestrator; your brief wins on conflict)")
+        L.append("## Project memory (binding: your brief wins only where it is more specific)")
         for sec in MEM_SECTIONS.values():
             sel = [mem_line(e) for e in es if e[0] == sec]
             if sel: L += [f"{sec}:", *sel]
         L.append("")
     bdir = str(board_dir(cfg)) if local else f"{h['root']}/board"
-    docs = mset(cfg, "agent_docs"); docs = [docs] if isinstance(docs, str) else docs
-    L += ["## Other agents and shared knowledge (janus)",
+    docs = cfg.c.get("memory", {}).get("agent_docs", ["AGENTS.md"]); docs = [docs] if isinstance(docs, str) else docs
+    L += ["## Shared knowledge (janus)",
           f"- Project instructions: read the root {' / '.join(docs)} of your tree ({rcwd}) and the one in each folder you touch, where present.",
           f"- Reports index: {bdir}/index.md (one line per unit: verdict, result, report path).",
-          f"- Decisions: {bdir}/decisions.md (one line per decision record; read the record before you decide anything it touches).",
-          f"- Peers: {bdir}/peers.md (each running unit: host, model, branch, files it changed, step, jobs it waits on, report, transcript).",
-          ("- Another agent's transcript: `janus transcript <unit> --grep '<regex>'` or `janus transcript <unit> --tail 20` (condensed)." if local else
-           "- Another agent's transcript: peers.md names where it is; when it is on this host, grep or tail it (never read it whole); "
-           "otherwise ask with a board question and the orchestrator reads it for you."),
-          "- Rule: read peers.md and the index when your task touches another unit's area; read a transcript only to solve a problem "
-          "another unit met, by grep or tail, never whole.", "", ""]
-    rel = related_pointers(cfg, name, brief_text, pred)
-    if rel: L += [rel, ""]
+          "- Messages are addressed: `board.sh send <unit|orchestrator> <text>` reaches one recipient; `board.sh read <you>` shows what was sent to you. "
+          "Memory changes arrive there as `[memory]` lines: apply them, no reply needed.",
+          "- Another agent's transcript: `janus transcript <unit> --grep '<regex>'` (condensed, never whole)." if local else
+          "- Another agent's transcript: ask with a board question; the orchestrator reads it for you.", ""]
     return "\n".join(L)
 
-def quality_block(cfg, report=None):
-    """The quality rules every brief header carries: the project's rules file by pointer ([quality] rules_file), the fail-first
-    test rule, "run only the tests your change can affect", and the report.json contract."""
-    rf = qset(cfg, "rules_file")
-    L = ["**Quality (janus):** every new test names the failure it catches, shown failing first; run only the tests your change can affect."]
-    if rf: L.append(f"- Project quality rules: read `{rf}` in your tree where present, before you start.")
-    L.append(f"- Structured report: also write `report.json` beside {report or 'REPORT.md'} (verdict, files_changed, jobs with their exit codes, "
-             f"tests_added with the failure each catches, left); janus reads it before the prose.")
-    return "\n".join(L) + "\n"
+def report_block(report=None):
+    """Run only the tests the change can affect, and the structured report janus reads before the prose."""
+    return ("**Tests (janus):** run only the tests your change can affect, through the lane; a whole-suite run needs the orchestrator's go.\n"
+            f"- Structured report: also write `report.json` beside {report or 'REPORT.md'} (verdict, files_changed, jobs with their exit codes, left); "
+            f"janus reads it before the prose.\n")
 
 def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None):
     """The header every unit's brief gets: the absolute report path once, prominently (the one thing janus reads; a runtime that
     wrote it elsewhere lost its report), where it runs and how it submits builds and tests (detached, then WAITING), its report,
-    the quality rules, then the session memory and the swarm pointers (swarm_header; imp-awareness adds the RELATED: names and
-    the predecessor there)."""
+    the test rule, then the project memory and the shared-knowledge pointers (swarm_header)."""
     rep = report or "REPORT.md"
     head = (f"<!-- janus: unit {name} runs on {hn} -->\n"
             f"**Write your report to `{rep}`.** That absolute path is the only report janus reads: keep it current after every "
@@ -299,7 +285,7 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
         b = build or hn
         return (head + PARK_RULE.format(
             submit=f"janus run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=rep)
-            + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
+            + report_block(report) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
     return (head + f"**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
             f"brings back a patch of your changes, your REPORT and logs). **No git here (janus):** your copy has no `.git` and no "
@@ -307,7 +293,7 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
             f"patch of your changes). Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
             f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=rep)
-            + quality_block(cfg, report) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
+            + report_block(report) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
 
 def place(cfg, a, brief, mc, units, hs):
     """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
@@ -340,27 +326,6 @@ def place(cfg, a, brief, mc, units, hs):
         if fit: return fit, f"{note}needs {words} ({', '.join(fit)}); most room", want
         note += f"needs {words}, but no allowed host's profile has it ({'; '.join(f'{n}: {w}' for n, (_, w) in miss.items())}: janus hosts --refresh); "
     return allowed, note + "most room", want
-
-def land_first_block(cfg, units, hs):
-    """Why a NEW implement unit is refused (None when it is not): [landing] hold_h is set, a capped provider has under 25 % of its
-    cap left, and a finished DONE unit's gates passed over hold_h hours ago but it is not landed. Then the work that is done is
-    landed before more is started (S1 finish-and-land, S3 land-first-lean). Inert unless [landing] hold_h is set."""
-    h = cfg.c.get("landing", {}).get("hold_h")
-    if not h: return None
-    from janus.findings.work import landing_findings
-    from janus.ledger import committed
-    if not any("cap_usd" in pv and committed(cfg, pv) >= 0.75 * pv["cap_usd"] for pv in cfg.prov.values()): return None
-    stuck = []
-    for k, why in landing_findings(cfg, units, hs):
-        if not k.endswith(":unlanded"): continue
-        n = k.split(":")[1]; u = next((x for x in units if x["name"] == n), None)
-        if not u: continue
-        try: age = (now() - report_path(cfg, u).stat().st_mtime) / 3600
-        except OSError: continue
-        if age >= h: stuck.append(f"{n} ({age:.0f} h)")
-    if not stuck: return None
-    return ("land first: " + ", ".join(stuck[:6]) + ("..." if len(stuck) > 6 else "") + f" passed their gates over {h} h ago and are not "
-            f"landed, while a provider is under 25 % of its cap: land them (janus land <unit>), then start more work")
 
 def choose(cfg, a, brief, mc, units, hs):
     """(agent host, build host, why) for a new unit, or Err saying why not and when to expect room. The agent host has room for
@@ -484,20 +449,16 @@ def cmd_launch(cfg, a):
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
     bd = Beads(cfg); units = bd.units(); prev = next((u for u in units if u["name"] == name), None)
     if prev and a.kind != "review": raise Err(f"{name} already launched on {prev.get('host')}")
-    wp = waste_block(cfg)
-    if wp: raise Err(f"refused (waste pause): {wp}")
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
-    if a.kind == "implement":   # a deferred item is not started without asking (S3 first-collection-means-working)
-        _it = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
-        db = deferred_block(cfg, name, _it)
-        if db: raise Err(f"refused: {db}")
     of = next((u for u in units if u["name"] == (a.of or name)), None)
     if a.model:   # an explicit model passes the same enabled and budget checks as a routed one (M1)
         if a.model not in cfg.models: raise Err(f"unknown model {a.model}")
         ok, w = model_ok(cfg, a.model)
         if not ok: raise Err(f"model {a.model}: {w}")
-    mname = a.model or pick_model(cfg, a.tier, a.kind, of.get("vendor") if of else None, a.host)
+    route_note = []
+    mname = a.model or pick_model(cfg, a.tier, a.kind, of.get("vendor") if of else None, a.host, note=route_note)
+    for n_ in route_note: say(f"note: {n_}")
     mc = cfg.models[mname]
     hs = getattr(a, "probes", None)
     if not hs:
@@ -506,9 +467,6 @@ def cmd_launch(cfg, a):
         if prev and a.kind != "review": raise Err(f"{name} already launched on {prev.get('host')}")
     ag = herdr_agents(cfg) if not getattr(a, "probes", None) else {}
     for x in units: x.setdefault("state", unit_state(x, hs, ag))   # finished units hold no build position
-    if a.kind == "implement":   # land the done work before starting more (S1 finish-and-land, S3 land-first-lean; inert unless configured)
-        lb = land_first_block(cfg, units, hs)
-        if lb: raise Err(f"refused: {lb}")
     hn, build, why_place = choose(cfg, a, brief, mc, units, hs)
     h = cfg.hosts[hn]; local = h.get("local", False)
     if getattr(a, "new_worktree", None) and a.cwd:   # finding 12: --new-worktree makes its own tree
@@ -527,9 +485,6 @@ def cmd_launch(cfg, a):
         if hst in ("working", "queued", "blocked", "unknown"):
             raise Err(f"{handover}: cannot hand over its tree: its agent is {what}; stop it first (janus stop {handover}), then hand its tree over")
     if main_checkout(cwd) and not a.allow_main: raise Err(f"refused: {cwd} is a main checkout with linked worktrees; use a worktree (or --allow-main)")
-    if qset(cfg, "brief_lint"):   # [quality] brief_lint: a brief that fails is refused with every reason (opt-in, item 5)
-        probs = lint_brief(cfg, brief, cwd=cwd, reachable=local)
-        if probs: raise Err(f"brief {brief} fails the lint ([quality] brief_lint = true): " + "; ".join(probs))
     outd = cfg.p("out", "out") / name; outd.mkdir(parents=True, exist_ok=True)
     rbrief, rcwd = str(brief), str(cwd)
     budget = None
@@ -561,7 +516,7 @@ def cmd_launch(cfg, a):
         else: cwd = new_worktree(Path(a.new_worktree).resolve(), cwd, name, ref)
         rcwd = str(cwd)
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
-    pred = predecessor_name(cfg, name, a.resume_of)   # RELATED: names and the predecessor reach the brief (imp-awareness)
+    pred = None
     u = {"v": UNIT_V, "host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
     if not cfg.run.dry: u["busy"] = busy_mark("launch")   # the remote part below runs without the writer lock: this says so (check: unit:<n>:interrupted)
@@ -681,10 +636,10 @@ def cmd_launch(cfg, a):
         raise
     if cfg.run.dry: return
     u = settle_launch(bd, u, snap); u.pop("busy", None)
-    bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}"); note_event(cfg, "launch")
+    bd.save(u); bd.comment(u["id"], f"{ts()} launched {a.kind} on {hn} model {mname} via {u['via']}")
     chk = f"herdr {name}" if u["via"] == "herdr" else f"pueue {hn}:{u['task']}" if u["via"] == "pueue" else f"tmux {hn}:janus-{name}"
     board(cfg, "post", name, "status", f"launched ({mname}, {hn})",
-       env={"BOARD_MACHINE": hn, "BOARD_BRIEF": str(brief), "BOARD_CHECK": chk, "BOARD_REPORT": str(report_path(cfg, u))})   # row 26: a resumed unit's own report
+       env={"BOARD_MACHINE": hn, "BOARD_BRIEF": str(brief), "BOARD_CHECK": chk, "BOARD_REPORT": str(report_path(cfg, u)), "BOARD_TOOL": model_tool(mc), "BOARD_MODEL": mname})   # row 26: a resumed unit's own report
     st = u.get("start_state", "running" if u["via"] == "herdr" else "unknown")
     say((f"launched {name} on {hn} via {u['via']}" if st in ("running", "queued", "finished") else f"queued {name} on {hn} via {u['via']}, NOT confirmed running ({st})")
         + (f" (task {u['task']}{', waiting for an agents slot' if st == 'queued' else ''})" if u.get("task") is not None else ""))
@@ -719,14 +674,15 @@ def brief_plan(cfg, h, name, cwd, text):
         if pr in rq.parents:
             rel = rq.relative_to(pr)
             if q.exists(): rep[p] = f"{ctx}/{rel}"; copy.append((str(rq), str(rel))); continue
-            if rel.parts[:2] == ("out", name): rep[p] = f"{root}/{rel}"; continue
+            od = cfg.p("out", "out").resolve()
+            if od / name in (rq, *rq.parents): rep[p] = f"{root}/out/{rq.relative_to(od)}"; continue   # the host's own out/<unit>
             ask.append(p); continue
         ask.append(p)
     if pr in [Path(p).resolve() for p in rep if rep[p] == ctx]:   # the root is named (B = <root>): B/out/x.md and out/x.md files too
         have = {r for _, r in copy}
         for m in re.finditer(r"(?<![\w./~$-])([A-Za-z0-9._-]+(?:/[A-Za-z0-9._@+-]+)+)", text):
             t = m.group(1).rstrip("."); parts = t.split("/")
-            for rel in ("/".join(parts), "/".join(parts[1:])):
+            for rel in ("/".join(parts), "/".join(parts[1:]), ".janus/" + "/".join(parts), ".janus/" + "/".join(parts[1:])):
                 f = pr / rel
                 if rel and rel not in have and f.is_file() and pr in f.resolve().parents and not f.resolve().is_relative_to(cw):
                     have.add(rel); copy.append((str(f.resolve()), rel)); break
@@ -747,34 +703,3 @@ def ship_context(cfg, h, name, copy):
     lst = "".join(r + "\n" for _, r in copy)
     rc, o, e = sh(["rsync", "-a", "-r", "--files-from=-", "-e", " ".join(SSH), f"{cfg.root.resolve()}/", f"{h['ssh']}:{ctx}/"], inp=lst, timeout=600)
     if rc: raise Err(f"copying the brief's files to {h.get('ssh')} failed: {(e or o).strip()[-160:]}")
-
-# A brief must say what the unit does and how it is judged before anything runs: the lint names every missing part. It is off
-# unless [quality] brief_lint is set (the owner's projects carry briefs of every shape; a project turns it on once its briefs
-# carry the markers). The five parts are the tier line, a scope, the report path, done-criteria, and reachable paths.
-TIER_RX = re.compile(r"(?im)^\s*\**\s*TIER\s*[:=]\s*(\S+)")
-SCOPE_RX = re.compile(r"(?im)(?:^#{1,6}\s*scope\b)|(?<![\w-])(?:scope|in[- ]scope|out[- ]of[- ]scope|modules|your modules)\s*:")
-REPORT_RX = re.compile(r"(?i)report\.(?:md|json)")
-DONE_RX = re.compile(r"(?im)^\s*(?:[-*>]\s*)?\**\s*(done[- ]when|done|proof|acceptance|done[- ]criteria|accepted|exit codes?)\b\s*[:=-]")
-
-def lint_brief(cfg, brief, text=None, cwd=None, reachable=True):
-    """Problems that make a brief unfit to launch ([] when it is good): no tier line, no scope, no report path, no
-    done-criteria, or a path under the project root it names that is not there. `reachable=False` skips the path check (a remote
-    launch's paths are enforced by brief_plan). Reads the brief unless text is given."""
-    t = brief.read_text() if text is None else text
-    P = []
-    if not TIER_RX.search(t): P.append("no tier line: add 'TIER: NORMAL' or 'TIER: CRITICAL'")
-    if not SCOPE_RX.search(t): P.append("no scope: add 'SCOPE:' (or 'Your modules:') naming what the unit may touch")
-    if not REPORT_RX.search(t): P.append("no report path: name REPORT.md, where the unit writes its report")
-    if not DONE_RX.search(t): P.append("no done-criteria: add 'DONE-WHEN:' or 'PROOF:' saying what proves the unit done")
-    if reachable:
-        root = cfg.root.resolve(); cw = Path(cwd).resolve() if cwd else None
-        for p in brief_paths(t):
-            q = Path(p)
-            try: rq = q.resolve()
-            except OSError: rq = q
-            if cw and (rq == cw or cw in rq.parents): continue          # in the unit's own tree: it is what it edits
-            if rq == root or root in rq.parents:
-                rel = rq.relative_to(root) if rq != root else Path(".")
-                if not rq.exists() and rel.parts[:1] != ("out",):       # out/<unit> is created at launch
-                    P.append(f"path {p} is not reachable: under the project root but missing")
-    return P

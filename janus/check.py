@@ -1,34 +1,21 @@
-"""janus check, status, capacity and ack: one pass that probes every host, reads the units and collects the findings.
+"""janus check, status and capacity: one pass that probes every host, reads the units and collects the findings.
 
-collect_findings returns registered Findings (findings/__init__.py); run_check filters acks, records open problems and writes
-the Live part of HANDOFF.md (a writer only: the registered orchestrator or the watcher)."""
-import contextlib, json, re
+Findings are derived from what is observed now (findings/__init__.py): nothing is acknowledged, nothing is stored as "open since",
+and a finding is gone when its condition is. status is the same pass printed as a state view."""
+import contextlib, json
 from janus.actions.jobs import slots
-from janus.actions.lifecycle import fetch_remote_outputs, sync_remote_outputs   # item 11 addendum: sync a remote report before judging parked/orphan
+from janus.actions.lifecycle import fetch_remote_outputs, sync_remote_outputs   # sync a remote report before judging parked/orphan
 from janus.backlog import ready_work
-from janus.autopilot import autopilot_findings, unattended_findings
 from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
-from janus.context import DECISION_ACKS, Err, LB, note_event, LE, NOTES0, atomic_write, handoff_path, hrun, is_orchestrator, now, say, ts
-from janus.decisions import decision_findings
-from janus.findings import ackable, ack_ttl, finding, live_acks
-from janus.findings.hosts import (enforce, host_findings, lane_findings, orphan_job_findings, pane_findings, sync_findings, tab_findings, proc_findings,
-    script_findings, thrash_findings, tidy_findings)
-from janus.findings.awareness import note_findings, related_findings   # imp-awareness: related:<a>:<b>, note:<agent>:<n>
-from janus.findings.memory import memory_findings, rule_findings
-from janus.findings.quality import quality_findings, review_findings, test_signal_findings
-from janus.findings.sched import overrun_findings
-from janus.findings.stall import lock_findings, install_findings, present_findings, stall_findings   # skill-fix57: land:<u>:stalled|recovered, install:blocked-by-blocker, present:<u>
-from janus.findings.units import (budget_findings, cap_findings, card_findings, ledger_findings, peer_findings,
-    report_findings, reserve_findings, resumable_findings, spend_findings, unit_findings)
-from janus.findings.work import (backlog_findings, gate_findings, git_findings, known_failure_findings, landing_findings,
-    orchestrator_findings, session_findings)
+from janus.context import Err, hrun, is_orchestrator, now, ts
+from janus.findings import finding
+from janus.findings.hosts import host_findings, lane_findings, orphan_job_findings, pane_findings, sync_findings, tab_findings, thrash_findings, tidy_findings
+from janus.findings.units import card_findings, cap_findings, ledger_findings, spend_findings, unit_findings
+from janus.findings.work import backlog_findings, git_findings, orchestrator_findings, session_findings
 from janus.ledger import committed
-from janus.issue import auto_log_issues, repeated_issue_findings
 from janus.project import own_card
 from janus.transcripts import card_fields
-from janus.intents import intent_findings, intent_lines
-from janus.reset import context_findings
 from janus.probe import cap_line, probe_all, pueue, room
 from janus.units import all_units, herdr_agents, unit_state
 
@@ -43,33 +30,20 @@ def board_upkeep(cfg, units):
 
 def collect_findings(cfg, hs, units, ag, bd_err, bd=None, fetched=None):
     """Every finding of one pass, as registered Findings, in the order check prints them (findings/*.py hold the families)."""
-    F = []; viol = []   # viol: the processes enforce may stop (burner, direct), found on the way
+    F = []
     if bd_err: F.append(("beads", f"beads unavailable: {bd_err}; fix bd (janus doctor), units cannot be read until then"))
     names = {u["name"] for u in units}
     for u in units: u["state"] = unit_state(u, hs, ag)   # finished units hold no build position (host_cap)
-    if bd is not None: sync_remote_outputs(cfg, units, bd, fetched)   # item 11 addendum: judge a remote unit on its synced report
-    F += host_findings(cfg, hs, units, viol) + pane_findings(cfg, units, ag) + tab_findings(cfg, units) + sync_findings(cfg, hs)
-    F += board_findings(cfg, names) + card_findings(cfg, names) + note_findings(cfg)
+    if bd is not None: sync_remote_outputs(cfg, units, bd, fetched)   # judge a remote unit on its synced report
+    F += host_findings(cfg, hs, units) + pane_findings(cfg, units, ag) + tab_findings(cfg, units) + sync_findings(cfg, hs)
+    F += board_findings(cfg, names) + card_findings(cfg, names)
     UF, running = unit_findings(cfg, hs, units, ag); F += UF
-    F += autopilot_findings(cfg, units)   # unit:<n>:relaunch: a remote unit the autopilot leaves to the orchestrator (fix-core F4)
-    F += peer_findings(cfg, units, hs)   # peers.md, overlap:<a>:<b> (janus-swarm item 4)
-    F += related_findings(cfg, units, hs)   # related:<a>:<b> when two running units' work meets (imp-awareness)
     board_upkeep(cfg, units)
     F += orphan_job_findings(cfg, hs, units, {k for k, _ in F})
     cfg.jput("running.json", {"n": running})
-    F += cap_findings(cfg, units)
-    F += gate_findings(cfg, hs) + known_failure_findings(cfg, names) + thrash_findings(cfg) + tidy_findings(cfg) + context_findings(cfg)
-    F += test_signal_findings(cfg) + quality_findings(cfg, units) + review_findings(cfg, units)
-    F += lane_findings(cfg, hs, units) + overrun_findings(cfg, hs)
-    if any(h.get("local") for h in cfg.hosts.values()): F += proc_findings(cfg, viol=viol) + script_findings()
-    F += ledger_findings(cfg, units)
-    F += backlog_findings(cfg, hs, units) + landing_findings(cfg, units, hs) + budget_findings(cfg, units) + report_findings(cfg, units)
-    SF = stall_findings(cfg, hs, units); F += SF + install_findings(cfg, SF) + present_findings(cfg, units) + lock_findings(cfg)   # a blocking step never stalls in silence (skill-fix57)
-    F += orchestrator_findings(cfg) + git_findings(cfg) + memory_findings(cfg) + rule_findings(cfg) + session_findings(cfg, running, units) + intent_findings(cfg, units)
-    F += decision_findings(cfg)
-    F += repeated_issue_findings(cfg)
-    F += spend_findings(cfg) + reserve_findings(cfg, units) + resumable_findings(cfg, units) + unattended_findings(cfg, units)
-    if not cfg.run.ro and not cfg.run.dry: F = enforce(cfg, F, viol)
+    F += cap_findings(cfg, units) + thrash_findings(cfg) + tidy_findings(cfg) + lane_findings(cfg, hs, units)
+    F += ledger_findings(cfg, units) + backlog_findings(cfg, hs, units) + spend_findings(cfg)
+    F += orchestrator_findings(cfg) + git_findings(cfg) + session_findings(cfg)
     return [finding(k, t) for k, t in F]
 
 def tune_pueue(cfg, hs, units):
@@ -85,8 +59,9 @@ def tune_pueue(cfg, hs, units):
             w = max(1, w); g = groups.get(grp)
             if g and g.get("parallel_tasks") != w: hrun(h, f"{pueue(h)} parallel -g {grp} {w}")
 
-def live_state(cfg, hs, units, F):
-    L = ["## Live state (" + ts() + ")", "Hosts:"] + ["- " + cap_line(cfg, n, p, units) for n, p in hs.items()]
+def status_text(cfg, hs, units, F):
+    """The state view, derived now from hosts, units, the ready queue, spend and findings (nothing of it is stored)."""
+    L = ["Status (" + ts() + ")", "Hosts:"] + ["- " + cap_line(cfg, n, p, units) for n, p in hs.items()]
     L.append("Units:")
     for u in units:
         L.append(f"- {u['name']} | {u.get('host')} | {u.get('model')} | {u.get('state', '?')}" + (f" on {' '.join(u['_park'][:4])}" if u.get("_park") else "")
@@ -96,27 +71,8 @@ def live_state(cfg, hs, units, F):
     except Err as e: L.append(f"Queue: unavailable ({e})")
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv: L.append(f"Spend {n}: ${committed(cfg, pv):.2f} of ${pv['cap_usd']}")
-    L += intent_lines(cfg)   # skill-fix52: what is meant and not finished survives a context clear here
     L.append("Problems:"); L += [f"- [{k}] {t}" for k, t in F] or ["- none"]
     return "\n".join(L)
-
-def write_handoff(cfg, live):
-    p = handoff_path(cfg); t = p.read_text() if p.exists() else ""
-    notes = t.split(LE, 1)[1] if LE in t else "\n" + NOTES0
-    new = f"# HANDOFF: {cfg.name}\n{LB}\n{live}\n{LE}{notes}"
-    if new != t and not cfg.run.ro: atomic_write(p, new)
-
-def acks_after(cfg, F, hs):
-    """The acks still in force after this check. An ack whose finding is gone is dropped only when every host answered: a
-    finding read from a host (a unit's files, its jobs) is not gone because the host did not answer once (row 234: each
-    flap dropped the acks of overlap:/related: and they came back unacked)."""
-    return live_acks(cfg, {k for k, _ in F} if all(p.get("ok") for p in hs.values()) else None)
-
-def held_after(cfg, F, hs):
-    """Row 93: end the ack episode of every key whose finding is gone (the next ack of it counts as a recurrence). Like the
-    acks, only when every host answered."""
-    held = cfg.jget("ack-held.json"); keys = {k for k, _ in F}
-    if held and all(p.get("ok") for p in hs.values()) and not set(held) <= keys: cfg.jput("ack-held.json", {k: v for k, v in held.items() if k in keys})
 
 def read_remote(cfg):
     """The read phase of a check, run before the writer lock is taken: probe every host and, for a writer, bring the output of
@@ -133,41 +89,29 @@ def read_remote(cfg):
     return hs, fetched
 
 def run_check(cfg, cycle=True, writer=None, pre=None):
-    """Returns (findings not acknowledged, live text, probes, units). writer (default: the caller is the registered orchestrator,
-    or the watcher) regenerates the Live part of HANDOFF.md, saves acks and open problems and sets pueue limits; anyone else
-    only reads. pre: read_remote's result when the caller took it before its own lock (the watcher). The cycle stamp (last_cycle) is touched only for the orchestrator's own check."""
+    """Returns (findings, status text, probes, units). writer (default: the caller is the registered orchestrator, or the watcher)
+    saves board files and sets pueue limits; anyone else only reads. pre: read_remote's result when the caller took it before its
+    own lock (the watcher)."""
     cfg.run.ro = not (writer if writer is not None else is_orchestrator(cfg))
-    hs, fetched = pre if pre is not None else read_remote(cfg)   # the slow part, outside the lock (a hung host must not block an ack)
-    with cfg.writer() if not cfg.run.ro else contextlib.nullcontext():   # one writer at a time (panel problem 2); readers lock nothing
+    hs, fetched = pre if pre is not None else read_remote(cfg)   # the slow part, outside the lock
+    with cfg.writer() if not cfg.run.ro else contextlib.nullcontext():   # one writer at a time; readers lock nothing
         bd_err = None; units = []; bd = None
         try: bd = Beads(cfg); units = bd.units()   # read again under the lock: the records the sync judges and saves are current
         except Err as e: bd_err = str(e)
         ag = herdr_agents(cfg)
         F = collect_findings(cfg, hs, units, ag, bd_err, bd, fetched)
-        if not cfg.run.ro and not cfg.run.dry: auto_log_issues(cfg)   # a key acked 3+ times earns an issue row once
-        if not cfg.run.ro: tune_pueue(cfg, hs, units)
-        acks = acks_after(cfg, F, hs); cfg.jput("acks.json", acks)
-        held_after(cfg, F, hs)
-        F = [f for f in F if f.key not in acks or not f.ackable]   # an ack never hides an unackable family (registry)
-        op = cfg.jget("open.json"); op = {k: op.get(k, now()) for k, _ in F}; cfg.jput("open.json", op)
-        live = live_state(cfg, hs, units, F); write_handoff(cfg, live)
-        if cycle: cfg.touch("last_cycle")
+        if not cfg.run.ro:
+            with cfg.unlocked(): tune_pueue(cfg, hs, units)   # ssh to every host: not under the state lock
+        live = status_text(cfg, hs, units, F)
     return F, live, hs, units
 
 def cmd_check(cfg, a):
-    if getattr(a, "acked", False):   # the acked-findings view: what an ack is hiding, and for how long (audit acked-findings-hidden)
-        acks = live_acks(cfg)
-        return 0, ([f"[{k}] acked {int((now() - v.get('t', 0)) / 60)} min ago (ttl {ack_ttl(k) // 60} min): {v.get('d', '')}"
-                    for k, v in sorted(acks.items())] or ["(no live acks)"])
     F, live, hs, units = run_check(cfg)
-    op = cfg.jget("open.json")
-    if a.escalate: F = [f for f in F if now() - op.get(f.key, now()) > cfg.deadline]
-    if a.json:
-        return 0, [json.dumps({"read_only": cfg.run.ro, "findings": [{**f.data(), "open_since": int(op.get(f.key, now()))} for f in F]}, indent=1)]
+    if a.json: return 0, [json.dumps({"read_only": cfg.run.ro, "findings": [f.data() for f in F]}, indent=1)]
     mine = [f for f in F if f.family != "machine"]; mach = [f for f in F if f.family == "machine"]   # machine state: listed apart, last
     L = [f"[{k}] {t}" for k, t in mine] + (["machine state (no project id; not this project's, never acted on):"] + [f"  [{k}] {t}" for k, t in mach] if mach else [])
     if a.brief and len(L) > 8: L = L[:8] + [f"[more] +{len(L) - 8} more: run janus check"]
-    return 0, L + (["(read-only: not the registered orchestrator session, so nothing was saved, tuned or stamped)"] if cfg.run.ro else [])
+    return 0, L
 
 def cmd_capacity(cfg, a):
     cfg.run.ro = True; hs = probe_all(cfg)
@@ -179,38 +123,3 @@ def cmd_capacity(cfg, a):
 
 def cmd_status(cfg, a):
     F, live, *_ = run_check(cfg, cycle=False); return 0, [live]
-
-def cmd_ack(cfg, a):
-    k, d = a.problem, a.decision
-    if not ackable(k):   # row 229: an ack of the instructions finding classified nothing and hid it; only closing or remembering clears it
-        if k.split(":", 1)[0] == "instructions":
-            raise Err("instructions cannot be acked: classify each instruction instead: bd close <id> once it is done, or bd remember --key <subject> for a standing rule (janus decide --instruction <id> for a decision)")
-        if k.split(":", 1)[0] == "handoff":   # row 238: 12 acks in one evening hid stale notes; only writing them clears it
-            raise Err("handoff cannot be acked: update the Orchestrator notes in the state folder's HANDOFF.md (what changed and what is next; move old notes to history.md when it is too long)")
-        raise Err(f"{k} cannot be acked: it costs money every hour; act on it (janus park {k.split(':', 1)[-1]})")
-    if k.split(":", 1)[0] in ("idle", "landing") and re.match(r"(?i)^\s*(?:i |we )?(?:will|'ll|am going to|are going to|going to|plan|intend|shall)\b", d or ""):
-        raise Err(f"ack {k} with what was DONE, not what you will do (a plan is not a decision): run it, then ack")
-    if k == "idle-backlog:nobrief":   # skill-fix52: an ack hides ready items without briefs once; the next needs progress
-        st = cfg.jget("nobrief.json")
-        if st.get("acked") is not None and st.get("n", 0) >= st["acked"]:
-            raise Err(f"{k} was acked at {st['acked']} item(s) without a brief and {st.get('n', 0)} still have none: an ack hides it once, then the count must "
-                      "drop. Get the briefs written (janus brief draft <items>), or janus backlog set <id> actor=owner for what no agent does")
-        cfg.jput("nobrief.json", {**st, "acked": st.get("n", 0)})
-    acks = live_acks(cfg); acks[k] = {"t": now(), "d": d}; cfg.jput("acks.json", acks); cfg.touch("last_ack")
-    # A key acked 3+ times earns an issue row, counted once per episode of its finding (row 93): a re-ack while the finding
-    # stands (the ack's time ran out; a finished unit held open for a chain, two units that share a file by plan) is the same
-    # decision again, a hold and not a failure that came back. ack-held.json: keys acked whose finding has not cleared since.
-    held = cfg.jget("ack-held.json")
-    if k not in held:
-        cnt = cfg.jget("ack-counts.json"); cnt[k] = cnt.get(k, 0) + 1; cfg.jput("ack-counts.json", cnt)
-        held[k] = int(now()); cfg.jput("ack-held.json", held)
-    if getattr(a, "decision_class", False) or k.split(":", 1)[0] in DECISION_ACKS: note_event(cfg, "decision")   # routine acks leave the notes fresh
-    try:
-        bd = Beads(cfg); m = re.match(r"unit:([^:]+)", k)
-        u = next((u for u in bd.units() if m and u["name"] == m.group(1)), None)
-        if u: i = u["id"]
-        else:
-            ex = bd.issues("janus-log"); i = ex[0]["id"] if ex else bd.create("janus: decisions", "janus-log")
-        bd.comment(i, f"{ts()} ack {k}: {d}")
-    except Err as e: say(f"ack kept locally; beads: {e}")
-    say(f"acked {k}")

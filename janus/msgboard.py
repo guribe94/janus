@@ -16,16 +16,13 @@ On another host the same script (<root>/bin/board.sh) writes posts to <root>/boa
 coordinating machine merges each outbox in order and pushes a read-only copy of the board to <root>/board/ on each host,
 where `read`, `summary` and the peers.md / index.md files janus writes there can be read.
 Usage:
-  board.sh post <agent> <kind> <text>   kind: status blocked question waiting learned done (step: kept, but steps belong in the
-                                        report). waiting <job ids>: parked on jobs, never SILENT or GONE. learned <fact>: a
-                                        proposal for the session memory (janus check lists it until remembered or rejected).
-                                        A launcher sets the card's fixed fields on its first post: BOARD_MACHINE, BOARD_BRIEF,
-                                        BOARD_REPORT, BOARD_CHECK ("pid <n>", "herdr <agent>", "pueue <host>:<task>", "tab <label>").
-  board.sh note <agent> "<file>: <what>"
-                                        an agent leaves a note on ANOTHER agent's card (the one exception to hub-and-spoke:
-                                        a file both touch); janus check lists it (note:<agent>) until acked. The author is
-                                        the agent running this (its JANUS_UNIT).
-  board.sh direct <agent|all> <text>    orchestrator to an agent (or every open card); answers that agent's open questions
+  board.sh post <agent> <kind> <text>   kind: status blocked question waiting done (step: kept, but steps belong in the
+                                        report). waiting <job ids>: parked on jobs, never SILENT or GONE.
+                                        A launcher sets the card's fixed fields on its first post: BOARD_MACHINE, BOARD_TOOL,
+                                        BOARD_MODEL, BOARD_BRIEF, BOARD_REPORT, BOARD_CHECK ("pid <n>", "herdr <agent>", "pueue <host>:<task>", "tab <label>").
+  board.sh send <agent> <text>          one addressed message from you (JANUS_UNIT or BOARD_AGENT; the orchestrator when neither) to
+                                        one recipient: it shows in `read <agent>`; nobody else sees it. Same for every tool.
+  board.sh direct <agent> <text>        orchestrator to one agent; answers that agent's open questions
   board.sh answer <question id> <text>  orchestrator: answer one question (a direction to its agent)
   board.sh read <agent>                 the agent's new directions since its last read (newest first)
   board.sh questions                    open questions: <id> <agent> <asked> <text> (tab-separated)
@@ -38,8 +35,8 @@ Usage:
   board.sh outbox                       minutes the oldest post here has waited for that sync (0: none waits)
 Every write on the coordinating machine takes one flock (.lock)."""
 
-KINDS = ("status", "step", "blocked", "question", "waiting", "learned", "done", "note")
-FIELDS = ("task", "brief", "machine", "state", "step", "blockers", "report", "check", "notes", "updated", "project")
+KINDS = ("status", "step", "blocked", "question", "waiting", "done", "send")
+FIELDS = ("task", "brief", "machine", "tool", "model", "state", "step", "blockers", "report", "check", "notes", "updated", "project")
 GROUP = {"question": 1, "blocked": 2, "working": 3, "waiting": 4, "done": 5}
 NOTE_SEP = " || "   # notes on one card are one field value, notes separated (a card is rewritten from FIELDS alone)
 SSH = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
@@ -149,15 +146,12 @@ class Board:
     def apply(self, t, a, k, x, brief="", report="", machine="", check="", host=""):
         """One post: its log line, a question's record, the card rewritten."""
         os.makedirs(self.p("agents"), exist_ok=True); os.makedirs(self.p("to"), exist_ok=True)
-        if k == "note":   # a shared-file note onto another agent's card (the one exception to hub-and-spoke)
+        if k == "send":   # one addressed message: to its recipient's directions, from its author
             target, sep, text = x.partition(" ")
             if not goodname(target): raise Die(f"bad agent name '{target}'")
-            if not sep or not text.strip(): raise Die("usage: note <other-agent> \"<file>: <what>\"")
-            c = self.p("agents", f"{target}.md"); card = {n: field(c, n) for n in FIELDS}
-            note = f"{t} {a}: {oneline([text])}"
-            card["notes"] = NOTE_SEP.join([e for e in [card["notes"]] if e] + [note]); card["updated"] = t
-            write(c, f"# {target}\n" + "".join(f"- {n}: {card[n]}\n" for n in FIELDS))
-            with open(self.p("log.md"), "a") as f: f.write(f"{t} {a} note -> {target}: {oneline([text])}\n")
+            if not sep or not text.strip(): raise Die("usage: send <agent> <text>")
+            f = self.p("to", f"{target}.md"); write(f, f"- {t} from {a}: {oneline([text])}\n" + read(f))
+            with open(self.p("log.md"), "a") as lf: lf.write(f"{t} {a} send -> {target}: {oneline([text])}\n")
             return
         if k == "question":   # a question gets an id; it needs an answer until the orchestrator gives one
             os.makedirs(self.p("questions"), exist_ok=True)
@@ -175,13 +169,14 @@ class Board:
                 m = re.search(rf"[^ `'\"\n]*/out/{re.escape(a)}/[A-Za-z0-9._-]*\.md", read(brief)); card["report"] = m.group(0) if m else ""
         if report: card["report"] = report
         if machine: card["machine"] = machine
+        if os.environ.get("BOARD_TOOL"): card["tool"] = os.environ["BOARD_TOOL"]   # who: the same identity every tool posts under
+        if os.environ.get("BOARD_MODEL"): card["model"] = os.environ["BOARD_MODEL"]
         if not card["machine"]: card["machine"] = host
         if check: card["check"] = check
         if not card["project"]: card["project"] = os.environ.get("BOARD_PROJECT") or os.environ.get("JANUS_PROJECT") or ""   # its creator's project id
         st = {"status": dict(state="working", blockers=""), "step": dict(state="working", step=x, blockers=""),
               "blocked": dict(state="blocked", blockers=x), "question": dict(state="question", blockers=x),
-              "waiting": dict(state="waiting", step=f"waiting on {x}", blockers=""), "done": dict(state="done", step=x, blockers=""),
-              "learned": dict(state=card["state"] or "working")}[k]
+              "waiting": dict(state="waiting", step=f"waiting on {x}", blockers=""), "done": dict(state="done", step=x, blockers="")}[k]
         card.update(st); card["updated"] = t
         write(c, f"# {a}\n" + "".join(f"- {n}: {card[n]}\n" for n in FIELDS))
         if k in ("question", "blocked"): self.notify()
@@ -247,9 +242,8 @@ class Board:
                 if age > int(os.environ.get("BOARD_SILENT_MIN") or 30): flag = f"SILENT {age}m"
                 if self.master and self.gone(field(c, "check")): flag = (flag + ", " if flag else "") + "GONE (no done post)"
             b = field(c, "blockers")
-            nt = notes_of(c)
             rows.append((GROUP.get(st, 3), f"{a:<24} {field(c, 'machine'):<8} {st:<9} {str(age) + 'm':<6} {field(c, 'step')[:40]:<40} "
-                                          f"{b}{'; ' if b and flag else ''}{flag}" + (f"; note: {nt[-1][2][:60]}" if nt else "")))
+                                          f"{b}{'; ' if b and flag else ''}{flag}"))
         return rows
 
     # ---- commands
@@ -285,37 +279,24 @@ class Board:
     def need_master(self, what):
         if not self.master: raise Die(f"{what} runs on the coordinating machine only")
 
-    def cmd_note(self, other="", *words):
-        """An agent leaves a shared-file note on another agent's card (the one exception to hub-and-spoke: normally only the
-        orchestrator writes to a card). The author is the agent running this (JANUS_UNIT, else BOARD_AGENT)."""
-        a = os.environ.get("JANUS_UNIT") or os.environ.get("BOARD_AGENT") or ""
-        x = oneline(words)
-        if not goodname(a): raise Die('usage: note <other-agent> "<file>: <what>" (the author is the agent running this: JANUS_UNIT)')
-        okname(other)
-        if not x: raise Die('usage: note <other-agent> "<file>: <what>"')
-        t = now()
+    def cmd_send(self, to="", *words):
+        """One addressed message to one recipient. The author is the agent running this (JANUS_UNIT, else BOARD_AGENT), else the
+        orchestrator."""
+        a = os.environ.get("JANUS_UNIT") or os.environ.get("BOARD_AGENT") or "orchestrator"; x = oneline(words)
+        if not x: raise Die("usage: send <agent> <text>")
+        okname(to); t = now()
         if self.master:
             os.makedirs(self.p("agents"), exist_ok=True)
-            with Locked(self.p(".lock")): self.apply(t, a, "note", f"{other} {x}", host=self.localname())
+            with Locked(self.p(".lock")): self.apply(t, a, "send", f"{to} {x}", host=self.localname())
         else:
             os.makedirs(self.out, exist_ok=True)
-            with Locked(os.path.join(self.out, ".lock")), open(os.path.join(self.out, "outbox.log"), "a") as f: f.write(f"{t} {a} note: {other} {x}\n")
+            with Locked(os.path.join(self.out, ".lock")), open(os.path.join(self.out, "outbox.log"), "a") as f: f.write(f"{t} {a} send: {to} {x}\n")
 
     def cmd_direct(self, a="", *words):
         self.need_master("direct"); x = oneline(words)
-        if not x: raise Die("usage: direct <agent|all> <text>")
-        os.makedirs(self.p("to"), exist_ok=True)
-        if a != "all":
-            okname(a)
-            with Locked(self.p(".lock")): self.direct1(a, x, now())
-            return
-        t = now(); n = 0
-        for c in sorted(glob.glob(self.p("agents", "*.md"))):
-            if field(c, "state") == "done": continue
-            with Locked(self.p(".lock")): self.direct1(os.path.basename(c)[:-3], f"(to all) {x}", t, answer=False)
-            n += 1
-        print(f'broadcast to {n} open card(s). If it is a rule for you (how to run the project): bd remember "<rule>" --key <subject>. '
-              f'If agents must follow it: janus remember it (MEMORY.md heads every brief).')
+        if not x or a == "all": raise Die("usage: direct <agent> <text> (messages are addressed: there is no broadcast)")
+        os.makedirs(self.p("to"), exist_ok=True); okname(a)
+        with Locked(self.p(".lock")): self.direct1(a, x, now())
 
     def cmd_answer(self, q="", *words):
         self.need_master("answer"); x = oneline(words)
@@ -353,7 +334,7 @@ class Board:
         s = int(since[:-1]) * mult[since[-1]] if since[-1:] in mult else int(since)
         cs = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - s))
         print(f"board digest since {cs}")
-        L = {k: [] for k in ("landed", "started", "done", "asked", "answered", "failed", "learned", "broadcast")}; seen = set()
+        L = {k: [] for k in ("landed", "started", "done", "asked", "answered", "failed")}; seen = set()
         for l in read(self.p("log.md")).splitlines():
             f = l.split(" ", 4)
             if len(f) < 4 or f"{f[0]} {f[1]}" < cs: continue
@@ -365,11 +346,7 @@ class Board:
             elif k == "blocked": L["failed"].append(line)
             elif k == "question": L["asked"].append(line)
             elif who == "orchestrator" and k == "direction" and re.search(r"\[q[0-9]+\]", txt): L["answered"].append(line)
-            elif who == "orchestrator" and k == "direction" and "(to all)" in txt:
-                bk = re.sub(r"^@\S+ ", "", txt)
-                if bk not in seen: seen.add(bk); L["broadcast"].append(line)
             elif k == "status" and txt.startswith("launched"): L["started"].append(line)
-            elif k == "learned": L["learned"].append(line)
             elif "landed" in txt: L["landed"].append(line)
         for k, v in L.items(): print(f"{k}: {len(v)}" + "".join("\n" + x for x in v))
 
@@ -392,10 +369,10 @@ class Board:
             if r: p = f"{r}/bin/board.sh"
         # No quote characters: launchers embed this in quoted prompts and remote command lines. One copy, one path (F9, F10).
         print(f"Board: B={p}. Post with $B post {a} <kind> <text>: status (start), waiting <job ids> (parked), blocked or question "
-              f"(stuck), learned <fact + source> (others should know), done <VERDICT line> (end). Only these; your steps go in your "
+              f"(stuck), done <VERDICT line> (end). Only these; your steps go in your "
               f"report. Before each step run $B read {a}: it prints the new directions; follow them. After a question: keep working on "
               f"what does not depend on it; if nothing is left, read the board before each step; never sleep to wait. A file both units "
-              f"touch: $B note <unit> <file>: <what>.")
+              f"touch: $B send <unit> <text> (one addressed message).")
 
     def merge(self, lines, host):
         """Apply outbox lines (<date> <time> <agent> <kind>: <text>) in order; bad lines are skipped."""

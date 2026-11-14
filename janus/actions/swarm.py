@@ -1,18 +1,17 @@
-"""The swarm's shared knowledge and the owner's report: janus remember/forget/memory/learned, peers, transcript, index,
-report, and janus ledger (check, repair, reconcile)."""
+"""The shared project memory and the status view: janus remember/forget/memory, transcript, index, report, and janus ledger
+(check, repair, reconcile)."""
 import json, os, re, time
 from janus.backlog import backlog_items, item_actors, unit_items
 from janus.beads import Beads
-from janus.board import board, board_dir, learned_posts
-from janus.budgets import OUTCOMES, first_review_pass, rset, run_outcomes, waste_block, waste_state
-from janus.context import Err, Locked, NUM, atomic_write, note_event, now, refuse_agent, say, slug, ts
-from janus.findings.awareness import introduced_recently, related_cases
-from janus.findings.units import peer_rows, peers_text, unreconciled
+from janus.board import board, board_dir
+from janus.budgets import OUTCOMES, run_outcomes
+from janus.context import Err, Locked, NUM, atomic_write, memory_path, refuse_agent, say, slug, ts
+from janus.findings.units import unreconciled
 from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, committed, left_cost, recost, recost_plan, reconciled_plan, spend
-from janus.memory import MEM_SECTIONS, learned_mark, mem_line, memory_history, memory_path, memory_read, memory_write
+from janus.memory import MEM_SECTIONS, mem_line, memory_history, memory_read, memory_write
 from janus.probe import probe_all
-from janus.transcripts import pointer_text, read_transcript
-from janus.units import ENDED, herdr_agents, report_summary, unit_any, unit_state, verdict, waiting_line_jobs
+from janus.transcripts import read_transcript
+from janus.units import ENDED, herdr_agents, report_summary, unit_any, unit_state
 
 def cmd_ledger(cfg, a):
     """janus ledger check: every provider ledger, exit 1 when one is malformed. janus ledger recost: correct the done rows that
@@ -84,21 +83,9 @@ def cmd_ledger(cfg, a):
         if bad: say(f"  still malformed: {bad[0]}"); worst = 1
     return worst
 
-def cmd_learned(cfg, a):
-    if a.reject:
-        refuse_agent("janus learned --reject")
-        if not any(i == a.reject.removeprefix("learned:") for i, _ in learned_posts(cfg)): raise Err(f"no learned post {a.reject}")
-        learned_mark(cfg, a.reject, "rejected" + (f": {a.why}" if a.why else "")); return 0, [f"rejected {a.reject}"]
-    done = cfg.jget("learned.json")
-    return 0, [f"{i:24} {done.get(i, {}).get('how', 'open'):10} {t}" for i, t in learned_posts(cfg)]
-
 def cmd_report(cfg, a):
-    """The owner's status report: backlog completeness and remaining work, spend by outcome, the waste rule, open units.
-    --brief: the summary lines only. --sent: record that it was sent (clears report-due until the next checkpoint)."""
-    if getattr(a, "presented", None):
-        from janus.findings.stall import mark_presented
-        mark_presented(cfg, a.presented, a.summary); return 0, [f"{a.presented}: its result is recorded as presented to the owner"]
-    if a.sent: cfg.touch("report_sent"); return 0, ["report marked sent"]
+    """The status view, derived from the board, the units and the backlog now (nothing is stored): backlog progress, spend by
+    outcome, open units. --brief: the summary lines only."""
     L = [f"janus report: {cfg.name}, {ts()}"]
     items = backlog_items(cfg)
     if items is not None:
@@ -115,21 +102,11 @@ def cmd_report(cfg, a):
         L.append(f"Spend {pn}: ${tot:.2f} in {len(mine)} run(s)")
         for k, lab in OUTCOMES:
             xs = [x for x in mine if x[4] == k]
-            if xs: L.append(f"  {lab:28} ${sum(x[3] for x in xs):8.2f}  {len(xs):3} run(s)  {100 * sum(x[3] for x in xs) / max(tot, 1e-9):4.0f} %"
-                            + ("" if a.brief or k in ("verdict",) else ": " + ", ".join(dict.fromkeys(x[2] for x in xs))[:120]))
-    w, tot, pct = waste_state(cfg, outs)
-    L.append(f"Last {rset(cfg, 'recent_h')} h: ${w:.2f} of ${tot:.2f} ({pct:.0f} %) capped without a verdict; limit {rset(cfg, 'waste_pause')} %"
-             + (": launch and fill PAUSED until janus ack waste-pause" if waste_block(cfg) else ""))
+            if xs: L.append(f"  {lab:28} ${sum(x[3] for x in xs):8.2f}  {len(xs):3} run(s)")
     try:
         us = Beads(cfg).units()
         L.append(f"Open units: {len(us)}" + ("" if a.brief else ": " + ", ".join(u["name"] for u in us)[:300]))
     except Err as e: L.append(f"Open units: unavailable ({e})")
-    if not a.brief:
-        fr = first_review_pass(cfg)
-        if fr:
-            L.append("First review per implementer model (route by outcome, not only cost):")
-            for m, (p, f) in sorted(fr.items(), key=lambda x: (-x[1][0], sum(x[1]))):
-                L.append(f"  {m:24} {p} pass, {f} fail ({100 * p // max(p + f, 1)} %)")
     return 0, L
 
 def Counter_(it):
@@ -147,15 +124,6 @@ def cmd_transcript(cfg, a):
         if a.grep: L = [l for l in L if re.search(a.grep, l, re.I)]
         txt = f"(saved copy {saved})\n" + "\n".join(L[-a.tail:] if a.tail > 0 else L); rc = 0
     return 0 if rc == 0 else 1, [txt]
-
-def cmd_peers(cfg, a):
-    cfg.run.ro = True; hs = probe_all(cfg)
-    try: units = Beads(cfg).units()
-    except Err as e: raise Err(f"beads unavailable: {e}")
-    for u in units:
-        u["state"] = unit_state(u, hs, {}) if u.get("via") != "herdr" else unit_state(u, hs, herdr_agents(cfg))
-        if not verdict(cfg, u) and u["state"] in ENDED: u["_park"] = (u.get("parked") or {}).get("jobs") or waiting_line_jobs(cfg, u)
-    return 0, [peers_text(peer_rows(cfg, units, hs)).rstrip()]
 
 def write_index(cfg):
     """out/INDEX.md, one line per unit (verdict, result, report path), newest first; a copy in the board folder (index.md) so
@@ -193,9 +161,18 @@ def cmd_remember(cfg, a):
     if cfg.run.dry: say(f"+ remember {mem_line(new)}" + (f" (replaces {len(old)} on [{key}])" if old else "")); return
     for e in old: memory_history(cfg, e, "replaced")
     memory_write(cfg, [e for e in es if e not in old] + [new])
-    if a.learned: learned_mark(cfg, a.learned, "remembered")
-    if kind == "decision": note_event(cfg, "decision")
     say(f"remembered ({MEM_SECTIONS[kind]})" + (f", replacing the older entry on [{key}]" if old else "") + f": {text}")
+    if kind in ("instruction", "decision"): tell_running(cfg, f"{'replaced' if old else 'new'} {kind}{f' [{key}]' if key else ''}: {text}")
+
+def tell_running(cfg, text):
+    """A changed instruction or decision reaches each running agent as one addressed board direction (read before its next step).
+    No answer is asked for and nothing forces a final response."""
+    try: units = Beads(cfg).units()
+    except Err: return
+    for u in units:
+        if u.get("state") in ENDED or u.get("verdict"): continue
+        rc, o, e = board(cfg, "direct", u["name"], "[memory] " + text + " (MEMORY.md has the whole list; no reply needed)")
+        if rc: say(f"not delivered to {u['name']}: {(e or o).strip()[:80]}")
 
 def cmd_forget(cfg, a):
     refuse_agent("janus forget")
@@ -207,59 +184,4 @@ def cmd_forget(cfg, a):
     say(f"forgotten (moved to {cfg.f('memory-history.md').name}): {hit[0][3]}")
 
 def cmd_memory(cfg, a):
-    es = memory_read(cfg)
-    if a.keep:
-        refuse_agent("janus memory --keep")
-        if not (0 < a.keep <= len(es)): raise Err(f"no entry {a.keep}")
-        e = es[a.keep - 1]; es[a.keep - 1] = (e[0], time.strftime("%Y-%m-%d"), *e[2:])
-        if not cfg.run.dry: memory_write(cfg, es)
-        return 0, [f"kept (re-dated): {e[3]}"]
-    return 0, [f"{i:3} {e[0][:-1].lower():8} {mem_line(e)[2:]}" for i, e in enumerate(es, 1)] or [f"(no entries in {memory_path(cfg)})"]
-
-
-def introduce_topic(why, other=""):
-    """The grep topic for a transcript pointer: a path the reason names, else the other unit's name."""
-    m = re.search(r"[\w.-]+/[\w./-]+", why or "")
-    return m.group(0) if m else (other or (why or "").strip()[:40])
-
-
-def introduce(cfg, na, nb, why, topic=None):
-    """Make two units aware of each other: a direction on both cards, each naming the other, what it is doing, its report path
-    and the exact `janus transcript <unit> --grep <topic>` command. Recorded so related:<a>:<b> stays quiet for a while."""
-    ua, ub = unit_any(cfg, na), unit_any(cfg, nb)
-    if not ua: raise Err(f"no unit {na}")
-    if not ub: raise Err(f"no unit {nb}")
-    why = re.sub(r"\s+", " ", why or "").strip()
-    ta, tb = topic or introduce_topic(why, nb), topic or introduce_topic(why, na)   # each reads the OTHER's transcript
-    to_a = f"{why + '. ' if why else ''}{pointer_text(cfg, ub, ta, 'work with it')}"
-    to_b = f"{why + '. ' if why else ''}{pointer_text(cfg, ua, tb, 'work with it')}"
-    if cfg.run.dry: return [f"+ board.sh direct {na}: {to_a}", f"+ board.sh direct {nb}: {to_b}"]
-    for who, text in ((na, to_a), (nb, to_b)):
-        rc, o, e = board(cfg, "direct", who, text)
-        if rc: raise Err(f"board.sh direct {who}: {(e or o).strip()[:120]}")
-    d = cfg.jget("related.json"); d[f"{na}:{nb}" if na < nb else f"{nb}:{na}"] = {"t": int(now()), "reasons": [why], "topic": ta}
-    cfg.jput("related.json", d); cfg.touch("changed")
-    return [f"-> {na}: {to_a}", f"-> {nb}: {to_b}"]
-
-
-def cmd_introduce(cfg, a):
-    """janus introduce <a> <b> --why "<reason>": a direction on both agents' cards naming the other unit (imp-awareness item 1)."""
-    refuse_agent("janus introduce")
-    for n in (a.a, a.b):
-        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", n): raise Err(f"not a unit name: {n!r}")
-    if a.a == a.b: raise Err("janus introduce: a and b are the same unit")
-    why = re.sub(r"\s+", " ", a.why or "").strip()
-    if not why: raise Err('janus introduce needs --why "<why they should know each other>"')
-    return 0, introduce(cfg, a.a, a.b, why, a.topic)
-
-
-def tend_related(cfg, hs, units, log):
-    """The watcher's autopilot (exposed for watch.py, not called here): introduce two running units whose changes collide in the
-    same file or the same module (the two cases it may perform itself), once. Returns the pairs it introduced."""
-    out = []
-    for (x, y), d in sorted(related_cases(cfg, units, hs).items()):
-        if not (d["kinds"] & {"file", "module"}) or introduced_recently(cfg, x, y): continue
-        try: log("related " + " | ".join(introduce(cfg, x, y, "; ".join(d["reasons"])[:200], (d["topics"] or [None])[0])))
-        except Err as e: log(f"related {x}:{y}: {e}"); continue
-        out.append(f"{x}:{y}")
-    return out
+    return 0, [f"{i:3} {e[0][:-1].lower():11} {mem_line(e)[2:]}" for i, e in enumerate(memory_read(cfg), 1)] or [f"(no entries in {memory_path(cfg)})"]

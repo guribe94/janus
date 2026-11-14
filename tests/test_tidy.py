@@ -9,15 +9,15 @@ Run by ./check (it discovers tests/test_*.py)."""
 import tempfile, unittest
 from pathlib import Path
 
-from janusload import load
+from janusload import conf, load
 
 janus = load()
 
 
 def project(extra=""):
     d = Path(tempfile.mkdtemp(prefix="janus-test-"))
-    (d / "janus.toml").write_text('[project]\nname = "t"\n[paths]\nworktrees = "wt"\n[hosts.here]\nlocal = true\n' + extra)
-    (d / "out").mkdir(); (d / "wt").mkdir()
+    conf(d).write_text('[project]\nname = "t"\n[paths]\nworktrees = "wt"\n[hosts.here]\nlocal = true\n' + extra)
+    (d / ".janus" / "out").mkdir(); (d / "wt").mkdir()
     return d, janus.Cfg(d)
 
 

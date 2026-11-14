@@ -7,14 +7,14 @@ Standard library only; no network, no API spend."""
 import os, shlex, subprocess, sys, tempfile, textwrap, unittest
 from pathlib import Path
 
-from janusload import load
+from janusload import conf, load
 
 janus = load()
 
 
 def project(extra=""):
     d = Path(tempfile.mkdtemp(prefix="janus-test-"))
-    (d / "janus.toml").write_text(textwrap.dedent('''
+    conf(d).write_text(textwrap.dedent('''
         [project]
         name = "t"
         [hosts.here]
@@ -23,14 +23,14 @@ def project(extra=""):
         enabled = true
         cap_usd = 10
         budget_per_unit = 1
-        ledger = "out/ledger.tsv"
+        ledger = ".janus/out/ledger.tsv"
         key_file = "KEYFILE"
         [models.m]
         provider = "api"
         kind = "api"
         api_id = "test-model"
         ''').replace("KEYFILE", str(d / "key.env")) + extra)
-    (d / "out").mkdir(); (d / "briefs").mkdir()
+    (d / ".janus" / "out").mkdir(); (d / ".janus" / "briefs").mkdir()
     return d, janus.Cfg(d)
 
 
@@ -61,7 +61,6 @@ class Templates(unittest.TestCase):
         self.sh_n(janus.CLEAN_PUEUE % {"real": "pueue"}, "CLEAN_PUEUE")
         self.sh_n(janus.UNIT_PROCS % {"unit": "u", "roots": "1 2"}, "UNIT_PROCS")
         self.sh_n(janus.FINGERPRINT % {"root": "'/tmp'", "n": "u", "ex": "--exclude=.git"}, "FINGERPRINT")
-        self.sh_n(janus.GATE_DEFAULT, "GATE_DEFAULT")
 
 
 if __name__ == "__main__":

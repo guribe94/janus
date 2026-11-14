@@ -1,54 +1,80 @@
-"""Legacy cleanup and the setup gate finding: janus migrate ports or lists the project's own scripts that call the retired CLI
-(soak 39), and check raises gate-setup for a gate whose steps all fail at once (a setup problem, not tests)."""
-import tempfile, time, unittest
+"""janus migrate: the one-time move from the old nested root to the workspace's .janus. Catches: identity, messages, instructions or
+the registry lost in the move; a move while work is queued or a host cannot say; the old root left active."""
+import os, tempfile, unittest
 from pathlib import Path
+from unittest import mock
 
 from janusload import load
 
 janus = load()
 
 
-def project():
-    d = Path(tempfile.mkdtemp(prefix="janus-test-"))
-    (d / "janus.toml").write_text('[project]\nname = "t"\n[paths]\ngate_log = "out/gates.log"\n[hosts.here]\nlocal = true\n')
-    (d / "out").mkdir()
-    return d, janus.Cfg(d)
+class FakeBeads:
+    units_ = [{"name": "u1", "id": "b1", "via": "pueue", "host": "here", "state": "done"}]
+    def __init__(self, cfg): pass
+    def units(self): return list(self.units_)
+    def issues(self, label, status="open"):
+        return [{"id": "x9", "title": "instr: never touch prod", "description": "Never touch the production database; ask first."}] if label == "instruction" else []
 
 
-class PortScripts(unittest.TestCase):
-    def test_shim_ported_other_calls_listed(self):
-        d = Path(tempfile.mkdtemp(prefix="janus-test-"))
-        (d / "bin").mkdir(); shim = d / "bin/orch"; shim.write_text('#!/bin/sh\nexec orch "$@"\n')
-        (d / "gate.sh").write_text("#!/bin/sh\norch run --host x -- true\n")
-        plan = janus.port_old_scripts(d, dry=True)
-        self.assertTrue(any("bin/orch" in x and "shim" in x for x in plan), plan)
-        self.assertTrue(any("gate.sh:2" in x for x in plan), plan)
-        self.assertIn("exec orch", shim.read_text())                      # dry run: nothing changed
-        janus.port_old_scripts(d, dry=False)
-        self.assertIn("exec janus", shim.read_text())                     # the shim is ported
+def probe_ok(tasks=None, pueue=True):
+    return lambda n, h, **k: {"name": n, "ok": True, "pueue": {"tasks": tasks or {}} if pueue else None}
 
 
-class GateSetup(unittest.TestCase):
-    def test_all_steps_failing_at_once_is_a_setup_problem(self):
-        d, cfg = project()
-        t = time.strftime("%Y-%m-%d %H:%M:%S")
-        (d / "out/gates.log").write_text(f"{t} g EXIT_tests=2 RESULT: FAIL\n{t} h EXIT_tests=1 RESULT: FAIL\n")
-        cfg.jput("gate-times.json", {"g": [0.0], "h": [3.0]})
-        keys = [k for k, _ in janus.gate_findings(cfg)]
-        self.assertIn("gate-setup:g", keys)                              # exit 2 in 0 min: the retired CLI / a broken script
-        self.assertNotIn("gate-setup:h", keys)                           # exit 1 after 3 min: a real test failure
+class Migrate(unittest.TestCase):
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="janus-mig-")); self.old = self.ws / "gate-logs" / "orch-1"; self.old.mkdir(parents=True)
+        (self.old / "janus.toml").write_text('[project]\nname = "rig"\nbeads = "."\n[paths]\nbriefs = "briefs"\nout = "out"\n[hosts.here]\nlocal = true\n')
+        for d in ("briefs", "out", "board"): (self.old / d).mkdir()
+        (self.old / "board/log.md").write_text("2026-11-13 10:00 ann question: [q1] which one?\n"); (self.old / "out/r.md").write_text("result\n")
+        (self.old / ".janus").mkdir(); (self.old / ".janus/MEMORY.md").write_text("# m\n\n## Decisions\n- 2026-11-01 [db] use sqlite\n")
+        self.home = Path(tempfile.mkdtemp(prefix="janus-home-")); (self.home / ".config/janus").mkdir(parents=True)
+        (self.home / ".config/janus/projects").write_text(f"{self.old}\n")
+        self.patches = [mock.patch.object(janus, "Beads", FakeBeads), mock.patch.object(janus, "probe", probe_ok()), mock.patch.object(janus, "herdr_agents", lambda cfg: {}),
+                        mock.patch.object(janus, "session_alive", lambda cfg: None), mock.patch.dict(os.environ, {"HOME": str(self.home)}),
+                        mock.patch.object(Path, "home", lambda: self.home),
+                        mock.patch.object(janus, "sh", lambda cmd, **k: (0, "", "") if cmd[:3] == ["bd", "--readonly", "memories"] else (1, "", "n/a"))]
+        for p in self.patches: p.start(); self.addCleanup(p.stop)
 
+    def run_migrate(self, *a, **k):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf): rc = janus.migrate(*a, **k)
+        return rc, buf.getvalue()
 
-class ModelHosts(unittest.TestCase):
-    def test_warns_when_a_routed_model_is_limited_to_fewer_hosts(self):
-        d = Path(tempfile.mkdtemp(prefix="janus-test-"))
-        (d / "janus.toml").write_text(
-            '[project]\nname = "t"\n[hosts.a]\nlocal = true\n[hosts.b]\nssh = "x"\n[hosts.c]\nssh = "y"\n'
-            '[providers.api]\nenabled = true\n[models.m]\nprovider = "api"\nkind = "claude"\nhosts = ["a"]\n'
-            '[models.n]\nprovider = "api"\nkind = "claude"\n[routing]\nnormal = ["m", "n"]\n')
-        cfg = janus.Cfg(d)
-        self.assertTrue(any("runs on 1 of 3" in w for w in janus.model_host_warnings(cfg)))   # m limited to one host
-        self.assertFalse(any("model n" in w for w in janus.model_host_warnings(cfg)))          # n may run anywhere
+    def test_dry_run_changes_nothing_and_names_the_plan(self):
+        rc, out = self.run_migrate(str(self.old), str(self.ws))
+        self.assertEqual(rc, 0, out); self.assertIn("dry run", out); self.assertIn("1 into MEMORY.md", out)
+        self.assertTrue((self.old / "janus.toml").is_file()); self.assertFalse((self.ws / ".janus").exists())
+
+    def test_relocation_keeps_identity_messages_instructions_and_registry(self):
+        rc, out = self.run_migrate(str(self.old), str(self.ws), apply=True)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse((self.old / "janus.toml").exists(), "the old root is still active")
+        t = (self.ws / ".janus/janus.toml").read_text()
+        self.assertIn('id = "rig"', t); self.assertIn('beads = "gate-logs/orch-1"', t); self.assertNotIn("briefs =", t)
+        self.assertEqual((self.ws / ".janus/board/log.md").read_text().count("which one"), 1)
+        self.assertEqual((self.ws / ".janus/out/r.md").read_text(), "result\n")
+        self.assertTrue((self.old / "out").is_symlink())   # temporary: records that name the old path still resolve
+        mem = (self.ws / ".janus/MEMORY.md").read_text()
+        self.assertIn("use sqlite", mem); self.assertIn("Never touch the production database", mem)
+        self.assertEqual([Path(x).resolve() for x in (self.home / ".config/janus/projects").read_text().split()], [self.ws.resolve()])
+        sub = self.ws / "app" / "src"; sub.mkdir(parents=True)
+        self.assertEqual(janus.find_root(sub), self.ws.resolve())   # one resolver, from a subdirectory
+
+    def test_queued_work_or_an_unknown_queue_refuses(self):
+        task = {"1": {"id": 1, "label": "unit:u1@rig", "status": "Queued"}}
+        with mock.patch.object(janus, "probe", probe_ok(task)):
+            rc, out = self.run_migrate(str(self.old), str(self.ws), apply=True)
+        self.assertEqual(rc, 1); self.assertIn("is queued", out); self.assertTrue((self.old / "janus.toml").is_file())
+        with mock.patch.object(janus, "probe", probe_ok(pueue=False)):
+            rc, out = self.run_migrate(str(self.old), str(self.ws), apply=True)
+        self.assertEqual(rc, 1); self.assertIn("status unknown", out); self.assertFalse((self.ws / ".janus").exists())
+
+    def test_a_nonempty_local_outbox_refuses(self):
+        (self.old / ".janus/board-outbox").mkdir(); (self.old / ".janus/board-outbox/outbox.log").write_text("2026-11-13 10:00 ann done: x\n")
+        rc, out = self.run_migrate(str(self.old), str(self.ws), apply=True)
+        self.assertEqual(rc, 1); self.assertIn("not synced", out)
 
 
 if __name__ == "__main__":

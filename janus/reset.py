@@ -1,11 +1,16 @@
-"""The orchestrator's context reset at a safe boundary (fixes10 item 8, finished in imp-autopilot).
+"""The orchestrator's context reset, at a safe boundary.
 
-The runtime compacts a long context on its own, lossily. janus resets it first, below [project] reset_tokens (default 120000):
-when a Stop passes (no late finding, notes fresh: everything worth keeping is in HANDOFF.md), stop_reset starts a detached
-`janus watch --reset`, which sends /clear once the turn has ended and then the wake prompt. Every skipped reset says why in
-watch.log; check raises context when the context is over the threshold and no reset was asked."""
+The runtime compacts a long context on its own, lossily. janus resets it first, above [project] reset_tokens (default 120000),
+using what each tool supports and checking that it happened: Claude Code `/clear` and Codex `/new` start a new session (their
+SessionStart hook then registers it; the harness binaries' own command tables were read for this), and the reset counts as done
+only when the registered session id and transcript are new. Any other tool is reported unsupported: nothing is claimed.
+Before it, at the turn's Stop, the orchestrator is asked once to bring HANDOFF.md up to date (MEMORY.md is always current);
+after it the new session is told to read both."""
 import json, os, subprocess, sys, time
-from janus.context import JANUS_MARK, JANUS_SELF, clean_env, herdr, now, ts, wake_clear
+from janus.context import JANUS_MARK, JANUS_SELF, atomic_write, clean_env, herdr, memory_path, handoff_path, now, ts, wake_clear
+
+# tool kind -> the slash command that starts a new session there (read from each binary's command table, not assumed)
+RESET_CMD = {"claude": "/clear", "codex": "/new"}
 
 def log_line(cfg, m): cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
 
@@ -49,35 +54,50 @@ def orch_tokens(cfg):
     tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
     return context_tokens(tr) if tr else 0
 
-def stop_reset(cfg, blocked_by=None):
-    """Called by the orchestrator's Stop hook. blocked_by: why this Stop is not a safe boundary (late findings, stale notes).
-    Over the threshold it starts the reset, or logs why not. Returns what it did ("asked", or the reason it skipped)."""
+def stop_reset(cfg, d):
+    """The orchestrator's Stop hook. Under the threshold: nothing. Over it, at most one reminder to update HANDOFF.md (a Stop that
+    comes after the reminder, or with the handoff newer than the request, is the safe boundary): then a detached
+    `janus watch --reset` starts. Returns the reminder text to block with, or None. Never blocks twice, never in a user's wait."""
     tok = orch_tokens(cfg)
-    if tok <= cfg.reset_tokens: return "under the threshold"
-    why = (f"not a safe boundary ({blocked_by})" if blocked_by else
-           "a reset was asked under 10 min ago" if now() - cfg.mtime("reset_asked") < 600 else None)
-    if why: log_line(cfg, f"context reset skipped at Stop ({tok} tokens over {cfg.reset_tokens}): {why}"); return why
+    if tok <= cfg.reset_tokens: return None
+    if now() - cfg.mtime("reset_asked") < 600:
+        log_line(cfg, f"context reset not repeated: one was asked under 10 min ago ({tok} tokens)"); return None
+    asked = cfg.mtime("handoff_asked")
+    if not d.get("stop_hook_active") and not (asked and handoff_path(cfg).exists() and handoff_path(cfg).stat().st_mtime > asked):
+        cfg.touch("handoff_asked")
+        return (f"[janus] The context is {tok} tokens, over the reset threshold: bring {handoff_path(cfg)} up to date now (objective, decisions, "
+                f"blockers, next actions: curated, short; binding instructions belong in {memory_path(cfg)} via janus remember), then end the turn. "
+                "janus then starts a new session and loads both.")
     cfg.touch("reset_asked"); log_line(cfg, f"context reset at Stop: {tok} tokens over {cfg.reset_tokens}")
     if not os.environ.get("JANUS_IN_TESTS"):
         subprocess.Popen([sys.executable, str(JANUS_SELF), "watch", "--reset"], cwd=cfg.root, env=clean_env({"JANUS_ROOT": str(cfg.root)}),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    return "asked"
+    return None
 
-def reset_now(cfg, wait_s=60):
-    """`janus watch --reset`: once the orchestrator's turn has ended, /clear, then the wake prompt."""
+def reset_now(cfg, wait_s=60, verify_s=90):
+    """`janus watch --reset`: once the orchestrator's turn has ended, start a new session with the tool's own command and verify it:
+    the registered session id and transcript must be new. Returns True when verified; False (logged why) when not, with the old
+    registration restored so nothing is lost; an unsupported tool is said so, never reported as reset."""
     pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
-    if not pane: log_line(cfg, "context reset skipped: no orchestrator pane"); return
+    kind = (cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else "") or cfg.c.get("orchestrator", {}).get("kind", "claude")
+    cmd = RESET_CMD.get(kind)
+    if not cmd: log_line(cfg, f"context reset UNSUPPORTED for {kind!r}: no verified new-session command (supported: {', '.join(RESET_CMD)})"); return False
+    if not pane: log_line(cfg, "context reset skipped: no orchestrator pane"); return False
+    if not handoff_path(cfg).exists(): log_line(cfg, "context reset skipped: no HANDOFF.md to carry the state"); return False
     for _ in range(max(1, wait_s // 5)):
         time.sleep(5)
         if ((herdr("agent", "get", pane) or {}).get("agent") or {}).get("agent_status") != "working": break
-    else: log_line(cfg, f"context reset skipped: the orchestrator kept working for {wait_s} s"); return
-    herdr("agent", "prompt", pane, "/clear"); time.sleep(5); herdr("agent", "prompt", pane, JANUS_MARK + wake_clear(cfg, "the context was cleared"))
-    log_line(cfg, "context reset: /clear, then wake")
-
-def context_findings(cfg):
-    """context: the orchestrator's context is over reset_tokens and no reset was asked in 15 min (it would soon be compacted)."""
-    tok = orch_tokens(cfg)
-    if tok > cfg.reset_tokens and now() - cfg.mtime("reset_asked") > 900:
-        return [("context", f"orchestrator context is {tok} tokens, over [project] reset_tokens {cfg.reset_tokens}, and no reset was asked: "
-                 "update the notes and end the turn (the Stop hook then resets it); watch.log says why a reset was skipped")]
-    return []
+    else: log_line(cfg, f"context reset skipped: the orchestrator kept working for {wait_s} s"); return False
+    old = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
+    old_tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
+    atomic_write(cfg.f("session"), f"pending:{int(now())}:{pane}")   # the new session's SessionStart hook claims it (hooks.cmd_hook)
+    herdr("agent", "prompt", pane, cmd)
+    for _ in range(max(1, verify_s // 3)):
+        time.sleep(3)
+        cur = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
+        tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
+        if cur and not cur.startswith("pending:") and cur != old and tr != old_tr:
+            herdr("agent", "prompt", pane, JANUS_MARK + wake_clear(cfg, "the session was reset"))
+            log_line(cfg, f"context reset verified: new session {cur[:12]} (was {old[:12]}), {kind} {cmd}"); return True
+    atomic_write(cfg.f("session"), old)
+    log_line(cfg, f"context reset NOT verified: no new session registered within {verify_s} s after {cmd}; the old registration is restored"); return False

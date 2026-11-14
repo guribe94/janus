@@ -6,7 +6,7 @@ from pathlib import Path
 from janus.board import board_dir
 from janus.context import hrun, qp, sh
 from janus.templates import CONDENSE
-from janus.units import all_units, api_out, report_path, unit_any
+from janus.units import api_out, report_path
 
 # One condenser for Claude Code (jsonl under ~/.claude/projects) and Codex (rollout jsonl under ~/.codex/sessions) transcripts.
 # It runs where the transcript is: here, or on the agent's host as `python3 -` with this source on stdin (standard library only).
@@ -114,25 +114,3 @@ def related_names(text):
     return [n for n in re.split(r"[,\s]+", (m.group(1) if m else "").strip()) if NAME_RX.fullmatch(n)]
 
 
-def predecessor_name(cfg, name, resume_of=None):
-    """The unit a follow-up continues: --resume-of, else the unit whose name this one extends ('u21-finish' -> 'u21', the
-    longest such name among every unit ever recorded). None when there is none."""
-    if resume_of: return resume_of
-    names = set(all_units(cfg))
-    cands = [p for p in names if p != name and (name.startswith(p + "-") or name.startswith(p + "_"))]
-    return max(cands, key=len) if cands else None
-
-
-def related_pointers(cfg, name, brief_text="", pred=None):
-    """The 'Related units' block a brief gets: one pointer per RELATED: name and for the unit's predecessor (the same
-    pointers janus introduce posts as directions). '' when neither names a known unit."""
-    names = related_names(brief_text or "")
-    if pred: names = [pred, *[n for n in names if n != pred]]
-    L, seen = [], set()
-    for n in names:
-        if n == name or n in seen: continue
-        seen.add(n); u = unit_any(cfg, n)
-        if not u: continue
-        topic = name[len(pred) + 1:] if n == pred and pred and name.startswith(pred + "-") else n
-        L.append("- " + pointer_text(cfg, u, topic, f"your predecessor {n}" if n == pred else f"related unit {n}"))
-    return ("## Related units (janus)\n" + "\n".join(L)) if L else ""

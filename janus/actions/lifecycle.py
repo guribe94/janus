@@ -1,22 +1,21 @@
 """A unit's life after launch: janus stop, collect, close, park, resume, board-close; saving its output, task log and
-transcript; the watcher's tend_parked (resume a parked unit when its jobs finished, wrap up a capped run)."""
+transcript; the watcher's tend_parked (resume a parked unit when its jobs finished)."""
 import os, re, shlex, sys, time
 from pathlib import Path
-from janus.findings.stall import note_collected, present_line
 from janus.actions.jobs import collect_job, job_of, job_state, recorded_jid, runs_dir, save_task_log, task_rc, task_status, unit_jobs
 from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken
-from janus.autopilot import apc, ending, forget, held, record
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
-from janus.budgets import bset, budget_for, budget_note, finish_refusal, fits_cap, reload_usd, run_spend, session_usage
-from janus.context import (DIFF_X, Err, LockLost, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, note_event, now, pq, ps_table, qp, say,
+from janus.budgets import budget_note, finish_refusal, reload_usd, session_usage
+from janus.context import (DIFF_X, Err, JANUS_MARK, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, now, pq, ps_table, qp, say,
     sh, ts)
+from janus.memory import memory_text
 from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, run_cost, settle_run
 from janus.project import project_id, tag, unit_tmux
 from janus.probe import probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
-from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, api_out, get_unit, herdr_agents, own_tree, report_path, unit_runs, unit_spent, unit_state,
+from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, own_tree, report_path, unit_runs, unit_spent, unit_state,
     verdict, waiting_line_jobs)
 
 # Agents never pay to wait. An agent submits its builds and tests detached (`janus run --detach`, or its lane runner's
@@ -247,7 +246,6 @@ def collect_state(cfg, bd, u, h, kv, p):
     if kv: u["collected"] = kv.get("fp"); u["collected_at"] = int(now()); bd.save(u)   # stop and close compare against it
     if not cfg.run.dry: bd.comment(u["id"], f"{ts()} collected from {u['host']}")
     say(f"collected: {p} ({p.stat().st_size if p.exists() else 0} bytes; apply in {u['cwd']} with git apply --3way)")
-    if not cfg.run.dry: note_collected(cfg, n, "collect"); say(present_line(n))   # collected means presented (skill-fix57)
 
 def unit_dirty(cfg, cwd):
     """(uncommitted paths the unit owns, whether its tree lies in the project's own repo). Only the unit's cwd subtree counts,
@@ -333,14 +331,8 @@ def cmd_close(cfg, a):
     if cfg.run.dry: return
     u = next((x for x in bd.units() if x["id"] == u["id"]), u)   # as it is now: the run is settled and the issue closed on the current record
     if ended: settle_run(cfg, u, "closed")
-    bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done"); note_event(cfg, "close")
+    bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done")
     say("closed")
-    if not dup: note_collected(cfg, u["name"], "close"); say(present_line(u["name"]))   # a duplicate relaunch has no result of its own
-
-WRAPUP = ("Your budget is spent; this short run is only for your report. Do not run, submit or wait for anything. Write {report} "
-          "now: what is done, its state, what is left, the real exit codes of everything you ran (say \"not run\" where none), then "
-          "the last line 'VERDICT: DONE' only if the brief's done-criteria are met, else 'VERDICT: BLOCKED'. Update report.json "
-          "beside it to match. Then stop.")
 
 def job_result(cfg, hs, ref, agent_host):
     """(exit code or None, log path the agent can read) of a finished job. A remote job's files are copied here first when
@@ -373,7 +365,7 @@ def unit_used(cfg, u):
     runs = ledger_read(cfg, pv)[0]; tot, known = 0.0, True
     for k in unit_runs(u):
         r = runs.get(k)
-        if not r or k == u.get("wrapup") or k in u.get("wrapups", []): continue
+        if not r: continue
         if r["done"]: tot += r["cost"] or 0.0; continue
         c, rep = run_cost(cfg.p("out", "out") / u["name"] / "api.json", None, k) if k == u.get("run") else (0.0, False)
         if rep: tot += c
@@ -401,11 +393,11 @@ def resume_message(cfg, hs, u, jobs):
 class NoBudget(Err):
     """A resume refused because the unit's own budget cannot pay for it: the unit becomes resumable (item 7)."""
 
-def resume_unit(cfg, u, msg, wrapup=False, budget=None):
+def resume_unit(cfg, u, msg, budget=None):
     """Continue the unit's own agent session with msg (see above). budget: a new budget for this run (`janus resume --budget`,
     same tree), instead of the unit's remaining budget (item 24: a capped unit with an unpushed commit can be continued). The
     caller saves u. Returns a line saying what was done."""
-    name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); text = JANUS_MARK + msg
+    name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); mem = memory_text(cfg); text = JANUS_MARK + msg + (f"\n\nProject memory (binding; it may have changed since you started):\n{mem}" if mem else "")
     if via == "herdr":
         if not cfg.run.dry: herdr("agent", "prompt", name, text)
         return f"{name}: " + ("prompted in its herdr pane" if not cfg.run.dry else "would prompt in its herdr pane")
@@ -417,16 +409,15 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
     sid = session_of(cfg, u)
     if not sid: raise Err(f"{name}: no session id (api.json or transcript) to resume")
     if u.get("run"):   # the run before is closed first (idempotent): its reported cost, else its budget
-        cost, rep = run_cost(od / "api.json", (u.get("budget") or pv.get("budget_per_unit", 0)) if u.get("run") != u.get("wrapup") else bset(cfg, "wrapup_usd"), u["run"])
+        cost, rep = run_cost(od / "api.json", (u.get("budget") or pv.get("budget_per_unit", 0)), u["run"])
         if rep: keep_run_json(cfg, od, u["run"])   # the next run of this session is charged against it
         ledger_done(cfg, pv, u["run"], name, cost, "resumed")
     spent = unit_spent(cfg, u); explicit = budget is not None
     # The agent CLI stops a resumed run when THIS run's spend reaches its cap, and the first request of a resume loads the whole
     # context again: a cap under that cost stops at turn 1 with nothing done. So the wrap-up gets its budget on top of the
     # reload, and any other resume is refused when what is left cannot pay for the reload plus [budget] resume_min_usd.
-    use = session_usage(cfg, u, sid=sid); reload = reload_usd(cfg, use); floor = round(reload + bset(cfg, "resume_min_usd"), 2)
-    if wrapup: budget = round(bset(cfg, "wrapup_usd") + reload, 2)
-    elif budget is None: budget = round((u.get("budget") or pv.get("budget_per_unit", 0)) - spent, 2)
+    use = session_usage(cfg, u, sid=sid); reload = reload_usd(cfg, use); floor = round(reload + 0.1, 2)   # a resume must be able to pay for loading the context again
+    if budget is None: budget = round((u.get("budget") or pv.get("budget_per_unit", 0)) - spent, 2)
     if budget < floor:
         need = f", and a resume needs ${floor:.2f} (${reload:.2f} to load its {use['ctx']}-token context again)" if reload else " (under [budget] resume_min_usd)"
         raise (Err if explicit else NoBudget)(f"{name}: ${budget:.2f} budget {'given' if explicit else 'left'}{need}: resume it with janus resume {name} --budget <usd> (same tree), or janus launch --resume-of and a new budget")
@@ -435,7 +426,7 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
     if why: raise Err(why)
     k = len(unit_runs(u)) + 1; run = f"{name}.r{k}.{int(now())}"
     run = reserve_budget(cfg, mc, name, budget, run)
-    if not wrapup: text += "\n\n" + budget_note(cfg, budget, spent, round(spent + budget, 2) if explicit else u.get("budget"), reload)   # item 6
+    text += "\n\n" + budget_note(cfg, budget, spent, round(spent + budget, 2) if explicit else u.get("budget"), reload)   # item 6
     local = h.get("local", False); old = u.get("task")
     report = str(report_path(cfg, u)) if local else f"{h['root']}/out/{name}/REPORT.md"
     env = {"JANUS_ROLE": "agent", "JANUS_REPORT": report, "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root)}
@@ -458,13 +449,10 @@ def resume_unit(cfg, u, msg, wrapup=False, budget=None):
     if old is not None: save_task_log(cfg, h, u, old, remove=True)   # the finished task's log is kept, then the task removed
     u.update(task=int(o.strip() or 0), run=run, runs=[*unit_runs(u), run], resumes=u.get("resumes", 0) + 1, resumed_at=int(now()),
              **({"budget": round(spent + budget, 2)} if explicit else {}))   # item 24: the unit's budget grows by the new run's
-    if wrapup: u["wrapup"] = run
-    else:
-        u.pop("resumable", None)   # item 7: it runs again
-        if u.get("wrapup"): u["wrapups"] = [*u.get("wrapups", []), u.pop("wrapup")]   # a later capped run is wrapped up again
+    u.pop("resumable", None)
     chk = f"herdr {name}" if via == "herdr" else f"pueue {u['host']}:{u['task']}" if via == "pueue" else f"tmux {u['host']}:{unit_tmux(u)}"
     board(cfg, "post", name, "waiting", f"resumed as task {u['task']}", env={"BOARD_CHECK": chk})   # item 9: a queued run is not GONE
-    return f"{name}: resumed session {sid[:8]} as run {run} (${budget:g}{', wrap-up' if wrapup else ''}), task {u['task']}"
+    return f"{name}: resumed session {sid[:8]} as run {run} (${budget:g}), task {u['task']}"
 
 def park_tab(cfg, u):
     """A parked unit's tab only shows a run that ended (pueue follow) or mirrors a session that waits (tmux attach): closed, so
@@ -627,8 +615,23 @@ def sync_remote_outputs(cfg, units, bd, fetched=None):
         try: settle_remote(cfg, u); bd.save(u)
         except Err: pass
 
+RESUME_TRIES = 3   # failed resumes of the same finished jobs before the watcher stops trying
+
+def once(cfg, key, cause):
+    """Record that one action was taken for (key, cause) and say whether it is new: False when it was already taken, so a
+    resume is never started twice for the same finished jobs. Only a real, observed condition reaches it."""
+    rec = cfg.jget("once.json"); k = f"{key}|{cause}"
+    if k in rec: return False
+    rec[k] = int(now()); cfg.jput("once.json", dict(list(rec.items())[-300:])); return True
+
+def unonce(cfg, key, cause):
+    """Undo once() for an action that failed before it started anything: the next pass may try again (bounded by the next pass)."""
+    rec = cfg.jget("once.json")
+    if rec.pop(f"{key}|{cause}", None) is not None: cfg.jput("once.json", rec)
+
 def tend_parked(cfg, hs, units, log, fetched=None):
-    """The watcher's part: record parked units, resume those whose jobs all finished, wrap up capped runs (item 2)."""
+    """The watcher's part: record parked units, and resume those whose jobs all finished (done or gone; an unknown host is
+    never a reason)."""
     bd = Beads(cfg)
     for u in units:
         try:
@@ -643,12 +646,13 @@ def tend_parked(cfg, hs, units, log, fetched=None):
                     # once only (panel-eng F1): the handled fact is recorded here before the resume and guards it; the unit
                     # record (bd) is saved best-effort after, so a failed save cannot start a second run on the same session
                     key, cause = f"parked:{u['name']}", f"resume:{','.join(jobs)}"
-                    if cfg.run.dry or record(cfg, key, cause, f"resumed: jobs {', '.join(jobs)} finished", u):
+                    if (u.get("resume_error") or {}).get("n", 0) >= RESUME_TRIES: continue
+                    if cfg.run.dry or once(cfg, key, cause):
                         try: log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs)))
                         except Err as e:   # nothing started: recorded on the unit, check reports it; the next pass tries again
-                            if not cfg.run.dry: forget(cfg, key, cause, str(e))
-                            if isinstance(e, NoBudget) and not u.get("resumable") and not cfg.run.dry: mark_resumable(cfg, u, "its budget cannot pay for the resume its finished jobs need"); save_soft(bd, u, log)
-                            elif (u.get("resume_error") or {}).get("why") != str(e): u["resume_error"] = {"why": str(e), "at": int(now())}; save_soft(bd, u, log)
+                            if not cfg.run.dry: unonce(cfg, key, cause)
+                            if not cfg.run.dry:   # bounded: after RESUME_TRIES failures the watcher leaves it (parked:<unit>:resume says so)
+                                u["resume_error"] = {"why": str(e), "at": int(now()), "n": (u.get("resume_error") or {}).get("n", 0) + 1}; save_soft(bd, u, log)
                             raise
                         u.pop("resume_error", None)
                     elif set(jobs) <= set(u.get("handled_jobs", [])): continue
@@ -656,101 +660,12 @@ def tend_parked(cfg, hs, units, log, fetched=None):
                     if cfg.run.dry: continue
                     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); save_soft(bd, u, log)
                 continue
-            if wrap_due(cfg, u):
-                if not cfg.run.dry and not record(cfg, f"unit:{u['name']}", "wrapup", "ended at its budget cap without a verdict: resumed once to write its report", u, ack=f"unit:{u['name']}:limit"):
-                    continue   # already wrapped up once (the unit record's save failed): never a second wrap-up run
-                try: log(resume_unit(cfg, u, WRAPUP.format(report=report_path(cfg, u) if cfg.hosts[u["host"]].get("local") else f"{cfg.hosts[u['host']]['root']}/out/{u['name']}/REPORT.md"), wrapup=True))
-                except Err as e:
-                    if not cfg.run.dry: forget(cfg, f"unit:{u['name']}", "wrapup", str(e), ack=f"unit:{u['name']}:limit")
-                    raise
-                save_soft(bd, u, log)
         except Err as e: log(f"{u['name']}: {e}")
-
-CHECKPOINT = ("janus budget checkpoint: this run has used about ${sp:.2f} of its ${b:g} budget ({pct:.0f} %) and is stopped at ${b:g} without warning. "
-              "Now, before anything else: commit your work, write your state in your report (done, left, the next step, the real exit codes), then "
-              "park on your jobs or finish with your VERDICT line. Start no new long step: about ${left:.2f} is left.")
-
-def tend_checkpoint(cfg, hs, units, log):
-    """The watcher's part of budget-follow item 6: a working API unit whose run has used [budget] warn_pct of its budget is
-    ordered, once per run, to checkpoint (a board direction: the agent reads the board before each step; a remote unit gets it
-    with the pass's sync). The wrap-up run is the checkpoint itself and gets none."""
-    done = cfg.jget("autopilot.json").get("done", {})
-    for u in units:
-        n = u["name"]; mc = cfg.models.get(u.get("model"), {})
-        if u.get("state") != "working" or u.get("via") != "pueue" or mc.get("kind") != "api" or not u.get("run") or u.get("run") == u.get("wrapup"): continue
-        if f"unit:{n}|checkpoint:{u['run']}" in done: continue   # ordered already: no second look (a remote look is an ssh)
-        try:
-            sp, b = run_spend(cfg, u)
-            if sp is None or not b or sp < bset(cfg, "warn_pct") / 100 * b: continue
-            if cfg.run.dry: log(f"{n}: would order a budget checkpoint (${sp:.2f} of ${b:g})"); continue
-            if not record(cfg, f"unit:{n}", f"checkpoint:{u['run']}", f"run at ${sp:.2f} of its ${b:g} budget: ordered to checkpoint", u): continue
-            board(cfg, "direct", n, CHECKPOINT.format(sp=sp, b=b, pct=100 * sp / b, left=max(0.0, b - sp))); log(f"{n}: budget checkpoint ordered (${sp:.2f} of ${b:g})")
-        except Err as e: log(f"{n}: budget checkpoint: {e}")
-
-# Budget-follow item 7: a unit stopped by its budget (its run and its wrap-up ended at the cap, or its budget cannot pay for the
-# resume its finished jobs need) is recorded resumable with the budget it needs; that money is part of the finish reserve, so
-# no new unit takes it; and with the unattended loop on the watcher resumes it FIRST, in its own session and tree (a remote
-# unit too), as soon as the provider's cap has room: after the cap was raised, or other runs ended under their budgets.
-
-RESUME_CAPPED = ("Your earlier run was stopped at its budget; this run has a new one. Read {report} (your own state) and continue the brief from "
-                 "where it stands: do not redo what it says is done. janus added a 'VERDICT: PENDING' line at its end (the unit is not finished): "
-                 "write your state above it as before and end the report with your final VERDICT line and the real exit codes. Same rules: submit "
-                 "builds and tests detached, write 'WAITING <job ids>' in the report and end your turn.")
-
-def mark_resumable(cfg, u, why):
-    """Record on the unit that it can go on and what it needs: a new unit's budget of its kind and tier, plus what loading its
-    context again costs (a resume pays that before it does anything). The caller saves u."""
-    mc = cfg.models[u["model"]]; b = budget_for(cfg, mc, u.get("kind") or "implement", u.get("tier") or "normal")[0]
-    u["resumable"] = {"why": why, "need": round(b + reload_usd(cfg, session_usage(cfg, u)), 2), "at": int(now())}
-
-def tend_resumable(cfg, hs, units, log):
-    """The watcher's part of item 7 (see above), before the autopilot and before fill. Bounded: a unit is given a new budget at
-    most [autopilot] relaunch_max times, then it is left to the orchestrator (unit:<n>:resume-limit). Never a held unit."""
-    if cfg.run.dry: return
-    bd = Beads(cfg); api = lambda u: u.get("via") == "pueue" and cfg.models.get(u.get("model"), {}).get("kind") == "api"
-    for u in units:
-        try:
-            if api(u) and not u.get("resumable") and not u.get("resume_limit") and ending(cfg, u) == "capped":
-                mark_resumable(cfg, u, "its run and its wrap-up ended at the budget cap"); save_soft(bd, u, log)
-                log(f"{u['name']}: stopped by its budget: resumable with ${u['resumable']['need']:.2f}")
-        except Err as e: log(f"{u['name']}: {e}")
-    if not apc(cfg, "enabled"): return   # recorded and kept; unit:<n>:resumable tells the orchestrator how to continue it
-    wait = sorted((u for u in units if u.get("resumable") and api(u)), key=lambda u: u["resumable"].get("at", 0))   # oldest first
-    for i, u in enumerate(wait):
-        n = u["name"]; need = u["resumable"].get("need") or 0; k = u.get("topups", 0); h = cfg.hosts[u["host"]]
-        try:
-            if u.get("state") in ("working", "queued") or held(cfg, n): continue
-            if k >= apc(cfg, "relaunch_max"):
-                u.pop("resumable"); u["resume_limit"] = k; save_soft(bd, u, log)
-                if record(cfg, f"unit:{n}", "resume-limit", f"stopped by its budget again after {k} new budget(s): left to the orchestrator", u): log(f"{n}: resume limit reached")
-                continue
-            if not fits_cap(cfg, cfg.models[u["model"]], n, need, units, but=[x["name"] for x in wait[i + 1:]]): continue   # waits for room
-            key, cause = f"unit:{n}", f"topup:{k + 1}"
-            if not record(cfg, key, cause, f"stopped by its budget: resumed in its own session with a new budget of ${need:.2f}", u): continue
-            jobs = (u.get("parked") or {}).get("jobs") or u.get("_park") or []
-            report = str(report_path(cfg, u)) if h.get("local") else f"{h['root']}/out/{n}/REPORT.md"
-            try: log(resume_unit(cfg, u, resume_message(cfg, hs, u, jobs) if jobs else RESUME_CAPPED.format(report=report), budget=need))
-            except Err as e: forget(cfg, key, cause, str(e)); raise
-            u["topups"] = k + 1; u.pop("resume_error", None)
-            if jobs: u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None)
-            elif u.get("verdict"):   # its wrap-up wrote a closing verdict: the unit is not finished any more
-                line = f"VERDICT: PENDING - resumed {ts()} with a new budget (janus)"
-                if h.get("local"):
-                    with open(report, "a") as f: f.write("\n" + line + "\n")
-                else: X(cfg, h, f"printf '\\n%s\\n' {shlex.quote(line)} >> {qp(report)}")
-            save_soft(bd, u, log)
-        except Err as e: log(f"{n}: {e}")
 
 def save_soft(bd, u, log):
     """Save the unit record best-effort: the once-only facts live in .janus/autopilot.json, so a busy bd only delays it."""
     try: bd.save(u)
     except Err as e: log(f"{u['name']}: saving the unit record failed ({e}); retried next pass")
-
-def wrap_due(cfg, u):
-    """A run that ended at its budget cap without a final verdict, not yet wrapped up (item 2)."""
-    mc = cfg.models.get(u.get("model"), {})
-    return (u.get("via") == "pueue" and mc.get("kind") == "api" and u.get("state") in ENDED and not u.get("verdict") and not u.get("wrapup")
-            and api_out(cfg, u).get("subtype") == "error_max_budget_usd" and not u.get("_park"))
 
 def save_transcript(cfg, u):
     """out/<unit>/transcript.md: the whole condensed transcript (collect; it outlives the remote copy)."""

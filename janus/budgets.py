@@ -1,11 +1,10 @@
-"""Budgets from history, spend so far, and the spend-by-outcome policy (waste pause, report checkpoints).
+"""Budgets from history, spend so far and each run's outcome.
 
 Queries only: a unit's default budget, its spend so far (ledger, else its transcript priced at learned rates), each run's
-outcome, and whether launch and fill are paused by the waste rule."""
+outcome."""
 import calendar, json, re, time
 from pathlib import Path
-from janus.context import Err, hrun, now, sh
-from janus.findings import live_acks
+from janus.context import Err, hrun, sh
 from janus.ledger import RECONCILED, budget_of, committed, ledger_read, reserved, run_time
 from janus.transcripts import remote_slug_sh, transcript_of
 from janus.usage import usage_scan
@@ -96,18 +95,6 @@ def learned_rates(cfg):
             if wt > 0 and isinstance(x.get("costUSD"), (int, float)): a = acc.setdefault(m, [0.0, 0.0]); a[0] += x["costUSD"]; a[1] += wt
     cfg.run.rates = {m: c / wt for m, (c, wt) in acc.items() if wt}
     return cfg.run.rates
-
-def unit_spend(cfg, u):
-    """(dollars so far, how known) of an API unit: its api.json cost when finished, else its transcript priced at the learned
-    rate; (None, why) when it cannot be told (remote, no transcript, no learned rate)."""
-    try:
-        c = json.loads((cfg.p("out", "out") / u["name"] / "api.json").read_text()).get("total_cost_usd")
-        if isinstance(c, (int, float)): return float(c), "api.json"
-    except Exception: pass
-    if not cfg.hosts.get(u.get("host"), {}).get("local"): return None, "remote"
-    f = transcript_of(cfg, u)
-    if not f: return None, "no transcript"
-    return transcript_cost(cfg, f)
 
 def transcript_cost(cfg, f, since=0):
     """(dollars, "transcript") of a Claude Code transcript's assistant messages (those after since, a time), priced at the
@@ -225,12 +212,6 @@ def names_some(need, n=4):
     L = sorted(need, key=lambda k: -need[k])
     return ", ".join(f"{k} ${need[k]:.2f}" for k in L[:n]) + (f", {len(L) - n} more" if len(L) > n else "")
 
-def fits_cap(cfg, mc, name, budget, units=None, but=()):
-    """Whether a $budget run of unit name fits under its provider's cap beside the other open units' reserve (True: no cap)."""
-    pv = cfg.prov.get(mc.get("provider"), {})
-    if not pv.get("cap_usd") or "ledger" not in pv: return True
-    return committed(cfg, pv) + finish_reserve(cfg, mc["provider"], units, (name, *but))[0] + reserved(cfg, budget) <= pv["cap_usd"]
-
 def finish_refusal(cfg, mc, name, budget, units=None, but=()):
     """Why a new $budget run of the provider is refused for the finish reserve (None: it fits, or no cap is set)."""
     pv = cfg.prov.get(mc.get("provider"), {})
@@ -241,9 +222,6 @@ def finish_refusal(cfg, mc, name, budget, units=None, but=()):
             f"overshoot margin) would pass the ${pv['cap_usd']:g} cap of {mc['provider']}: let them finish or close one (janus close <unit>), or ask the "
             f"owner to raise {mc['provider']}'s cap_usd")
 
-REPORT_DEFAULTS = {"every_h": 4, "at": [], "waste_pause": 25, "recent_h": 24}
-
-def rset(cfg, k): return cfg.c.get("report", {}).get(k, REPORT_DEFAULTS[k])
 
 def work_written(cfg, u, since=0):
     """The unit left work: report lines beyond its VERDICT line, a non-empty patch of its changes, or in its worktree a commit
@@ -280,46 +258,3 @@ def run_outcomes(cfg):
             out.append((pn, k, u["name"], float(cost or 0), o, t))
     return out
 
-def first_review_pass(cfg):
-    """{implementer model: (passes, fails)}: for each unit with a review of it (a unit launched `--of <name>`), the EARLIEST
-    review's outcome (its verdict DONE = pass, else fail). The outcome data routing should read (S3 model-routing-policy): route
-    by the model whose work passes review first, not only by cost."""
-    au = all_units(cfg); by_of = {}
-    for r in au.values():
-        if r.get("of"): by_of.setdefault(r["of"], []).append(r)
-    out = {}
-    for name, x in au.items():
-        revs = sorted(by_of.get(name, []), key=lambda r: r.get("started", 0))
-        if not revs or not x.get("model"): continue
-        p, f = out.get(x["model"], (0, 0))
-        ok = "DONE" in (verdict(cfg, revs[0]) or "")
-        out[x["model"]] = (p + (1 if ok else 0), f + (0 if ok else 1))
-    return out
-
-def waste_state(cfg, outs=None):
-    """(capped-without-verdict dollars, all dollars, share %) of the runs of the last [report] recent_h hours."""
-    outs = run_outcomes(cfg) if outs is None else outs; cut = now() - rset(cfg, "recent_h") * 3600
-    rec = [x for x in outs if x[5] >= cut]; tot = sum(x[3] for x in rec); w = sum(x[3] for x in rec if x[4].startswith("capped"))
-    return w, tot, (100 * w / tot if tot else 0.0)
-
-def waste_paused(cfg):
-    """Why launch and fill are paused (wasted spend over [report] waste_pause % of recent spend). Item 7: the reason is stated
-    even while the ack is live, so the finding exists, run_check's ack filter hides it, and the ack lasts its TTL; waste_block is
-    the ack-aware refusal launch and fill use."""
-    w, tot, pct = waste_state(cfg)
-    if pct <= rset(cfg, "waste_pause"): return None
-    return (f"${w:.2f} of ${tot:.2f} ({pct:.0f} %) of the last {rset(cfg, 'recent_h')} h went to runs that ended at their budget cap without a "
-            f"verdict (limit {rset(cfg, 'waste_pause')} %): find the cause (janus report), then janus ack waste-pause \"<cause and fix>\"")
-
-def waste_block(cfg):
-    """Why launch and fill are refused now: waste_paused, unless the orchestrator acked waste-pause (the ack lasts its TTL)."""
-    return None if "waste-pause" in live_acks(cfg) else waste_paused(cfg)
-
-def last_checkpoint(cfg):
-    """The latest report checkpoint passed: [report] at (local HH:MM times) and every every_h hours from midnight."""
-    t = now(); lt = time.localtime(t); mid = time.mktime((*lt[:3], 0, 0, 0, 0, 0, -1)); cps = []
-    for x in rset(cfg, "at"):
-        try: h, m = map(int, str(x).split(":")); c = mid + h * 3600 + m * 60; cps.append(c if c <= t else c - 86400)
-        except ValueError: pass
-    if rset(cfg, "every_h"): e = rset(cfg, "every_h") * 3600; cps.append(mid + ((t - mid) // e) * e)
-    return max(cps) if cps else None

@@ -48,3 +48,8 @@ def load():
             if not k.startswith("__") and not isinstance(v, types.ModuleType): setattr(shim, k, v)
     shim.__class__ = _Broadcast
     return shim
+
+
+def conf(d):
+    """The project's config file under its .janus (the folder is made): conf(d).write_text(...) in a fixture."""
+    p = Path(d) / ".janus"; p.mkdir(exist_ok=True); return p / "janus.toml"

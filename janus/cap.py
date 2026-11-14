@@ -139,15 +139,15 @@ def host_cap(cfg, n, p, units):
     amb = class_mb(hist, "agent", c["agmb"], 0, c["hn"], c["margin"])
     rj, rc, rm, ra, ram = (int(fl(p.get(k))) for k in ("cap_rj", "cap_rc", "cap_rm", "cap_ra", "cap_ram"))
     t = list(((p.get("pueue") or {}).get("tasks") or {}).values())
-    qd = sum(1 for x in t if x.get("group") in ("jobs", "gates") and "Queued" in str(x.get("status")))
-    qd += int(fl(p.get("wait_jobs"))) + int(fl(p.get("wait_gates")))
+    qd = sum(1 for x in t if x.get("group") in ("jobs", "place") and "Queued" in str(x.get("status")))
+    qd += int(fl(p.get("wait_jobs")))
     here = [u for u in units if (u.get("build") or u.get("host")) == n and u.get("state") not in ("done", "failed", "gone", "idle")]
     on = [u for u in units if u.get("host") == n and u.get("state") not in ("done", "failed", "gone", "idle", "parked")]
     agents_mb = max(ram, len(on) * amb)   # every open agent on the host holds the agent figure (reservation files of api agents at least)
     slots = max(1, min(c["cores"] // c["cpj"], (c["memcap"] - agents_mb) // max(jmb, 1)))
     pause = p.get("cap_pause", "")
     free = 0 if pause else max(0, min((c["cores"] - rc) // c["cpj"], (c["memcap"] - rm - agents_mb) // max(jmb, 1)))
-    if rj == 0 and not pause: free = max(free, 1)
+    if rj == 0 and not pause and jmb <= c["memcap"] and c["cpj"] <= c["cores"]: free = max(free, 1)   # as the shell admission: the first job fits the host alone or none
     return {**c, "jmb": jmb, "amb": amb, "rj": rj, "rc": rc, "rm": rm, "ra": ra, "agents_mb": agents_mb, "queued": qd, "slots": slots,
             "free": free, "pause": pause, "agents": [u["name"] for u in here], "on": len(on), "hist": hist, "res": p.get("res", [])}
 

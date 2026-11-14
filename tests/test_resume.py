@@ -70,7 +70,7 @@ class StateSync(unittest.TestCase):
         other = Path(str(d) + "-other")   # another machine commits and pushes the state
         self.git("clone", str(origin), str(other), cwd=d)
         self.git("config", "user.email", "o@o", cwd=other); self.git("config", "user.name", "o", cwd=other)
-        (other / ".janus").mkdir(); (other / ".janus/remote.txt").write_text("from the other machine\n")
+        (other / ".janus").mkdir(exist_ok=True); (other / ".janus/remote.txt").write_text("from the other machine\n")
         self.git("add", "-A", cwd=other); self.git("commit", "-m", "other state", cwd=other); self.git("push", cwd=other)
         seen = []
         with mock.patch.object(janus, "takeover", lambda cfg: seen.append((cfg.root / ".janus/remote.txt").exists())), \

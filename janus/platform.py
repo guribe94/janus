@@ -8,8 +8,7 @@ The coordinator may be either OS. run() is the one subprocess call (context.sh a
 module imports nothing of janus and sits at the bottom of the package. Still to fold in: containers/scopes (`podman`,
 `systemd-run`) in job scripts, and launch.py's direct herdr calls (pane_tool says which tool a machine has).
 """
-import json, re, shutil, subprocess, sys
-from pathlib import Path
+import json, shutil, subprocess, sys
 
 
 def run(cmd, cwd=None, inp=None, timeout=25, env=None):
@@ -30,15 +29,6 @@ def ps_table():
         if len(f) >= 8 and f[0].isdigit(): t[int(f[0])] = (int(f[1]), int(f[2]), " ".join(f[3:8]), f[8] if len(f) > 8 else "")
     return t
 
-
-def env_janus(pid):
-    """The JANUS_* variables of a local process ({} when none or unreadable): Linux /proc/<pid>/environ; macOS ps -E, which
-    appends the environment after the command, so the command (from plain ps) is cut off first."""
-    try: return {k: v for k, _, v in (x.partition("=") for x in Path(f"/proc/{pid}/environ").read_bytes().decode(errors="replace").split("\0")) if k.startswith("JANUS_")}
-    except OSError: pass
-    o, c = (run(["ps", *f, "-ww", "-p", str(pid), "-o", "command="], timeout=10)[1].rstrip("\n") for f in (["-E"], []))
-    env = o[len(c):] if c and o.startswith(c) else ""
-    return dict(m.groups() for m in re.finditer(r"(?:^|\s)(JANUS_[A-Z_]+)=(\S+)", env))
 
 def secs(et):
     """ps' elapsed time ("[[dd-]hh:]mm:ss") in seconds."""
@@ -123,6 +113,7 @@ echo "arch=$(uname -m)"
 if [ "$(uname)" = Darwin ]; then
   echo "os=mac"; echo "cores=$(sysctl -n hw.ncpu)"; echo "mem_mb=$(( $(sysctl -n hw.memsize) / 1048576 ))"
   ioreg -p IOUSB -w0 2>/dev/null | grep -q '+-o .*@' && echo "dev=usb"
+  [ "$(uname -m)" = arm64 ] && echo "dev=gpu"
   security find-generic-password -s 'Claude Code-credentials' >/dev/null 2>&1 && echo "login=claude"
 else
   echo "os=linux"; echo "cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)"; echo "mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
@@ -134,7 +125,7 @@ else
   grep -qw memory /sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service/cgroup.controllers 2>/dev/null && echo "feature=memory-max"
 fi
 d=%(root)s; [ -d "$d" ] || d=$HOME; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
-for t in pueue pueued podman docker systemd-run launchctl bwrap firejail sandbox-exec tmux herdr flock secret-tool pass security git rsync python3 uv cargo node npm pnpm sccache ccache nvidia-smi; do
+for t in pueue pueued podman docker systemd-run launchctl bwrap firejail sandbox-exec tmux herdr flock secret-tool pass security git rsync python3 uv cargo node npm pnpm sccache ccache nvidia-smi rustc go java gcc clang make cmake dotnet swift xcodebuild ruby gh; do
   command -v "$t" >/dev/null 2>&1 && echo "tool=$t"
 done
 # the build and package caches already on the host (cache=<name> <dir>): what a job there can reuse instead of a cold start

@@ -41,7 +41,7 @@ class Case(unittest.TestCase):
         (self.root / "out/u").mkdir(parents=True); self.patch = self.root / "out/u/changes.patch"
         self.addCleanup(setattr, janus, "X", X0)
     def _project(self):
-        d = self.root / "proj"; d.mkdir(); (d / "janus.toml").write_text('[project]\nname = "t"\n[hosts.here]\nlocal = true\n'); return d
+        d = self.root / "proj"; d.mkdir(); (d / ".janus").mkdir(); (d / ".janus/janus.toml").write_text('[project]\nname = "t"\n[hosts.here]\nlocal = true\n'); return d
     def trees(self, base, wt):
         write(self.root / "base/u", base); write(self.root / "worktrees/u", wt)
         (self.root / "base/u").mkdir(parents=True, exist_ok=True); (self.root / "worktrees/u").mkdir(parents=True, exist_ok=True)

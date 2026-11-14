@@ -1,11 +1,9 @@
-"""janus backlog (import, list, set actor), janus fill (launch ready backlog units up to capacity) and janus brief (draft the
-briefs of ready items with one cheap unit; accept a draft so fill can launch it)."""
-import argparse, os, re, time
+"""janus backlog (import, list, set actor) and janus fill (launch ready backlog units up to capacity)."""
+import argparse, os, re
 from janus.actions.launch import choose, cmd_launch, pick_model
-from janus.context import atomic_write
 from janus.backlog import backlog_cfg, backlog_issues, backlog_items, item_actors, item_holds, unit_items
 from janus.beads import Beads
-from janus.budgets import budget_for, finish_reserve, waste_block
+from janus.budgets import budget_for, finish_reserve
 from janus.context import Err, say, sh, slug
 from janus.ledger import committed, reserved
 from janus.probe import probe_all
@@ -94,7 +92,7 @@ def fill_plan(cfg, hs, units, limit=None):
     if not cands: return plan, ["no ready backlog item has an unlaunched brief (a brief is for an item when it has an ITEM: <id> line)"]
     for pr, order, item, f, name, kind, tier in cands:
         a = argparse.Namespace(unit=name, host=None, test_host=None, kind=kind, tier=tier)
-        try: m = pick_model(cfg, tier, kind, None)
+        try: m = pick_model(cfg, tier, kind, None, fallback=False)   # unattended: the first route entry or a stated refusal, never a silent substitute
         except Err as e: stops.append(f"{name}: {e}"); continue
         mc = cfg.models[m]; budget, bwhy = budget_for(cfg, mc, kind, tier) if mc.get("kind") == "api" else (None, ""); hold = budget
         pv = cfg.prov.get(mc.get("provider"), {})
@@ -139,8 +137,6 @@ def cmd_fill(cfg, a):
     with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers take as long as the slowest host: not under the writer lock (the watcher's pass holds it)
     units = Beads(cfg).units(); ag = herdr_agents(cfg)
     for u in units: u["state"] = unit_state(u, hs, ag)
-    wp = waste_block(cfg)
-    if wp: say(f"fill: PAUSED: {wp}"); return 1
     plan, stops = fill_plan(cfg, hs, units, a.max)
     say(f"fill: {len(plan)} unit(s) fit now" + (" (dry run: nothing launched)" if cfg.run.dry else ""))
     for name, item, m, hn, b, budget, why, kind, tier, f in plan:
@@ -156,58 +152,3 @@ def cmd_fill(cfg, a):
         except Err as e: say(f"fill: {name} not launched: {e}"); rc = 1
     cfg.touch("last_fill")
     return rc
-
-DRAFT_BRIEF = """# Brief: {unit}: draft the briefs of {n} ready backlog item(s)
-TIER: NORMAL
-KIND: audit
-
-Write one brief per item below into `{drafts}/<item id>.md` (make the folder). Write nothing else: no code, no file outside
-that folder and your report. Nothing launches a draft: the orchestrator reads each one and accepts it (janus brief accept).
-
-Each brief is for an agent that knows nothing of this project. It holds exactly:
-- line 1 `# Brief: <unit name>: <what>` (unit name: lowercase letters, digits and dashes, starts with a letter, at most 32);
-- `TIER: NORMAL` (or `CRITICAL` when a mistake would lose data, money or the owner's trust) and `KIND: implement`;
-- `SCOPE:` what to build or fix, each point checkable, with the files and facts it rests on (path:line, a report, a decision);
-- `REPORT:` what the report must show; `DONE-WHEN:` the command or test that proves each point, and its expected result.
-Sources, in this order: the item's line in {checklist}; the reports and decisions it links (under {out}); the code it names.
-Read an older brief in {briefs} for the form only. An item that is unclear, or needs the owner or hardware: write
-`HOLD: <why>` as line 1 of its file instead of guessing.
-
-Items:
-{items}
-
-REPORT: your report lists each file written (item, path, one line) and each HOLD.
-DONE-WHEN: one file per item in {drafts}; the report's last line is `VERDICT: DONE`.
-"""
-
-def cmd_brief(cfg, a):
-    """janus brief draft <item>...: one normal-tier unit on the cheapest routed model ([routing] draft, else the normal route)
-    writes a brief per item into <briefs>/drafts/. janus brief accept <item> [--as <unit>]: the orchestrator's yes: the draft
-    moves to <briefs>/<unit>.md with its ITEM: line, and only then can janus fill launch it (fill never reads drafts/)."""
-    bdir = cfg.p("briefs", "briefs"); dr = bdir / "drafts"
-    if a.action == "accept":
-        if len(a.items) != 1: raise Err("usage: janus brief accept <item> [--as <unit>] (one draft at a time: read it first)")
-        item = a.items[0]; f = next((p for p in dr.glob("*.md") if p.stem.lower() == item.lower()), None) if dr.is_dir() else None
-        if not f: raise Err(f"no draft {dr / (item + '.md')} (janus brief draft {item})")
-        t = f.read_text(); m = re.search(r"^HOLD:\s*(.*)", t, re.M)
-        if m: raise Err(f"draft {f} is on hold ({m.group(1)[:120]}): settle that, edit the draft, then accept")
-        m = re.match(r"# Brief:\s*([a-z][a-z0-9_-]{0,31})\s*:", t)
-        name = a.as_name or (m.group(1) if m else re.sub(r"^(?![a-z])", "i-", slug(item))[:32])
-        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err(f"unit name {name!r} must match [a-z][a-z0-9_-]{{0,31}} (--as <unit>)")
-        if (bdir / f"{name}.md").exists() or name in all_units(cfg): raise Err(f"a brief or unit named {name} exists: give another name (--as <unit>)")
-        ls = [l for l in t.splitlines() if not l.startswith("ITEM:")]; t = "\n".join([*ls[:1], f"ITEM: {f.stem}", *ls[1:]]) + "\n"
-        if cfg.run.dry: say(f"+ {f} -> {bdir / (name + '.md')} (ITEM: {f.stem})"); return
-        atomic_write(bdir / f"{name}.md", t); f.unlink(); say(f"accepted {f.stem}: {bdir / (name + '.md')}; janus fill launches it when it fits")
-        return
-    try: iss = backlog_issues(cfg)
-    except Err: iss = {}
-    known = {r[8:]: i.get("title", "")[9:].removeprefix(r[8:]).strip() for r, i in iss.items()} or {i: t for i, t, *_ in backlog_items(cfg) or []}
-    bad = [i for i in a.items if i not in known]
-    if bad: raise Err(f"not a backlog item: {', '.join(bad)} (janus backlog list)")
-    unit = "brief-draft-" + time.strftime("%m%d-%H%M%S"); model = a.model or pick_model(cfg, "draft" if cfg.route.get("draft") else "normal", "audit", None)
-    text = DRAFT_BRIEF.format(unit=unit, n=len(a.items), drafts=dr, briefs=bdir, out=cfg.p("out", "out"), checklist=cfg.root / (backlog_cfg(cfg).get("file") or "the checklist"),
-                              items="\n".join(f"- {i}: {known[i]}" for i in a.items))
-    if cfg.run.dry: say(f"+ write {bdir / (unit + '.md')}; janus launch {unit} --kind audit --tier normal --model {model} (items: {' '.join(a.items)})"); return
-    bdir.mkdir(parents=True, exist_ok=True); atomic_write(bdir / f"{unit}.md", text)
-    return cmd_launch(cfg, argparse.Namespace(unit=unit, kind="audit", tier="normal", host=None, model=model, brief=str(bdir / f"{unit}.md"), cwd=None, budget=None,
-                                              test_host=None, allow_main=True, of=None, report=None, resume_of=None, item=None, dry_run=False))

@@ -94,7 +94,7 @@ ahead() {  # $1 this job's wait file ("pid expected-s since MB cores"): NB jobs 
   # First: the lower expected run time minus AGEW x seconds waited (short jobs first, a waiting job ages), among the same wait
   # kind (.wait or .gwait). A job is admitted only when it fits together with every job ahead of it, so it never takes their room.
   NB=0 BCC=0 BMB=0; nowt=$(date +%%s); me_e= me_t=; { read -r _ me_e me_t _ _ < "$1"; } 2>/dev/null
-  case $1 in *.gwait) pat='*.gwait';; *) pat='*.wait';; esac
+  pat='*.wait'
   for f in "$RD"/$pat; do
     [ "$f" = "$1" ] || [ ! -e "$f" ] && continue
     p= e= t= m= c=; { read -r p e t m c < "$f"; } 2>/dev/null
@@ -159,7 +159,8 @@ admit_ok() {  # $1 the job's class. Sets MB and CC (its reservation) and why; tr
   MB=$(cap_mb "${1:-job}" $CAPMB $CAPMB); CC=$(cap_cores "${1:-job}"); res_sum; cap_measure; cap_paused
   why="reserved $RJ job(s): $RC of $CORES cores, $RM MB + agents $RAM MB + this ${1:-job} $CC cores $MB MB of $MEMCAP MB (RAM - services); PSI $PSI, load $LOAD, disk $DF GB (floor $DISK)${PAUSE:+; PAUSED: $PAUSE}"
   BLK=; [ -n "$PAUSE" ] && BLK="paused"; [ "$DF" -ge "$DISK" ] || BLK="$BLK disk"
-  if [ "$RJ" -gt 0 ]; then [ $((RC + CC)) -le "$CORES" ] || BLK="$BLK cores"; [ $((RM + RAM + MB)) -le "$MEMCAP" ] || BLK="$BLK memory"; fi
+  if [ "$RJ" -gt 0 ]; then [ $((RC + CC)) -le "$CORES" ] || BLK="$BLK cores"; [ $((RM + RAM + MB)) -le "$MEMCAP" ] || BLK="$BLK memory"
+  else [ "$CC" -le "$CORES" ] || BLK="$BLK cores"; [ "$MB" -le "$MEMCAP" ] || BLK="$BLK memory"; fi   # the first job is exempt from the agents' share only: it must still fit the host alone
   [ -z "$BLK" ]
 }
 job_cpu() {  # $1 job id: CPU seconds its cgroup used so far (a container or scope; empty where the job is a plain process tree)
@@ -239,7 +240,7 @@ o=$(f -exec cksum {} + | sort | cksum); n=$(f | wc -l); p=$(grep -cv '^VERDICT: 
 echo "fp=$d|$o"; echo "n=$n"; echo "p=${p:-0}"'''
 
 ADMIT = r'''# Admission (janus-fixes8): by reservations, rule in $RD/cap.sh (re-read each poll). One job is judged at a time under the lock;
-# an admitted job writes its reservation ($R.res) before the lock is released. A jobs-lane job yields while a gates job waits.
+# an admitted job writes its reservation ($R.res) before the lock is released.
 [ -f "$RD/cap.sh" ] || { echo "janus: no $RD/cap.sh on this host (janus run or janus launch writes it)"; exit 125; }
 lane=%(lane)s; BROAD=%(broad)s; . "$RD/cap.sh"; CLS=$(cap_class %(clsrc)s); SHAPE=$(cap_shape %(clsrc)s)   # shape: the jobs this one is comparable to (item 32)
 EXP=$(cap_secs "$CLS"); EXP=${EXP:-$EXPS}; [ -n "$BROAD" ] && EXP=$((EXP * 2))   # expected run time; a broad run counts double (goes later)
@@ -247,14 +248,12 @@ if command -v flock >/dev/null 2>&1; then exec 7>>"$RD/admit.lock"; lk() { flock
 else   # no flock: a lock dir holding its owner's pid; a dead owner's dir is taken over (a SIGKILL never leaves the host stuck)
   lk() { until mkdir "$RD/admit.d" 2>/dev/null; do o=$(cat "$RD/admit.d/pid" 2>/dev/null); [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null && rm -rf "$RD/admit.d"; sleep 1; done; echo $$ > "$RD/admit.d/pid"; HELD=1; }
   ulk() { rm -rf "$RD/admit.d"; HELD=; }; fi
-gates_waiting() { for f in "$RD"/*.gwait; do [ -e "$f" ] && kill -0 "$(cut -d' ' -f1 "$f")" 2>/dev/null && return 0; done; return 1; }
-W="$R.wait"; [ "$lane" = gates ] && W="$R.gwait"; echo "$$ $EXP $(date +%%s) $(cap_mb "$CLS" $CAPMB $CAPMB) $(cap_cores "$CLS")" > "$W"
+W="$R.wait"; echo "$$ $EXP $(date +%%s) $(cap_mb "$CLS" $CAPMB $CAPMB) $(cap_cores "$CLS")" > "$W"
 HELD=; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"' EXIT; trap 'rm -f "$W" "$R.res"; [ -n "$HELD" ] && rm -rf "$RD/admit.d"; exit 143' TERM INT HUP   # a job killed while waiting leaves no files (L1)
 said=; last=0; BS=; WAITMAX=${JANUS_ADMIT_MAX_S:-%(waitmax)d}; REPORT=${JANUS_ADMIT_REPORT_S:-60}   # item 21: say why at least every REPORT s; finding 3: give up only after WAITMAX s of being BLOCKED (a yield resets the clock)
 while :; do
   Y=
-  if [ "$NOADMIT" = dispatcher ]; then CC=1; MB=0; why="gate dispatcher: its steps are admitted on their own hosts"; break; fi
-  if [ "$lane" = gates ] || ! gates_waiting; then
+  {
     lk; CAP_RO=; . "$RD/cap.sh"
     if admit_ok "$CLS"; then
       ahead "$W"   # shorter or older jobs waiting here go first unless this one fits beside them
@@ -264,17 +263,7 @@ while :; do
     ulk; nowt=$(date +%%s)
     case " $BLK " in *" paused "*) echo "$nowt $PAUSE" > "$RD/paused.$$" && mv -f "$RD/paused.$$" "$RD/paused";; esac   # row 221: this job's verdict, for the report (cap_seen)
     if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): $why"; said=$BLK; last=$nowt; fi
-  else
-    # finding 10: a jobs-lane job yields while a gates job waits, and says why (the old branch left BLK empty, so the give-up
-    # message read "no reason reported"). finding 7 (fix-install6): the yield is BOUNDED and names the gate's OWN cause -- a gate
-    # that is waiting is not progressing, and one itself blocked on disk/memory must not hold a jobs job forever (the old `Y=1`
-    # cleared the give-up clock on every poll, so the job exited only after the gate gave up plus its own limit; a new gate
-    # restarted that). So the clock runs here, and `why` is the same admission cause the gate is waiting on.
-    lk; CAP_RO=; . "$RD/cap.sh"; admit_ok gate >/dev/null 2>&1; ulk   # finding H: the cause is the GATE's own admission view
-    BLK="a gates job is waiting on this host"   # finding H: a stable key, so the line is not repeated when a load figure changes
-    nowt=$(date +%%s)
-    if [ "$said" != "$BLK" ] || [ $((nowt - last)) -ge "$REPORT" ]; then echo "janus: waiting for admission ($CLS; $BLK): the gate waits on ${why:-admission blocked}"; said=$BLK; last=$nowt; fi
-  fi
+  }
   # finding 3: the give-up clock starts at the first poll this job is blocked, never at enqueue (TQ); a yield to an older job
   # means the queue is moving, so it clears the clock. So a job that queued long is not dropped at its first blocked poll.
   nowt=$(date +%%s)

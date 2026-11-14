@@ -7,12 +7,13 @@ for collection). Read-only by construction: every collection builds a fresh Cfg 
 calls bd with --readonly, reads board files directly (never board.sh: read/summary would touch .seen files or the notify hook) and
 calls none of check, status, sync, handoff, writer lock, ack or wake code. Nothing here writes a project file. The one outside
 effect is the probe's own scratch under /tmp on each host, which `janus capacity` already makes. Standard library only."""
-import contextlib, dataclasses, datetime, json, os, queue, re, signal, sys, threading, time, tomllib
+import contextlib, dataclasses, datetime, json, os, queue, re, signal, sys, threading, time
 from pathlib import Path
 from janus.backlog import LOG_LABELS, LOG_RX
 from janus.beads import unit_record
 from janus.board import board_dir
-from janus.context import Cfg, Err, Run, sh
+from janus.context import CONF, Cfg, Err, Run, sh
+from janus.actions.launch import model_tool
 from janus.platform import herdr, ps_table
 from janus.probe import probe
 from janus.units import api_out, report_path, unit_state, verdict as unit_verdict, waiting_line_jobs
@@ -86,8 +87,7 @@ class Store:
 def fresh_cfg(root):
     """A new Cfg for one collection (nothing carried between refreshes), read-only whoever the caller is. Cfg would create a
     missing state folder: the monitor refuses to instead."""
-    st = Path(root) / tomllib.loads((Path(root) / "janus.toml").read_text()).get("project", {}).get("state", ".janus")
-    if not st.is_dir(): raise Err(f"no state folder {st.name}: run janus init (the monitor never creates it)")
+    if not (Path(root) / CONF).is_file(): raise Err(f"no {CONF} in {root}: run janus init (the monitor never creates it)")
     return Cfg(Path(root), Run(ro=True))
 
 def bd_json(cfg, *args, timeout=20):
@@ -175,7 +175,11 @@ def collect_board(cfg):
     for f in sorted((bd / "questions").glob("q[0-9]*.md")) if (bd / "questions").is_dir() else []:
         d = read_fields(f)
         if d: qs[f.stem] = {k: clean(d.get(k), 1000) for k in ("agent", "asked", "state", "text", "answered", "answer")}
-    return {"msgs": msgs[-BOARD_TAIL:], "questions": qs}
+    cards = {}   # each agent's own card: its latest step and when it last posted (the "latest progress" of a task)
+    for f in sorted((bd / "agents").glob("*.md")) if (bd / "agents").is_dir() else []:
+        d = read_fields(f)
+        if d: cards[f.stem] = {k: clean(d.get(k), 200) for k in ("state", "step", "updated", "machine", "tool", "model")}
+    return {"msgs": msgs[-BOARD_TAIL:], "questions": qs, "cards": cards}
 
 class Collector:
     """One background thread: a collection at start, then one every interval after the last finished, and one at once on request().
@@ -208,7 +212,7 @@ class Collector:
         try:
             try: cfg = fresh_cfg(self.root)
             except Exception as e: st.fail("config", err_text(e), self.clock()); return
-            st.ok("config", {"name": clean(cfg.name), "hosts": list(cfg.hosts)}, self.clock())
+            st.ok("config", {"name": clean(cfg.name), "hosts": list(cfg.hosts), "tools": {m: clean(model_tool(c)) for m, c in cfg.models.items()}}, self.clock())
             done = queue.Queue()
             def host(n):
                 try: p = collect_host(cfg, n); done.put((n, p, None, self.clock()))
@@ -318,15 +322,18 @@ def classify(u, ps, agents, rep):
     if not vw: return "Finished", "ended:no-verdict", f"process {st}; the report states no verdict (a process ending is not success)"
     return "Finished", "finished" if vw == "DONE" else f"ended:{vw[:9]}", f"process {st}; report: {v}"
 
-def unit_row(u, tab, state, note, now, stale, rep):
+def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None):
     end = epoch(u.get("closed_at") or u.get("collected_at")) if tab == "Finished" else now
     t0 = epoch(u.get("started"))
     el = fmt_dur(end - t0) if end is not None and t0 is not None else "?"
     d = [f"Name:      {u.get('name')}", f"State:     {state}" + ("  (data is stale)" if stale else ""), f"Meaning:   {note}" if note else "",
-         f"Host:      {clean(u.get('host')) or '?'}", f"Model:     {clean(u.get('model')) or '?'}", f"Via:       {clean(u.get('via')) or '?'}" + (f"  task {clean(u.get('task'))}" if u.get("task") is not None else ""),
+         f"Host:      {clean(u.get('host')) or '?'}", f"Tool:      {tool or (card or {}).get('tool') or '?'}", f"Model:     {clean(u.get('model')) or '?'}", f"Via:       {clean(u.get('via')) or '?'}" + (f"  task {clean(u.get('task'))}" if u.get("task") is not None else ""),
          f"Elapsed:   {el}" + ("  (start to close)" if tab == "Finished" and el != "?" else ""),
          f"Started:   {time.strftime('%Y-%m-%d %H:%M', time.localtime(t0)) if t0 else '?'}", f"Worktree:  {clean(u.get('cwd')) or '?'}", f"Brief:     {clean(u.get('brief')) or '?'}",
          f"Report:    {(rep or {}).get('path') or '?'}", f"Verdict:   {(rep or {}).get('verdict') or ('unknown (report unreadable)' if (rep or {}).get('err') else 'none')}"]
+    if card and (card.get("step") or card.get("updated")): d.append(f"Progress:  {card.get('step') or '-'}  (posted {card.get('updated') or '?'})")
+    rp = (rep or {}).get("path")
+    if rp and rp != "?": d.append(f"Log dir:   {os.path.dirname(rp)}" + (f"  (task log: janus queue --log {clean(u.get('host'))}:{clean(u.get('task'))})" if u.get("via") == "pueue" and u.get("task") is not None else ""))
     if (rep or {}).get("waiting"): d.append("Waiting:   " + ", ".join(rep["waiting"]))
     if (u.get("parked") or {}).get("jobs"): d.append("Parked on: " + ", ".join(map(clean, u["parked"]["jobs"])))
     if (rep or {}).get("limit"): d.append(f"Stopped:   {rep['limit']}")
@@ -385,12 +392,14 @@ def derive(view, now, interval):
     general = [f"{n}: {S(n).err}" for n in ("config", "collection") if S(n).err]
     ps = {n: S(f"host:{n}").data for n in hosts if S(f"host:{n}").data}
     units, closed, ag = S("units").data, S("closed").data, S("herdr").data
+    tools = (cfg.data or {}).get("tools", {}); cards = (S("board").data or {}).get("cards", {})
     rows = {t: [] for t in TABS}; live = {}   # live: host -> [agents known to be alive, agents whose state is unknown]
     def host_stale(u): return stale("herdr") if u.get("via") == "herdr" else stale(f"host:{u.get('host')}")
     for u in units or []:
         rep = (S("reports-open").data or {}).get(u["name"], NOT_READ)
         tab, state, note = classify(u, ps, ag, rep)
-        rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or host_stale(u), rep))
+        rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or host_stale(u), rep,
+                                  tools.get(u.get("model")), cards.get(u["name"])))
         if tab == "Active" and u.get("host"):
             c = live.setdefault(u["host"], [0, 0])
             if state in ("working", "idle", "blocked"): c[0] += 1
@@ -422,8 +431,9 @@ def machine_row(n, s, now, limit, agents):
     k = source_state(s, now, limit); p = s.data or {}
     run, qd = num(p.get("cap_rj")), None
     if p.get("pueue") is not None:
-        tasks = list(((p.get("pueue") or {}).get("tasks") or {}).values()); w = [num(p.get("wait_jobs")), num(p.get("wait_gates"))]
-        qd = None if None in w else sum(1 for x in tasks if x.get("group") in ("jobs", "gates") and "Queued" in str(x.get("status"))) + sum(w)
+        tasks = list(((p.get("pueue") or {}).get("tasks") or {}).values()); w = [num(p.get("wait_jobs"))]
+        if run is not None: run = max(run, sum(1 for x in tasks if x.get("group") in ("jobs", "place") and "Running" in str(x.get("status"))))   # work that runs counts even when it holds no reservation
+        qd = None if None in w else sum(1 for x in tasks if x.get("group") in ("jobs", "place") and "Queued" in str(x.get("status"))) + sum(w)
     mb = num(p.get("avail_mb")); load = clean(p.get("load")) or "?"
     ram = f"{mb / 1024:.1f}G" if mb else "?"
     ag = "?" if agents is None else f"{agents[0]}" + ("+?" if agents[1] else "")
@@ -467,6 +477,9 @@ class UI:
     dcache: list = dataclasses.field(default_factory=list)
     seen: set | None = None                                   # board message keys the user has been shown; None until the first board read
     flash: str = ""
+    filt: str = ""                                            # rows must hold this text (case-insensitive); / edits it
+    typing: bool = False
+    help: bool = False
 
     def observe(self, model):
         """Board baseline: what is there when the board first loads is not new; later posts are, until they are selected."""
@@ -494,6 +507,15 @@ class UI:
     def key(self, model, k, bh):
         """One key press: 'quit', 'refresh' or None. q always quits; Esc only closes details."""
         K = curses
+        if self.typing:   # the filter line: printable keys add, Backspace removes, Enter keeps it, Esc clears it
+            if k in (10, 13, K.KEY_ENTER): self.typing = False
+            elif k == 27: self.typing = False; self.filt = ""
+            elif k in (127, 8, K.KEY_BACKSPACE): self.filt = self.filt[:-1]
+            elif 32 <= k < 127: self.filt += chr(k)
+            return None
+        if self.help: self.help = False; return None
+        if k == ord("?"): self.help = True; return None
+        if k == ord("/"): self.typing = True; self.detail = False; return None
         if k in (ord("q"), ord("Q")): return "quit"
         if k in (ord("r"), ord("R")): self.flash = "refresh requested"; return "refresh"
         if k in (9, K.KEY_RIGHT, K.KEY_BTAB, K.KEY_LEFT) or k in map(ord, "1234"):
@@ -501,12 +523,29 @@ class UI:
             self.detail = False; return None
         if k in (10, 13, K.KEY_ENTER):
             self.detail = not self.detail and bool(model.rows[TABS[self.tab]]); self.dscroll = 0; self.dkey = self.sel.get(TABS[self.tab]); return None
-        if k == 27: self.detail = False; return None
+        if k == 27:
+            if self.detail: self.detail = False
+            else: self.filt = ""
+            return None
         d = {K.KEY_DOWN: 1, ord("j"): 1, K.KEY_UP: -1, ord("k"): -1, K.KEY_NPAGE: max(1, bh - 1), K.KEY_PPAGE: -max(1, bh - 1), K.KEY_HOME: -10**9, ord("g"): -10**9, K.KEY_END: 10**9, ord("G"): 10**9}.get(k)
         if d is not None:
             if self.detail: self.dscroll = max(0, self.dscroll + d)   # clamped when drawn
             else: self.move(model, d)
         return None
+
+HELP = ["janus monitor: read-only (it writes nothing and runs nothing that does)", "",
+        "Tab / Left / Right / 1-4   switch tabs: Active, Backlog, Finished, Board", "Up / Down / j / k / PgUp / PgDn / g / G   select and scroll",
+        "Enter   details of the selected row (Esc or Enter: back)", "/       filter the rows of every tab by text (Enter keeps it, Esc clears it)",
+        "r       refresh now", "q       quit", "", "Unknown stays '?': a host that does not answer is UNREACHABLE or STALE with the age of its last good data;",
+        "a process that ended is not 'finished' until its report says VERDICT: DONE. Any key closes this help."]
+
+def filtered(model, text):
+    """The model with every tab's rows reduced to those whose cells or details hold text (counts and machines stay whole)."""
+    if not text: return model
+    t = text.lower(); m = dataclasses.replace(model, rows={k: [r for r in v if t in " ".join(map(str, r.cells)).lower() or t in " ".join(r.detail).lower()] for k, v in model.rows.items()})
+    for k, v in m.rows.items():
+        if not v and model.rows[k]: m.empty = {**m.empty, k: f"No row matches the filter {text!r} (/ then Esc clears it)"}
+    return m
 
 def wrap(lines, w):
     out = []
@@ -521,6 +560,7 @@ def wrap(lines, w):
 def render(model, ui, h, w, now, status):
     """The screen as lines of (text, style) segments, h lines of at most w columns. Pure: no curses here."""
     if h < 3 or w < 24: return [[("too small (q quits)"[:max(w, 1)], "warn")]][:max(h, 1)]
+    if ui.help: return [[(l[:w], "bold" if i == 0 else "")] for i, l in enumerate(wrap(HELP, w))][:h]
     L = []
     tab = TABS[ui.tab]
     L.append([("janus monitor", "bold"), (f" {model.project}  ", ""), ("READ-ONLY", "info"), (f"  {status}"[:max(0, w - 30)], "dim")])
@@ -571,7 +611,8 @@ def render(model, ui, h, w, now, status):
     L = L[:h - 1]
     while len(L) < h - 1: L.append([])
     pos = f" {i + 1}/{len(rows)}" if rows else ""
-    L.append([((ui.flash or "Tab/Left/Right tabs  Up/Down select  Enter details  r refresh  q quit")[:max(0, w - len(pos) - 1)], "dim"), (pos, "dim")])
+    foot = f"/{ui.filt}_" if ui.typing else (f"filter: {ui.filt}  " if ui.filt else "") + (ui.flash or "Tab tabs  Up/Down select  Enter details  / filter  ? help  r refresh  q quit")
+    L.append([(foot[:max(0, w - len(pos) - 1)], "dim"), (pos, "dim")])
     return [[(t[:w], s) for t, s in line] for line in L][:h]
 
 def status_line(store_view, model, now, interval):
@@ -615,9 +656,9 @@ def run_ui(scr, collector, store, interval, attrs=None, clock=time.time):
     while True:
         view = store.view()
         if ui.flash and flash_at is not None and view[3] != flash_at: ui.flash = ""   # the refresh began: the header says so
-        stamp = (view[3], int(clock()), scr.getmaxyx(), ui.flash)
+        stamp = (view[3], int(clock()), scr.getmaxyx(), ui.flash, ui.filt)
         if stamp != last or dirty:
-            now = clock(); model = derive(view[0], now, interval); ui.observe(model)
+            now = clock(); model = derive(view[0], now, interval); ui.observe(model); model = filtered(model, ui.filt)
             h, w = scr.getmaxyx(); paint(scr, render(model, ui, h, w, now, status_line(view, model, now, interval)), attrs)
             last, dirty = stamp, False
         try: k = scr.getch()

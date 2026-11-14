@@ -46,10 +46,10 @@ class World:
         return 0, "", ""
     def herdr(self, *a, **k): return None if "herdr" in self.fail else {"agents": self.agents or []}
     def patches(self): return [mock.patch.object(janus, "sh", self.sh), mock.patch.object(janus, "herdr", self.herdr)]
-    def report(self, name, text): (self.d / "out" / name).mkdir(parents=True, exist_ok=True); (self.d / "out" / name / "REPORT.md").write_text(text)
+    def report(self, name, text): (self.d / ".janus" / "out" / name).mkdir(parents=True, exist_ok=True); (self.d / ".janus" / "out" / name / "REPORT.md").write_text(text)
     def board(self, text, mode="a"):
-        (self.d / "board").mkdir(exist_ok=True)
-        with open(self.d / "board/log.md", mode) as f: f.write(text)
+        (self.d / ".janus" / "board").mkdir(exist_ok=True)
+        with open(self.d / ".janus/board/log.md", mode) as f: f.write(text)
 
 
 def snapshot(d):
@@ -103,7 +103,7 @@ class States(Base):
         self.w.probes["here"] = probe_text(rj=3, load="2.50", avail=2048, tasks={"1": task(1, {"Running": {}}), "2": task(2, {"Running": {}}), "9": task(9, "Queued", "jobs")}, waits=(2, 1))
         self.w.probes["far"] = probe_text(pause="memory pressure 40")
         self.collect(); r = {x.cells[0]: x.cells for x in self.model().machines}
-        self.assertEqual(r["here"][:6], ("here", "ok", "3/4", "2", "2.50", "2.0G"))   # queued: one pueue job + 2 + 1 waiting in admission
+        self.assertEqual(r["here"][:6], ("here", "ok", "3/3", "2", "2.50", "2.0G"))   # queued: one pueue job + 2 waiting in admission
         self.assertEqual((r["far"][1], r["far"][3]), ("PAUSED", "0")); self.assertIn("memory pressure 40", r["far"][6])
 
     def test_backlog_queue_states(self):
@@ -123,13 +123,13 @@ class ReadOnly(Base):
     def test_nothing_is_written_and_nothing_mutating_runs_whoever_asks(self):
         """Catches: the monitor writing state (acks, handoff, hosts.json, locks, board marks) or running a mutating bd call, even when the
         caller is the registered orchestrator (check and status would be writers then)."""
-        (self.d / "board").mkdir(); self.w.board("2026-11-13 10:00 ann question: [q1] which one?\n")
-        (self.d / "board/questions").mkdir(); (self.d / "board/questions/q1.md").write_text("- id: q1\n- agent: ann\n- asked: 2026-11-13 10:00\n- state: open\n- text: which one?\n")
+        (self.d / ".janus" / "board").mkdir(); self.w.board("2026-11-13 10:00 ann question: [q1] which one?\n")
+        (self.d / ".janus/board/questions").mkdir(); (self.d / ".janus/board/questions/q1.md").write_text("- id: q1\n- agent: ann\n- asked: 2026-11-13 10:00\n- state: open\n- text: which one?\n")
         self.cfg.f("session").write_text("SID-1"); self.w.units = [unit("a")]; self.w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})})
         before = snapshot(self.d); cfgs = []
         real = M.fresh_cfg; M.fresh_cfg = lambda root: (cfgs.append(real(root)), cfgs[-1])[1]
         self.addCleanup(setattr, M, "fresh_cfg", real)
-        boom = [mock.patch.object(janus, n, side_effect=AssertionError(n)) for n in ("run_check", "board", "board_files", "cmd_ack", "write_handoff", "sync_remote_outputs", "fetch_remote_outputs", "note_event", "board_upkeep")]
+        boom = [mock.patch.object(janus, n, side_effect=AssertionError(n)) for n in ("run_check", "board", "board_files", "sync_remote_outputs", "fetch_remote_outputs", "board_upkeep")]
         for p in boom: p.start(); self.addCleanup(p.stop)
         with mock.patch.dict(os.environ, {"JANUS_SESSION": "SID-1", "JANUS_ROLE": ""}):
             self.assertTrue(janus.is_orchestrator(self.cfg))   # the identity that makes check a writer
@@ -145,7 +145,7 @@ class ReadOnly(Base):
         """Catches: Cfg() quietly creating .janus in a folder that has none."""
         import shutil; shutil.rmtree(self.d / ".janus"); self.collect()
         self.assertFalse((self.d / ".janus").exists())
-        self.assertIn("no state folder", self.store.view()[0]["config"].err); self.assertIn("no state folder", self.model().banners["Active"][0])
+        self.assertIn("no .janus/janus.toml", self.store.view()[0]["config"].err); self.assertIn("no .janus/janus.toml", self.model().banners["Active"][0])
 
     def test_nothing_secret_reaches_the_screen(self):
         """Catches: a credential in a board post, a bd error or a host error printed on the screen or in details."""

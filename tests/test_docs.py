@@ -20,14 +20,11 @@ ROOT = Path(janus.__file__).resolve().parent          # janus.py's folder (the t
 CLI = ROOT / "janus" / "cli.py"
 REFERENCE = ROOT / "docs" / "REFERENCE.md"
 
-# Commands that are janus's own plumbing, not orchestrator-facing: the hook handler (installed by ./install), the two halves of
-# the gate wrapper (gate-exec and gate-judge, run by the generated gate script), api-run (queued by launch), and
+# Commands that are janus's own plumbing, not orchestrator-facing: the hook handler (installed by ./install), api-run (queued by launch), and
 # commit-state/report-sent style internals are documented by their caller. Each is deliberate, so a new one cannot inherit this
 # and go undocumented.
 INTERNAL = {
     "hook": "installed by ./install and run by the runtime, never by hand",
-    "gate-exec": "the gate wrapper's inner half, generated into the gate script",
-    "gate-judge": "the gate wrapper's judging half, called by the generated gate script",
     "api-run": "queued by janus launch; never typed by the orchestrator",
 }
 

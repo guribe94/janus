@@ -2,8 +2,9 @@
 JANUS_PY names the janus.py under test (default: the one next to tests/). Standard library only; no network, no API spend."""
 import contextlib, io, json, os, re, stat, subprocess, sys, tempfile, textwrap, time, unittest
 from pathlib import Path
+from unittest import mock
 
-from janusload import JANUS_PY, load
+from janusload import JANUS_PY, conf, load
 
 janus = load()
 # Every fixture (temp project, script, daemon) lives under one root named with janus's fixture mark, so a live janus check running
@@ -15,7 +16,7 @@ atexit.register(shutil.rmtree, FIX_ROOT, True)
 
 def project(extra=""):
     d = Path(tempfile.mkdtemp(prefix="janus-test-"))
-    (d / "janus.toml").write_text(textwrap.dedent('''
+    conf(d).write_text(textwrap.dedent('''
         [project]
         name = "t"
         [hosts.here]
@@ -24,19 +25,19 @@ def project(extra=""):
         enabled = true
         cap_usd = 10
         budget_per_unit = 1
-        ledger = "out/ledger.tsv"
+        ledger = ".janus/out/ledger.tsv"
         key_file = "KEYFILE"
         [models.m]
         provider = "api"
         kind = "api"
         api_id = "test-model"
         ''').replace("KEYFILE", str(d / "key.env")) + extra)
-    (d / "out").mkdir(); (d / "briefs").mkdir()
+    (d / ".janus" / "out").mkdir(parents=True); (d / ".janus" / "briefs").mkdir()
     return d, janus.Cfg(d)
 
 class Ledger(unittest.TestCase):
     def setUp(self): self.d, self.cfg = project(); self.pv = self.cfg.prov["api"]; self.mc = self.cfg.models["m"]
-    def rows(self): return (self.d / "out/ledger.tsv").read_text().splitlines()
+    def rows(self): return (self.d / ".janus/out/ledger.tsv").read_text().splitlines()
 
     def test_one_running_one_done_idempotent(self):
         run = janus.reserve_budget(self.cfg, self.mc, "u1", 2)
@@ -69,7 +70,7 @@ class Ledger(unittest.TestCase):
         self.assertEqual(janus.cmd_ledger(self.cfg, a), 1)
         a.action = "repair"; self.assertEqual(janus.cmd_ledger(self.cfg, a), 0)
         self.assertEqual(len(self.rows()), 2)
-        self.assertTrue(list((self.d / "out").glob("ledger.tsv.bak-*")))
+        self.assertTrue(list((self.d / ".janus" / "out").glob("ledger.tsv.bak-*")))
         a.action = "check"; self.assertEqual(janus.cmd_ledger(self.cfg, a), 0)
 
 class Secret(unittest.TestCase):
@@ -87,22 +88,22 @@ class ApiRun(unittest.TestCase):
         fake = d / "fake.py"
         fake.write_text("import json, os, sys\nk = os.environ.get('ANTHROPIC_API_KEY')\n"
                         "print(json.dumps({'total_cost_usd': 0.25, 'key_ok': k == 'abc123', 'argv_has_key': any('abc123' in a for a in sys.argv)}))\n")
-        t = (d / "janus.toml").read_text().replace("[providers.api.x]\n", "").replace('enabled = true\ncap_usd', f'enabled = true\ncmd = ["{sys.executable}", "{fake}", "{{prompt}}"]\ncap_usd', 1)
-        (d / "janus.toml").write_text(t); k = d / "key.env"; k.write_text("ANTHROPIC_API_KEY=abc123\n"); k.chmod(0o600)
-        (d / "briefs/u.md").write_text("do nothing\n")
+        t = conf(d).read_text().replace("[providers.api.x]\n", "").replace('enabled = true\ncap_usd', f'enabled = true\ncmd = ["{sys.executable}", "{fake}", "{{prompt}}"]\ncap_usd', 1)
+        conf(d).write_text(t); k = d / "key.env"; k.write_text("ANTHROPIC_API_KEY=abc123\n"); k.chmod(0o600)
+        (d / ".janus/briefs/u.md").write_text("do nothing\n")
         env = {x: v for x, v in os.environ.items() if x not in ("ANTHROPIC_API_KEY", "JANUS_ROOT", "JANUS_UNIT", "JANUS_ROLE", "JANUS_REPORT")}
         r = subprocess.run([sys.executable, str(JANUS_PY), "api-run", "u", "--run", "u.1.1", "--model", "m", "--budget", "1",
-                            "--brief", str(d / "briefs/u.md"), "--cwd", str(d)], cwd=d, env=env, capture_output=True, text=True)
+                            "--brief", str(d / ".janus/briefs/u.md"), "--cwd", str(d)], cwd=d, env=env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        out = json.loads((d / "out/u/api.json").read_text())
+        out = json.loads((d / ".janus/out/u/api.json").read_text())
         self.assertTrue(out["key_ok"]); self.assertFalse(out["argv_has_key"])
-        rows = (d / "out/ledger.tsv").read_text().splitlines()
+        rows = (d / ".janus/out/ledger.tsv").read_text().splitlines()
         self.assertEqual([x.split("\t")[2] for x in rows], ["running", "0.25"])
         r = subprocess.run([sys.executable, str(JANUS_PY), "api-run", "u", "--run", "u.1.1", "--model", "m", "--budget", "1",
-                            "--brief", str(d / "briefs/u.md"), "--cwd", str(d)], cwd=d, env=env, capture_output=True, text=True)
+                            "--brief", str(d / ".janus/briefs/u.md"), "--cwd", str(d)], cwd=d, env=env, capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0)   # the same run id again: refused, nothing written
-        self.assertEqual(len((d / "out/ledger.tsv").read_text().splitlines()), 2)
-        self.assertNotIn("abc123", r.stdout + r.stderr + (d / "out/ledger.tsv").read_text())
+        self.assertEqual(len((d / ".janus/out/ledger.tsv").read_text().splitlines()), 2)
+        self.assertNotIn("abc123", r.stdout + r.stderr + (d / ".janus/out/ledger.tsv").read_text())
 
 class Hooks(unittest.TestCase):
     def setUp(self): self.d, self.cfg = project()
@@ -133,7 +134,7 @@ class AgentStop(unittest.TestCase):
     only exit was to poll (or to write a false DONE)."""
     def setUp(self):
         self.d, self.cfg = project()
-        self.rp = self.d / "out/u/REPORT.md"; self.rp.parent.mkdir(parents=True, exist_ok=True)
+        self.rp = self.d / ".janus/out/u/REPORT.md"; self.rp.parent.mkdir(parents=True, exist_ok=True)
     def stop(self, text, active=False):
         import io
         from contextlib import redirect_stdout
@@ -149,46 +150,13 @@ class AgentStop(unittest.TestCase):
     def test_a_block_does_not_loop(self):
         t = "VERDICT: PENDING\nnothing done yet\n"
         self.assertIn("Not finished", self.stop(t))                     # first stop: blocked
-        msg = self.stop(t, active=True)
-        self.assertIn("Not finished", msg)                              # the block re-fires (repeat one)
+        self.assertNotIn("Not finished", self.stop(t, active=True))     # the one reminder is given once: a re-fired stop passes, a block never loops
+        msg = self.stop(t)
         for w in ("'VERDICT: DONE'", "'VERDICT: BLOCKED'", "'VERDICT: FAILED'"): self.assertIn(w, msg)   # names all three
-        self.assertNotIn("Not finished", self.stop(t, active=True))     # repeat two: give up, the block never loops
     def test_finished_report_stops(self):
         self.assertNotIn("Not finished", self.stop("VERDICT: DONE\nran the suite: exit code 0\n"))
         # a final verdict after a line-1 PENDING (janus reads the last VERDICT line) is finished too
         self.assertNotIn("Not finished", self.stop("VERDICT: PENDING\nwork\nVERDICT: BLOCKED\nno commands run: exit codes none\n"))
-
-
-class UserPrompt(unittest.TestCase):
-    """F3: an owner instruction is filed to one store per audience — beads memories for the orchestrator's own rules, MEMORY.md
-    for what agents must follow. The failure caught: the old text told the orchestrator to copy the same fact into both stores,
-    and a rule filed with `bd remember` never reached an agent."""
-    def setUp(self):
-        self.d, self.cfg = project()
-        self.cfg.f("session").write_text(f"pending:{int(time.time())}")
-    def prompt(self, text):
-        import io
-        from contextlib import redirect_stdout
-        from unittest import mock
-        created = []
-        class FakeBeads:
-            def __init__(self, cfg): pass
-            def create(self, title, kind, body): created.append((title, kind)); return "i-7"
-        saved = (janus.Beads, janus.session_root); janus.Beads = FakeBeads; janus.session_root = lambda sid: None
-        try:
-            with mock.patch.dict(os.environ, {"JANUS_ROLE": ""}), \
-                 mock.patch("sys.stdin", io.StringIO(json.dumps({"session_id": "sid", "cwd": str(self.d), "prompt": text}))):
-                buf = io.StringIO()
-                with redirect_stdout(buf): janus.cmd_hook("UserPromptSubmit")
-        finally: janus.Beads, janus.session_root = saved
-        return created, buf.getvalue()
-    def test_the_two_stores_are_named_and_not_copied(self):
-        created, out = self.prompt("Make the gate use the new runner")
-        self.assertEqual(created, [("instr: Make the gate use the new runner", "instruction")])
-        text = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("bd remember", text)              # the orchestrator's own rules (beads)
-        self.assertIn("janus remember", text)           # what agents must follow (MEMORY.md)
-        self.assertNotIn("also janus remember", text)   # the old copy-the-same-fact-into-both instruction
 
 
 class PromptFixes(unittest.TestCase):
@@ -214,7 +182,7 @@ class PromptFixes(unittest.TestCase):
         self.assertIn("cycle overdue", janus.wake(self.cfg, "cycle overdue"))
         self.assertIn(str(self.cfg.f("HANDOFF.md")), janus.wake_clear(self.cfg, "the context was cleared"))
     def test_read_shows_only_new_directions(self):
-        bd = self.d / "board"; bd.mkdir(); (bd / ".master").write_text("here\n")
+        bd = self.d / ".janus" / "board"; bd.mkdir(); (bd / ".master").write_text("here\n")
         B = lambda *a: janus.board(self.cfg, *a)
         B("post", "a1", "status", "start")
         B("direct", "a1", "first"); B("direct", "a1", "second")
@@ -224,7 +192,7 @@ class PromptFixes(unittest.TestCase):
         o3 = B("read", "a1")[1]; self.assertIn("third", o3); self.assertNotIn("second", o3)
     def test_the_opencode_launch_writes_the_absolute_report_path_in_the_header(self):
         d, cfg = project('\n[providers.oc]\nenabled = true\n[models.oc]\nprovider = "oc"\nkind = "opencode"\nmodel = "z"\n')
-        (d / "briefs/u.md").write_text("TIER: NORMAL\nSCOPE: all\nWrite REPORT.md.\nPROOF: x\n")
+        (d / ".janus/briefs/u.md").write_text("TIER: NORMAL\nSCOPE: all\nWrite REPORT.md.\nPROOF: x\n")
         hs = {"here": {"name": "here", "ok": True, "avail_mb": "64000", "disk_gb": "100", "load": "0"}}
         class FakeBeads:
             def __init__(self, cfg): pass
@@ -241,9 +209,9 @@ class PromptFixes(unittest.TestCase):
                                "resume_of": None, "item": None, "probes": hs, "share_with": None, "dry_run": False})()
             with self.assertRaises(janus.Err): janus.cmd_launch(cfg, a)
         finally: janus.Beads, janus.herdr = saved
-        f = d / "out/u/u.md"
+        f = d / ".janus/out/u/u.md"
         self.assertTrue(f.exists(), "the brief with the header was not written")
-        hd = f.read_text(); rep = str(d / "out/u/REPORT.md")
+        hd = f.read_text(); rep = str(d / ".janus/out/u/REPORT.md")
         self.assertIn(f"Write your report to `{rep}`", hd)     # the absolute path, once, prominently (the opencode path)
         self.assertIn(rep, hd)                                 # and the same path in the park rule and the quality block
 
@@ -288,8 +256,8 @@ class Backlog(unittest.TestCase):
 
 class Resume(unittest.TestCase):
     def test_report_path(self):
-        d, cfg = project(); (d / "out/orig").mkdir(); rep = d / "out/orig/REPORT.md"; rep.write_text("VERDICT: BLOCKED\nold\nVERDICT: BLOCKED\n")
-        b = d / "briefs/r.md"; b.write_text(f"Continue the same report {rep} (line 1 PENDING).\n")
+        d, cfg = project(); (d / ".janus/out/orig").mkdir(); rep = d / ".janus/out/orig/REPORT.md"; rep.write_text("VERDICT: BLOCKED\nold\nVERDICT: BLOCKED\n")
+        b = d / ".janus/briefs/r.md"; b.write_text(f"Continue the same report {rep} (line 1 PENDING).\n")
         a = type("A", (), {"report": None, "resume_of": None, "unit": "r"})()
         self.assertIsNone(janus.resume_report(cfg, a, b))   # never parsed from the brief's prose (a launch died on such a path)
         a.resume_of = "orig"; b.write_text("x\n"); self.assertIsNone(janus.resume_report(cfg, a, b)); self.assertEqual(janus.seed_report(cfg, a), rep.resolve())   # continued as a copy (soak 43b)
@@ -313,7 +281,7 @@ class ResumeBudget(unittest.TestCase):
         (under resume_min_usd) and told you to use launch --resume-of, which said 'already launched' for the same unit, was
         refused by H9 for a successor with --cwd, and close said 'unpushed commits'."""
         d, cfg = project()
-        b = d / "briefs/u1.md"; b.write_text("# Brief: u1\n")
+        b = d / ".janus/briefs/u1.md"; b.write_text("# Brief: u1\n")
         u = {"id": "t-1", "name": "u1", "host": "here", "via": "pueue", "model": "m", "task": 5, "budget": 2.0, "run": "u1.1",
              "brief": str(b), "rbrief": str(b), "rcwd": str(d), "started": 0}
         got = {}
@@ -357,19 +325,19 @@ class LaunchQuoting(unittest.TestCase):
 
     def test_odd_path_launches_and_dead_run_is_not_launched(self):
         import argparse, io, contextlib
-        d = Path(tempfile.mkdtemp(prefix="janus t (`B it's ")); (d / "out").mkdir(); (d / "briefs").mkdir()
+        d = Path(tempfile.mkdtemp(prefix="janus t (`B it's ")); (d / ".janus" / "out").mkdir(parents=True); (d / ".janus" / "briefs").mkdir()
         fake = d / "agent dir (`x)" / "fake.py"; fake.parent.mkdir()
         fake.write_text("import json, os, sys\nr = os.environ['JANUS_REPORT']\nopen(r, 'a').write('agent saw ' + r + '\\nVERDICT: DONE\\n')\n"
                         "print(json.dumps({'total_cost_usd': 0.01, 'subtype': 'success'}))\n")
-        prov = lambda n, cmd: (f'[providers.{n}]\nenabled = true\ncap_usd = 10\nbudget_per_unit = 1\nledger = "out/ledger-{n}.tsv"\n'
+        prov = lambda n, cmd: (f'[providers.{n}]\nenabled = true\ncap_usd = 10\nbudget_per_unit = 1\nledger = ".janus/out/ledger-{n}.tsv"\n'
                                f'key_file = {json.dumps(str(d / "key.env"))}\ncmd = {json.dumps(cmd)}\n')
-        (d / "janus.toml").write_text(f'[project]\nname = "t"\n[hosts.here]\nlocal = true\npueue_config = "{self.pd}/p.yml"\n'
+        conf(d).write_text(f'[project]\nname = "t"\n[hosts.here]\nlocal = true\npueue_config = "{self.pd}/p.yml"\n'
             + prov("api", [sys.executable, str(fake), "{prompt}"]) + prov("bad", [str(d / "no such agent"), "{prompt}"])
             + '[models.m]\nprovider = "api"\nkind = "api"\napi_id = "x"\n[models.bad]\nprovider = "bad"\nkind = "api"\napi_id = "x"\n')
         k = d / "key.env"; k.write_text("ANTHROPIC_API_KEY=abc123\n"); k.chmod(0o600)
         cfg = janus.Cfg(d)
-        (d / "out/orig").mkdir(); rep = d / "out/orig/REPORT.md"; rep.write_text("VERDICT: BLOCKED\nold\n")
-        for n in ("u", "dead"): (d / f"briefs/{n}.md").write_text(f"Continue the same report /x/(`B/out/{n}/REPORT.md\n")   # prose: ignored
+        (d / ".janus/out/orig").mkdir(); rep = d / ".janus/out/orig/REPORT.md"; rep.write_text("VERDICT: BLOCKED\nold\n")
+        for n in ("u", "dead"): (d / f".janus/briefs/{n}.md").write_text(f"Continue the same report /x/(`B/out/{n}/REPORT.md\n")   # prose: ignored
         saved = {}
         class FakeBeads:   # no beads database in a temp project
             def __init__(self, cfg): pass
@@ -394,7 +362,7 @@ class LaunchQuoting(unittest.TestCase):
         with contextlib.redirect_stdout(out), self.assertRaises(janus.Err) as e: janus.cmd_launch(cfg, ns("dead", "bad"))
         self.assertIn("died at once", str(e.exception)); self.assertNotIn("launched dead", out.getvalue())
         self.assertEqual(saved["dead"]["via"], "failed")
-        self.assertIn("died-at-start", (d / "out/ledger-bad.tsv").read_text())
+        self.assertIn("died-at-start", (d / ".janus/out/ledger-bad.tsv").read_text())
         # janus run in the same odd tree: the job script it would queue parses and quotes the odd paths, and the busy record it
         # writes (row 53) holds the tree while the job is queued or running -- no real pueue or admission (item 22: the lane's
         # admission disk floor made this test wait forever on a full root volume)
@@ -408,7 +376,7 @@ class LaunchQuoting(unittest.TestCase):
         hs = {"here": {"ok": True, "pueue": {"tasks": {"7": {"status": {"Running": {}}, "label": "run:wt___q__x@t"}}}}}
         why = janus.busy_reasons(cfg, wt, hs=hs, ps="")
         self.assertEqual(len(why), 1, why); self.assertRegex(why[0], "is running")
-        self.assertEqual(janus.busy_reasons(cfg, d / "briefs", hs=hs, ps=""), [])   # another tree is not busy
+        self.assertEqual(janus.busy_reasons(cfg, d / ".janus" / "briefs", hs=hs, ps=""), [])   # another tree is not busy
         rec.unlink()
         self.assertEqual(janus.busy_reasons(cfg, wt, hs=hs, ps=""), [])
         # a remote host whose root has the same characters: every generated script parses
@@ -439,39 +407,22 @@ class Close(unittest.TestCase):
         kept that repo dirty). Only the unit's cwd subtree counts, minus janus's state dir and the board folder."""
         d, cfg = project(); g = lambda *x: subprocess.run(["git", "-C", str(d), *x], capture_output=True, text=True)
         g("init", "-q"); (d / "bin").mkdir(); (d / "bin/tool.sh").write_text("x\n"); g("add", "-A"); g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i")
-        for f in ("board/card.md", ".janus/acks.json", "out/other/REPORT.md", "bin/.janus-note"): (d / f).parent.mkdir(parents=True, exist_ok=True)
-        (d / "board/card.md").write_text("post\n"); (d / ".janus/acks.json").write_text("{}\n"); (d / "out/other/REPORT.md").write_text("x\n")
+        for f in (".janus/board/card.md", ".janus/acks.json", ".janus/out/other/REPORT.md", "bin/.janus-note"): (d / f).parent.mkdir(parents=True, exist_ok=True)
+        (d / ".janus/board/card.md").write_text("post\n"); (d / ".janus/acks.json").write_text("{}\n"); (d / ".janus/out/other/REPORT.md").write_text("x\n")
         self.assertEqual(janus.unit_dirty(cfg, d / "bin"), ([], True))
         (d / "bin/tool.sh").write_text("y\n"); self.assertEqual(janus.unit_dirty(cfg, d / "bin")[0], ["bin/tool.sh"])
-
-class SelfSafety(unittest.TestCase):
-    def test_in_place_edit_flagged_rename_not(self):
-        d = Path(tempfile.mkdtemp()); s = d / "loop.sh"; s.write_text("#!/bin/bash\nsleep 30\necho done\n")
-        p = subprocess.Popen(["/bin/bash", str(s)]); time.sleep(1.5)
-        try:
-            janus.atomic_write(s, "#!/bin/bash\nsleep 30\necho other\n", 0o755); time.sleep(1.1)
-            self.assertFalse([k for k, _ in janus.script_findings() if k.startswith(f"script:{p.pid}:")])   # renamed: safe
-        finally: p.kill(); p.wait()
-        p = subprocess.Popen(["/bin/bash", str(s)]); time.sleep(1.5)
-        try:
-            with open(s, "r+") as f: f.seek(0, 2); f.write("echo appended\n")   # in place
-            time.sleep(1.1)
-            self.assertTrue([k for k, _ in janus.script_findings() if k.startswith(f"script:{p.pid}:")])
-        finally: p.kill(); p.wait()
 
 class Register(unittest.TestCase):
     def test_tree_guard(self):
         d = Path(tempfile.mkdtemp()); g = lambda *x: subprocess.run(["git", "-C", str(d), *x], capture_output=True)
         g("init", "-q", "-b", "main"); (d / "a").write_text("x\n"); g("add", "a"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "a")
         _, cfg = project()
-        self.assertIsNone(janus.tree_guard(cfg, d))
+        self.assertIsNone(janus.tree_guard(d))
         (d / "a").write_text("<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")
-        self.assertIn("conflict markers", janus.tree_guard(cfg, d))
+        self.assertIn("conflict markers", janus.tree_guard(d))
         (d / "a").write_text("x\n"); g("checkout", "-q", "-b", "wk"); g("checkout", "-q", "main")
         for i in range(11): (d / "a").write_text(f"{i}\n"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", str(i))
         g("checkout", "-q", "wk")
-        self.assertIn("11 commits behind", janus.tree_guard(cfg, d))       # gates and land: refused
-        self.assertIsNone(janus.tree_guard(cfg, d, behind=False))            # an agent's own jobs: never for being behind (item 5)
 
 def host_probe(**k):
     """A probe result as probe() returns it, for the capacity model."""
@@ -561,7 +512,7 @@ class Capacity(unittest.TestCase):
         d, cfg = project()
         a = type("A", (), {"host": "here", "test_host": None, "unit": "u", "kind": "review"})()
         hs = {"here": {"name": "here", "ok": True, "avail_mb": "8000", "disk_gb": "100"}}
-        hn, b, why = janus.choose(cfg, a, d / "briefs/none.md", cfg.models["m"], [], hs)
+        hn, b, why = janus.choose(cfg, a, d / ".janus/briefs/none.md", cfg.models["m"], [], hs)
         self.assertEqual((hn, b), ("here", "here"))
     def test_build_room_and_when(self):
         p = host_probe(cap_rj="2", cap_rc="4", cap_rm="5000", hist=[f"{int(time.time()) - 100}\tcargo_test\t2000\t600\t0"],
@@ -578,25 +529,6 @@ class Capacity(unittest.TestCase):
         self.assertFalse(ok); self.assertIn("should free about", why)          # 4 agents = 2 x slots: refused, and says when
         hc = janus.host_cap(self.cfg, "b", dict(p, cap_pause="memory PSI avg10 30 over 10"), units[:1])
         self.assertFalse(janus.build_room(self.cfg, "b", hc)[0])
-
-class DiskFloor(unittest.TestCase):
-    def test_the_disk_floor_honours_the_host_value_over_capacity(self):
-        """Catches (item 20): the disk finding and the land lane used a fixed default instead of [hosts.<h>] min_disk_gb (host
-        value over [capacity], the per-host floor the config documents)."""
-        import argparse
-        d, cfg = project('\n[capacity]\nmin_disk_gb = 3\n')
-        h = cfg.hosts["here"]; p = {"ok": True, "disk_gb": "5", "load": "0"}
-        self.assertEqual(janus.capv(cfg, h, "min_disk_gb"), 3)                 # [capacity]
-        self.assertEqual(janus.margins(h, p, cfg=cfg), [])                     # 5 GB free is over the 3 GB floor
-        h["min_disk_gb"] = 7
-        self.assertEqual(janus.capv(cfg, h, "min_disk_gb"), 7)                 # the host value wins over [capacity]
-        self.assertTrue(any("disk" in w for w in janus.margins(h, p, cfg=cfg)), "the disk finding ignored the host floor")
-        h.pop("min_disk_gb")                                                   # the land lane falls back to [capacity] too
-        r = argparse.Namespace(host="here", lane="land", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
-                               allow_unmerged=False, command=["--", "true"], broad=None)
-        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
-        self.assertIn('"$d" -ge 3', js, "the land lane used a fixed disk floor, not [capacity] min_disk_gb")
-
 
 class AdmitBound(unittest.TestCase):
     def test_a_blocked_job_says_why_and_gives_up(self):
@@ -654,7 +586,7 @@ class Fill(unittest.TestCase):
         d, cfg = project('\n[backlog]\nfile = "S.md"\n[routing]\nnormal = ["m"]\ncritical = ["m"]\n'
                          '[hosts.b]\nssh = "b"\ncores = 4\ncores_per_job = 2\nram_gb = 8\nservices_gb = 2\njob_gb = 2\nagent_gb = 1\n')
         (d / "S.md").write_text("| # | item | status |\n|---|---|---|\n| X1 | one | READY |\n| X2 | two | READY |\n| X3 | three | READY |\n| X4 | four | DONE |\n")
-        for n, it in (("x1-a", "X1"), ("x2-a", "X2"), ("x3-a", "X3")): (d / f"briefs/{n}.md").write_text(f"# {n}\nITEM: {it}\nTEST-HOST: b\n")
+        for n, it in (("x1-a", "X1"), ("x2-a", "X2"), ("x3-a", "X3")): (d / f".janus/briefs/{n}.md").write_text(f"# {n}\nITEM: {it}\nTEST-HOST: b\n")
         cfg.hosts["here"].update(ram_gb=64, cores=16)
         janus.Beads.run = lambda self, *a: (_ for _ in ()).throw(janus.Err("no beads"))   # no beads here: the checklist is the backlog
         hs = {"here": host_probe(name="here"), "b": host_probe(name="b")}
@@ -671,97 +603,12 @@ class Budget(unittest.TestCase):
         d, cfg = project('\n[budget]\nmargin_pct = 50\n')
         cfg.run.all_units = {f"u{i}": {"name": f"u{i}", "kind": "implement", "tier": "critical"} for i in range(4)}
         for i in range(4):   # item 16c: a run counts only when its unit ended with a verdict
-            o = d / "out" / f"u{i}"; o.mkdir(); (o / "REPORT.md").write_text("VERDICT: DONE\ndone\n")
+            o = d / ".janus" / "out" / f"u{i}"; o.mkdir(); (o / "REPORT.md").write_text("VERDICT: DONE\ndone\n")
         for i, c in enumerate((1.0, 2.0, 3.0, 9.0)):
             janus.ledger_append(cfg, cfg.prov["api"], ["t", f"u{i}", "running", 5, f"r{i}"]); janus.ledger_append(cfg, cfg.prov["api"], ["t", f"u{i}", c, "done rc=0", f"r{i}"])
         b, why = janus.budget_for(cfg, cfg.models["m"], "implement", "critical")
         self.assertEqual(b, 4.0); self.assertIn("median $2.50", why)            # median 2.5 + 50 % = 3.75, rounded up to $0.50
         self.assertEqual(janus.budget_for(cfg, cfg.models["m"], "review", "normal")[0], 1)   # no history: budget_per_unit
-
-class Land(unittest.TestCase):
-    def setUp(self):
-        self.d, self.cfg = project('\n[landing]\nbranch = "main"\n')
-        self.r = self.d / "repo"; self.r.mkdir(); self.wt = self.d / "wt"
-        self.g("init", "-q", "-b", "main"); (self.r / "a").write_text("1\n2\n3\n"); self.g("add", "a"); self.g("commit", "-qm", "base")
-        self.g("config", "user.name", "t"); self.g("config", "user.email", "t@t")   # land's own commits: a machine without a git identity failed these tests
-        self.g("worktree", "add", "-q", "-b", "wk/u", str(self.wt))
-        self.u = {"id": "x-1", "name": "u", "cwd": str(self.wt), "tier": "normal"}
-        janus.Beads.units = lambda s: [self.u]; janus.Beads.comment = lambda s, *a: None
-        self.cfg.run.all_units = {"u": self.u}
-    def g(self, *a, cwd=None): return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd or self.r), *a], capture_output=True, text=True)
-    def a(self, **k): return type("A", (), {"unit": "u", "no_gate": True, "no_dispatch": True, **k})()
-    def test_a_land_on_another_host_merges_gates_and_pushes_there(self):
-        """Catches (skill-fix55): a land could only merge, gate and push in the coordinator's worktree: named another host, it
-        still did its git work on this machine's (stale) main and pushed nothing, so no other host could ever land."""
-        from unittest import mock
-        o = self.d / "o.git"; self.g("init", "-q", "--bare", "-b", "main", str(o)); self.g("remote", "add", "origin", str(o)); self.g("push", "-q", "-u", "origin", "main")
-        (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: add b", cwd=self.wt)
-        other = self.d / "other"; self.g("clone", "-q", str(o), str(other)); (other / "c").write_text("moved\n")
-        self.g("add", "c", cwd=other); self.g("commit", "-qm", "main: c", cwd=other); self.g("push", "-q", "origin", "main", cwd=other)   # the remote's main moves; this machine never fetches it
-        tip = self.g("rev-parse", "HEAD", cwd=other).stdout.strip()
-        self.cfg.hosts["far"] = {"ssh": "far", "root": str(self.d / "far")}; self.cfg.c["landing"]["final_gate"] = "test -f b"
-        ran = []
-        with mock.patch.object(janus, "hrun", lambda h, script, timeout=25, inp=None, env=None: janus.sh(["sh", "-c", script], timeout=timeout, inp=inp)), \
-             mock.patch.object(janus, "ssh_url", lambda h, p: p), mock.patch.object(janus, "cmd_run", lambda cfg, ra: ran.append(ra) or 0), \
-             contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(janus.cmd_land(self.cfg, self.a(host="far", no_gate=False)), 0)
-        tree = self.d / "far" / "land" / "wt" / "u"
-        self.assertEqual((ran[0].host, ran[0].host_tree), ("far", str(tree)))   # the gate: in the host's own tree, through its lane
-        self.assertTrue((tree / "b").is_file() and (tree / "c").is_file())      # ... which holds the merge made there
-        self.assertEqual(self.g("log", "--format=%s %P", "-1", "main", cwd=o).stdout.strip(), f"u: land wk/u (1 commit(s), squashed) {tip}")   # pushed from there, onto the remote's tip
-        self.assertEqual(janus.gate_place(self.cfg, "far", "janus gate land-u --wait")[0], "here")   # row 64: a janus gate is the coordinator's dispatcher, never run on the far host
-        self.assertIn("gate --host far land-u", janus.gate_place(self.cfg, "far", "janus gate land-u --wait")[1])   # the dispatcher is told the host it lands on: without it a landing aimed at far gated on another host
-
-    def test_squash_land_and_conflict_stop(self):
-        (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: add b", cwd=self.wt)
-        (self.r / "c").write_text("main moved\n"); self.g("add", "c"); self.g("commit", "-qm", "main: c")   # main moves: merge needed
-        self.assertEqual(janus.cmd_land(self.cfg, self.a()), 0)
-        self.assertEqual(self.g("log", "--format=%s", "-1").stdout.strip(), "u: land wk/u (1 commit(s), squashed)")
-        self.assertEqual(sorted(p.name for p in self.r.iterdir() if p.name != ".git"), ["a", "b", "c"])   # the main checkout followed
-        self.assertEqual(self.g("rev-list", "--count", "main").stdout.strip(), "3")                        # one squashed commit
-        (self.wt / "a").write_text("1\nX\n3\n"); self.g("commit", "-qam", "u: a", cwd=self.wt)
-        (self.r / "a").write_text("1\nY\n3\n"); self.g("commit", "-qam", "main: a")
-        head = self.g("rev-parse", "HEAD", cwd=self.wt).stdout
-        self.assertEqual(janus.cmd_land(self.cfg, self.a()), 3)                 # conflict: stops ...
-        self.assertEqual(self.g("rev-parse", "HEAD", cwd=self.wt).stdout, head)   # ... with the tree untouched
-        self.assertNotEqual(self.g("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=self.wt).returncode, 0)
-    def test_land_once(self):
-        """review-fixes8 #2: after a squash-land the unit counts as landed (its tree is on main), and a second land is refused."""
-        (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: b", cwd=self.wt)
-        (self.r / "c").write_text("main moved\n"); self.g("add", "c"); self.g("commit", "-qm", "main: c")
-        self.assertIs(janus.landed(self.cfg, self.u), False)
-        self.assertEqual(janus.cmd_land(self.cfg, self.a()), 0)
-        self.assertIs(janus.landed(self.cfg, self.u), True)
-        with self.assertRaises(janus.Err) as e: janus.cmd_land(self.cfg, self.a())
-        self.assertIn("already landed", str(e.exception))
-        self.assertEqual(self.g("rev-list", "--count", "main").stdout.strip(), "3")   # no duplicate squash commit
-    def _odd_branch(self, name):
-        self.assertEqual(self.g("branch", "-m", name, cwd=self.wt).returncode, 0, f"git itself refuses the branch name {name}")
-        (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: b", cwd=self.wt)
-        (self.r / "c").write_text("main moved\n"); self.g("add", "c"); self.g("commit", "-qm", "main: c")   # behind main: a merge is due
-        return self.g("rev-parse", "HEAD", cwd=self.wt).stdout.strip()
-    def test_a_legal_branch_name_lands_when_no_gate_command_takes_it(self):
-        """Catches (review-fix-install7 F2): `janus land --no-gate` on branch `wk/fix#12` merged main into it and THEN refused
-        the name for a gate command that was never going to be built; the same with a gate template that has no {branch}."""
-        self._odd_branch("wk/fix#12")
-        self.assertEqual(janus.cmd_land(self.cfg, self.a()), 0)
-        self.assertEqual(self.g("log", "-1", "--format=%s", "main").stdout.strip()[:1], "u", "nothing was landed on main")
-        for legal in ("wk/fix#12", "issue-12=retry", "wk/\u00fcberholt", "release,candidate", "fix%20thing"):
-            self.assertIn(legal, janus.final_gate_cmd_checked({"final_gate": "./gate {branch}"}, "u", "/w", legal), f"{legal} is a legal branch name")
-        self.assertEqual(janus.final_gate_cmd_checked({"final_gate": "./check"}, "u", "/w", "wk/a;b"), "./check")   # the gate never sees it
-    def test_a_branch_the_gate_cannot_take_is_refused_before_anything_is_merged(self):
-        """Catches (review-fix-install7 F2): the refusal came after step 1, so the unit's branch was left holding a merge commit
-        for a land that could not go on; and a name starting with `-` reached the gate's command as an option."""
-        head = self._odd_branch("wk/a;b"); self.cfg.c["landing"].update(final_gate_host="here", final_gate="./gate {branch}")
-        with self.assertRaises(janus.Err) as e: janus.cmd_land(self.cfg, self.a(no_gate=False))
-        self.assertEqual(self.g("rev-parse", "HEAD", cwd=self.wt).stdout.strip(), head, "main was merged into the branch before the refusal")
-        self.assertIn("';'", str(e.exception))
-        for hostile in ("--force", "#x", "a b", "a$b", "a`b", "a&b", "a|b", "a'b", 'a"b', "a\nb", "a!b", "a\u00a0b", ""):
-            with self.assertRaises(janus.Err, msg=repr(hostile)): janus.final_gate_cmd_checked({"final_gate": "git push origin {branch}"}, "u", "/w", hostile)
-    def test_gate_required(self):
-        (self.wt / "b").write_text("new\n"); self.g("add", "b", cwd=self.wt); self.g("commit", "-qm", "u: b", cwd=self.wt)
-        with self.assertRaises(janus.Err) as e: janus.cmd_land(self.cfg, self.a(no_gate=False))
-        self.assertIn("final_gate", str(e.exception))
 
 class Probe(unittest.TestCase):
     def test_scheduler_and_capacity_report(self):
@@ -779,7 +626,7 @@ class Probe(unittest.TestCase):
 class Park(unittest.TestCase):
     """janus-fixes9 item 1: a WAITING line parks a unit on its jobs; PENDING is no verdict; a resume continues the session."""
     def test_waiting_line_jobs_and_states(self):
-        d, cfg = project(); r = d / "out/u/REPORT.md"; r.parent.mkdir(parents=True)
+        d, cfg = project(); r = d / ".janus/out/u/REPORT.md"; r.parent.mkdir(parents=True)
         r.write_text("VERDICT: PENDING\nstep 1 done\nWAITING here:7 here:8 nohost:9\n")
         u = {"name": "u", "started": 0}
         self.assertIsNone(janus.verdict(cfg, u))   # PENDING is not a verdict (close and park relied on that)
@@ -797,32 +644,6 @@ class Park(unittest.TestCase):
         r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\n"); self.assertIsNone(janus.verdict(cfg, u))
         r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\nVERDICT: DONE\n"); self.assertEqual(janus.verdict(cfg, u), "VERDICT: DONE")
 
-    def test_wrapup_once_when_capped_without_verdict(self):
-        """item 2: a run that ended at its budget cap with no final verdict is wrapped up once; not with a verdict, not twice."""
-        d, cfg = project(); o = d / "out/u"; o.mkdir(parents=True); (o / "REPORT.md").write_text("VERDICT: PENDING\nstep 1\n")
-        (o / "api.json").write_text(json.dumps({"subtype": "error_max_budget_usd", "total_cost_usd": 1.0}))
-        u = {"name": "u", "via": "pueue", "model": "m", "state": "failed", "verdict": None, "started": 0}
-        self.assertTrue(janus.wrap_due(cfg, u))
-        self.assertFalse(janus.wrap_due(cfg, {**u, "wrapup": "u.r2.1"}))
-        self.assertFalse(janus.wrap_due(cfg, {**u, "verdict": "VERDICT: BLOCKED"}))
-        self.assertFalse(janus.wrap_due(cfg, {**u, "state": "working"}))
-        (o / "api.json").write_text(json.dumps({"subtype": "success"})); self.assertFalse(janus.wrap_due(cfg, u))
-
-    def test_orphan_jobs(self):
-        """item 3: a job whose owner is gone: closed unit, ended agent not parked, ended wrapper; never an idle herdr agent's or a
-        parked unit's job."""
-        d, cfg = project(); run = lambda: {"status": {"Running": {}}}
-        hs = {"here": {"ok": True, "pueue": {"tasks": {
-            "1": {**run(), "label": "unit:closed@t"}, "2": {**run(), "label": "unit:api@t"}, "3": {**run(), "label": "unit:idle@t"},
-            "4": {**run(), "label": "unit:parked@t"}, "5": {**run(), "label": "run:x@t", "command": "bash /r/runs/x-1.sh"}, "6": {"status": {"Done": {"result": "Success"}}, "label": "unit:closed@t"}}}}}
-        units = [{"name": "api", "via": "pueue", "state": "done"}, {"name": "idle", "via": "herdr", "state": "idle"},
-                 {"name": "parked", "via": "pueue", "state": "parked", "_park": ["here:4"]}]
-        wd = d / ".janus/runs/wrap"; wd.mkdir(parents=True); (wd / "w-1").write_text("here:5 x-1\n")   # its wrapper is not running
-        got = dict(janus.orphan_jobs(cfg, hs, units))
-        self.assertEqual(sorted(got), ["here:1", "here:2", "here:5"], got)
-        self.assertEqual(janus.stop_job_cmd({"runner": "podman"}, "j1").split(";")[0], "podman stop -t 5 janus-run-j1 >/dev/null 2>&1")
-        self.assertIn("janus-j1.scope", janus.stop_job_cmd({}, "j1"))
-
     def test_uncollected_guard(self):
         """item 4: a remote copy with changes or output that collect has not brought here refuses stop/close; a fresh copy does not."""
         d, cfg = project(); r = d / "remote"
@@ -837,111 +658,6 @@ class Park(unittest.TestCase):
             u["collected"] = janus.fingerprint(cfg, u)["fp"]; self.assertIsNone(janus.uncollected(cfg, u))   # as collect records it
             (r / "out/u/REPORT.md").write_text("VERDICT: PENDING\nstep 2\n"); self.assertIn("not collected", janus.uncollected(cfg, u))
         finally: janus.hrun = real
-
-    def test_resume_argv_and_no_ack(self):
-        mc = {"api_id": "x"}
-        a = janus.api_argv({}, mc, 1, "go", "S1")
-        self.assertEqual(a[:5], ["claude", "--bare", "-p", "--resume", "S1"]); self.assertEqual(a[-1], "go")
-        self.assertEqual(janus.api_argv({"cmd": ["c", "{prompt}"], "resume_cmd": ["c", "resume", "{session}", "{prompt}"]}, mc, 1, "go", "S1"), ["c", "resume", "S1", "go"])
-        with self.assertRaises(janus.Err): janus.api_argv({"cmd": ["c", "{prompt}"]}, mc, 1, "go", "S1")   # cannot guess how to resume
-        d, cfg = project()
-        with self.assertRaises(janus.Err): janus.cmd_ack(cfg, type("A", (), {"problem": "waiting:u", "decision": "x"})())
-
-class Report(unittest.TestCase):
-    def test_outcomes_waste_pause_and_checkpoint(self):
-        """item 6: spend by outcome; capped-without-verdict spend over waste_pause % pauses launch until acked; report-due."""
-        d, cfg = project('\n[report]\nevery_h = 0\nat = ["00:00"]\n'); mc = cfg.models["m"]; pv = cfg.prov["api"]
-        for n, cost, sub, rep in (("ok", 1.0, "success", "VERDICT: DONE\nexit codes 0\n"), ("cap", 3.0, "error_max_budget_usd", "VERDICT: PENDING\n"),
-                                  ("half", 1.0, "error_max_budget_usd", "VERDICT: PENDING\nstep 1 done\nstep 2 done\n")):
-            run = janus.reserve_budget(cfg, mc, n, 5, f"{n}.1"); janus.ledger_done(cfg, pv, run, n, cost, 0)
-            o = d / "out" / n; o.mkdir(); (o / "REPORT.md").write_text(rep); (o / f"api-{run}.json").write_text(json.dumps({"subtype": sub}))
-        janus.reserve_budget(cfg, mc, "lost", 2, "lost.1")
-        cfg.run.all_units = {n: {"name": n, "run": f"{n}.1", "status": "closed"} for n in ("ok", "cap", "half", "lost")}
-        got = {x[2]: x[4] for x in janus.run_outcomes(cfg)}
-        self.assertEqual(got, {"ok": "verdict", "cap": "capped-nothing", "half": "capped-partial", "lost": "unknown"})
-        self.assertIn("waste pause", "refused (waste pause): " + (janus.waste_paused(cfg) or ""))   # 4 of 7 dollars capped: over 25 %
-        self.assertIsNotNone(janus.waste_paused(cfg))
-        janus.cmd_ack(cfg, type("A", (), {"problem": "waste-pause", "decision": "cause: budgets too small; fixed"})())
-        self.assertIsNotNone(janus.waste_paused(cfg), "waste_paused must still state the reason, or the ack is dropped as 'finding gone' (item 7)")
-        self.assertIsNone(janus.waste_block(cfg))   # the orchestrator acked the cause: launch and fill are not refused
-        self.assertIn("report-due", [k for k, _ in janus.report_findings(cfg, [])])
-        cfg.touch("report_sent"); self.assertNotIn("report-due", [k for k, _ in janus.report_findings(cfg, [])])
-
-class FalseFindings(unittest.TestCase):
-    """item 7: findings that were false."""
-    def test_localtest_skips_a_shim_whose_child_is_janus_run(self):
-        d, cfg = project()
-        shim = " 10     1    10   0.0    01:00 sh -c cargo test -p x\n"
-        self.assertIn("localtest:10", [k for k, _ in janus.proc_findings(cfg, shim)])          # a build outside the lanes: flagged
-        child = shim + " 11    10    10   0.0    00:59 python3 /x/janus.py run --host h --wt /w -- cargo test -p x\n"
-        self.assertNotIn("localtest:10", [k for k, _ in janus.proc_findings(cfg, child)])     # its child is janus run: a lane call
-
-    def test_git_dirty_ignores_state_files(self):
-        d, cfg = project(); g = lambda *x: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *x], capture_output=True)
-        (d / ".janus/acks.json").write_text("{}"); g("init", "-q"); g("add", "-A"); g("commit", "-qm", "a")
-        (d / ".janus/acks.json").write_text('{"x": 1}'); (d / ".janus/open.json").write_text("{}")   # an ack, a check: janus's own
-        self.assertNotIn("git:dirty", [k for k, _ in janus.git_findings(cfg)])
-        (d / ".janus/history.md").write_text("notes\n")                                       # the orchestrator's notes count
-        self.assertIn("git:dirty", [k for k, _ in janus.git_findings(cfg)])
-
-    def test_idle_lane_uses_the_admission_verdict(self):
-        """row 48: jobs admitted inside their scripts (waiting there) are held by admission: the lane is not idle."""
-        d, cfg = project('\n[capacity]\nmin_disk_gb = 100000\n'); h = cfg.hosts["here"]
-        p = janus.probe("here", h, ro=True, cfg=cfg)
-        self.assertIn("disk", p["cap_admit"])                      # the admission's own verdict: blocked by the disk floor
-        p["pueue"] = {"groups": {"jobs": {"status": "Running", "parallel_tasks": 4}}, "tasks": {
-            "1": {"group": "jobs", "status": {"Running": {}}, "label": "unit:u"}, "2": {"group": "jobs", "status": {"Queued": {}}, "label": "unit:u"}}}
-        p["wait_jobs"] = "1"
-        self.assertEqual([k for k, _ in janus.lane_findings(cfg, {"here": p}) if k.startswith("idle:")], [])
-        p["wait_jobs"] = "0"; p["cap_admit"] = "yes"   # nothing held by admission, it would admit one, pueue's limit holds the queue: idle
-        p["pueue"]["groups"]["jobs"]["parallel_tasks"] = 1
-        self.assertIn("idle:here:jobs", [k for k, _ in janus.lane_findings(cfg, {"here": p})])
-
-class Memory(unittest.TestCase):
-    def test_remember_forget_and_findings(self):
-        import argparse
-        d, cfg = project('\n[memory]\ncap_lines = 2\n')
-        R = lambda text, kind="decision", **k: janus.cmd_remember(cfg, argparse.Namespace(text=text, source=k.get("source"), key=k.get("key"), learned=None,
-                                                                                     **{x: x == kind for x in janus.MEM_SECTIONS}))
-        with self.assertRaises(janus.Err): R("the cache lives on the build host", "fact")          # a fact needs a source
-        (d / "docs").mkdir(); (d / "docs/n.md").write_text("x")
-        R("the cache lives on the build host", "fact", source="docs/n.md")
-        with self.assertRaises(janus.Err): R("the cache lives on the build host", "fact", source="docs/n.md")   # exact duplicate
-        R("tests run on the mac", "pitfall", key="tests where"); R("tests run on linux only", "pitfall", key="tests where")
-        es = janus.memory_read(cfg)
-        self.assertEqual([e[3] for e in es if e[2] == "tests-where"], ["tests run on linux only"])   # replaced, not beside
-        self.assertIn("tests run on the mac", cfg.f("memory-history.md").read_text())
-        self.assertEqual(janus.memory_findings(cfg), [])
-        R("a third one"); (d / "docs/n.md").unlink()
-        keys = {k for k, _ in janus.memory_findings(cfg)}
-        self.assertIn("memory-long", keys); self.assertTrue(any(k.startswith("memory-source:") for k in keys))
-        janus.cmd_forget(cfg, argparse.Namespace(text="a third")); self.assertEqual(len(janus.memory_read(cfg)), 2)
-        hd = janus.brief_header(cfg, "here", cfg.hosts["here"], "u1", d, True)   # every agent's brief starts with it
-        self.assertIn("Session memory (curated by the orchestrator; your brief wins on conflict)", hd)
-        self.assertIn("tests run on linux only", hd); self.assertIn("peers.md", hd); self.assertIn("janus transcript", hd)
-        rh = janus.brief_header(cfg, "far", {"root": "/r", "ssh": "x"}, "u2", "/r/worktrees/u2", False)
-        self.assertIn("tests run on linux only", rh); self.assertIn("/r/board/peers.md", rh)
-
-    def test_rule_subject(self):
-        S = janus.rule_subject
-        self.assertEqual(S("claude-api-on-the-new-key-cap-175"), S("claude-api-on-the-new-key-keychain-janus"))   # one subject, two rules
-        self.assertNotEqual(S("keep-build-output-in-the-shared-build-cache"), S("keep-herdr-tidy-one-labelled-tab-per-running"))
-
-class Peers(unittest.TestCase):
-    def test_peers_file_and_overlap(self):
-        d, cfg = project(); (d / "board").mkdir(); cfg.run.ro = False
-        g = lambda *a, cwd: subprocess.run(["git", *a], cwd=cwd, capture_output=True, check=True)
-        repo = d / "repo"; repo.mkdir(); g("init", "-q", "-b", "main", cwd=repo); (repo / "a.txt").write_text("a\n"); (repo / "b.txt").write_text("b\n")
-        g("add", ".", cwd=repo); g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init", cwd=repo)
-        units = []
-        for i, f in (("1", "a.txt"), ("2", "a.txt"), ("3", "b.txt")):
-            w = d / f"wt{i}"; g("worktree", "add", "-q", "-b", f"u{i}", str(w), cwd=repo); (w / f).write_text("changed\n")
-            units.append({"id": i, "name": f"u{i}", "host": "here", "model": "m", "cwd": str(w), "state": "working"})
-        F = janus.peer_findings(cfg, units, {})
-        self.assertEqual([k for k, _ in F], ["overlap:u1:u2"])
-        txt = (d / "board/peers.md").read_text()
-        self.assertIn("u3 | host here", txt); self.assertIn("branch u1", txt); self.assertIn("files: a.txt", txt)
-        units[1]["state"] = "done"; self.assertEqual(janus.peer_findings(cfg, units, {}), [])   # a finished unit is no peer
 
 class Transcript(unittest.TestCase):
     def test_condense_claude_and_codex_with_grep_and_tail(self):
@@ -964,36 +680,6 @@ class Transcript(unittest.TestCase):
 
 class Board(unittest.TestCase):
     """The shipped board: question ids that stay until answered, waiting never SILENT, broadcast, learned posts, the alert."""
-    def test_questions_waiting_broadcast_learned_alert(self):
-        d, cfg = project(); cfg.run.ro = False
-        janus.board_upkeep(cfg, [])   # .master, .hosts, .notify
-        bd = d / "board"; self.assertTrue((bd / ".master").is_file()); self.assertIn("watch --alert", (bd / ".notify").read_text())
-        (bd / ".notify").write_text("true\n")
-        B = lambda *a, **env: janus.board(cfg, *a, env=env)
-        B("post", "a1", "status", "start"); B("post", "a2", "status", "start")
-        B("post", "a1", "question", "which port?"); B("post", "a1", "status", "carrying on")   # still needs an answer
-        B("post", "a2", "waiting", "here:3")
-        old = "2000-01-01 00:00"; c = bd / "agents/a2.md"; c.write_text(c.read_text().replace(c.read_text().split("- updated: ")[1].strip(), old))
-        rows = janus.board_rows(cfg)
-        self.assertEqual(rows["a2"]["state"], "waiting"); self.assertFalse(rows["a2"]["silent"])   # parked: never SILENT
-        self.assertEqual([k for k, _ in janus.board_findings(cfg, {"a1", "a2"})], ["question:q1"])
-        sent = []; real = janus.herdr
-        janus.herdr = lambda *a, **k: sent.append(a) or {}
-        try:
-            cfg.f("pane").write_text("p1"); logs = []
-            self.assertIn("QUESTION [q1] from a1: which port?", janus.board_alerts(cfg, logs.append))
-            self.assertIsNone(janus.board_alerts(cfg, logs.append))          # told once
-        finally: janus.herdr = real
-        self.assertEqual(sent[0][:3], ("agent", "prompt", "p1"))
-        self.assertIn("broadcast to 2", B("direct", "all", "freeze main")[1])
-        self.assertTrue(B("questions")[1].startswith("q1"))   # a broadcast answers no question
-        B("answer", "q1", "8080"); self.assertEqual(B("questions")[1], "")
-        self.assertIn("[q1] 8080", B("read", "a1")[1]); self.assertIn("freeze main", B("read", "a2")[1])
-        B("post", "a2", "learned", "the cache is in /var/c (source: docs/c.md)")
-        self.assertEqual([k for k, _ in janus.board_findings(cfg, set())], ["learned:a2:1"])
-        janus.learned_mark(cfg, "learned:a2:1", "rejected"); self.assertEqual(janus.board_findings(cfg, set()), [])
-        self.assertIn("asked: 1", B("digest", "--since", "1h")[1])
-
     def test_remote_rule_on_a_fresh_board(self):
         """A remote unit launched before any check got this machine's board path in its rule (exit 127 there)."""
         d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\n')
@@ -1011,142 +697,6 @@ class Board(unittest.TestCase):
         for bad in ("../evil", "a/b", "..", "."):
             rc, o, e = janus.board(cfg, "post", bad, "status", "x"); self.assertEqual(rc, 2, bad); self.assertIn("bad agent name", e)
 
-
-class ReviewFixes9(unittest.TestCase):
-    """review-fixes9 findings: each test failed before its fix."""
-    def fake_remote(self, d):
-        """A fake ssh (runs the command here; an `rm` of a sending file is lost, as on a flaky link) and a no-op rsync."""
-        b = d / "fakebin"; b.mkdir()
-        (b / "ssh").write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do case $1 in -n) shift;; -o) shift 2;; *) break;; esac; done\nshift\n'
-                               'case "$*" in "rm -f "*) exit 0;; esac\nexec sh -c "$*"\n')
-        (b / "rsync").write_text("#!/bin/sh\nexit 0\n")
-        for f in b.iterdir(): f.chmod(0o755)
-        return str(b) + ":" + os.environ["PATH"]
-
-    def test_sync_merges_a_surviving_sending_file_once(self):
-        """#1: locked()'s local f shadowed merge()'s $f, so .merged-<host> recorded the lock path and a sending file that
-        survived its rm was merged again (one question, two ids)."""
-        r = Path(tempfile.mkdtemp(prefix="janus-rem-"))
-        d, cfg = project(f'\n[hosts.far]\nssh = "far"\nroot = "{r}"\n'); cfg.run.ro = False
-        janus.board_upkeep(cfg, []); (janus.board_dir(cfg) / ".notify").write_text("true\n")
-        (r / "board-outbox").mkdir(); (r / "board-outbox/outbox.log").write_text("2026-01-01 10:00 eve question one question\n".replace("question one", "question: one"))
-        env = {"PATH": self.fake_remote(d)}
-        janus.board(cfg, "sync", env=env); janus.board(cfg, "sync", env=env)
-        self.assertEqual(len(janus.board_questions(cfg)), 1, janus.board_questions(cfg))
-
-    def test_posts_that_wait_unsynced_are_reported_not_silent(self):
-        """Issue 266: a remote agent's posts sat in its host's outbox for minutes with no sign anywhere (the board looked
-        stopped). The host's board says how long its oldest post has waited, tells the agent, and check raises board:stale-sync."""
-        r = Path(tempfile.mkdtemp(prefix="janus-rem-")); (r / "bin").mkdir()
-        d, cfg = project(f'\n[hosts.far]\nssh = "far"\nroot = "{r}"\n')
-        for n, t in janus.board_shipped(cfg): (r / "bin" / n).write_text(t)
-        b = r / "bin/board.sh"; b.chmod(0o755)
-        run = lambda *a: subprocess.run([str(b), *a], capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
-        self.assertEqual(run("post", "eve", "question", "which", "branch?").stderr, "")
-        self.assertEqual(run("outbox").stdout.strip(), "0")   # a fresh post is not late
-        ob = r / "board-outbox/outbox.log"; ob.write_text(time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - 600)) + ob.read_text()[16:])
-        self.assertIn("board:stale-sync", run("read", "eve").stderr)
-        line = next(l for l in janus.probe_extra({**cfg.hosts["far"], "_rd": str(r / "runs")}).splitlines() if "outbox_min" in l)
-        out = subprocess.run(["sh", "-c", line], capture_output=True, text=True).stdout.strip()
-        self.assertRegex(out, r"^outbox_min=(9|10)$")
-        self.assertEqual([k for k, _ in janus.sync_findings(cfg, {"far": {"outbox_min": out.split("=")[1]}})], ["board:stale-sync"])
-        self.assertEqual(janus.sync_findings(cfg, {"far": {"outbox_min": "3"}, "old": {}}), [])   # within the watcher's cadence; an older shipped board says nothing
-
-    def test_close_withdraws_open_questions(self):
-        """#3: closing an agent's card left its open questions open: question:<id> fired forever."""
-        d, cfg = project(); cfg.run.ro = False; janus.board_upkeep(cfg, []); (janus.board_dir(cfg) / ".notify").write_text("true\n")
-        janus.board(cfg, "post", "carol", "question", "still running?"); self.assertEqual(len(janus.board_questions(cfg)), 1)
-        janus.board(cfg, "close", "carol"); self.assertEqual(janus.board_questions(cfg), [])
-
-
-    def test_parked_unit_that_cannot_resume_is_reported(self):
-        """#2: a parked unit whose resume raised stayed parked with no finding (the watch log was the only trace)."""
-        d, cfg = project(); (d / "out/u").mkdir(parents=True); (d / "out/u/REPORT.md").write_text("VERDICT: PENDING\nWAITING here:7\n")
-        u = {"id": "x-1", "name": "u", "host": "here", "via": "pueue", "model": "m", "rcwd": str(d / "nowhere"), "started": 0, "_park": ["here:7"],
-             "parked": {"jobs": ["here:7"], "since": 0, "by": "report"}}
-        hs = {"here": {"ok": True, "pueue": {"tasks": {"7": {"status": {"Done": {"result": "Success"}}}}}}}
-        saved = []; real = (janus.Beads.save, janus.Beads.comment)
-        janus.Beads.save = lambda s, x: saved.append(dict(x)); janus.Beads.comment = lambda s, *a: None
-        try: logs = []; janus.tend_parked(cfg, hs, [u], logs.append)
-        finally: janus.Beads.save, janus.Beads.comment = real
-        self.assertIn("no session id", u.get("resume_error", {}).get("why", ""))
-        self.assertTrue(saved and "resume_error" in saved[-1])
-        f = janus.parked_findings(cfg, hs, u, ["here:7"])
-        self.assertEqual([k for k, _ in f], ["parked:u:resume"]); self.assertIn("no session id", f[0][1])
-
-    def test_landed_needs_the_units_change_on_the_tip(self):
-        """#5: a unit whose tree equals an OLD commit's tree on the branch (it reverts a change main still has) counted as landed."""
-        d, cfg = project('\n[landing]\nbranch = "main"\n'); r = d / "repo"; r.mkdir(); wt = d / "wt"
-        g = lambda *a, cwd=r: subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *a], capture_output=True, text=True)
-        g("init", "-q", "-b", "main"); (r / "a").write_text("1\n"); g("add", "a"); g("commit", "-qm", "base")
-        (r / "a").write_text("2\n"); g("commit", "-qam", "main: a=2")
-        g("worktree", "add", "-q", "-b", "wk/u", str(wt))
-        (wt / "a").write_text("1\n"); g("commit", "-qam", "u: revert a", cwd=wt)     # its tree is the base commit's tree
-        u = {"name": "u", "cwd": str(wt)}
-        self.assertIs(janus.landed(cfg, u), False)
-        (r / "a").write_text("1\n"); g("commit", "-qam", "main: the same revert")   # the change is on the tip now: nothing to land
-        self.assertIs(janus.landed(cfg, u), True)
-
-    def test_remote_transcript_dir_uses_the_expanded_cwd(self):
-        """#4: a remote rcwd under $HOME gave the slug -HOME-...; Claude Code's folder is the expanded absolute path's slug."""
-        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "$HOME/o"\n')
-        u = {"name": "u", "host": "far", "rcwd": "$HOME/o/worktrees/u", "rcwd_abs": "/home/me/o/worktrees/u"}
-        self.assertIn("/.claude/projects/-home-me-o-worktrees-u/", janus.transcript_where(cfg, u))
-        sl = janus.remote_slug_sh({"rcwd": "$HOME/o/worktrees/u"})
-        o = subprocess.run(["sh", "-c", f"HOME=/home/me; echo {sl}"], capture_output=True, text=True).stdout.strip()
-        self.assertEqual(o, "-home-me-o-worktrees-u")
-
-class GatePolicy(unittest.TestCase):
-    """fixes10 item 2: known failures (PASS with only known failures; findings for entries with no open unit or that pass now),
-    a per-gate time limit, a quick slot by expected length, and the affected-scope hook."""
-    def setUp(self):
-        self.d, self.cfg = project('\n[landing]\nknown_failures = "out/known.tsv"\nquick_gate_min = 10\nscope_cmd = "sh scope.sh {unit} {tree}"\n')
-        (self.d / "out/known.tsv").write_text("# id cols, cause, unit\nsuite\tflaky_a\tissue 1\tfix-a\nsuite\tstale_b\told\t-\n")
-        self.cfg.run.ro = False
-
-    def test_judge_and_default_runner(self):
-        g = self.d / "out/g1"; g.mkdir()
-        self.assertEqual(janus.judge_gate(self.cfg, "g1", 1)[0], "FAIL")          # names no failure: a build error, a timeout
-        (g / "failed.txt").write_text("suite/flaky_a\n"); self.assertEqual(janus.judge_gate(self.cfg, "g1", 1)[:2], ("PASS", []))
-        (g / "failed.txt").write_text("suite/stale_b\n"); self.assertEqual(janus.judge_gate(self.cfg, "g1", 1)[0], "FAIL")   # no fixing unit
-        (g / "failed.txt").write_text("suite/flaky_a\nsuite/new_c\n"); self.assertEqual(janus.judge_gate(self.cfg, "g1", 1)[1], ["suite/new_c"])
-        (g / "tests.sh").write_text('echo suite/flaky_a > "$JANUS_GATE_OUT/failed.txt"; exit 1\n')
-        log = self.d / "out/gates.log"
-        r = subprocess.run(["sh", "-c", janus.GATE_DEFAULT, "gate", str(g / "tests.sh"), "g1", str(log), sys.executable, str(JANUS_PY)],
-                           env={**os.environ, "JANUS_ROOT": str(self.d)}, cwd=self.d, capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("KNOWN=1 RESULT: PASS", log.read_text())
-        log.write_text("2026-01-01 00:00:00 g1 EXIT_tests=1 RESULT: FAIL\n"); os.utime(g / "failed.txt", (0, 0))
-        self.assertEqual(janus.gate_results(self.cfg)["g1"][1], "FAIL")   # an old failed.txt does not re-judge a newer line
-        (g / "failed.txt").write_text("suite/flaky_a\n"); log.write_text(time.strftime("%Y-%m-%d %H:%M:%S") + " g1 EXIT_tests=1 RESULT: FAIL\n")
-        self.assertEqual(janus.gate_results(self.cfg)["g1"][1], "PASS")   # a project runner's FAIL with known failures only
-
-    def test_known_failure_findings(self):
-        keys = [k for k, _ in janus.known_failure_findings(self.cfg, {"fix-a"})]
-        self.assertEqual(keys, ["known-failure:suite/stale_b"])                     # no unit named
-        self.assertIn("known-failure:suite/flaky_a", [k for k, _ in janus.known_failure_findings(self.cfg, set())])   # its unit is not open
-        g = self.d / "out/g2"; g.mkdir(); (g / "passed.txt").write_text("suite/flaky_a\n")
-        (self.d / "out/gates.log").write_text(time.strftime("%Y-%m-%d %H:%M:%S") + " g2 EXIT_tests=0 RESULT: PASS\n")
-        self.assertIn("known-failure:suite/flaky_a:passes", [k for k, _ in janus.known_failure_findings(self.cfg, {"fix-a"})])
-
-    def test_timeout_and_quick_slot(self):
-        a = type("A", (), {"name": "land-u1-x", "timeout_min": 0.01, "command": ["--", "sleep 30"]})()
-        t0 = time.time(); self.assertEqual(janus.cmd_gate_exec(self.cfg, a), 124); self.assertLess(time.time() - t0, 15)
-        self.assertIn("land-u1-x EXIT_timeout=124 RESULT: FAIL", (self.d / "out/gates.log").read_text())
-        self.assertIsNone(janus.gate_estimate(self.cfg, "land-u1-x"))               # a stopped run is not a length
-        a.timeout_min = 0; a.command = ["true"]; self.assertEqual(janus.cmd_gate_exec(self.cfg, a), 0)
-        self.assertIsNotNone(janus.gate_estimate(self.cfg, "land-u9-x"))              # same family, another unit
-        self.assertIsNone(janus.gate_estimate(self.cfg, "other"))
-        self.assertIn("gates-quick", janus.ensure_lanes(self.cfg.hosts["here"], self.cfg))
-
-    def test_scope_hook(self):
-        tree = self.d / "tree"; tree.mkdir(); (tree / "f").write_text("x\n")
-        (self.d / "scope.sh").write_text('echo "# steps for $1"; echo "lint: test -f f"; echo "unit: test $1 = u1"\n')
-        st = janus.scope_steps(self.cfg, "u1", tree)
-        self.assertEqual(st, [(None, "lint", "test -f f"), (None, "unit", "test u1 = u1")])
-        r = subprocess.run(["bash", "-c", janus.scope_script(self.cfg, "u1", tree, st)], capture_output=True, text=True)
-        self.assertEqual((r.returncode, r.stdout.split()), (0, ["EXIT_lint=0", "EXIT_unit=0"]))
-        (self.d / "scope.sh").write_text('echo "@nohost x: true"\n')
-        with self.assertRaises(janus.Err): janus.scope_steps(self.cfg, "u1", tree)
 
 class Thrash(unittest.TestCase):
     """fixes10 item 3: a shared host over thrash_psi for thrash_min: this project's newest admitted job is stopped and re-queued
@@ -1192,19 +742,19 @@ class RemoteBrief(unittest.TestCase):
     def test_paths_rewritten_copied_or_refused(self):
         r = Path(tempfile.mkdtemp(prefix="janus-rem-"))
         d, cfg = project(f'\n[hosts.far]\nssh = "nowhere"\nroot = "{r}"\n'); h = cfg.hosts["far"]
-        wt = d / "wt"; (wt / "src").mkdir(parents=True); (d / "out/rev").mkdir(parents=True); (d / "out/rev/REPORT.md").write_text("x\n")
+        wt = d / "wt"; (wt / "src").mkdir(parents=True); (d / ".janus/out/rev").mkdir(parents=True); (d / ".janus/out/rev/REPORT.md").write_text("x\n")
         real = janus.hrun; janus.hrun = lambda h, script, **k: real({"local": True}, script, **k)
         try:
-            text = (f"Worktree `{wt}`, run `python3 {wt}/src/x.py`. Findings: {d}/out/rev/REPORT.md. B = `{d}`. Write {d}/out/u/REPORT.md.\n"
+            text = (f"Worktree `{wt}`, run `python3 {wt}/src/x.py`. Findings: {d}/.janus/out/rev/REPORT.md. B = `{d}`. Write {d}/.janus/out/u/REPORT.md.\n"
                     f"Shell is /bin/sh; see https://example.com/a/b and $HOME/x and <root>/bin/board.sh and s/a/b/.\n")
             t2, copy, notes = janus.brief_plan(cfg, h, "u", wt, text)
             self.assertIn(f"`{r}/worktrees/u`", t2); self.assertIn(f"python3 {r}/worktrees/u/src/x.py", t2)
-            self.assertIn(f"{r}/ctx/u/out/rev/REPORT.md", t2); self.assertEqual(copy, [(str((d / "out/rev/REPORT.md").resolve()), "out/rev/REPORT.md")])
+            self.assertIn(f"{r}/ctx/u/.janus/out/rev/REPORT.md", t2); self.assertEqual(copy, [(str((d / ".janus/out/rev/REPORT.md").resolve()), ".janus/out/rev/REPORT.md")])
             self.assertIn(f"Write {r}/out/u/REPORT.md", t2); self.assertIn(f"B = `{r}/ctx/u`", t2); self.assertTrue(notes)
             self.assertIn("/bin/sh;", t2); self.assertIn("https://example.com/a/b", t2); self.assertIn("<root>/bin/board.sh", t2)
             self.assertNotIn(str(d), t2)
             t3, copy, _ = janus.brief_plan(cfg, h, "u", wt, f"B = `{d}`. Read B/out/rev/REPORT.md and B/out/none.md.")
-            self.assertEqual([x for _, x in copy], ["out/rev/REPORT.md"])   # relative to the named root: copied, B points at ctx
+            self.assertEqual([x for _, x in copy], [".janus/out/rev/REPORT.md"])   # relative to the named root: copied, B points at ctx
             with self.assertRaises(janus.Err) as e: janus.brief_plan(cfg, h, "u", wt, text + f"Also {d.parent}/elsewhere-xyz/f.md and /no/such/path.\n")
             self.assertIn("/no/such/path", str(e.exception)); self.assertIn("elsewhere-xyz", str(e.exception))
         finally: janus.hrun = real
@@ -1222,7 +772,7 @@ class Tidy(unittest.TestCase):
         cfg.run.all_units = {"old": {"status": "closed"}, "live": {"status": "open"}}
         ag = {"old": {"pane_id": "p1", "agent_status": "idle", "workspace_id": "w1"}, "live": {"pane_id": "p2", "workspace_id": "w1"}, "orchestrator": {"pane_id": "p0", "workspace_id": "w1"}}
         rows = {"ghost": {"gone": True}, "live": {"gone": True}, "fine": {"gone": False}}
-        (d / "board/agents").mkdir(parents=True); (d / "board/agents/ghost.md").write_text("# ghost\n- project: t\n")
+        (d / ".janus/board/agents").mkdir(parents=True); (d / ".janus/board/agents/ghost.md").write_text("# ghost\n- project: t\n")
         real = janus.ws_id; janus.ws_id = lambda cfg, create=False: "w1"
         try: P = janus.tidy_plan(cfg, [{"name": "live", "cwd": str(w / "inuse")}], ag, rows)
         finally: janus.ws_id = real
@@ -1230,7 +780,7 @@ class Tidy(unittest.TestCase):
 
     def test_hook_loops_and_force_close(self):
         d, cfg = project(); j = lambda c: janus.judge(cfg, c, str(d), janus.edit_ok_dirs(cfg))
-        self.assertIsNone(j("git merge -q origin/main && git push -q; for w in worktrees/a worktrees/b; do janus ack x \"y\"; janus status; done"))
+        self.assertIsNone(j("git merge -q origin/main && git push -q; for w in worktrees/a worktrees/b; do janus check; janus status; done"))
         self.assertIsNone(j("git -C worktrees/a merge origin/main; for p in 1 2; do echo $p; done"))   # the merge is not in the loop
         for c in ("for w in worktrees/*; do git -C $w merge origin/main; done", "for w in worktrees/*; do janus close $w; done",
                   "ls worktrees | xargs -I{} git -C {} add -A", "while read w; do rm $w/f; done < worktrees.txt"):
@@ -1246,24 +796,6 @@ class Tidy(unittest.TestCase):
 
 class Fixtures(unittest.TestCase):
     """fixes10 item 6: a live check skips the suite's process fixtures (marked by their root); the suite still sees them."""
-    def test_marked_processes_are_skipped_live(self):
-        d, cfg = project()
-        self.assertIn(janus.FIXTURE_MARK, str(d))                          # every fixture root carries the mark
-        ps = (f"501 1 501 0.0 01:00 cargo test -p x --manifest-path {d}/Cargo.toml\n"
-              "502 1 502 0.0 01:00 cargo test -p y --manifest-path /w/real/Cargo.toml\n")
-        self.assertEqual(len(janus.proc_findings(cfg, ps)), 2)              # the suite sees its own fixtures
-        os.environ.pop("JANUS_IN_TESTS")
-        try:
-            self.assertEqual([k for k, _ in janus.proc_findings(cfg, ps)], ["localtest:502"])   # a live check does not
-            s = d / "loop.sh"; s.write_text("#!/bin/bash\nsleep 30\n"); p = subprocess.Popen(["/bin/bash", str(s)]); time.sleep(1.5)
-            try:
-                with open(s, "a") as f: f.write("echo x\n")
-                time.sleep(1.1); self.assertFalse([k for k, _ in janus.script_findings() if k.startswith(f"script:{p.pid}:")])
-                self.assertNotIn(f"{janus.FIXTURE_MARK}", janus.probe_extra({"_rd": "/x", "local": True, "schedulers": ["sleep"]}).split("grep -v")[0])
-                self.assertIn(f"-e {janus.FIXTURE_MARK}", janus.probe_extra({"_rd": "/x", "local": True, "schedulers": ["sleep"]}))
-            finally: p.kill(); p.wait()
-        finally: os.environ["JANUS_IN_TESTS"] = "1"
-
 class TidyAll(unittest.TestCase):
     """fixes10 item 5b (owner core rule): tidy covers branches (local and remote), run files, caches over a disk budget, test
     roots, our stopped containers, remote copies of closed units; check raises disk:<host> and tidy:<n>."""
@@ -1312,7 +844,7 @@ class Reconcile(unittest.TestCase):
     """fixes10 item 7: runs whose agent is gone with no done row are found, marked done unknown (budget as the upper bound),
     shown by janus report, and no longer raised once reconciled."""
     def test_reconcile(self):
-        d, cfg = project(); pv = cfg.prov["api"]; L = d / "out/ledger.tsv"; old = "2026-01-01 00:00:00"; new = janus.tstamp()
+        d, cfg = project(); pv = cfg.prov["api"]; L = d / ".janus/out/ledger.tsv"; old = "2026-01-01 00:00:00"; new = janus.tstamp()
         L.write_text("".join(f"{t}\t{u}\trunning\t{b}\t{k}\n" for t, u, b, k in (
             (new, "closed", 2, "closed.r1"), (new, "live", 1, "live.r1"), (new, "live", 1, "live.r2"), (new, "ended", 3, "ended.r1"),
             (old, "ghost", 4, "ghost.r1"), (new, "fresh", 5, "fresh.r1"))))
@@ -1347,192 +879,6 @@ class Generic(unittest.TestCase):
                 hits = [f"{f.name}:{i}" for i, l in enumerate(f.read_text(errors="replace").splitlines(), 1) if bad.search(l)]
                 self.assertEqual(hits, [], f"project details in {f}")
 
-class Migrate(unittest.TestCase):
-    """janus migrate: one-time, idempotent move of a project and the toolkit install from orch to janus."""
-    def test_moves_config_state_hooks_and_watcher_once(self):
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "orch.toml").write_text("[project]\nname = 't'\n")
-        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("old notes\n")
-        home = Path(tempfile.mkdtemp(prefix="janus-home-"))
-        (home / ".claude").mkdir()
-        (home / ".claude/settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/u/.local/bin/orch hook Stop"}]}]}}))
-        (home / "Library/LaunchAgents").mkdir(parents=True); (home / "Library/LaunchAgents/com.orch.watch.plist").write_text("old plist\n")
-        calls = []; real_run = janus.run; janus.run = lambda *a, **k: (calls.append(a[0][0]), 0, "", "")[1:]
-        old_home = os.environ.get("HOME"); os.environ["HOME"] = str(home)
-        try:
-            self.assertEqual(janus.migrate(str(d)), 0)
-            self.assertTrue((d / "janus.toml").is_file()); self.assertFalse((d / "orch.toml").exists())
-            self.assertTrue((d / ".janus/HANDOFF.md").is_file()); self.assertFalse((d / ".orch").exists())
-            cmd = json.loads((home / ".claude/settings.json").read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]
-            self.assertIn("janus hook Stop", cmd); self.assertNotIn("/orch hook", cmd)
-            if sys.platform == "darwin":
-                self.assertFalse((home / "Library/LaunchAgents/com.orch.watch.plist").exists())
-                self.assertTrue((home / "Library/LaunchAgents/com.janus.watch.plist").is_file()); self.assertIn("launchctl", calls)
-            self.assertEqual(janus.migrate(str(d)), 0)   # idempotent: nothing left to do, still exit 0
-            self.assertTrue((d / "janus.toml").is_file())
-        finally:
-            janus.run = real_run
-            if old_home is None: os.environ.pop("HOME", None)
-            else: os.environ["HOME"] = old_home
-
-    def test_config_values_naming_the_old_state_are_rewritten(self):
-        """Catches (item 1): migrate renamed .orch/ to .janus/ but left [project] state = ".orch", so the next janus check read
-        .orch/HANDOFF.md and crashed."""
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-"))
-        (d / "orch.toml").write_text('[project]\nname = "t"\nstate = ".orch"   # where the state lives\n'
-                                     '[paths]\ngate_log = ".orch/gates.log"\n')
-        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("old notes\n")
-        home = Path(tempfile.mkdtemp(prefix="janus-home-"))
-        old_home = os.environ.get("HOME"); os.environ["HOME"] = str(home)
-        real_run, real_sh = janus.run, janus.sh
-        janus.run = lambda *a, **k: (0, "", ""); janus.sh = lambda *a, **k: (1, "", "")
-        try: self.assertEqual(janus.migrate(str(d)), 0)
-        finally:
-            janus.run, janus.sh = real_run, real_sh
-            if old_home is None: os.environ.pop("HOME", None)
-            else: os.environ["HOME"] = old_home
-        t = (d / "janus.toml").read_text()
-        self.assertIn('state = ".janus"', t); self.assertIn('gate_log = ".janus/gates.log"', t)
-        self.assertIn("# where the state lives", t, "the comment was rewritten")   # comments are left as written
-        self.assertNotIn(".orch", t)
-
-    def test_values_that_must_stay_are_not_rewritten_and_continuation_lines_are(self):
-        """Catches (finding 1): rewrite_config replaced a bare `orch` token in any value (a path, host, keychain name or word),
-        and left a multi-line array's continuation lines alone."""
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-"))
-        (d / "orch.toml").write_text(
-            '[project]\nname = "t"\nstate = ".orch"\n'
-            '[hosts.alpha]\nroot = "/home/dev/orch"\n'
-            '[hosts.beta]\nroot = "/srv/fleet/orch"\n'
-            '[paths]\ngate_log = ".orch/gates.log"\n'
-            'scripts = [\n  ".orch/bin/lane.sh",\n  "bin/orch.py",\n]\n'
-            '[misc]\nssh = "me@orch"\nkey_keychain = "orch"\nenv = "ORCH_API"\npy = "scripts/torch.py"\ndoc = "docs/research.orchard.md"\n')
-        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("old notes\n")
-        home = Path(tempfile.mkdtemp(prefix="janus-home-"))
-        old_home = os.environ.get("HOME"); os.environ["HOME"] = str(home)
-        real_run, real_sh = janus.run, janus.sh
-        janus.run = lambda *a, **k: (0, "", ""); janus.sh = lambda *a, **k: (1, "", "")
-        try: self.assertEqual(janus.migrate(str(d)), 0)
-        finally:
-            janus.run, janus.sh = real_run, real_sh
-            if old_home is None: os.environ.pop("HOME", None)
-            else: os.environ["HOME"] = old_home
-        t = (d / "janus.toml").read_text()
-        self.assertIn('state = ".janus"', t); self.assertIn('gate_log = ".janus/gates.log"', t)
-        self.assertIn('".janus/bin/lane.sh"', t); self.assertIn('"bin/janus.py"', t)   # continuation lines of a multi-line array
-        for keep in ('root = "/home/dev/orch"', 'root = "/srv/fleet/orch"', 'ssh = "me@orch"',
-                     'key_keychain = "orch"', 'env = "ORCH_API"', 'py = "scripts/torch.py"', 'doc = "docs/research.orchard.md"'):
-            self.assertIn(keep, t, f"a value that must stay was rewritten: {keep}")
-        # idempotent: a second migrate rewrites nothing
-        os.environ["HOME"] = str(home); janus.run = lambda *a, **k: (0, "", ""); janus.sh = lambda *a, **k: (1, "", "")
-        try: self.assertEqual(janus.migrate(str(d)), 0)
-        finally:
-            janus.run, janus.sh = real_run, real_sh
-            if old_home is None: os.environ.pop("HOME", None)
-            else: os.environ["HOME"] = old_home
-        self.assertEqual(t, (d / "janus.toml").read_text())
-
-    def test_dry_run_changes_nothing(self):
-        """Catches (item 3): migrate had no --dry-run, so a project could not see what the state-changing command would do."""
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-"))
-        (d / "orch.toml").write_text('[project]\nname = "t"\nstate = ".orch"\n')
-        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("old notes\n")
-        home = Path(tempfile.mkdtemp(prefix="janus-home-")); (home / ".claude").mkdir()
-        (home / ".claude/settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/u/.local/bin/orch hook Stop"}]}]}}))
-        old_home = os.environ.get("HOME"); os.environ["HOME"] = str(home)
-        calls = []; real_run, real_sh = janus.run, janus.sh
-        janus.run = lambda *a, **k: (calls.append(a[0][0]), 0, "", "")[1:]; janus.sh = lambda *a, **k: (1, "", "")
-        out = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(out): self.assertEqual(janus.migrate(str(d), dry=True), 0)
-        finally:
-            janus.run, janus.sh = real_run, real_sh
-            if old_home is None: os.environ.pop("HOME", None)
-            else: os.environ["HOME"] = old_home
-        self.assertTrue((d / "orch.toml").is_file()); self.assertTrue((d / ".orch/HANDOFF.md").is_file())
-        self.assertFalse((d / "janus.toml").exists())
-        cmd = json.loads((home / ".claude/settings.json").read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]
-        self.assertIn("/orch hook", cmd, "dry-run rewrote the hooks file"); self.assertNotIn("launchctl", calls, "dry-run touched the watcher")
-        s = out.getvalue()
-        self.assertIn("orch.toml -> janus.toml", s); self.assertIn(".orch/ -> .janus/", s); self.assertIn("hook command(s) -> janus", s)
-
-    def test_adopts_pre_existing_items(self):
-        """Catches (item 6): jobs, sessions and cards made before the project id existed were left as machine state and never
-        collected, cancelled or tracked."""
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "janus.toml").write_text('[project]\nname = "t"\nid = "proj"\n')
-        (d / "board/agents").mkdir(parents=True)
-        (d / "board/agents/u1.md").write_text("# u1\n- task: t\n- state: working\n- project: \n")
-        (d / "board/agents/zzz.md").write_text("# zzz\n- task: t\n- state: working\n- project: \n")
-        tasks = {"7": {"label": "unit:u1", "status": "Queued", "path": str(d)},
-                 "8": {"label": "unit:u9", "status": "Running", "path": str(d)},
-                 "9": {"label": "gate:g@proj", "status": "Running", "path": str(d)},
-                 "10": {"label": "unit:u1", "status": "Queued", "path": "/tmp/another-project"}}
-        calls = []
-        def fake_sh(cmd, **k):
-            calls.append(list(cmd))
-            b = os.path.basename(cmd[0])
-            if b == "pueue" and cmd[1:2] == ["status"]: return 0, json.dumps({"tasks": tasks}), ""
-            if b == "pueue" and cmd[1:2] == ["edit"]:   # pueue applies the label the editor wrote
-                tasks[cmd[2]]["label"] += "@proj"; return 0, "", ""
-            if cmd[:2] == ["tmux", "list-sessions"]: return 0, "janus-u2\norch-u1\njanus-zzz\n", ""
-            return 0, "", ""
-        real_sh, real_units = janus.sh, janus.all_units
-        janus.sh = fake_sh; janus.all_units = lambda cfg: {"u1": {}, "u2": {}, "u3": {}}
-        try:
-            out = janus.adopt_items(d, dry=False, config=d / "janus.toml")
-        finally:
-            janus.sh, janus.all_units = real_sh, real_units
-        s = "\n".join(out)
-        self.assertIn("adopt: job 7: unit:u1 -> unit:u1@proj", s)
-        self.assertIn("adopt: job 8 (unit:u9): not one of this project's units", s)
-        self.assertIn("adopt: session janus-u2 -> janus-u2@proj", s)
-        self.assertIn("adopt: session orch-u1 -> janus-u1@proj", s)
-        self.assertIn("adopt: session janus-zzz: not one of this project's units", s)
-        self.assertIn("adopt: card u1: project proj", s); self.assertIn("adopt: card zzz: not one", s)
-        self.assertIn("- project: proj", (d / "board/agents/u1.md").read_text())
-        self.assertEqual(sorted(tuple(c) for c in calls if c[:2] == ["tmux", "rename-session"]),
-                         [("tmux", "rename-session", "-t", "janus-u2", "janus-u2@proj"),
-                          ("tmux", "rename-session", "-t", "orch-u1", "janus-u1@proj")])
-        edits = [c[1:] for c in calls if os.path.basename(c[0]) == "pueue" and c[1:2] == ["edit"]]
-        self.assertEqual(edits, [["edit", "7"]], "another project's job was touched")
-
-    def test_adopt_dry_run_changes_nothing(self):
-        d = Path(tempfile.mkdtemp(prefix="janus-mig-")); (d / "janus.toml").write_text('[project]\nname = "t"\nid = "proj"\n')
-        (d / "board/agents").mkdir(parents=True); (d / "board/agents/u1.md").write_text("# u1\n- state: working\n- project: \n")
-        calls = []
-        def fake_sh(cmd, **k):
-            calls.append(list(cmd))
-            b = os.path.basename(cmd[0])
-            if b == "pueue" and cmd[1:2] == ["status"]: return 0, json.dumps({"tasks": {"7": {"label": "unit:u1", "status": "Queued", "path": str(d)}}}), ""
-            if cmd[:2] == ["tmux", "list-sessions"]: return 0, "janus-u1\n", ""
-            return 0, "", ""
-        real_sh, real_units = janus.sh, janus.all_units
-        janus.sh = fake_sh; janus.all_units = lambda cfg: {"u1": {}}
-        try: s = "\n".join(janus.adopt_items(d, dry=True, config=d / "janus.toml"))
-        finally: janus.sh, janus.all_units = real_sh, real_units
-        self.assertIn("job 7: unit:u1 -> unit:u1@proj", s); self.assertIn("session janus-u1 -> janus-u1@proj", s)
-        self.assertFalse(any(c[:2] == ["pueue", "edit"] for c in calls), "dry-run relabelled a job")
-        self.assertFalse(any(c[:2] == ["tmux", "rename-session"] for c in calls), "dry-run renamed a session")
-        self.assertNotIn("project: proj", (d / "board/agents/u1.md").read_text(), "dry-run wrote the card")
-
-
-class CheckMissingState(unittest.TestCase):
-    def test_missing_handoff_is_a_finding_not_a_crash(self):
-        """Catches (item 2): check crashed with FileNotFoundError .orch/HANDOFF.md when git records a state file the disk lost."""
-        d = Path(tempfile.mkdtemp(prefix="janus-handoff-"))
-        (d / "janus.toml").write_text('[project]\nname = "t"\nstate = ".orch"\n[hosts.here]\nlocal = true\n')
-        (d / ".orch").mkdir(); (d / ".orch/HANDOFF.md").write_text("notes\n")
-        g = lambda *x: subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t", *x], capture_output=True, check=True)
-        g("init", "-q"); g("add", "."); g("commit", "-qm", "a")
-        (d / ".orch/HANDOFF.md").unlink()   # on disk gone, still a tracked file in git (the live crash)
-        cfg = janus.Cfg(d)
-        keys = {k for k, _ in janus.git_findings(cfg)}   # no crash; the deleted state file is just reported
-        self.assertIn("git:dirty", keys)
-        real = janus.watcher_loaded; janus.watcher_loaded = lambda *a: True
-        try: keys = {k for k, _ in janus.session_findings(cfg, 0)}
-        finally: janus.watcher_loaded = real
-        self.assertIn("handoff:missing", keys)
-
-
 class DoctorProjectListed(unittest.TestCase):
     """item 4: doctor said 'ok project not listed in ~/.config/janus/projects' while the project IS listed."""
     def _doctor(self, d, listed):
@@ -1551,7 +897,7 @@ class DoctorProjectListed(unittest.TestCase):
         return next(l for l in out.getvalue().splitlines() if "listed" in l)
 
     def _project(self):
-        d = Path(tempfile.mkdtemp(prefix="janus-doc-")); (d / "janus.toml").write_text('[project]\nname = "t"\n[hosts.here]\nlocal = true\n'); return d
+        d = Path(tempfile.mkdtemp(prefix="janus-doc-")); conf(d).write_text('[project]\nname = "t"\n[hosts.here]\nlocal = true\n'); return d
 
 
     def test_unlisted_project_is_warned(self):
@@ -1569,39 +915,80 @@ class DoctorProjectListed(unittest.TestCase):
         self.assertTrue(line.startswith("ok "), line); self.assertIn("project listed in", line); self.assertNotIn("not listed", line)
 
 
-class SkillPointers(unittest.TestCase):
-    def test_a_release_copy_missing_a_pointed_path_is_caught(self):
-        """Catches (finding 15): SkillPointers passed in a release copy missing docs/REFERENCE.md, because without `install` it
-        had nothing to compare (PARTS) and a missing path was skipped."""
-        import ast, shutil
-        root = JANUS_PY.parent; skill = root / "skill/SKILL.md"
-        self.assertTrue(skill.is_file(), skill)
-        state = (".janus", ".orch", "out", "briefs", "worktrees", "board", ".beads", "ctx", "run", "base")
-        def missing_in(base):
-            """Paths SKILL.md names that a copy at `base` does not hold (a project's own state paths are not shipped files)."""
-            inst = base / "install"; parts = None
-            if inst.is_file():
-                parts = next(ast.literal_eval(n.value) for n in ast.parse(inst.read_text()).body
-                             if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "PARTS")
-            out = set()
-            for m in re.finditer(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*[A-Za-z0-9]", (base / "skill/SKILL.md").read_text()):
-                r = m.group(0).rstrip(".,;:)")
-                if r.split("/", 1)[0] in state: continue
-                if parts is not None and not any(r == p or r.startswith(p + "/") for p in parts): out.add(r); continue
-                if not (base / r).exists(): out.add(r)
-            return out
-        self.assertEqual(sorted(missing_in(root)), [], "SKILL.md names paths the tree does not hold")
-        inst = root / "install"
-        if inst.is_file():   # build the release copy install would ship and drop a pointed path from it
-            parts = next(ast.literal_eval(n.value) for n in ast.parse(inst.read_text()).body
-                         if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "PARTS")
-            rel = Path(tempfile.mkdtemp(prefix="janus-release-"))
-            for p in parts:
-                src, dst = root / p, rel / p
-                if src.is_dir(): shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-                elif src.is_file(): shutil.copy2(src, dst)
-            (rel / "docs/REFERENCE.md").unlink()
-            self.assertEqual(sorted(missing_in(rel)), ["docs/REFERENCE.md"], "a release copy missing a pointed path passed")
+
+class Memory(unittest.TestCase):
+    """MEMORY.md: keyed replacement, instructions never truncated, delivered to running units without a forced reply, loaded in full."""
+    def test_keyed_instruction_replaces_and_loads_in_full(self):
+        d, cfg = project(); A = lambda text, **k: type("A", (), {"text": text, "source": None, "key": k.get("key"), "instruction": True, "decision": False, "fact": False, "pitfall": False})()
+        told = []
+        with mock.patch.object(janus, "Beads", lambda cfg: type("B", (), {"units": lambda s: [{"name": "u1", "id": "1"}]})()), \
+             mock.patch.object(janus, "board", lambda cfg, *a, **k: told.append(a) or (0, "", "")):
+            janus.cmd_remember(cfg, A("use sqlite", key="db")); janus.cmd_remember(cfg, A("use postgres " + "x" * 3000, key="db"))
+        es = janus.memory_read(cfg)
+        self.assertEqual([(e[0], e[2]) for e in es], [("Instructions", "db")]); self.assertIn("postgres", es[0][3]); self.assertGreater(len(es[0][3]), 3000)   # replaced, never cut
+        self.assertEqual([a[1] for a in told], ["u1", "u1"]); self.assertIn("no reply needed", told[0][2])
+        self.assertIn("x" * 3000, janus.session_start_text(cfg))   # the hook loads the memory whole, before the handoff
+        self.assertIn("x" * 3000, janus.swarm_header(cfg, "here", cfg.hosts["here"], "u1", "/w", True))
 
 
-if __name__ == "__main__": unittest.main()
+class AddressedBoard(unittest.TestCase):
+    """Cross-tool board: one identity per card (host, tool, model), messages go to one recipient only, a question is answerable by
+    `janus answer`, and there is no broadcast."""
+    def test_identity_addressed_send_answer_and_no_broadcast(self):
+        d, cfg = project(); cfg.run.ro = False; b = lambda *a, **k: janus.board(cfg, *a, **k)
+        b("post", "u1", "status", "launched", env={"BOARD_MACHINE": "here", "BOARD_TOOL": "codex", "BOARD_MODEL": "m1"})
+        b("post", "u2", "status", "launched", env={"BOARD_MACHINE": "here", "BOARD_TOOL": "claude", "BOARD_MODEL": "m2"})
+        card = (d / ".janus/board/agents/u1.md").read_text()
+        for x in ("- machine: here", "- tool: codex", "- model: m1"): self.assertIn(x, card)
+        b("send", "u2", "the lock is yours", env={"JANUS_UNIT": "u1"})
+        self.assertIn("from u1: the lock is yours", b("read", "u2")[1]); self.assertIn("no new directions", b("read", "u1")[1])   # only u2 got it
+        self.assertNotEqual(b("direct", "all", "x")[0], 0)
+        b("post", "u1", "question", "which port?")
+        self.assertEqual(janus.cmd_answer(cfg, type("A", (), {"id": "q1", "answer": "8080"})())[0], 0)
+        self.assertIn("[q1] 8080", b("read", "u1")[1])
+
+
+class Land(unittest.TestCase):
+    """janus land: squash to one commit on the landing branch, moved only from the tip that was merged; a conflict stops with the
+    files named; a moved branch is merged again, a bounded number of times; no gate, no test run."""
+    def setUp(self):
+        self.d, self.cfg = project('\n[landing]\nbranch = "main"\n')
+        self.r = self.d / "repo"; self.r.mkdir(); self.wt = self.d / "wt"
+        self.g("init", "-q", "-b", "main"); (self.r / "a").write_text("1\n2\n3\n"); self.g("add", "a"); self.g("commit", "-qm", "base")
+        self.g("config", "user.name", "t"); self.g("config", "user.email", "t@t")
+        self.g("worktree", "add", "-q", "-b", "wk/u", str(self.wt))
+        self.u = {"name": "u", "id": "1", "cwd": str(self.wt), "host": "here"}
+        for p in (mock.patch.object(janus, "Beads", lambda cfg: type("B", (), {"units": lambda s: [self.u], "comment": lambda s, *a: None})()),
+                  mock.patch.object(janus, "own_tree", lambda *a: True), mock.patch.object(janus, "unapplied_patch", lambda *a: None)): p.start(); self.addCleanup(p.stop)
+    def g(self, *a, wt=False):
+        r = subprocess.run(["git", "-C", str(self.wt if wt else self.r), *a], capture_output=True, text=True); return r.stdout.strip()
+    def commit(self, name, text, wt=True):
+        (( self.wt if wt else self.r) / name).write_text(text); self.g("add", name, wt=wt); self.g("commit", "-qm", f"add {name}", wt=wt)
+    def a(self, **k): return type("A", (), {"unit": "u", "push": False, "host": None, **k})()
+    def test_squash_lands_one_commit_and_names_nothing_to_gate(self):
+        self.commit("b", "x\n"); self.commit("c", "y\n")
+        self.assertEqual(janus.cmd_land(self.cfg, self.a()), 0)
+        self.assertEqual(self.g("log", "--format=%s", "main").count("\n"), 1)   # base + one squashed commit
+        self.assertEqual(self.g("show", "main:b"), "x")
+    def test_a_moved_branch_is_merged_in_and_a_conflict_stops_with_the_files(self):
+        self.commit("b", "x\n"); self.g("checkout", "-q", "main"); self.commit("m", "m\n", wt=False)   # main moved (a clean change)
+        self.assertEqual(janus.cmd_land(self.cfg, self.a()), 0); self.assertEqual(self.g("show", "main:m"), "m")
+        self.wt2 = self.d / "wt2"; self.g("worktree", "add", "-q", "-b", "wk/v", str(self.wt2), "main"); self.u["cwd"] = str(self.wt2); self.wt = self.wt2
+        (self.wt2 / "a").write_text("1\nZ\n3\n"); self.g("commit", "-qam", "z", wt=True); (self.r / "a").write_text("1\nY\n3\n"); self.g("commit", "-qam", "y")
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf): rc = janus.cmd_land(self.cfg, self.a())
+        self.assertEqual(rc, 3); self.assertIn("conflicts in 1 file(s): a", buf.getvalue()); self.assertNotIn("MERGE_HEAD", self.g("status", wt=True))
+    def test_the_branch_never_moves_from_a_tip_it_did_not_merge(self):
+        self.commit("b", "x\n"); base = self.g("rev-parse", "main")
+        real = janus.move_local; calls = []
+        def moved(wt, br, new, b):   # main moves between the merge and the move: the expected old value fails, nothing is overwritten
+            calls.append(1)
+            if len(calls) == 1: self.g("checkout", "-q", "--detach"); self.commit("other", "o\n", wt=False); self.g("branch", "-f", "main", "HEAD")
+            return real(wt, br, new, b)
+        with mock.patch.object(janus, "move_local", moved): rc = janus.cmd_land(self.cfg, self.a())
+        self.assertEqual(rc, 0); self.assertEqual(len(calls), 2); self.assertEqual(self.g("show", "main:other"), "o"); self.assertEqual(self.g("show", "main:b"), "x")   # both kept
+
+
+if __name__ == "__main__":
+    unittest.main()

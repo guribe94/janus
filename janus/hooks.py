@@ -1,4 +1,4 @@
-"""The Claude Code / Codex hooks (one format): SessionStart, UserPromptSubmit, PreToolUse and Stop.
+"""The Claude Code / Codex hooks (one format): SessionStart, PreToolUse and Stop.
 
 The PreToolUse shell rules parse the command (heredocs are data, substitutions are judged, wrappers are stripped); extend the
 parser, never replace it (section 9)."""
@@ -6,9 +6,8 @@ import json, os, re, shlex, sys
 from pathlib import Path
 from janus.beads import Beads
 from janus.reset import stop_reset
-from janus.context import (CLAIM_WINDOW, Cfg, Err, atomic_write, JANUS_MARK, find_root, handoff_path, handoff_stale, note_event, now, pending_age, record_session_proc,
-    session_alive, session_root, sh, ts)
-from janus.decisions import session_text as decisions_text
+from janus.context import (CLAIM_WINDOW, Cfg, atomic_write, find_root, handoff_path, pending_age, record_session_proc,
+    session_alive, session_root, ts)
 from janus.memory import memory_text
 from janus.units import main_checkout, own_tree
 
@@ -234,7 +233,7 @@ def force_close_ok(cfg, args):
         return bool(u and u.get("cwd") and own_tree(cfg, u, units) and not main_checkout(Path(u["cwd"])))
     except Exception: return False
 
-JANUS_READ = {"ack", "check", "status", "queue", "peers", "transcript", "memory", "report", "capacity", "busy", "doctor", "learned", "thrash"}
+JANUS_READ = {"check", "status", "queue", "transcript", "memory", "report", "capacity", "busy", "doctor", "hosts", "thrash"}
 
 # Why a refusal names the command that does the job instead (F13): a model shown the wrong alternative retries variants.
 DENY_ALT = (
@@ -302,11 +301,10 @@ def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
     return None
 
 def edit_ok_dirs(cfg):
-    """Paths the orchestrator may write: its state dir, briefs, janus.toml, its own plan files (~/.claude/plans: plan mode writes
-    there), and the project's status checklist and old state docs (paths.checklist, paths.state_docs) (audit M7)."""
-    ok = [cfg.state, cfg.p("briefs", "briefs"), cfg.root / "janus.toml", Path.home() / ".claude/plans"]   # its own plan files (plan mode)
+    """Paths the orchestrator may write: .janus (config, memory, handoff, briefs), its own plan files (~/.claude/plans: plan mode
+    writes there) and the project's status checklist (paths.checklist)."""
+    ok = [cfg.state, cfg.p("briefs", "briefs"), Path.home() / ".claude/plans"]
     if cfg.paths.get("checklist"): ok.append(cfg.p("checklist"))
-    ok += [cfg.root / x for x in cfg.paths.get("state_docs", [])]
     return [p.resolve() for p in ok]
 
 def patch_paths(ti):
@@ -364,42 +362,24 @@ def agent_hook(ev, d):
     if verdict and re.search(r"exit(\s+code)?s?\b", t, re.I): return
     # parked (PARK_RULE): the last 'WAITING <job ids>' line is newer than any verdict line
     if waiting and (not verdict or waiting[-1] > verdict[-1]): return
-    # The runtime re-fires Stop while the hook blocks it (stop_hook_active); after it repeats twice, stop blocking so a misjudged
-    # report can never loop forever. The count lives beside the report (one file per unit, collect brings it along harmlessly).
-    f = Path(rp + ".stop")
-    try: c = (int(f.read_text().strip() or 0) + 1) if d.get("stop_hook_active") else 0
-    except (OSError, ValueError): c = 0
-    try: f.write_text(str(c))
-    except OSError: pass
-    if c < 2:
-        block(f"[janus] Not finished. Before you stop, {rp} must either (a) end with 'VERDICT: DONE', 'VERDICT: BLOCKED' or "
-              f"'VERDICT: FAILED' plus the real exit codes of what you ran, or (b) hold a line 'WAITING <job ids>' for jobs you "
-              f"submitted detached. Write the true one; never write DONE to get past this check.")
-
-def capped(text, n, note):
-    """A part of the SessionStart context, cut to n chars with the note that says how to see the rest (F2: each part is capped
-    on its own, so a long handoff or bd prime can never push the instruction or a later part out)."""
-    return text if len(text) <= n else text[:n] + f"\n({note})"
+    # One reminder at most: the runtime re-fires Stop with stop_hook_active once the hook has blocked, and then it passes. A stop
+    # is never trapped (an agent that waits for a clarification must be able to end its turn).
+    if d.get("stop_hook_active"): return
+    block(f"[janus] Not finished. Before you stop, {rp} must either (a) end with 'VERDICT: DONE', 'VERDICT: BLOCKED' or "
+          f"'VERDICT: FAILED' plus the real exit codes of what you ran, or (b) hold a line 'WAITING <job ids>' for jobs you "
+          f"submitted detached. Write the true one; never write DONE to get past this check. If you wait for an answer, post it "
+          f"with board.sh post <you> question <text> and end your turn again.")
 
 def session_start_text(cfg):
-    """What a session gets at start and on `janus resume --here` (item 4): the instruction first, then the live state, the
-    session memory, the decisions index and the owner rules (bd prime), each labelled and capped on its own (F2). The same text
-    either way, so a resumed session loses nothing (imp-resume reuses this from janus/setup.py)."""
-    # The instruction comes first, the one place the model weights most, and every part is labelled and capped on its own
-    # (F2): a long handoff or bd prime can no longer push the instruction past the cut.
-    head = (f"[janus] You are the orchestrator of {cfg.name} (janus skill). A message from the owner is answered first, before "
-            f"any housekeeping. Otherwise your first act: run janus check, act on every line, "
-            f"janus ack <key> \"what you did\", then update the Orchestrator notes. Below: (1) HANDOFF.md: Live state as of "
-            f"the last check, then your notes; (2) session MEMORY.md; (3) decision titles; (4) owner rules (bd prime).")
-    parts = [head]
-    hp = handoff_path(cfg)
-    if hp.exists(): parts += ["## 1 HANDOFF.md", capped(hp.read_text(), 16000, "cut: read .janus/HANDOFF.md")]
+    """What a session gets at start, after a reset and on `janus resume --here`: the project memory in full (it holds the binding
+    instructions: never cut), then the curated handoff. The same text every time, so a resumed session loses nothing."""
+    parts = [f"[janus] You are the orchestrator of {cfg.name} (janus skill). A message from the user is answered first. "
+             f"Below: (1) MEMORY.md, the binding instructions and durable decisions; (2) HANDOFF.md, your curated objective, decisions, "
+             f"blockers and next actions. Then run janus status."]
     mt = memory_text(cfg)
-    if mt: parts += ["## 2 MEMORY.md", capped(mt, 8000, "cut: janus memory")]
-    dt = decisions_text(cfg)
-    if dt: parts += ["## 3 Decisions", capped(dt, 6000, "cut: janus decisions")]
-    rc, o, e = sh(["bd", "prime"], cwd=cfg.beads, timeout=20)
-    parts += ["## 4 Owner rules (bd prime)", capped(o if rc == 0 else f"(bd prime unavailable: {e.strip()[:80]})", 6000, "cut: run bd prime")]
+    if mt: parts += ["## 1 MEMORY.md", mt]
+    hp = handoff_path(cfg)
+    if hp.exists() and hp.read_text().strip(): parts += ["## 2 HANDOFF.md", hp.read_text()]
     return "\n\n".join(parts)
 
 def cmd_hook(ev):
@@ -408,11 +388,9 @@ def cmd_hook(ev):
     if os.environ.get("JANUS_ROLE") == "agent": return agent_hook(ev, d)
     sid = d.get("session_id")
     if not sid: return
-    # The project is the one whose registered session this is, wherever the session's shell is (H3). Only a pending
-    # registration (janus register without a session id, or the watcher's new orchestrator) is claimed from the cwd, within
-    # CLAIM_WINDOW (10 min). The watcher records the pane it started the new orchestrator in (pending:<ts>:<pane>, panel-eng F5): only a hook
-    # in that pane claims it. No pane recorded (janus register): the old behaviour. No variable (JANUS_ROLE) takes a
-    # registration over (H4).
+    # The project is the one whose registered session this is, wherever the session's shell is. Only a pending registration
+    # (janus register without a session id, or the watcher's new orchestrator) is claimed from the cwd, within CLAIM_WINDOW
+    # (10 min), and only by a hook in the pane the watcher recorded for it.
     root = session_root(sid)
     if not root:
         root = find_root(d.get("cwd"))
@@ -426,44 +404,18 @@ def cmd_hook(ev):
     else: cfg = Cfg(root)
     if session_alive(cfg) is not True: record_session_proc(cfg)
     if d.get("transcript_path"): atomic_write(cfg.f("transcript"), d["transcript_path"])
-    if ev == "SessionStart":   # cached state only: the hook has a 60 s limit, and the check runs as the session's first act (M14)
+    if ev == "SessionStart":   # cached state only: the hook has a 60 s limit
         ctx(ev, session_start_text(cfg))
-    elif ev == "UserPromptSubmit":
-        pr = (d.get("prompt") or "").strip()
-        janus_own = pr.startswith(JANUS_MARK) or pr.startswith("/")   # every prompt janus sends carries the mark (F15: no WAKE prefix list to keep in sync)
-        if pr and not janus_own and "<task-notification>" not in pr and "[SYSTEM NOTIFICATION" not in pr:
-            try:
-                i = Beads(cfg).create("instr: " + re.sub(r"\s+", " ", pr)[:70], "instruction", pr[:4000]); note_event(cfg, "instruction")
-                # ISSUES row 133 [report-first]: the deliverable is the owner's answer, given first; the bead is bookkeeping.
-                # The old text ("Filed as instruction <id>. Do it, then: close it") made closing the bead the task, and the
-                # loop ran check/ack/notes before the owner got a word.
-                ctx(ev, f"[janus] The owner wrote this. Answer the owner FIRST, in this turn, before janus check, acks or notes: "
-                    f"a question gets its answer, an order gets what you do about it and by when. That answer is the "
-                    f"deliverable. Housekeeping after it: the message is filed as instruction {i}; close it once it is done "
-                    f"(bd close {i}); or, if it is a standing rule, bd remember \"<rule>\" --key <subject> (reuse an existing "
-                    f"key to replace it: bd memories <word>); if agents must follow it, janus remember it instead; if it "
-                    f"settles a choice, janus decide ... --instruction {i}; work that takes longer: janus intent add "
-                    f"--instruction {i}.")
-            except Err: pass
     elif ev == "PreToolUse":
         why = pretool_why(cfg, d)
         if why: deny_log(cfg, d, why)
         if why: out({"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny",
                      "permissionDecisionReason": f"[janus] Refused: {why}. The orchestrator does not operate by hand. Instead: "
-                         f"{deny_alt(why)}. If this refusal is wrong, write it in the notes (denied.log has it) and carry on "
+                         f"{deny_alt(why)}. If this refusal is wrong, say so in the handoff (denied.log has it) and carry on "
                          f"another way; do not retry variants of the command."}})
     elif ev == "Stop":
-        n = cfg.jget("stops.json"); c = n.get(sid, 0) + 1 if d.get("stop_hook_active") else 0; n[sid] = c; cfg.jput("stops.json", n)
-        if c >= 3: return
-        op = cfg.jget("open.json"); late = [k for k, t in op.items() if now() - t > cfg.deadline]
-        stale = handoff_stale(cfg)   # stale only after a real event (launch, close, landing, instruction, decision)
-        # a Stop that passes is the safe boundary for the context reset (janus/reset.py); a blocked one logs why it waits
-        stop_reset(cfg, ", ".join(([f"late findings {', '.join(late[:3])}"] if late else []) + (["notes stale"] if stale else [])) or None)
-        if late or stale:
-            pieces = []
-            if late: pieces.append(f"{len(late)} finding(s) past deadline ({', '.join(late[:6])}): act on each, then janus ack <key> \"what you did\"")
-            if stale: pieces.append(" ".join(stale).rstrip("."))
-            block("[janus] Not yet: " + ". ".join(pieces) + ".")
+        r = stop_reset(cfg, d)   # at most one reminder to update the handoff, only over the context threshold; never blocks otherwise
+        if r: block(r)
 
 def hook_kind(d):
     tp = d.get("transcript_path") or ""

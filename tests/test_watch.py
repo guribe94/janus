@@ -18,7 +18,7 @@ class SecondOrchestrator(unittest.TestCase):
         stubs = {"run_check": lambda cfg, cycle=False, writer=True, pre=None: ([janus.finding("unit:x:finished", "t")], None, {}, []),
                  "herdr": herdr, "new_tab": lambda cfg, n, root: (started.append(n), ("P3", None))[1], "wait_shell": lambda *a: None,
                  "sh": lambda *a, **k: (0, "", "")}
-        stubs.update({n: (lambda *a, **k: []) for n in ("heartbeat_beat", "board_alerts", "tend_parked", "tend_autopilot", "tend_thrash", "tend_tidy", "orphan_jobs")})
+        stubs.update({n: (lambda *a, **k: []) for n in ("heartbeat_beat", "board_alerts", "tend_parked", "tend_thrash", "tend_tidy", "orphan_jobs")})
         with mock.patch.multiple(sys.modules["janus.watch"], **stubs):
             for _ in range(janus.ORCH_WAIT): janus.watch_pass(cfg, lambda m: None)
         self.assertEqual(started, [], "a second orchestrator was started next to the pane it started before")
@@ -41,7 +41,7 @@ class Restart(unittest.TestCase):
             return {"agent": None} if a[:2] == ("agent", "get") else {}
         stubs = {"run_check": lambda cfg, cycle=False, writer=True, pre=None: ([janus.finding("unit:x:finished", "t")], None, {}, []), "herdr": herdr,
                  "new_tab": lambda cfg, n, root: (self.started.append(n), ("P3", None))[1], "wait_shell": lambda *a: None, "sh": lambda *a, **k: (0, "", "")}
-        stubs.update({k: (lambda *a, **kw: []) for k in ("heartbeat_beat", "board_alerts", "tend_parked", "tend_autopilot", "tend_thrash", "tend_tidy", "orphan_jobs")})
+        stubs.update({k: (lambda *a, **kw: []) for k in ("heartbeat_beat", "board_alerts", "tend_parked", "tend_thrash", "tend_tidy", "orphan_jobs")})
         with mock.patch.multiple(sys.modules["janus.watch"], **stubs):
             for _ in range(n): janus.watch_pass(self.cfg, lambda m: None); os.utime(self.cfg.f("last_wake"), (time.time() - 7200,) * 2)
 

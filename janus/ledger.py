@@ -247,6 +247,10 @@ def model_ok(cfg, m):
     if not c: return False, "unknown model"
     pv = cfg.prov.get(c["provider"], {})
     if not pv.get("enabled"): return False, f"provider {c['provider']} disabled"
+    r = cfg.route; tool = c.get("tool") or (c["kind"] if c.get("kind") in ("claude", "codex", "opencode") else {"anthropic": "claude", "openai": "codex"}.get(c.get("vendor"), c.get("kind")))
+    auth = pv.get("auth") or ("api_key" if c.get("kind") == "api" else "subscription")
+    if r.get("allow_tools") is not None and tool not in r["allow_tools"]: return False, f"tool {tool} is not in [routing] allow_tools"
+    if r.get("allow_auth") is not None and auth not in r["allow_auth"]: return False, f"auth {auth} (provider {c['provider']}) is not in [routing] allow_auth"
     if "ledger" in pv:
         runs, bad, _ = ledger_read(cfg, pv)
         if bad: return False, f"{c['provider']} ledger malformed ({len(bad)} problem(s); janus ledger check)"

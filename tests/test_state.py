@@ -8,14 +8,14 @@ import argparse, contextlib, io, json, os, subprocess, sys, tempfile, textwrap, 
 from pathlib import Path
 from unittest import mock
 
-from janusload import load
+from janusload import conf, load
 
 janus = load()
 
 
 def project():
     d = Path(tempfile.mkdtemp(prefix="janus-test-"))
-    (d / "janus.toml").write_text(textwrap.dedent('''
+    conf(d).write_text(textwrap.dedent('''
         [project]
         name = "t"
         [hosts.here]
@@ -81,7 +81,7 @@ class State(unittest.TestCase):
         the state lock): an ack waited for the copy. The copy is made before the lock, once, and the unit is saved under it."""
         import threading
         d, cfg = project(); d2, _ = d, None
-        (d / "janus.toml").write_text((d / "janus.toml").read_text() + '\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); cfg = janus.Cfg(d)
+        conf(d).write_text(conf(d).read_text() + '\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); cfg = janus.Cfg(d)
         inside, release = threading.Event(), threading.Event(); copies = []; saved = []
         u = {"name": "u1", "id": "1", "host": "far", "via": "pueue", "task": 5, "saved_at": 0}
         class Bd:
@@ -111,7 +111,7 @@ class State(unittest.TestCase):
         The lock is taken after the remote reads, and the fingerprint is saved on the record read then, not the one read first."""
         import threading
         d, cfg = project()
-        (d / "janus.toml").write_text((d / "janus.toml").read_text() + '\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n')
+        conf(d).write_text(conf(d).read_text() + '\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n')
         inside, release = threading.Event(), threading.Event(); saved = []; recs = [{"name": "u1", "id": "1", "host": "far", "cwd": str(d), "v": 1}]
         class Bd:
             def __init__(self, cfg): pass
@@ -124,8 +124,8 @@ class State(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "JANUS_ROLE"}; cwd = os.getcwd(); os.chdir(d)
         with mock.patch.object(janus, "Beads", Bd), mock.patch.object(janus, "save_output", slow_save), mock.patch.object(janus, "remote_patch", lambda *a, **k: (0, "", "")), \
              mock.patch.object(janus, "fingerprint", lambda cfg, u: {"fp": "x"}), mock.patch.object(janus, "X", lambda *a, **k: (0, "", "")), \
-             mock.patch.object(janus, "save_transcript", lambda *a: True), mock.patch.object(janus, "note_collected", lambda *a: None), \
-             mock.patch.object(janus, "present_line", lambda n: ""), mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "argv", ["janus", "collect", "u1"]):
+             mock.patch.object(janus, "save_transcript", lambda *a: True), \
+             mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "argv", ["janus", "collect", "u1"]):
             from janus.cli import main; t = threading.Thread(target=main); t.start()
             try: self.assertTrue(inside.wait(30)); out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30).stdout
             finally: release.set(); t.join(60); os.chdir(cwd)
@@ -140,7 +140,7 @@ class State(unittest.TestCase):
         the record as the ack-time writer found it)."""
         import threading
         from test_janus import project as jproject
-        d, cfg = jproject('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); (d / "briefs/u.md").write_text("do it\n"); (d / "wt").mkdir()
+        d, cfg = jproject('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); (d / ".janus/briefs/u.md").write_text("do it\n"); (d / "wt").mkdir()
         inside, release = threading.Event(), threading.Event(); recs = {}; calls = []; ledger = []; seen = {}
         if op == "close": recs["1"] = {"name": "u", "id": "1", "host": "far", "via": "tmux", "cwd": str(d / "wt"), "rcwd": "/r/worktrees/u", "run": "u.1"}
         class Bd:
@@ -173,8 +173,8 @@ class State(unittest.TestCase):
         patches = [mock.patch.object(janus, n, v) for n, v in (("Beads", Bd), ("X", X), ("herdr", lambda *a, **k: None), ("read_secret", lambda p: "k"),
             ("write_cap", lambda *a: None), ("reserve_budget", lambda *a: "u.1"), ("confirm_started", lambda *a: ("running", "")), ("unit_tab", lambda *a: None),
             ("ledger_done", lambda *a: ledger.append(a[-1])), ("uncollected", lambda *a: None), ("close_tab", lambda *a: None), ("probe", lambda n, h, **k: {"ok": True}),
-            ("unit_state", lambda *a, **k: "done"), ("probe_all", lambda cfg: hs), ("note_event", lambda *a: None), ("note_collected", lambda *a: None),
-            ("present_line", lambda n: ""), ("settle_run", lambda *a: ledger.append("settled")), ("board", lambda *a, **k: (0, "", "")))]
+            ("unit_state", lambda *a, **k: "done"), ("probe_all", lambda cfg: hs),
+            ("settle_run", lambda *a: ledger.append("settled")), ("board", lambda *a, **k: (0, "", "")))]
         for pt in patches: pt.start()
         try:
             t = threading.Thread(target=run); t.start()
