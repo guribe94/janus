@@ -19,6 +19,10 @@ PY
 (cd "$ship" && PYTHONDONTWRITEBYTECODE=1 python3 -c 'import janus' && python3 janus.py --help >/dev/null \
   && echo '{}' | python3 janus.py hook PreToolUse >/dev/null && echo '{}' | python3 janus.py hook Stop >/dev/null)
 echo "smoke ok"
-for p in "$@"; do
-  (cd "$ship" && env -u JANUS_ROOT -u JANUS_UNIT -u JANUS_ROLE -u JANUS_REPORT JANUS_PY="$ship/janus.py" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p "$p" 2>&1 | tail -6)
+fail=0
+for p in "$@"; do   # the output is captured, not piped into tail: a failing unittest keeps its exit status
+  out=$(cd "$ship" && env -u JANUS_ROOT -u JANUS_UNIT -u JANUS_ROLE -u JANUS_REPORT JANUS_PY="$ship/janus.py" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p "$p" 2>&1) && rc=0 || rc=$?
+  printf '%s\n' "$out" | tail -6
+  [ "$rc" -eq 0 ] || { echo "FAILED: $p (exit $rc)"; fail=1; }
 done
+exit $fail

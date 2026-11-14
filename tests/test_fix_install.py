@@ -798,6 +798,23 @@ class Item27ParkedFinished(unittest.TestCase):
         F3 = janus.parked_findings(cfg, self._hs(cfg, "Running"), u, ["here:9"])   # a job still running: the normal park
         self.assertEqual(F3, [])
 
+    def test_hooks_drop_janus_own_user_prompt_entry_and_never_add_it_back(self):
+        """Catches: UserPromptSubmit left in EVENTS, so merge_hooks removed janus's own entry and added it again at once."""
+        src = Path(JANUS_PY).parent / "install"
+        if not src.is_file(): self.skipTest("install is not shipped in the release copy; ./check runs this against the tree")
+        home = Path(tempfile.mkdtemp(prefix="janus-home-")); ns = {"__name__": "install_under_test", "__file__": str(src)}
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(sys, "argv", ["install", "--dry-run"]), contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(src.read_text().rsplit("\nmain()", 1)[0], str(src), "exec"), ns)
+        ns["DRY"] = False; J = ns["JANUS"]; f = home / "settings.json"
+        mine = {"hooks": [{"type": "command", "command": f"{J} hook UserPromptSubmit"}]}; other = {"hooks": [{"type": "command", "command": "other-tool prompt"}]}
+        f.write_text(json.dumps({"hooks": {"UserPromptSubmit": [mine, other]}}))
+        with contextlib.redirect_stdout(io.StringIO()): ns["merge_hooks"](str(f))
+        h = json.loads(f.read_text())["hooks"]
+        self.assertEqual(h["UserPromptSubmit"], [other])                                       # janus's own entry dropped, the other tool's kept, nothing re-added
+        self.assertEqual(sorted(h), ["PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"])
+        before = f.read_text()
+        with contextlib.redirect_stdout(io.StringIO()): ns["merge_hooks"](str(f))
+        self.assertEqual(f.read_text(), before)                                                # a second run changes nothing
 
 if __name__ == "__main__": unittest.main()
 
@@ -857,3 +874,21 @@ class LauncherLinks(unittest.TestCase):
         run(); self.assertEqual(J.read_text(), "#!/bin/sh\necho mine\n")
         J.unlink(); J.symlink_to(home / ".local/share/janus/releases/r1/janus.py"); run(); self.assertTrue(J.is_symlink())
         J.unlink(); run(); self.assertTrue(ns["generated_launcher"](J)); self.assertTrue(os.access(J, os.X_OK))
+
+    def test_hooks_drop_janus_own_user_prompt_entry_and_never_add_it_back(self):
+        """Catches: UserPromptSubmit left in EVENTS, so merge_hooks removed janus's own entry and added it again at once."""
+        src = Path(JANUS_PY).parent / "install"
+        if not src.is_file(): self.skipTest("install is not shipped in the release copy; ./check runs this against the tree")
+        home = Path(tempfile.mkdtemp(prefix="janus-home-")); ns = {"__name__": "install_under_test", "__file__": str(src)}
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(sys, "argv", ["install", "--dry-run"]), contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(src.read_text().rsplit("\nmain()", 1)[0], str(src), "exec"), ns)
+        ns["DRY"] = False; J = ns["JANUS"]; f = home / "settings.json"
+        mine = {"hooks": [{"type": "command", "command": f"{J} hook UserPromptSubmit"}]}; other = {"hooks": [{"type": "command", "command": "other-tool prompt"}]}
+        f.write_text(json.dumps({"hooks": {"UserPromptSubmit": [mine, other]}}))
+        with contextlib.redirect_stdout(io.StringIO()): ns["merge_hooks"](str(f))
+        h = json.loads(f.read_text())["hooks"]
+        self.assertEqual(h["UserPromptSubmit"], [other])                                       # janus's own entry dropped, the other tool's kept, nothing re-added
+        self.assertEqual(sorted(h), ["PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"])
+        before = f.read_text()
+        with contextlib.redirect_stdout(io.StringIO()): ns["merge_hooks"](str(f))
+        self.assertEqual(f.read_text(), before)                                                # a second run changes nothing
