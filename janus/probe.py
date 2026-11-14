@@ -38,9 +38,10 @@ def probe_extra(h):
 
 BUILD_ERE = "(^|[ /])cargo(-[a-z]+)? (test|nextest|build|clippy|bench)( |$)|(^|[ /])pytest( |$)|(^|[ /])(npm|pnpm) (run )?test( |$)|xcodebuild.* test"
 
-def pueue(h):
+def pueue(h, wrap=""):
+    """The pueue command for host h; wrap (e.g. "timeout 300 ") runs pueue under that command, after the PATH prefix."""
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
-    return pre + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
+    return pre + wrap + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
 LIST_KEYS = ("res", "cls", "sched", "direct", "waitjob", "apiproc", "apiinfo", "live")   # apiproc/apiinfo: API processes janus did not start, and whose they are   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
 

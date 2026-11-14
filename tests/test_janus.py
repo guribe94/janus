@@ -575,6 +575,35 @@ class AdmitBound(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("held by admission", out.getvalue()); self.assertIn("disk", out.getvalue())
 
+    def test_a_timed_out_wait_leaves_no_pueue_behind_local_or_remote(self):
+        """Catches (Asgard609: 26 orphan `pueue wait -q` per task): the subprocess timeout killed only the local sh / ssh, so the
+        pueue child (local) and the remote wait (remote) kept running and every retry added one. Local: the wait is exec'd, so
+        the timeout kills pueue itself. Remote: pueue runs under the host's `timeout WAIT_STEP`, whose exit 124 is a timed-out
+        step (task polled, no 'retrying' noise)."""
+        d, cfg = project(); h = cfg.hosts["here"]
+        bindir = Path(tempfile.mkdtemp(prefix="janus-test-")); pidf = bindir / "pid"
+        (bindir / "pueue").write_text(f"#!/bin/sh\necho $$ > {pidf}\nexec sleep 30\n"); (bindir / "pueue").chmod(0o755)
+        saved = (janus.WAIT_STEP, janus.task_status, janus.hrun, os.environ["PATH"])
+        janus.WAIT_STEP = 1; os.environ["PATH"] = f"{bindir}:{saved[3]}"
+        janus.task_status = lambda h_, tid: {"status": {"Done": {"result": "Success"}}}
+        janus.hrun = lambda h_, script, **k: (0, "0\n", "")
+        try: rc = janus.finish_job(cfg, "here", h, 7, "j-1", quiet=True)
+        finally: janus.WAIT_STEP, janus.task_status, janus.hrun, os.environ["PATH"] = saved
+        self.assertEqual(rc, 0)
+        pid = int(pidf.read_text())
+        with self.assertRaises(ProcessLookupError): os.kill(pid, 0)   # no pueue left after the timeout
+        cmds = []; err = io.StringIO()
+        def fake_run(cmd, **k):
+            cmds.append((cmd, k.get("timeout"))); return type("R", (), {"returncode": 124 if len(cmds) == 1 else 0})()
+        rh = {"ssh": "box", "bin": "/opt/bin", "_rd": "/r"}
+        with mock.patch.object(subprocess, "run", fake_run), mock.patch.object(janus, "task_status", side_effect=[{"status": {"Running": {}}}, {"status": {"Done": {"result": "Success"}}}]), \
+             mock.patch.object(janus, "hrun", lambda h_, script, **k: (0, "", "")), contextlib.redirect_stderr(err):
+            rc = janus.finish_job(cfg, "far", rh, 7, "j-1", quiet=True)
+        self.assertEqual(rc, 0); self.assertEqual(len(cmds), 2, cmds)
+        for cmd, t in cmds:
+            self.assertRegex(cmd[-1], r'^PATH="[^"]*" timeout 300 pueue wait -q 7$'); self.assertGreater(t, 300)
+        self.assertNotIn("retrying", err.getvalue())
+
     def test_a_blocked_admission_is_a_finding_with_the_reason(self):
         """Catches (item 21): a job held in admission raised no finding naming why."""
         d, cfg = project()

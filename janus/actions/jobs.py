@@ -238,9 +238,13 @@ def finish_job(cfg, hn, h, tid, jid, quiet=False):
     miss = 0; last = 0
     while True:
         try:
-            if h.get("local"): rc = subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {int(tid)}"], timeout=WAIT_STEP).returncode
-            else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h)} wait -q {int(tid)}"], stdin=subprocess.DEVNULL, timeout=WAIT_STEP).returncode
-        except subprocess.TimeoutExpired:
+            # Bounded where the wait runs: `exec` makes the local pueue the process subprocess kills on timeout (a plain sh -c left
+            # pueue behind), and the remote pueue runs under the host's `timeout`, since killing the local ssh left the remote wait
+            # running (26 orphans per task on a flapping link). The local limit is only a backstop for a hung ssh.
+            if h.get("local"): rc = subprocess.run(["sh", "-c", f"exec {pueue(h)} wait -q {int(tid)}"], timeout=WAIT_STEP).returncode
+            else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h, f'timeout {WAIT_STEP} ')} wait -q {int(tid)}"], stdin=subprocess.DEVNULL, timeout=WAIT_STEP + 30).returncode
+        except subprocess.TimeoutExpired: rc = 124
+        if rc == 124:   # the wait ran out (local, or the host's timeout): the step's report below
             t = task_status(h, tid)
             if task_rc(t) is not None: break
             if now() - last >= WAIT_STEP:
