@@ -948,6 +948,11 @@ class DoctorProjectListed(unittest.TestCase):
         self.assertTrue(line.startswith("ok "), line); self.assertIn("project listed in", line); self.assertNotIn("not listed", line)
 
 
+    def test_routing_policy_keys_are_not_model_routes(self):
+        d = self._project(); conf(d).write_text(conf(d).read_text() + '[routing]\nallow_tools = ["claude"]\nallow_auth = ["api_key"]\nfallback = true\n')
+        self.assertEqual(janus.route_lists(janus.Cfg(d)), {})
+        self.assertEqual(janus.model_host_warnings(janus.Cfg(d)), [])
+
 
 class Memory(unittest.TestCase):
     """MEMORY.md: keyed replacement, instructions never truncated, delivered to running units without a forced reply, loaded in full."""

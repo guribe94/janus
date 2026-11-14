@@ -218,10 +218,16 @@ def cmd_init(cfg, a):
 
 def cmd_doctor(cfg, a): return doctor(cfg, a)
 
+POLICY_KEYS = ("allow_tools", "allow_auth", "fallback")
+
+def route_lists(cfg):
+    """The [routing] entries pick_model reads as model lists (a tier or review); allow_tools, allow_auth and fallback are policy."""
+    return {k: v for k, v in cfg.route.items() if k not in POLICY_KEYS and isinstance(v, list)}
+
 def model_host_warnings(cfg):
     """A warning per routed model whose [models.<m>] hosts is narrower than the configured hosts (decision 0004: agents run on
     every host): 'model X: runs on 1 of 3 host(s)'. A model with no hosts key may run anywhere and is not warned."""
-    routed = {m for lst in cfg.route.values() for m in lst}
+    routed = {m for lst in route_lists(cfg).values() for m in lst}
     out = []
     for m, c in cfg.models.items():
         hs = c.get("hosts")
@@ -273,7 +279,7 @@ def doctor(cfg, a):
         if c.get("kind") in ("claude", "codex", "opencode") or c.get("kind") == "api":
             t = "claude" if c.get("kind") == "api" else c["kind"]
             if not which(t): r(False if c.get("kind") == "api" else None, f"model {m}: {t} not on PATH", f"install {t}")
-    for tier, lst in cfg.route.items():
+    for tier, lst in route_lists(cfg).items():
         for m in lst:
             if m not in cfg.models: r(False, f"routing {tier}: unknown model {m}", "fix [routing]")
     if cfg.f("migration/PENDING.md").is_file(): r(None, "migration is not final: the bd database and its unit records still name the old root", f"review {cfg.f('migration/PENDING.md')}")
