@@ -1,0 +1,41 @@
+# Arm B: Claude Code as the janus orchestrator of a one-host project in the task container (bench/lhtb/agent.py).
+#   export ANTHROPIC_API_KEY=...            # in the environment, never here
+#   export DOCKER_DEFAULT_PLATFORM=linux/amd64
+#   cd ~/code/orchestrator && PYTHONPATH=. harbor run -c bench/lhtb/arm_b_janus.yaml
+job_name: lhtb-pilot-b-janus
+jobs_dir: ./bench/lhtb/jobs
+n_attempts: 2
+n_concurrent_trials: 2
+timeout_multiplier: 1.0
+
+environment:
+  type: docker
+  force_build: false
+  delete: true
+
+agents:
+  - import_path: bench.lhtb.agent:JanusClaudeCode
+    model_name: anthropic/claude-sonnet-5-5
+    override_timeout_sec: 2400      # same 40 min as arm A
+    kwargs:
+      cap_usd: 20                   # the container project's spend cap for sub-agents (janus ledger, reported by report.py)
+      budget_per_unit: 3
+      append_system_prompt: >-
+        [janus] You are the orchestrator of the janus project at /app (janus skill: ~/.claude/skills/janus/SKILL.md;
+        janus is on PATH; one local host "box"; one API model "main"). The task below is the whole backlog: run `janus register`,
+        then split the task into units, write each brief to /app/.janus/briefs/<unit>.md, launch them with
+        `janus launch <unit> --kind implement --brief /app/.janus/briefs/<unit>.md --cwd /app` (reviews: --kind review),
+        read their reports under /app/.janus/out/<unit>/REPORT.md, verify the work yourself, and keep going until the task is
+        done. Units share /app; brief them on which files each owns. Do not do the work by hand when a unit can do it.
+
+datasets:
+  - path: ~/code/LHTB/tasks-2.0
+    task_names:
+      - sqlite_wal_recovery_audit__02
+      - nginx_location_regex_tryfiles_precedence__06
+      - duckdb_recursive_hierarchy_report__03
+      - pcap_http2_tls_fingerprint__04
+  - path: ~/code/LHTB/tasks
+    task_names:
+      - commit0-multilib-tdd
+      - langchain-version-migration

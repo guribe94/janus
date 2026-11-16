@@ -1,0 +1,31 @@
+# Arm A: stock Claude Code, no janus. Same model, tasks, budget and trials as arm B.
+#   export ANTHROPIC_API_KEY=...            # in the environment, never here
+#   export DOCKER_DEFAULT_PLATFORM=linux/amd64
+#   cd ~/code/orchestrator && harbor run -c bench/lhtb/arm_a_stock.yaml
+job_name: lhtb-pilot-a-stock
+jobs_dir: ./bench/lhtb/jobs
+n_attempts: 2
+n_concurrent_trials: 2
+timeout_multiplier: 1.0
+
+environment:
+  type: docker
+  force_build: false
+  delete: true
+
+agents:
+  - name: claude-code
+    model_name: anthropic/claude-sonnet-5-5
+    override_timeout_sec: 2400      # 40 min per trial for both arms: the question is relative, not absolute
+
+datasets:
+  - path: ~/code/LHTB/tasks-2.0
+    task_names:
+      - sqlite_wal_recovery_audit__02
+      - nginx_location_regex_tryfiles_precedence__06
+      - duckdb_recursive_hierarchy_report__03
+      - pcap_http2_tls_fingerprint__04
+  - path: ~/code/LHTB/tasks
+    task_names:
+      - commit0-multilib-tdd
+      - langchain-version-migration
