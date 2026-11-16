@@ -45,6 +45,8 @@ args = []
 
 # [tidy]                 # janus tidy [--dry-run]: what orchestration leaves behind, each by a safe rule
 # branches = ["wk/*"]    # branch patterns it may delete when contained in the landing branch (and the remote one at the same commit)
+# auto = true            # the watcher removes clean landed worktrees and landed branches itself (every other kind: janus tidy)
+# artifacts = ["target", "node_modules"]   # rebuildable build output inside closed units' worktrees that janus tidy removes
 # remote = "origin"
 # keep_days = 14         # job run files and test roots older than this
 # every_min = 60         # the watcher refreshes the reclaimable list (check: tidy:<n>, disk:<host>)
