@@ -5,7 +5,7 @@ and a finding is gone when its condition is. status is the same pass printed as 
 import contextlib, json
 from janus.actions.jobs import slots
 from janus.actions.lifecycle import fetch_remote_outputs, sync_remote_outputs   # sync a remote report before judging parked/orphan
-from janus.backlog import ready_work
+from janus.backlog import backlog_cfg, checklist_line, checklist_totals, ready_work
 from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
 from janus.context import Err, hrun, is_orchestrator, now, ts
@@ -69,6 +69,7 @@ def status_text(cfg, hs, units, F):
     if not units: L.append("- none")
     try: rd = ready_work(cfg); L.append("Queue: " + (", ".join(i.get("title", "")[:40] for i in rd[:8]) or "empty"))
     except Err as e: L.append(f"Queue: unavailable ({e})")
+    if backlog_cfg(cfg).get("file"): L.append(checklist_line(checklist_totals(cfg, units), cfg.run.briefless, cfg.run.held))   # the same totals as janus report
     for n, pv in cfg.prov.items():
         if "cap_usd" in pv: L.append(f"Spend {n}: ${committed(cfg, pv):.2f} of ${pv['cap_usd']}")
     L.append("Problems:"); L += [f"- [{k}] {t}" for k, t in F] or ["- none"]

@@ -2,7 +2,7 @@
 
 janus run / janus cancel / janus busy / janus thrash, and the job queries every layer above uses (task_status, task_rc,
 job_state, unit_jobs, orphan_jobs)."""
-import argparse, calendar, concurrent.futures as cf, json, os, re, shlex, subprocess, sys, time
+import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 from janus.beads import Beads
 from janus.board import board
@@ -508,6 +508,37 @@ def stop_job_cmd(h, jid):
     if h.get("runner") == "podman": return f"podman stop -t 5 janus-run-{jid} >/dev/null 2>&1; "
     return f"systemctl --user stop janus-{jid}.scope >/dev/null 2>&1; "
 
+# The patch helper's systemd scope (remote_patch): one name per project copy on a host (a hash of the project's root there),
+# with that root in its Description. A scope is this project's only when both match: recovery and janus thrash stop or reset
+# it only then, never a scope of the same name another project or a person made.
+def patch_scope(h):
+    return "janus_patch-" + hashlib.sha256(str(h["root"]).encode()).hexdigest()[:16] + ".scope"   # janus_ (not janus-): no job id for cap.sh's janus-*.scope
+
+def patch_scope_desc(h):
+    return f"janus patch {h['root']}"
+
+def patch_scope_sh(h, act="", grace=5):
+    """Shell printing this project's patch scope on host h as one word: none, foreign (a scope of that name that is not this
+    project's), nosystemd, unknown, or owned-<ActiveState>. act "stop": an owned scope's processes get TERM, those left KILL
+    grace s later (a stop never waits out systemd's 90 s), then it is stopped and its failed state reset; the word printed is
+    its state after that. The ownership is checked in the same script, right before."""
+    s, d = shlex.quote(patch_scope(h)), shlex.quote(patch_scope_desc(h))
+    stop = (f'if systemctl --user kill --signal=TERM {s} >/dev/null 2>&1; then sleep {grace}; systemctl --user kill --signal=KILL {s} >/dev/null 2>&1; fi; '
+            f'systemctl --user stop {s} >/dev/null 2>&1; systemctl --user reset-failed {s} >/dev/null 2>&1; '
+            f'a=$(systemctl --user show -p ActiveState --value {s} 2>/dev/null); ') if act == "stop" else ""
+    return (f"if ! command -v systemctl >/dev/null 2>&1; then echo nosystemd; "
+            f"elif ! l=$(systemctl --user show -p LoadState --value {s} 2>/dev/null); then echo unknown; "
+            f'elif [ "$l" != loaded ]; then echo none; '
+            f'elif [ "$(systemctl --user show -p Description --value {s} 2>/dev/null)" != {d} ]; then echo foreign; '
+            f'else a=$(systemctl --user show -p ActiveState --value {s} 2>/dev/null); {stop}echo "owned-${{a:-unknown}}"; fi')
+
+def patch_scope_state(h, act=""):
+    """(state word of patch_scope_sh, detail): what this project's patch helper scope on h is (act "stop": stopped, when owned)."""
+    if h.get("local"): return "nosystemd", "a local host has no patch scope"
+    rc, o, e = hrun(h, patch_scope_sh(h, act), timeout=60)
+    w = (o.split() or [""])[-1]
+    return (w, "") if not rc and re.fullmatch(r"none|foreign|nosystemd|unknown|owned-[a-z-]+", w) else ("unknown", (e or o).strip()[-160:] or f"no answer (exit {rc})")
+
 def cancel_job(cfg, ref, force=False):
     """Cancel job <host>:<task>: its files are saved here first (runs/<jid>.*; refused when that fails, unless force: nothing is
     removed before it is collected), then pueue kill and remove, then its container or scope is stopped by name."""
@@ -599,20 +630,37 @@ def thrash_log(cfg, h, jid, line):
     jl = h.get("job_log")
     if jl and jl != "/dev/null": hrun(h, f"printf '%s\\n' {qp(txt)} >> {qp(jl)}", timeout=30)
 
-def tend_thrash(cfg, hs, units, log, dry=False):
+PATCH_RUNNING = ("owned-active", "owned-activating", "owned-reloading", "owned-deactivating")
+
+def tend_thrash(cfg, hs, units, log, dry=False, explain=False):
     """Lines saying what was (or, dry, would be) done on each shared host over its thrash limit. Finding 8: the stop and the
     re-queue are written to the job's own log and named in the line (the check's finding reads it), and the over-since clock is
-    reset after an action, so one pass never stops the next newest job too."""
+    reset after an action, so one pass never stops the next newest job too. This project's patch helper (its own scope, by
+    name and Description: patch_scope) is stopped first, as that pass's one action; another project's is never touched.
+    explain: a line for every shared host, also those left alone (janus thrash)."""
     out = []
     for n, (psi, mins) in thrash_track(cfg, hs).items():
-        lim, need = thrash_cfg(cfg, cfg.hosts[n])
+        lim, need = thrash_cfg(cfg, cfg.hosts[n]); h = cfg.hosts[n]
         if psi is None or psi <= lim or mins < need:
-            if dry: out.append(f"{n}: memory PSI {psi if psi is not None else '-'} (limit {lim:g} for {need:g} min): {'over for ' + format(mins, '.0f') + ' min' if mins else 'fine'}")
+            if dry or explain: out.append(f"{n}: memory PSI {psi if psi is not None else '-'} (limit {lim:g} for {need:g} min): {'over for ' + format(mins, '.0f') + ' min' if mins else 'fine'}")
             continue
+        head = f"{n} thrashing (memory PSI {psi} over {lim:g} for {mins:.0f} min)"
+        ps, pwhy = patch_scope_state(h)   # a read: a dry run asks too, so it says what it would really do
+        if ps in PATCH_RUNNING:
+            msg = f"{head}: stop this project's patch helper ({patch_scope(h)}) first"
+            if dry: out.append("would " + msg); continue
+            st = cfg.jget("thrash.json"); st[n] = int(now()); cfg.jput("thrash.json", st)   # claimed before the host is touched, as for a job
+            with cfg.unlocked(): ps2, why2 = patch_scope_state(h, "stop")   # ownership checked again on the host, right before the stop
+            line = f"{msg}: " + ("stopped (its collect or backup fails and keeps the earlier patch)" if ps2 in ("owned-inactive", "none")
+                                 else f"NOT stopped ({ps2}{': ' + why2 if why2 else ''})")
+            rec = cfg.jget("thrash-acts.json"); rec[str(int(now()))] = line; cfg.jput("thrash-acts.json", dict(list(rec.items())[-50:]))
+            out.append(line); log(line); continue
+        pnote = {"foreign": f"; {patch_scope(h)} there is not this project's (left alone)",
+                 "unknown": f"; its patch helper scope could not be read ({pwhy or 'systemctl --user did not answer'})"}.get(ps, "; no patch helper of this project runs there")
         jobs = own_admitted_jobs(cfg, hs, n)
-        if not jobs: out.append(f"{n}: memory PSI {psi} over {lim:g} for {mins:.0f} min, but no job of this project runs there: nothing to stop"); continue
+        if not jobs: out.append(f"{n}: memory PSI {psi} over {lim:g} for {mins:.0f} min, but no job of this project runs there{pnote}: nothing to stop"); continue
         ref, jid, spec, _ = jobs[0]; to = requeue_host(cfg, hs, units, n, spec)
-        msg = f"{n} thrashing (memory PSI {psi} over {lim:g} for {mins:.0f} min): stop {ref} ({jid}, newest of {len(jobs)}), re-queue on {to}"
+        msg = f"{head}: stop {ref} ({jid}, newest of {len(jobs)}), re-queue on {to}" + (pnote if ps in ("foreign", "unknown") else "")
         if to == n: msg += " (no other host has room or meets it: re-queued on the SAME host, which is still over the limit)"
         if dry: out.append("would " + msg); continue
         st = cfg.jget("thrash.json"); st[n] = int(now()); cfg.jput("thrash.json", st)   # claimed before the host is touched: finding 8's over-since clock restarts, so no other pass or command stops/re-queues this job or the next one meanwhile
@@ -638,7 +686,9 @@ def cmd_thrash(cfg, a):
     units = Beads(cfg).units()
     for u in units: u["state"] = unit_state(u, hs, {})
     if not any(h.get("shared") for h in cfg.hosts.values()): say("no host has shared = true"); return
-    for l in tend_thrash(cfg, hs, units, lambda m: None, dry=cfg.run.dry or cfg.run.ro) or ["nothing to do"]: say(l)
+    lines = tend_thrash(cfg, hs, units, lambda m: None, dry=cfg.run.dry or cfg.run.ro, explain=True)
+    lines += [f"{n}: shared, but it did not answer the probe: not judged, nothing done" for n, h in cfg.hosts.items() if h.get("shared") and not (hs.get(n) or {}).get("ok")]
+    for l in lines: say(l)
 
 def orphan_jobs(cfg, hs, units):
     """Jobs whose owner is gone: [(ref, why)]. A lane job of a closed unit, or of an open unit whose agent ended and is not parked.

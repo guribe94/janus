@@ -82,11 +82,11 @@ class States(Base):
         w.report("good", "# r\nVERDICT: DONE\n"); w.report("bad", "VERDICT: DONE\n"); w.report("blk", "x\nVERDICT: BLOCKED\n"); w.report("exit0", "# notes, no verdict yet\nsome notes\n")
         w.closed = [{**unit("old", task=1), "status": "closed", "closed_at": "2026-11-12T10:00:00Z"}]; w.report("old", "VERDICT: DONE\n")
         self.collect(); m = self.model()
-        act, fin = self.states("Active", m), self.states("Finished", m)
+        act, fin = self.states("Active", m), self.states("Ended", m)
         self.assertEqual(act, {"run": "working", "que": "queued", "park": "parked", "blk": "working"})   # a live process with a BLOCKED report is still running
         self.assertEqual(fin, {"good": "finished", "exit0": "ended:no-verdict", "bad": "failed", "nolaunch": "failed", "far1": "ended:no-verdict", "old": "closed:DONE"})
-        self.assertEqual(m.rows["Finished"][-1].cells[0], "old")   # closed units after those still waiting to be collected
-        why = lambda n: " ".join(next(r for r in m.rows["Finished"] if r.key == n).detail)
+        self.assertEqual(m.rows["Ended"][-1].cells[0], "old")   # closed units after those still waiting to be collected
+        why = lambda n: " ".join(next(r for r in m.rows["Ended"] if r.key == n).detail)
         self.assertIn("not success", why("exit0")); self.assertIn("not success", why("bad"))
         self.assertEqual(next(r for r in m.rows["Active"] if r.key == "park").detail[2], "Meaning:   waiting for here:9")
 
@@ -94,8 +94,8 @@ class States(Base):
         """Catches: a unit's first screen, drawn before its report was read, saying 'no verdict' (or finished) of a report nobody read."""
         self.w.units = [unit("x", task=3)]; self.w.probes["here"] = probe_text(tasks={"3": task(3, {"Done": {"result": "Success"}})}); self.w.report("x", "VERDICT: DONE\n"); self.collect()
         view = {k: v for k, v in self.store.view()[0].items() if k != "reports-open"}
-        self.assertEqual({r.cells[0]: r.cells[1] for r in M.derive(view, time.time(), 5).rows["Finished"]}, {"x": "ended:unverified"})
-        self.assertEqual(self.states("Finished"), {"x": "finished"})
+        self.assertEqual({r.cells[0]: r.cells[1] for r in M.derive(view, time.time(), 5).rows["Ended"]}, {"x": "ended:unverified"})
+        self.assertEqual(self.states("Ended"), {"x": "finished"})
 
     def test_tool_model_admission_capability_freshness_and_the_handoff_checkpoint(self):
         """Catches: a unit row without its tool beside its model, a host row that hides why it does not admit, capabilities that read
@@ -109,7 +109,7 @@ class States(Base):
         self.assertTrue(r["far"][7].startswith("claude+ codex ("), r["far"][7])
         self.assertTrue(r["here"][7].startswith("unknown"), r["here"][7])               # never discovered: unknown, not none
         self.assertEqual(m.rows["Overview"][0].cells[0], "Checkpoint"); self.assertIn("~60%", m.rows["Overview"][0].cells[1]); self.assertIn("tests left", m.rows["Overview"][0].cells[1])
-        self.assertIn("/", next(x for x in m.rows["Active"] + m.rows["Finished"] if x.key == "a").cells[3])   # tool/model
+        self.assertIn("/", next(x for x in m.rows["Active"] + m.rows["Ended"] if x.key == "a").cells[3])   # tool/model
         (self.d / ".janus/hosts-facts.json").write_text("{not json"); self.collect(); m = self.model()
         self.assertIn("unreadable", {x.cells[0]: x.cells for x in m.machines}["far"][7]); self.assertIn("unreadable", m.rows["Overview"][-1].cells[1])
 
@@ -132,7 +132,7 @@ class States(Base):
                      {"id": "b-4", "title": "Item four", "labels": ["backlog"], "external_ref": "backlog:four"}]
         w.units = [unit("u", item="one")]; w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})})
         self.collect()
-        self.assertEqual(self.states("Backlog"), {"plain ready work": "ready", "Item one": "launched", "Item two": "owner", "Item three": "ready", "Item four": "waiting"})
+        self.assertEqual(self.states("Backlog"), {"plain ready work": "ready", "Item one": "open-unit", "Item two": "owner", "Item three": "ready", "Item four": "waiting"})
 
 
 class ReadOnly(Base):
@@ -192,7 +192,7 @@ class Recovery(Base):
     def test_never_loaded_is_unknown_not_zero(self):
         """Catches: counts, builds, load, RAM and agents of a source that never answered shown as 0."""
         self.w.fail = {"bd", "far", "herdr"}; self.collect(); m = self.model()
-        self.assertEqual(m.counts["Active"], None); self.assertEqual(m.counts["Finished"], None)
+        self.assertEqual(m.counts["Active"], None); self.assertEqual(m.counts["Ended"], None)
         far = next(r for r in m.machines if r.cells[0] == "far").cells
         self.assertEqual((far[1], far[2], far[3], far[4], far[5]), ("UNREACHABLE", "?/?", "?", "?", "?"))
         self.assertTrue(m.empty["Active"].startswith("bd") or "UNAVAILABLE" in m.empty["Active"], m.empty)
@@ -281,7 +281,7 @@ class Interaction(Base):
         self.assertEqual(selected(scr.s1), ["gamma"]); self.assertIn("[Active (3)]", scr.s1)
         self.assertIn("Details 2/3", scr.s2); self.assertIn("Name:      gamma", scr.s2); self.assertIn("Via:       pueue  task 3", scr.s2); self.assertNotIn("delta", scr.s2.split("Details")[1])
         self.assertEqual(selected(scr.s2b), ["gamma"])   # Esc: back to the list, same row
-        self.assertIn("[Backlog (0)]", scr.s3); self.assertEqual(spy.n, 1); self.assertIn("[Board (?)]", scr.s4); self.assertIn("[Finished (0)]", scr.s5)
+        self.assertIn("[Backlog (0)]", scr.s3); self.assertEqual(spy.n, 1); self.assertIn("[Board (?)]", scr.s4); self.assertIn("[Ended (0)]", scr.s5)
         self.assertEqual(scr.script, [ord("x")])   # q ended it: nothing after was read
         self.assertIn("READ-ONLY", scr.frames[0][0]); self.assertIn("RUN/QUEUED", scr.frames[0][1]); self.assertIn("working", scr.frames[0][-1] + "\n".join(scr.frames[0]))
 
@@ -326,6 +326,20 @@ class Interaction(Base):
         scr = FakeScr(30, 110, [ord("4"), post, self.at("a"), self.at("b")])
         self.run_ui(scr); self.assertEqual(len(new_rows(scr.b)), 2); self.assertIn("2 new", scr.b)
 
+    def test_a_growing_memory_group_keeps_its_selection_and_flags_each_new_delivery(self):
+        """Catches: a delivery joining a [memory] group marked read unseen (no NEW, no count), the selection jumping off the group as it grows."""
+        mem = lambda to: f"2026-11-13 09:05 orchestrator direction: @{to} {MEM}\n"
+        self.w.board("2026-11-13 09:00 ann status: started\n" + mem("a")); self.collect(); K = self.K
+        def post(to): return lambda s: (self.w.board(mem(to)), self.collect())
+        sel = lambda t: [l for l in t.splitlines() if l.startswith("> ")][0]
+        scr = FakeScr(30, 110, [ord("4"), self.at("a"), post("b"), self.at("b"), K.KEY_DOWN, K.KEY_UP, self.at("c"), K.KEY_DOWN, post("c"), self.at("d"), 10, 10, self.at("e")])
+        self.run_ui(scr)
+        self.assertEqual(new_rows(scr.a), []); self.assertIn("[Board (2)]", scr.a); self.assertIn("MEMORY", sel(scr.a))
+        self.assertIn("orchestrator -> 2 agents", sel(scr.b)); self.assertIn("Board (2, 1 new)", scr.b); self.assertEqual(len(new_rows(scr.b)), 1)   # still selected, the new delivery still flagged
+        self.assertEqual(new_rows(scr.c), []); self.assertIn("[Board (2)]", scr.c)   # selected again: read
+        self.assertIn("started", sel(scr.d)); self.assertIn("Board (2, 1 new)", scr.d); self.assertIn("3 agents", new_rows(scr.d)[0])   # not selected: flagged, the selection stays put
+        self.assertIn("started", sel(scr.e)); self.assertIn("1 new", scr.e)
+
     def test_resize_small_terminals(self):
         """Catches: a crash or overflow on a small or resized terminal, the machine table crowding out the list."""
         self.seed(); self.w.fail = {"far"}; self.collect(); K = self.K; shots = {}
@@ -355,6 +369,49 @@ class Interaction(Base):
         for cols in (M.WORK_COLS, M.BOARD_COLS, M.HOST_COLS):
             for w in range(24, 200):
                 lay = M.layout(cols, w); self.assertLessEqual(sum(x for _, x in lay) + len(lay) - 1, w, (w, lay))
+
+
+MEM = "[memory] new decision [db]: use postgres (MEMORY.md has the whole list; no reply needed)"
+
+
+class MemoryGroups(Base):
+    def board_rows(self, text):
+        self.w.board(text); self.collect(); return self.model().rows["Board"]
+
+    def test_identical_memory_directions_are_one_row_with_each_recipient(self):
+        """Catches: one [memory] change sent to every running unit flooding the board with a row per unit, a group hiding who got it
+        or when, the log or the collected deliveries changed, ordinary posts, questions and answers drawn differently."""
+        log = "".join(f"2026-11-13 09:05 orchestrator direction: @{u} {MEM}\n" for u in ("a", "b", "c"))
+        log = "2026-11-13 09:00 ann status: started\n2026-11-13 09:01 ann question: [q1] which db?\n" + log + "2026-11-13 09:06 orchestrator direction: @ann [q1] use main\n"
+        rows = self.board_rows(log)
+        self.assertEqual([r.cells[2:4] for r in rows], [("ANSWER", "orchestrator -> ann"), ("MEMORY", "orchestrator -> 3 agents"), ("QUESTION", "ann"), ("UPDATE", "ann")])
+        g = rows[1]; d = "\n".join(g.detail)
+        self.assertIn("sent to 3 recipients", d); self.assertIn(MEM, g.detail[-1])
+        for u in ("a", "b", "c"): self.assertIn(f"  {u}  2026-11-13 09:05", g.detail)
+        self.assertEqual(len(g.keys), 3); self.assertEqual(g.key, g.keys[0])
+        self.assertEqual((self.d / ".janus/board/log.md").read_text(), log)   # the log keeps a line per delivery
+        self.assertEqual(sum(1 for m in self.store.view()[0]["board"].data["msgs"] if m["full"]), 3)
+        self.assertEqual(rows[0].keys, ()); self.assertEqual(rows[0].detail[-1], "[q1] use main")   # ordinary rows as before
+
+    def test_long_memory_texts_alike_for_1000_characters_stay_apart_and_show_whole(self):
+        """Catches: grouping on the 1000-character cut text, merging two changes that differ only at their ends; details showing the cut text."""
+        a, b = "[memory] " + "x" * 1200 + " END-A", "[memory] " + "x" * 1200 + " END-B"
+        rows = self.board_rows(f"2026-11-13 09:05 orchestrator direction: @u1 {a}\n2026-11-13 09:05 orchestrator direction: @u2 {b}\n")
+        self.assertEqual(len(rows), 2); self.assertEqual({r.detail[-1] for r in rows}, {a, b})
+        self.assertTrue(all(r.cells[3] == f"orchestrator -> {to}" for r, to in zip(rows, ("u2", "u1"))))
+
+    def test_distinct_revisions_questions_and_resends_stay_separate(self):
+        """Catches: a change and its revision merged, the same text a minute later merged, a resend to the same unit counted as another
+        recipient, a memory line that answered an open question (so [qN] first) folded in, another author's identical text merged."""
+        r = lambda t, to, x, who="orchestrator": f"2026-11-13 {t} {who} direction: @{to} {x}\n"
+        rev = MEM.replace("postgres", "sqlite")
+        rows = self.board_rows(r("09:05", "a", MEM) + r("09:05", "a", rev) + r("09:05", "b", MEM)    # A, then its revision B, then A again: three changes
+                               + r("09:07", "a", MEM) + r("09:08", "a", MEM) + r("09:08", "b", MEM) + r("09:08", "b", MEM)
+                               + r("09:09", "c", "[q4] " + MEM) + r("09:09", "d", MEM, who="other") + r("09:09", "e", MEM))
+        self.assertEqual([(r.cells[2], r.cells[3]) for r in rows],
+                         [("MEMORY", "orchestrator -> e"), ("MEMORY", "other -> d"), ("ANSWER", "orchestrator -> c"), ("MEMORY", "orchestrator -> b"), ("MEMORY", "orchestrator -> 2 agents"),
+                          ("MEMORY", "orchestrator -> a"), ("MEMORY", "orchestrator -> b"), ("MEMORY", "orchestrator -> a"), ("MEMORY", "orchestrator -> a")])
+        self.assertIn("sqlite", rows[-2].detail[-1])
 
 
 class Cleanup(Base):

@@ -59,7 +59,7 @@ janus land UNIT [--push]         # merge and optionally push, never forced
 ```
 Commands, routing, capacity, locks and findings: [docs/REFERENCE.md](docs/REFERENCE.md).
 
-**Monitor** (read-only; needs an interactive terminal): tabs Active, Backlog, Finished, Board, Overview. Keys: `Tab`/`←`/`→` or `1`-`5` switch tabs,
+**Monitor** (read-only; needs an interactive terminal): tabs Active, Backlog, Ended, Board, Overview. Keys: `Tab`/`←`/`→` or `1`-`5` switch tabs,
 `↑`/`↓` or `j`/`k` and `PgUp`/`PgDn`/`g`/`G` move, `Enter` opens details (`Esc` closes), `/` filters, `r` refreshes, `?` help, `q` quits.
 A host that does not answer is shown as unreachable or stale with the age of its last good reading, never as empty.
 

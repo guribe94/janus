@@ -15,21 +15,21 @@ has `$JANUS_ROOT`.
 | `janus status` / `janus check [--json]` | the state now, derived from hosts, units, board, queues; findings clear when their condition clears |
 | `janus hosts [--refresh]` | each host: OS, arch, cores, RAM, disk, GPU, tools, coding clients (installed / login present / usable by config), caches |
 | `janus capacity` | each host's admission now: room, reservations, pause reason |
-| `janus monitor` | read-only curses dashboard; works from the root and any subdirectory; tabs Active, Backlog, Finished, Board, Overview (current % checkpoint from `HANDOFF.md`); tool/model per unit; per host admission reason, coding clients and the age of that reading; `?` help, `/` filter |
-| `janus launch UNIT --kind K` | start an agent on a host with room; model chosen by `[routing]`, only if allowed (see Routing) |
-| `janus fill` | launch ready backlog units that fit; `[fill] watcher = true` lets the watcher do it |
+| `janus monitor` | read-only curses dashboard; works from the root and any subdirectory; tabs Active, Backlog, Ended, Board, Overview (current % checkpoint from `HANDOFF.md`; the checklist totals `janus report` gives); tool/model per unit; per host admission reason, coding clients and the age of that reading; `?` help, `/` filter |
+| `janus launch UNIT --kind K` | start an agent on a host with room; model chosen by `[routing]`, only if allowed (see Routing). A remote launch needs a tree: `--new-worktree REPO`, `--cwd TREE` or an existing `<worktrees>/UNIT`; it is refused (nothing recorded or copied) rather than copy the project root |
+| `janus fill` | launch ready backlog units that fit: only items beads lists ready (`bd ready`), of an agent, not held, not covered by an open unit; beads unreadable: nothing launched (never from the bare checklist); a brief a remote host cannot satisfy is refused while planning; `[fill] watcher = true` lets the watcher do it. Brief header lines read: `ITEM`, `KIND`, `TIER`, `PRIORITY`, `BUDGET` (USD, replaces the learned budget), `TEST-HOST`, `HOST-NEEDS`, `REPO`; any other line is prose for the agent (ordering is a beads dependency: `bd dep add <blocked> <blocker>`) |
 | `janus run --host H -- CMD` | queue a job through the host's own admission (`--detach` returns `host:task`; `--needs` places by capability). A remote agent's `<root>/run/<unit>.lane [--detach] [--broad R] CMD` is the same code (`janus/lane.py`: guard, queueing, a job record beside the files) |
 | `janus queue`, `janus cancel`, `janus busy`, `janus thrash` | read queues; cancel one job; is a tree in use; shared-host thrash acts |
 | `janus park`, `janus resume [UNIT]` | park a unit on its jobs / resume it; with no unit, continue the orchestration in a new session |
-| `janus collect`, `janus stop`, `janus close` | bring back a unit's output, stop it, close it (checks nothing is lost) |
-| `janus land UNIT [--host H] [--push]` | merge the landing branch into the unit's branch, squash, move the branch from the tip merged (expected ref), optionally push (never forced); on the unit's own host. A requested push that stays refused exits non-zero (`NOT PUBLISHED`): the integrated result stays on the unit's branch and the remote is untouched |
+| `janus collect`, `janus stop`, `janus close` | bring back a unit's output, stop it, close it (checks nothing is lost). `janus collect UNIT --subdir PATH` (remote units only): a verified patch of one relative subtree of the copy, paths kept relative to the copy, in `out/UNIT/changes-scoped.patch`; partial, so the unit is not recorded collected and stop/close still need a full collect |
+| `janus land UNIT [--host H] [--push]` | merge the landing branch into the unit's branch, squash, move the branch from the tip merged (expected ref), optionally push (never forced); on the unit's own host. A requested push that stays refused exits non-zero (`NOT PUBLISHED`): the integrated result stays on the unit's branch and the remote is untouched. A verified push records the publication (source HEAD, commit, remote, branch) on the unit and writes the sha into the linked item's checklist evidence cell (status unchanged); `janus land` again finishes an incomplete writeback without landing again. `janus close` of a squash-landed unit accepts its unpushed commits only when its tree is contained in that publication, verified now |
 | `janus remember`, `janus forget`, `janus memory` | MEMORY.md: `--instruction`, `--decision`, `--fact`, `--pitfall`, `--key` replaces |
-| `janus answer q<N> TEXT`, `janus board-close AGENT` | answer a board question; archive a card |
+| `janus answer q<N> TEXT`, `janus send AGENT TEXT`, `janus board-close AGENT` | answer a board question; one addressed message; archive a card |
 | `janus transcript UNIT`, `janus index`, `janus report` | grep/tail a transcript; the reports index; derived status view |
-| `janus backlog`, `janus ledger`, `janus tidy`, `janus commit-state` | checklist import; API spend ledger; clean up; commit and push state |
+| `janus backlog`, `janus ledger`, `janus tidy`, `janus commit-state` | checklist import; API spend ledger; clean up; commit and push state. `janus backlog set ITEM status=DONE --unit UNIT [--dry-run]`: explicit acceptance of a whole item, only with the unit's publication verified on the remote now: the row's status becomes DONE, its evidence cell gets the sha, then its beads issue closes |
 | `janus register`, `janus install-host H`, `janus watch` | register the orchestrator session; set a host up; the watcher pass (`--reset`: verified new session) |
 
-`board.sh` (also `janus` for answers): `post`, `send <agent> <text>` (one addressed message), `direct <agent> <text>`, `read`, `summary`,
+`board.sh` (the agents' interface; the orchestrator uses `janus answer` and `janus send`): `post`, `send <agent> <text>` (one addressed message), `direct <agent> <text>`, `read`, `summary`,
 `questions`, `answer`, `digest`, `sync`. There is no broadcast.
 
 ## Memory and handoff
@@ -99,7 +99,7 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 | Family | Meaning |
 |---|---|
 | `age` | a job waited or ran past its lane's limit |
-| `backlog` | checklist not imported / ready units held |
+| `backlog` | checklist not imported / ready units held / ready items blocked by a beads dependency (`backlog:blocked`) |
 | `beads` | bd unavailable |
 | `blocked` | jobs wait in an admission that says no |
 | `board` | a card is blocked, has a question, is gone or silent; posts wait unsynced |
@@ -108,7 +108,7 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 | `git` | the project repository is dirty / unpushed |
 | `host` | a host is unreachable (unknown: nothing is moved or relaunched for it) |
 | `idle` | room while work waits |
-| `idle-with-backlog` | ready briefed units fit now: janus fill |
+| `idle-with-backlog` | ready briefed units fit now: janus fill; `:nobrief`: ready items without a usable brief, by id. Dispatch work: wakes an idle orchestrator again every 10 min while it holds |
 | `ledger` | a provider ledger is malformed or unreconciled |
 | `machine` | shared-host items with no project id: listed, never acted on |
 | `margin` | a host is over disk or memory margins |
@@ -118,6 +118,7 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 | `parked` | a parked unit's job cannot finish or its resume failed |
 | `pressure` | admission paused by back-pressure |
 | `provider` | a unit runs on a disabled provider |
+| `question` | an open board question: `janus answer q<N> TEXT` |
 | `scheduler` | job-running work outside janus's lanes |
 | `spend` | committed spend near or at the cap |
 | `stalled` | queued work with free slots |

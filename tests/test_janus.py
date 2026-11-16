@@ -760,6 +760,69 @@ class Board(unittest.TestCase):
 class Thrash(unittest.TestCase):
     """fixes10 item 3: a shared host over thrash_psi for thrash_min: this project's newest admitted job is stopped and re-queued
     elsewhere; jobs not recorded by this project (or another task with the same script) are never touched."""
+    def setUp(self):   # the host's patch scope is asked over ssh: never here (scope: what each test says, default none running)
+        self.scope, self.stops = ("none", ""), []
+        saved = janus.patch_scope_state; self.addCleanup(setattr, janus, "patch_scope_state", saved)
+        janus.patch_scope_state = lambda h, act="": (self.stops.append(h["root"]), ("owned-inactive", ""))[1] if act == "stop" else self.scope
+
+    def patch_fixture(self):
+        d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\nshared = true\nthrash_psi = 30\nthrash_min = 5\n'
+                         '[hosts.other]\nssh = "x@other"\nroot = "/o"\nshared = true\nthrash_psi = 30\n'); cfg.run.ro = False
+        jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)
+        (jd / "new-2.json").write_text(json.dumps({"host": "far", "task": "2", "lane": "jobs", "unit": "u", "wt": str(d), "cmd": "make", "at": 200}))
+        t = {"status": {"Running": {"start": "2026-01-01T11:00:00"}}, "command": "bash /r/runs/new-2.sh", "label": "unit:u@t", "group": "jobs"}
+        hs = {"far": {"ok": True, "psi": "55.0", "pueue": {"tasks": {"2": t}}}, "other": {"ok": True, "psi": "3"}, "here": {"ok": True}}
+        cfg.jput("thrash.json", {"far": int(time.time()) - 600})
+        calls = []
+        for k, v in (("cancel_job", lambda cfg, ref, force=False: calls.append(("cancel", ref)) or [f"cancelled {ref}"]),
+                     ("cmd_run", lambda cfg, a: calls.append(("run", a.host)) or print("here:9")),
+                     ("host_cap", lambda *a: {"free": 1, "pause": ""}), ("board", lambda *a, **k: (0, "", ""))):
+            self.addCleanup(setattr, janus, k, getattr(janus, k)); setattr(janus, k, v)
+        return cfg, hs, calls
+
+    def test_this_projects_patch_helper_is_stopped_first_and_alone(self):
+        """patch-containment: over the existing threshold, this project's running patch helper scope is stopped before any job,
+        as that pass's one action (the clock restarts); a dry run says so and touches nothing; a host under its limit and
+        other hosts are not touched."""
+        cfg, hs, calls = self.patch_fixture(); self.scope = ("owned-active", "")
+        dry = janus.tend_thrash(cfg, hs, [], lambda m: None, dry=True)
+        self.assertTrue(any(l.startswith("would far thrashing") and "patch helper" in l and janus.patch_scope(cfg.hosts["far"]) in l for l in dry), dry)
+        self.assertEqual((calls, self.stops), ([], []), "a dry run acted")
+        out = janus.tend_thrash(cfg, hs, [], lambda m: None)
+        self.assertEqual(self.stops, ["/r"], "only far's own scope is stopped"); self.assertEqual(calls, [], f"a job was stopped in the same pass: {out}")
+        self.assertTrue(any("patch helper" in l and "stopped" in l for l in out), out)
+        self.assertTrue(any("patch helper" in v for v in cfg.jget("thrash-acts.json").values()))
+        self.scope = ("none", ""); janus.tend_thrash(cfg, hs, [], lambda m: None); self.assertEqual(calls, [], "the clock was not restarted")
+        cfg.jput("thrash.json", {"far": int(time.time()) - 600}); janus.tend_thrash(cfg, hs, [], lambda m: None)
+        self.assertEqual(calls[0], ("cancel", "far:2"), "with no patch helper running, the newest job is next")
+
+    def test_a_scope_that_is_not_this_projects_is_never_stopped(self):
+        """Another project's (or anyone's) scope of that name, or one that could not be read, is left alone and named; the
+        job path goes on as before."""
+        for st, word in ((("foreign", ""), "not this project's"), (("unknown", "ssh: timeout"), "could not be read (ssh: timeout)")):
+            with self.subTest(st=st):
+                cfg, hs, calls = self.patch_fixture(); self.scope = st; self.stops.clear()
+                out = janus.tend_thrash(cfg, hs, [], lambda m: None, dry=True)
+                self.assertEqual(self.stops, []); self.assertTrue(any(word in l and "would far thrashing" in l for l in out), out)
+                out = janus.tend_thrash(cfg, hs, [], lambda m: None)
+                self.assertEqual(self.stops, []); self.assertEqual(calls[0], ("cancel", "far:2")); self.assertTrue(any(word in l for l in out), out)
+
+    def test_janus_thrash_gives_every_shared_hosts_reason(self):
+        """janus thrash (explain) says why for every shared host, never a bare `nothing to do`; the watcher's pass stays quiet
+        for hosts it leaves alone."""
+        cfg, hs, calls = self.patch_fixture(); cfg.jput("thrash.json", {}); hs["far"]["psi"] = "4"
+        self.assertEqual(janus.tend_thrash(cfg, hs, [], lambda m: None), [])
+        out = janus.tend_thrash(cfg, hs, [], lambda m: None, explain=True)
+        self.assertEqual(sorted(l.split(":")[0] for l in out), ["far", "other"], out); self.assertTrue(all("fine" in l for l in out), out)
+        del hs["far"]["pueue"]; hs["far"].update(psi="55"); cfg.jput("thrash.json", {"far": int(time.time()) - 600})
+        out = janus.tend_thrash(cfg, hs, [], lambda m: None, explain=True)
+        self.assertTrue(any("no job of this project runs there; no patch helper of this project runs there: nothing to stop" in l for l in out), out)
+        with mock.patch.object(janus, "probe_all", lambda cfg: {"far": {"ok": False}, "other": {"ok": True, "psi": "1"}}), \
+             mock.patch.object(janus, "Beads", lambda cfg: type("B", (), {"units": lambda s: []})()), contextlib.redirect_stdout(io.StringIO()) as buf:
+            janus.cmd_thrash(cfg, type("A", (), {})())
+        self.assertIn("far: shared, but it did not answer the probe", buf.getvalue()); self.assertIn("other: memory PSI", buf.getvalue())
+        self.assertNotIn("nothing to do", buf.getvalue())
+
     def test_stop_newest_own_job_and_requeue(self):
         d, cfg = project('\n[hosts.far]\nssh = "x@far"\nroot = "/r"\nshared = true\nthrash_psi = 30\nthrash_min = 5\n'); cfg.run.ro = False
         jd = cfg.f("runs") / "jobs"; jd.mkdir(parents=True)

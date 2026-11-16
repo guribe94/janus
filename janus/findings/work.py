@@ -1,6 +1,6 @@
 """Findings about work in flight: ready backlog that would fit, the project's own git state, the watcher's health."""
-from janus.actions.backlog import fill_candidates, fill_plan
-from janus.backlog import backlog_cfg, backlog_issues, item_actors, item_holds, unit_items
+from janus.actions.backlog import brief_dir, fill_candidates, fill_plan
+from janus.backlog import backlog_cfg, backlog_issues
 from janus.context import Err, sh
 from janus.platform import watcher_loaded, watcher_service
 
@@ -17,24 +17,29 @@ def git_findings(cfg):
     return F
 
 def backlog_findings(cfg, hs, units):
-    """backlog:import (the checklist is not in beads), idle-with-backlog (ready briefed units that fit now), backlog:held."""
+    """backlog:import (the checklist is not in beads), idle-with-backlog (ready briefed units that fit now), idle-with-backlog:nobrief
+    (ready items without a usable brief, by id: the orchestrator writes them), backlog:held (briefed units that do not fit now) and
+    backlog:blocked (ready items bd ready does not list: a beads dependency). The selection is fill's own (fill_candidates)."""
     b = backlog_cfg(cfg)
     if not b.get("file"): return []
     try: iss = backlog_issues(cfg)
     except Err: return []
     if not iss: return [("backlog:import", f"the checklist {b['file']} is not in beads: janus backlog import")]
-    F = []
-    cov = unit_items(cfg, units); act = item_actors(cfg); hold = item_holds(cfg)
-    todo = [r for r, i in iss.items() if i.get("status") in ("open", "in_progress") and "backlog-ready" in (i.get("labels") or [])
-            and r[8:] not in cov and act.get(r[8:], "agent") == "agent" and r[8:] not in hold]
-    if not todo: return F
-    plan, stops = fill_plan(cfg, hs, units)
+    F = []; missing, blocked, held = [], [], []
+    try: cands = fill_candidates(cfg, units, missing=missing, blocked=blocked, held=held)
+    except Err: return F
+    cfg.run.briefless = missing; cfg.run.held = held   # held: named by status only, never a dispatch finding
+    if missing: F.append(("idle-with-backlog:nobrief", f"{len(missing)} ready backlog item(s) have no usable brief: {', '.join(missing[:12])}{'...' if len(missing) > 12 else ''}; "
+                          f"write {brief_dir(cfg)}/<unit>.md with an ITEM: <id> line (janus fill launches it), or janus backlog set <id> hold=<reason>"))
+    if blocked: F.append(("backlog:blocked", f"{len(blocked)} ready backlog item(s) wait on a beads dependency (bd ready does not list them): {', '.join(blocked[:12])}"))
+    if not cands: return F
+    plan, stops = fill_plan(cfg, hs, units, cands=cands)
     if plan:
         per = {}
         for x in plan: per[x[3]] = per.get(x[3], 0) + 1
         F.append(("idle-with-backlog", f"{len(plan)} ready backlog unit(s) with briefs fit now ({', '.join(f'{k}: {v}' for k, v in per.items())}): "
                   + ", ".join(x[0] for x in plan[:6]) + ("..." if len(plan) > 6 else "") + "; janus fill"))
-    held = [x[4] for x in fill_candidates(cfg, units) if x[4] not in {p[0] for p in plan}]
+    held = [x[4] for x in cands if x[4] not in {p[0] for p in plan}]
     if held: F.append(("backlog:held", f"{len(held)} ready backlog unit(s) with briefs do not launch now ({', '.join(held[:6])}): " + "; ".join(stops)[:300]))
     return F
 

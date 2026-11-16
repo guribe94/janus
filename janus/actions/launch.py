@@ -3,6 +3,7 @@
 import argparse, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
+from janus.backlog import backlog_issues, item_eligible, norm_item, unit_items
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_shipped
 from janus.branch import landing_branch
@@ -478,6 +479,13 @@ def cmd_launch(cfg, a):
         with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers: not under the writer lock; the units are read again after it (another launch may have taken the name or the room)
         units = bd.units(); prev = next((u for u in units if u["name"] == name), None); of = next((u for u in units if u["name"] == (a.of or name)), None)
         if prev and a.kind != "review": raise Err(f"{name} already launched on {prev.get('host')}")
+    if getattr(a, "auto", False) and a.item:   # fill: the item may have been launched meanwhile (a manual launch while the hosts answered)
+        try: iss = backlog_issues(cfg)
+        except Err as e: raise Err(f"refused: beads cannot be read to recheck item {a.item} ({e}): not launched")
+        cov = [u["name"] for u in units if norm_item(a.item) in unit_items(cfg, [u], iss)]   # read under the writer lock, which is held until the record below
+        if cov: raise Err(f"refused: item {a.item} is covered by open unit(s) {', '.join(cov)} now (launched while fill planned): not launched twice")
+        why = item_eligible(cfg, a.item, units)   # and still ready, an agent's and not held, in beads now: an error refuses (fail closed)
+        if why: raise Err(f"refused: item {a.item} is no longer eligible ({why}): not launched")
     ag = herdr_agents(cfg) if not getattr(a, "probes", None) else {}
     for x in units: x.setdefault("state", unit_state(x, hs, ag))   # finished units hold no build position
     hn, build, why_place = choose(cfg, a, brief, mc, units, hs)
@@ -498,7 +506,7 @@ def cmd_launch(cfg, a):
         if hst in ("working", "queued", "blocked", "unknown"):
             raise Err(f"{handover}: cannot hand over its tree: its agent is {what}; stop it first (janus stop {handover}), then hand its tree over")
     if main_checkout(cwd) and not a.allow_main: raise Err(f"refused: {cwd} is a main checkout with linked worktrees; use a worktree (or --allow-main)")
-    outd = cfg.p("out", "out") / name; outd.mkdir(parents=True, exist_ok=True)
+    outd = cfg.p("out", "out") / name   # made only once every refusal is behind (brief_plan below): a refused launch leaves nothing
     rbrief, rcwd = str(brief), str(cwd)
     budget = None
     if mc["kind"] == "api":
@@ -513,6 +521,11 @@ def cmd_launch(cfg, a):
         btext, bcopy, bnotes = brief_plan(cfg, h, name, cwd, btext)
         for n_ in bnotes: say(f"note: {n_}")
         if bcopy or btext != brief.read_text(): say(f"brief for {hn}: {len(bcopy)} file(s) copied to {h['root']}/ctx/{name}, paths rewritten")
+        # scoped-collect 1: the project root is never copied to a host by default (it may hold every repository, build output and
+        # cache of the project); refused here, before any secret, reservation, record, out dir, worktree or copy
+        if no_tree: raise Err(f"refused: {name} would run on {hn} in a copy of the whole project root {cwd} (no --cwd, no --new-worktree and no "
+                              f"{cfg.p('worktrees', 'worktrees') / name}): launch with --new-worktree <repo> (a fresh worktree of that repository is made "
+                              "and copied) or --cwd <its worktree>")
     if mc["kind"] == "api":
         read_secret(cfg.prov[mc["provider"]])   # the secret store answers before anything is reserved or recorded
         ok, w = model_ok(cfg, mname)
@@ -528,6 +541,7 @@ def cmd_launch(cfg, a):
         if cfg.run.dry: say(f"+ git -C {a.new_worktree} worktree add -b {name} {cwd} {ref}")
         else: cwd = new_worktree(Path(a.new_worktree).resolve(), cwd, name, ref)
         rcwd = str(cwd)
+    if not cfg.run.dry: outd.mkdir(parents=True, exist_ok=True)
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
     pred = None
     u = {"v": UNIT_V, "host": hn, "build": build, "model": mname, "vendor": mc.get("vendor"), "kind": a.kind, "tier": a.tier, "brief": str(brief),

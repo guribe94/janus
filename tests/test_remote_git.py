@@ -65,7 +65,7 @@ class RemoteGit(unittest.TestCase):
         u = {"name": "u", "id": "1", "host": "far", "rcwd": self.rcwd, "cwd": str(self.wt), "repo": repo}
         a = type("A", (), {"unit": "u", "push": True, "host": None})()
         out = io.StringIO()
-        with mock.patch.object(janus, "Beads", lambda cfg: type("B", (), {"units": lambda s: [u], "comment": lambda s, *x: None})()), contextlib.redirect_stdout(out):
+        with mock.patch.object(janus, "Beads", lambda cfg: type("B", (), {"units": lambda s: [u], "comment": lambda s, *x: None, "save": lambda s, x: u.update(x)})()), contextlib.redirect_stdout(out):
             rc = janus.cmd_land(self.cfg, a)
         self.assertEqual(rc, 0, out.getvalue()); self.assertIn("push refused", out.getvalue())   # refused once because main had moved; the retry on the new tip published
         tree = git(self.origin, "ls-tree", "--name-only", "main").split()
@@ -73,6 +73,7 @@ class RemoteGit(unittest.TestCase):
         self.assertEqual(git(self.origin, "log", "--format=%s", "main").count("\n"), 2)         # base, other work, one squash: nothing rewritten
         self.assertIn("main", (git(self.origin, "for-each-ref", "--format=%(refname:short)")))
         self.assertIn("does not prove", out.getvalue())                                          # a clean merge is not called valid
+        self.assertEqual(u["published"]["commit"], git(self.origin, "rev-parse", "main"))       # the publication, verified on origin, on the unit's record
 
     def test_a_publication_that_stays_refused_fails_and_leaves_the_target_unchanged(self):
         """Catches: land --push reporting success (or closing the unit's work as done) when the remote refused the publication."""

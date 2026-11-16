@@ -4,7 +4,7 @@ import argparse, contextlib, os, sys, tomllib
 from pathlib import Path
 from janus.actions.jobs import LANES
 from janus.context import CONF, Cfg, Err, Run, find_root, old_layout, projects, say, session_root
-from janus.board import cmd_answer
+from janus.board import cmd_answer, cmd_send
 from janus.hooks import cmd_hook
 from janus.memory import MEM_SECTIONS
 from janus.migrate import migrate
@@ -60,11 +60,14 @@ def main():
         A("--budget", type=float, help="a new budget for this run (same tree), instead of the unit's remaining budget"), dry=True)
     add("ledger", cmd_ledger, A("action", choices=["check", "repair", "reconcile", "recost"]), A("--provider"), dry=True)
     add("doctor", cmd_doctor, A("--no-hosts", action="store_true", help="skip the ssh checks"))
-    add("backlog", cmd_backlog, A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...>"), dry=True)
+    add("backlog", cmd_backlog, A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...> | hold=<reason> | status=DONE"),
+        A("--unit", help="set <item> status=DONE: the unit whose verified published landing is the item's evidence"), dry=True)
     add("install-host", cmd_install_host, A("host", help="a host of janus.toml: folders, pueued as a user service, a janus copy, the heartbeat watchdog"), dry=True)
     add("queue", cmd_queue, A("host", nargs="?"), A("--log", metavar="[HOST:]ID", help="print one task's output: <host>:<id> (ids collide between hosts); the job's run log when pueue has none"))
     add("stop", cmd_stop, A("unit"), A("--force", action="store_true", help="stop although its remote copy has uncollected work"), dry=True)
-    add("collect", cmd_collect, A("unit", help="a unit, or <host>:<task id> for a janus run job"), dry=True)
+    add("collect", cmd_collect, A("unit", help="a unit, or <host>:<task id> for a janus run job"),
+        A("--subdir", metavar="PATH", help="a remote unit only: patch just this relative subtree of its copy into out/<unit>/changes-scoped.patch "
+                                         "(paths stay relative to the copy); partial: the unit is not recorded collected"), dry=True)
     add("run", cmd_run, A("--host", help="run there (pinned)"), A("--needs", action="append", help="requirements instead of a host: os, arch, features, devices, mem (linux,x86_64,device=usb,mem=4G); placed when a host that meets them has room"),
         A("--place-wait", action="store_true", help=argparse.SUPPRESS), A("--broad", metavar="REASON", help="a whole-suite run: why it must be whole (it runs at low priority)"), A("--lane", choices=[x for x in LANES if x != "place"], default="jobs"), A("--unit"), A("--wt", required=True),
         A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="a job that needs the host's USB devices (container.usb_args, usb_lock)"),
@@ -96,6 +99,7 @@ def main():
     add("init", cmd_init, A("--name", help="project name for a new .janus/janus.toml (default: the folder's name)"), dry=True)
     add("migrate", migrate, A("source", nargs="?", help="the old orchestration root (the folder holding janus.toml; default: found from here)"), A("--to", metavar="TARGET", help="the workspace root that will own .janus (default: the source itself)"), A("--apply", action="store_true", help="do it (default: a dry run that says what would move and what refuses it)"))
     add("answer", cmd_answer, A("id", help="q<N>: a board question"), A("answer"))
+    add("send", cmd_send, A("agent", help="a unit, or orchestrator"), A("text"))
     add("board-close", cmd_board_close, A("agent", help="a board card that is not an open unit"), dry=True)
     add("register", cmd_register, A("session", nargs="?"), dry=True)
     add("hook", cmd_hook, A("event", choices=["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"]))

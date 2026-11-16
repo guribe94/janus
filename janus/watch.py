@@ -1,7 +1,8 @@
 """janus watch: the watcher's one pass (launchd/systemd every few minutes): board sync and alerts, check as a writer, resume
 parked units whose jobs finished, thrash and tidy, cancel orphans, fill, and wake or restart the orchestrator. Each step is
 guarded (watch_step): one that fails is logged and counted, the others still run, and the next pass tries it again. The
-orchestrator is woken when the set of urgent observations CHANGES, never repeatedly for the same ones."""
+orchestrator is woken when the set of urgent observations CHANGES, never repeatedly for the same ones, except dispatch work
+(ready backlog that fits, ready items without a brief), which wakes it again after the cooldown while it waits."""
 import argparse, os, threading, traceback
 from janus.actions.backlog import cmd_fill
 from janus.actions.jobs import cancel_job, orphan_jobs, tend_thrash
@@ -102,13 +103,7 @@ def watch_pass(cfg, log, pre=None):
     # [fill] every_min (default 10) minutes, only when check found something that fits (idle-with-backlog)
     fc = cfg.c.get("fill", {})
     if fc.get("watcher") and any(k == "idle-with-backlog" for k, _ in F) and now() - cfg.mtime("last_fill") > fc.get("every_min", 10) * 60:
-        cfg.touch("last_fill")
-        try:
-            import io, contextlib
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf): cmd_fill(cfg, argparse.Namespace(max=fc.get("max_per_pass")))
-            log("fill: " + " | ".join(l.strip() for l in buf.getvalue().splitlines())[:600])
-        except Exception as e: log(f"fill failed: {e}")
+        cfg.touch("last_fill"); step("fill", watch_fill, cfg, log, fc)   # a step: a fill that keeps failing is watcher:step:fill
     running = any(u.get("state") in ("working", "queued") for u in units)
     pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
     pl = H("pane", "list")
@@ -158,12 +153,25 @@ def watch_pass(cfg, log, pre=None):
     if ag["agent"].get("agent_status") == "working": return
     wake_on_change(cfg, log, pane, F)
 
+def watch_fill(cfg, log, fc):
+    """The watcher's janus fill ([fill] watcher = true): its output in watch.log; an error is the step's (watch_step counts it)."""
+    import io, contextlib
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf): rc = cmd_fill(cfg, argparse.Namespace(max=fc.get("max_per_pass")))
+        if rc: raise Err(f"janus fill exited {rc}: a launch failed (" + " | ".join(l.strip() for l in buf.getvalue().splitlines() if "not launched" in l)[:200] + ")")
+    finally: log("fill: " + " | ".join(l.strip() for l in buf.getvalue().splitlines())[:600])
+
 def wake_on_change(cfg, log, pane, F):
     """Prompt the idle orchestrator when the set of urgent observations changed (a new one appeared), once per change; the same
-    set again is not a reason, and a set that cleared resets the memory so a recurrence is new. At least 10 min apart."""
+    set again is not a reason, and a set that cleared resets the memory so a recurrence is new. Dispatch findings (a family with
+    recur: ready work that fits, ready items without a brief) are a reason again while they hold: work waits on the
+    orchestrator, not on a change. At least 10 min apart."""
     keys = sorted(f.key for f in F if f.urgent); seen = set(cfg.jget("woken.json").get("keys", []))
-    new = [k for k in keys if k not in seen]; due = bool(new) and now() - cfg.mtime("last_wake") > 600
+    new = [k for k in keys if k not in seen]; still = [f.key for f in F if f.urgent and f.recur and f.key in seen]
+    due = bool(new or still) and now() - cfg.mtime("last_wake") > 600
     if not cfg.run.dry: cfg.jput("woken.json", {"keys": keys if due or not new else sorted(seen & set(keys))})   # a held-back wake stays pending
     if due:
-        cfg.touch("last_wake"); log(f"wake: new {new[:3]}")
-        with cfg.unlocked(): herdr("agent", "prompt", pane, JANUS_MARK + wake(cfg, "changed: " + ", ".join(new[:3])))
+        cfg.touch("last_wake"); log(f"wake: new {new[:3]}" + (f", still {still[:3]}" if still else ""))
+        why = ", ".join(x for x in ("changed: " + ", ".join(new[:3]) if new else "", "still waiting: " + ", ".join(still[:3]) if still else "") if x)
+        with cfg.unlocked(): herdr("agent", "prompt", pane, JANUS_MARK + wake(cfg, why))

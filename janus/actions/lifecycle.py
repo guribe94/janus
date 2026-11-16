@@ -1,11 +1,13 @@
 """A unit's life after launch: janus stop, collect, close, park, resume, board-close; saving its output, task log and
 transcript; the watcher's tend_parked (resume a parked unit when its jobs finished)."""
-import contextlib, os, re, shlex, sys, time
+import ast, contextlib, os, re, shlex, sys, time
 from pathlib import Path
-from janus.actions.jobs import collect_job, job_of, job_state, recorded_jid, runs_dir, save_task_log, task_rc, task_status, unit_jobs
+from janus.actions.jobs import (collect_job, job_of, job_state, patch_scope, patch_scope_desc, patch_scope_sh, recorded_jid, runs_dir, save_task_log,
+    task_rc, task_status, unit_jobs)
 from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken, tool_argv
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
+from janus.branch import published_contains
 from janus.budgets import budget_note, finish_refusal, reload_usd, session_usage
 from janus.context import (DIFF_X, Err, JANUS_MARK, LockLost, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, now, pq, ps_table, qp, say,
     sh, ts)
@@ -104,8 +106,11 @@ def cmd_stop(cfg, a):
 # being complete (an unreadable path, no git, a patch that does not rebuild the tree) is an error on stderr and a non-zero
 # exit; a fifo, socket or device, which git cannot carry, is named on stderr and left out. Tool caches (SKIP) and new files the
 # tree's own .gitignore ignores are no part of the unit's changes (row 251); a file that was sent is carried whatever the rules say.
-PATCH_PY = r"""import filecmp, os, shutil, stat, subprocess, sys, tempfile
+PATCH_PY = r"""import filecmp, os, shutil, signal, stat, subprocess, sys, tempfile
 unit, base, wt = sys.argv[1], sys.argv[2], sys.argv[3]
+sub = sys.argv[4] if len(sys.argv) > 4 else None   # janus collect --subdir: one subtree of the copy (scoped recovery)
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(143))   # the deadline's TERM: the scratch store is removed (finally) and git killed
+# every git it runs keeps the host's patch lock (fd 9, close_fds=False): the lock is free only when no process of the helper is left
 SKIP = {"target", ".venv", "node_modules", "__pycache__", ".git", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".hypothesis", ".tox"}   # gates.CACHE_DIRS too
 bad, notes = [], []
 def die(msg):
@@ -113,7 +118,9 @@ def die(msg):
 def entries(root):
     E = {}
     def err(e): bad.append("%s: %s" % (e.filename, e.strerror))
-    for d, dirs, files in os.walk(root, onerror=err):
+    top = os.path.join(root, sub) if sub else root   # scoped: only the selected subtree is walked; paths stay relative to root
+    if sub and not os.path.isdir(top): return E   # absent on this side: all of it added or deleted
+    for d, dirs, files in os.walk(top, onerror=err):
         links = [x for x in dirs if os.path.islink(os.path.join(d, x))]
         dirs[:] = [x for x in dirs if x not in SKIP and x not in links]
         for f in files + [x for x in links if x not in SKIP]:
@@ -123,8 +130,24 @@ def entries(root):
             if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode): E[os.path.relpath(p, root)] = st
             else: notes.append("%s: a fifo, socket or device, which no patch can carry: left out" % p)
     return E
-if not os.path.isdir(wt): sys.exit(0)
+if not os.path.isdir(wt):
+    if sub: die("%s is missing: no copy to recover %s from" % (wt, sub))
+    sys.exit(0)
 if not os.path.isdir(base): die("%s is missing: the tree the unit was sent, without which its changes cannot be told" % base)
+if sub is not None:   # checked again here, on the host, whatever the caller checked: never outside the copy, never through a symlink
+    parts = [x for x in sub.split("/") if x not in ("", ".")]
+    if sub.startswith("/") or not parts or ".." in parts or SKIP & set(parts):
+        die("--subdir %r: not a relative subdirectory of the copy (absolute, the copy itself, a .. component or an excluded folder)" % sub)
+    sub, have = "/".join(parts), 0
+    for root in (base, wt):
+        p = root
+        for x in parts:
+            p = os.path.join(p, x)
+            if not os.path.lexists(p): break
+            if os.path.islink(p): die("--subdir %s: %s is a symlink, which a scoped collect never follows" % (sub, p))
+            if not os.path.isdir(p): die("--subdir %s: %s is not a directory" % (sub, p))
+        else: have += 1
+    if not have: die("--subdir %s exists in neither %s nor %s: nothing to recover" % (sub, base, wt))
 A, B = entries(base), entries(wt)
 def same(r):
     a, b, pa, pb = A[r], B[r], os.path.join(base, r), os.path.join(wt, r)
@@ -149,7 +172,7 @@ try:
          "-c", "core.safecrlf=false", "-c", "core.quotePath=true", "-c", "core.precomposeUnicode=false", "-c", "core.ignoreCase=false",
          "-c", "core.protectHFS=false", "-c", "core.protectNTFS=false"]
     def git(args, cwd=tmp, inp=None, out=subprocess.PIPE, **e):
-        try: p = subprocess.run(G + args, cwd=cwd, input=inp, stdout=out, stderr=subprocess.PIPE, env=dict(env, **e))
+        try: p = subprocess.run(G + args, cwd=cwd, input=inp, stdout=out, stderr=subprocess.PIPE, env=dict(env, **e), close_fds=False)
         except OSError as x: die("git cannot be run on this host (%s): no patch without it" % x)
         if p.returncode: die("no complete patch: git %s failed: %s" % (args[0], p.stderr.decode(errors="replace").strip()[-800:]))
         return p.stdout.decode().strip() if out == subprocess.PIPE else ""
@@ -158,7 +181,7 @@ try:
     new = [r for r in ch if r not in A]   # row 251: a NEW file the tree's own .gitignore rules ignore (build output, a log) is not the unit's work
     if new:
         p = subprocess.run(G + ["check-ignore", "--no-index", "-z", "--stdin"], cwd=wt, input=b"".join(os.fsencode(r) + b"\0" for r in new),
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(env, GIT_WORK_TREE=os.path.abspath(wt)))
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(env, GIT_WORK_TREE=os.path.abspath(wt)), close_fds=False)
         if p.returncode not in (0, 1): die("no complete patch: git check-ignore failed: %s" % p.stderr.decode(errors="replace").strip()[-800:])
         ign = set(os.fsdecode(x) for x in p.stdout.split(b"\0") if x)
         if ign: sys.stderr.write("janus patch (%s): note: %d new path(s) ignored by .gitignore left out: %s\n" % (unit, len(ign), ", ".join(sorted(ign)[:8])))
@@ -181,13 +204,92 @@ finally:
     shutil.rmtree(tmp, ignore_errors=True)
 """
 
-def remote_patch(cfg, h, n, fname):
+# The helper's containment on a shared host. One patch helper per host and user at a time: a lock taken without waiting (busy:
+# exit PATCH_BUSY, nothing queued). Its fd is inherited by the helper and every git it runs, so the lock is held until the last
+# of them ends, whatever happens to the ssh session that started it. A remote helper runs in its own systemd scope
+# (patch_scope: the project's name and Description) capped at PATCH_MEM_MB in all with no swap; it checks inside the scope that
+# the cgroup limits are in force and that the lock reached it, else no patch (PATCH_UNSAFE: fail closed). A scope of that name
+# left over is stopped first only when it is this project's. GNU timeout puts the helper in its own process group: TERM to the
+# whole group at PATCH_DEADLINE s, KILL PATCH_KILL s later, well inside the caller's PATCH_CALLER s; then the scope is stopped
+# too (a process that left the group). The patch goes to a temporary file of its own and is renamed over <fname> only when the
+# helper succeeded: any failure keeps the earlier complete patch. A local host (no systemd) gets the lock and the deadline.
+PATCH_MEM_MB, PATCH_DEADLINE, PATCH_KILL, PATCH_CALLER, PATCH_BUSY, PATCH_UNSAFE = 512, 240, 5, 300, 75, 70
+PATCH_LOCK_DIR = '"${XDG_RUNTIME_DIR:-/tmp}"'   # shell text: the host's per-user folder
+CGROUP_ROOT = "/sys/fs/cgroup"
+PATCH_GUARD = ('CG=$(systemctl --user show -p ControlGroup --value "$1" 2>/dev/null) && [ -n "$CG" ] && [ "$(cat "$2$CG/memory.max" 2>/dev/null)" = "$3" ] '
+               '&& [ "$(cat "$2$CG/memory.swap.max" 2>/dev/null)" = 0 ] || { echo "$4 the memory limits of its scope $1 are not in force (cgroup v2 with '
+               'the memory controller delegated to the user is needed): no patch" >&2; exit %(unsafe)d; }\n'
+               'flock -n 9 || { echo "$4 the host patch lock did not reach the helper: no patch" >&2; exit %(unsafe)d; }\nshift 4; exec "$@"')
+
+def patch_script(h, n, fname, sub=None):
+    """The shell remote_patch runs on host h (see above). sub: only that subtree of the copy (janus collect --subdir)."""
+    q = shlex.quote; f = q(f"out/{n}/{fname}"); remote = not h.get("local"); sc = patch_scope(h); U = PATCH_UNSAFE
+    run = f'"$TO" -k {PATCH_KILL} -s TERM {PATCH_DEADLINE} python3 -c {q(PATCH_PY)} {q(n)} {q("base/" + n)} {q("worktrees/" + n)}' + (f" {q(sub)}" if sub is not None else "")
+    s = (f"cd {qp(h['root'])} || exit $?\nP={q(f'janus patch ({n}):')}\n"
+         f"for t in flock python3 mktemp{' systemd-run systemctl' if remote else ''}; do command -v $t >/dev/null 2>&1 || "
+         f'{{ echo "$P $t is missing on this host: no patch without its protections" >&2; exit {U}; }}; done\n'
+         f'TO=$(command -v timeout || command -v gtimeout) || {{ echo "$P no GNU timeout on this host: no patch without its deadline" >&2; exit {U}; }}\n'
+         f'L={PATCH_LOCK_DIR}/janus-patch-$(id -u).lock\nexec 9>>"$L" || {{ echo "$P cannot open the patch lock $L: no patch" >&2; exit {U}; }}\n'
+         f'flock -n 9 || {{ echo "$P busy: another patch helper of this user runs on this host (one at a time, nothing queued): try again later" >&2; exit {PATCH_BUSY}; }}\n')
+    if remote:
+        s += (f"s=$({patch_scope_sh(h, 'stop')})\n"
+              f'case "$s" in none|owned-inactive) ;; *) echo "$P its scope {sc} is $s, not free for this project (one that is not this project\'s is left alone): no patch" >&2; exit {U};; esac\n')
+    s += f'T=$(mktemp {f}.tmp.XXXXXX) || exit {U}\nchmod 644 "$T"\n'
+    # started in the background only to know its pid: systemd-run --scope and the guard exec, so it is timeout's pid, which
+    # is its process group's id. timeout returns once the helper itself ended; a process of its group that ignored the TERM
+    # gets the KILL here, PATCH_KILL s later.
+    if remote:
+        s += (f"systemd-run --user --scope -q --unit={q(sc)} --description={q(patch_scope_desc(h))} -p MemoryMax={PATCH_MEM_MB}M -p MemorySwapMax=0 -- "
+              f'sh -c {q(PATCH_GUARD % {"unsafe": U})} sh {q(sc)} {q(CGROUP_ROOT)} {PATCH_MEM_MB * 1048576} "$P" {run} > "$T" &\n')
+    else:
+        s += f'{run} > "$T" &\n'
+    s += f'pid=$!; wait $pid; rc=$?\ncase $rc in 124|137) kill -0 -$pid 2>/dev/null && {{ sleep {PATCH_KILL}; kill -KILL -$pid 2>/dev/null; }};; esac\n'
+    if remote: s += f"{patch_scope_sh(h, 'stop', PATCH_KILL)} >/dev/null 2>&1\n"   # what is left in its scope (a process that left the group): stopped, when owned
+    return s + (f'if [ $rc -eq 0 ]; then mv -f "$T" {f} && exit 0; rc=$?; fi\nrm -f "$T"\n'
+                f'case $rc in 124|137) echo "$P no patch within {PATCH_DEADLINE} s: the helper\'s process group was stopped (TERM, then KILL after {PATCH_KILL} s); the earlier patch is kept" >&2;; esac\n'
+                f"exit $rc\n")
+
+def remote_patch(cfg, h, n, fname, sub=None):
     """Write out/<unit>/<fname> on host h: the agent's changes as a patch against the tree it was sent (base/<unit>), written
-    and verified by git (PATCH_PY). Returns (rc, stdout, stderr): rc is non-zero when no complete patch could be made, and then
-    <fname> is left as it was (a partial patch never takes the place of an earlier whole one); stderr says why."""
-    f = shlex.quote(f"out/{n}/{fname}")
-    return X(cfg, h, f"cd {qp(h['root'])} && {{ python3 -c {shlex.quote(PATCH_PY)} {shlex.quote(n)} {shlex.quote('base/' + n)} {shlex.quote('worktrees/' + n)} > {f}.tmp && mv {f}.tmp {f}; }}"
-                     f" || {{ rc=$?; rm -f {f}.tmp; exit $rc; }}", timeout=300)
+    and verified by git (PATCH_PY), contained as patch_script says. Returns (rc, stdout, stderr): rc is non-zero when no
+    complete patch could be made (PATCH_BUSY: another helper runs there; PATCH_UNSAFE: its protections are not available), and
+    then <fname> is left as it was (a partial patch never takes the place of an earlier whole one); stderr says why. sub: the
+    changes under that subtree only (scoped_subdir), paths still relative to the copy."""
+    return X(cfg, h, patch_script(h, n, fname, sub), timeout=PATCH_CALLER)
+
+SCOPED_PATCH = "changes-scoped.patch"   # janus collect --subdir: never changes.patch, never the unit's collected state
+PATCH_SKIP = frozenset(ast.literal_eval(re.search(r"^SKIP = (\{.*?\})", PATCH_PY, re.M).group(1)))   # the helper's own excluded folders
+
+def scoped_subdir(s):
+    """--subdir as the helper gets it ('a/b'), or Err: a relative subdirectory of the copy, never the copy itself, a .. component
+    or a folder the patch leaves out (SKIP in PATCH_PY). Symlinks and existence are checked on the host (PATCH_PY), again."""
+    parts = [x for x in (s or "").split("/") if x not in ("", ".")]
+    if (s or "").startswith("/") or not parts or ".." in parts or PATCH_SKIP & set(parts):
+        raise Err(f"--subdir {s!r}: give a relative subdirectory of the unit's copy (not absolute, not the copy itself, no .. component, "
+                  f"no excluded folder: {', '.join(sorted(PATCH_SKIP))})")
+    return "/".join(parts)
+
+def collect_scoped(cfg, a, sub):
+    """janus collect UNIT --subdir PATH: a patch of the changes under one subtree of a remote copy, in out/<unit>/changes-scoped.patch
+    (written and verified on the host as remote_patch does, then fetched by rsync, which renames into place). A partial recovery: no
+    fingerprint, no ledger, no record written, so stop and close still refuse until a full janus collect succeeds."""
+    if ":" in a.unit: raise Err(f"--subdir is for a remote unit, not a job ({a.unit})")
+    bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; n = u["name"]
+    if h.get("local"): raise Err(f"--subdir: {n} is a local unit: its tree is here, nothing to recover")
+    if u.get("closing"): raise Err(f"{n} is being closed: its copy on {u['host']} is being removed (janus close {n} finishes it)")
+    od = cfg.p("out", "out") / n; p = (od / SCOPED_PATCH).resolve()
+    prc, _, perr = remote_patch(cfg, h, n, SCOPED_PATCH, sub)
+    if prc: raise Err(f"collect {n} --subdir {sub}: NO PATCH could be made on {u['host']} (exit {prc}): {(perr or '').strip()[-1500:] or 'no message'}"
+                      + (f"; {p} is from an earlier scoped collect, kept" if p.exists() else ""))
+    for l in (perr or "").splitlines():
+        if l.strip(): say(l.strip())
+    cmd = ["rsync", "-a", "-e", " ".join(SSH), f"{h['ssh']}:{h['root']}/out/{n}/{SCOPED_PATCH}", str(od) + "/"]
+    if cfg.run.dry: say("+ " + shlex.join(cmd)); return
+    od.mkdir(parents=True, exist_ok=True)
+    rc, o, e = sh(cmd, timeout=600)
+    if rc: raise Err(f"collect {n} --subdir {sub}: the patch was made on {u['host']} but fetching it failed (exit {rc}): {(e or o).strip()[-160:]}")
+    say(f"scoped patch of {sub} (paths relative to the copy): {p} ({p.stat().st_size} bytes; apply in {u['cwd']} with git apply --3way)\n"
+        f"partial recovery: {n} is NOT recorded collected; stop and close still need a full janus collect {n}")
 
 # A remote copy's fingerprint: the checksum of the agent's changes and of its output folder (janus's own files left out), the
 # number of output files and the report's lines other than PENDING. collect records it; stop and close compare (item 4).
@@ -211,6 +313,7 @@ def uncollected(cfg, u):
             + f": janus collect {u['name']} first, or --force")
 
 def cmd_collect(cfg, a):
+    if getattr(a, "subdir", None) is not None: return collect_scoped(cfg, a, scoped_subdir(a.subdir))   # validated before anything runs
     if ":" in a.unit:
         with cfg.command_writer(): return collect_job(cfg, a.unit)
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]
@@ -279,6 +382,13 @@ def duplicate_check(cfg, u, units, orig):
     if st in ("working", "queued", "blocked", "unknown"):
         raise Err(f"{u['name']}: its agent is " + (f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)") + f"; stop it first (janus stop {u['name']})")
 
+def tree_changed(cfg, cwd, head0):
+    """Why the unit's tree is no longer what close checked (uncommitted changes now, or its HEAD moved from head0), else None."""
+    dirty, _ = unit_dirty(cfg, cwd)
+    if dirty: return f"{cwd} has uncommitted changes now ({', '.join(dirty[:3])})"
+    head = sh(["git", "rev-parse", "HEAD"], cwd=cwd)[1].strip() or None
+    return f"its HEAD moved ({(head0 or '?')[:9]} -> {(head or '?')[:9]})" if head != head0 else None
+
 def cmd_close(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
     handover = bool(getattr(a, "handover", False)); dup = getattr(a, "duplicate_of", None)
@@ -286,12 +396,19 @@ def cmd_close(cfg, a):
     if u.get("busy") and not busy_dead(u): raise Err(f"{u['name']}: a {u['busy']['op']} of it is running (pid {u['busy'].get('pid')}); wait for it")
     if dup and a.force: raise Err("--duplicate-of with --force: --duplicate-of is the close without --force")
     mine = own_tree(cfg, u, units) or handover   # item 13: a successor took its tree, so --force is right
+    head0 = None   # the tree's HEAD the git checks saw: rechecked before the cleanup, after the lock was let go
     if a.force and not mine: raise Err(f"--force refused: {u['cwd']} is shared (project root or another open unit's cwd)")
     if mine:
         dirty, state_repo = unit_dirty(cfg, u["cwd"])
         if dirty and not a.force: raise Err(f"{u['cwd']} has uncommitted changes ({', '.join(dirty[:3])}); commit and push, or --force")
         rc, o, e = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=u["cwd"])
-        if rc == 0 and o.strip() != "0" and not a.force and not state_repo: raise Err("unpushed commits; push first, or --force")
+        if rc == 0 and o.strip() != "0" and not a.force and not state_repo:
+            # a squash landing leaves the branch's own commits unpushed for good: only its published landing, verified on the
+            # remote now and holding every file the branch changed, stands in for the push (branch.published_contains)
+            with cfg.unlocked(): why = published_contains(cfg, u)   # git fetch: never under the writer lock
+            if why: raise Err(f"unpushed commits; push first, or --force (not squash-landed: {why})")
+            say(f"{u['name']}: its commits are squash-landed in the published {u['published']['commit'][:12]} (verified now)")
+        head0 = sh(["git", "rev-parse", "HEAD"], cwd=u["cwd"])[1].strip() or None
     elif dup: duplicate_check(cfg, u, units, dup)   # soak 43: a stopped duplicate has no verdict to give and no tree of its own
     elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
         raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
@@ -317,6 +434,10 @@ def cmd_close(cfg, a):
     if why2:   # something changed since the guard: nothing was removed; undo the marks and refuse
         u = next((x for x in bd.units() if x["id"] == u["id"]), u); u.pop("closing", None); u.pop("busy", None); bd.save(u)
         raise Err(f"refused: {u['name']}: {why2} (it changed while the close was starting)")
+    why3 = tree_changed(cfg, u["cwd"], head0) if mine and not a.force else None   # under the lock again, right before the cleanup
+    if why3:
+        if not cfg.run.dry: u = next((x for x in bd.units() if x["id"] == u["id"]), u); u.pop("closing", None); u.pop("busy", None); bd.save(u)
+        raise Err(f"refused: {u['name']}: {why3} (it changed while the close was starting): commit and push, or land it, then close again")
     with cfg.unlocked():
         close_tab(cfg, u)
         if not h.get("local"):

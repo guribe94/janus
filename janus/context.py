@@ -16,7 +16,8 @@ MUX_REFUSED = "mux_client_request_session: session request failed: Session open 
 
 EXCL = ["--exclude", ".git", "--exclude", "target", "--exclude", ".venv", "--exclude", "node_modules"]
 
-WAKE = "Wake ({reason}): if the owner waits for an answer, answer first; then in {root} run janus status and act on what changed."
+WAKE = ("Wake ({reason}): if the owner waits for an answer, answer first; then in {root} run the operating loop: janus status, integrate and "
+        "record finished work, prepare missing briefs, fill authorized capacity, report concrete blockers.")
 # after a reset or a brand-new session (it holds no state): the memory, then the handoff, both by ABSOLUTE path -- the session's
 # cwd may be outside the project root.
 WAKE_CLEAR = "read {memory} (binding instructions) and {handoff}, then " + WAKE
@@ -34,11 +35,14 @@ class Run:
 
     dry: --dry-run, print what would change and change nothing (main sets it). ro: read-only, a check or status by anyone but
     the registered orchestrator or the watcher changes nothing (run_check sets it; jput/touch then write nothing). all_units
-    and rates: what this invocation read once (every unit ever recorded; learned $ per weighted token), None until read."""
+    and rates: what this invocation read once (every unit ever recorded; learned $ per weighted token), None until read; briefless:
+    the ready items without a usable brief that this invocation's check found."""
     dry: bool = False
     ro: bool = False
     all_units: dict | None = None
     rates: dict | None = None
+    briefless: list | None = None   # the ready backlog items check found without a usable brief (status names them)
+    held: list | None = None   # the backlog items check found left out only by a hold: (item, reason, sources, brief) (status names them)
 
 class Err(Exception): pass
 

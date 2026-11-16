@@ -1,7 +1,8 @@
 """The shared project memory and the status view: janus remember/forget/memory, transcript, index, report, and janus ledger
 (check, repair, reconcile)."""
 import json, os, re, time
-from janus.backlog import backlog_items, item_actors, unit_items
+from janus.actions.backlog import fill_candidates
+from janus.backlog import checklist_line, checklist_totals, norm_item
 from janus.beads import Beads
 from janus.board import board, board_dir
 from janus.budgets import OUTCOMES, run_outcomes
@@ -89,15 +90,16 @@ def cmd_report(cfg, a):
     """The status view, derived from the board, the units and the backlog now (nothing is stored): backlog progress, spend by
     outcome, open units. --brief: the summary lines only."""
     L = [f"janus report: {cfg.name}, {ts()}"]
-    items = backlog_items(cfg)
-    if items is not None:
-        act = item_actors(cfg); done = [x for x in items if x[3]]; left = [x for x in items if not x[3]]
-        try: cov = unit_items(cfg, Beads(cfg).units())
-        except Err: cov = set()
-        L.append(f"Backlog: {len(done)} of {len(items)} items done ({100 * len(done) // max(len(items), 1)} %); {len(left)} left: "
-                 + ", ".join(f"{n} {k}" for k, n in sorted(Counter_(act.get(i, 'agent') for i, *_ in left).items())) + f"; {sum(1 for i, *_ in left if i in cov)} in open units")
+    try: units = Beads(cfg).units()
+    except Err: units = []
+    tot = checklist_totals(cfg, units)
+    if tot is not None:
+        missing, held = [], []
+        try: fill_candidates(cfg, units, missing=missing, held=held)
+        except Err: missing = held = None   # unknown, not none
+        L.append(checklist_line(tot, missing, held))   # janus status and the monitor show the same totals
         if not a.brief:
-            for i, t, st, d, rd in left[:40]: L.append(f"  {'*' if i in cov else ' '} {i:10} [{act.get(i, 'agent')}] {st[:20]:20} {t[:80]}")
+            for i, t, st in tot["left"][:40]: L.append(f"  {'*' if norm_item(i) in tot['cov'] else ' '} {i:10} [{tot['act'].get(norm_item(i), 'agent')}] {st[:20]:20} {t[:80]}")
     outs = run_outcomes(cfg)
     for pn in dict.fromkeys(x[0] for x in outs):
         mine = [x for x in outs if x[0] == pn]; tot = sum(x[3] for x in mine)

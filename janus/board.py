@@ -61,6 +61,12 @@ def cmd_answer(cfg, a):
     if rc: raise Err(f"answer {a.id}: {(e or o).strip()[:160]}")
     return 0, [f"answered {a.id}"]
 
+def cmd_send(cfg, a):
+    """janus send <agent> <text>: one addressed board message from the orchestrator (board.sh send, without its path or BOARD_DIR)."""
+    rc, o, e = board(cfg, "send", a.agent, a.text)
+    if rc: raise Err(f"send {a.agent}: {(e or o).strip()[:160]}")
+    return 0, [f"sent to {a.agent}"]
+
 def board_findings(cfg, names):
     """question:<id> (stays until answered), board:stale:<path>."""
     F = stale_board_findings(cfg)
@@ -102,4 +108,4 @@ def _board_alerts(cfg, log):
     log(f"board alert: {msg[:600]}"); cfg.jput("alerted.json", {**{k: v for k, v in seen.items() if now() - v < 7 * 86400}, **{k: now() for k, _ in new}})
     return msg
 
-__all__ = ["board_script", "board_shipped", "board_dir", "board", "board_rows", "board_questions", "board_findings", "cmd_answer", "board_files", "board_alerts"]
+__all__ = ["board_script", "board_shipped", "board_dir", "board", "board_rows", "board_questions", "board_findings", "cmd_answer", "cmd_send", "board_files", "board_alerts"]

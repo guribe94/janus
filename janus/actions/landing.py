@@ -9,10 +9,12 @@ and tries again, at most LAND_TRIES times. No gate and no test run happens here:
 (janus run). A merge that is clean does not prove the merged tree is correct; land says when it integrated moved work."""
 import re, shlex
 from pathlib import Path
+from janus.actions.backlog import checklist_set
 from janus.actions.swarm import write_index
+from janus.backlog import unit_items
 from janus.beads import Beads
 from janus.branch import landing_branch, unapplied_patch
-from janus.context import Err, hrun, qp, say, sh, ts
+from janus.context import Err, hrun, now, qp, say, sh, ts
 from janus.units import all_units, own_tree
 
 LAND_TRIES = 3
@@ -91,7 +93,9 @@ def cmd_land(cfg, a):
             if lag: raise Err(f"{br} here is {lag} commit(s) behind {ups} (already pushed): fast-forward {br} first (in its checkout: git merge --ff-only {ups}), then janus land {a.unit} again")
         ahead = int(git(wt, "rev-list", "--count", f"{br}..HEAD")[1].strip() or 0); behind = int(git(wt, "rev-list", "--count", f"HEAD..{br}")[1].strip() or 0)
         if not ahead: raise Err(f"{branch} has no commits over {br}: nothing to land")
-        if contained(wt, br): raise Err(f"{a.unit} is already landed: {br} holds its tree ({branch} has no change since): janus close {a.unit}")
+        if contained(wt, br):
+            if retry_writeback(cfg, u, wt, rem, br): return 0   # a landing whose accounting failed: finished now, never landed again
+            raise Err(f"{a.unit} is already landed: {br} holds its tree ({branch} has no change since): janus close {a.unit}")
         say(f"land {a.unit}: {branch} in {wt}, {ahead} commit(s) ahead of {br} ({base[:9]}), {behind} behind" + (f" [attempt {attempt}/{LAND_TRIES}]" if attempt > 1 else ""))
         rc, files = merge_state(wt, br)
         if rc == 1:
@@ -102,7 +106,7 @@ def cmd_land(cfg, a):
             rc, o, e = git(wt, "merge", "--no-edit", br, timeout=600)
             if rc: git(wt, "merge", "--abort"); raise Err(f"git merge {br} failed although merge-tree was clean: {(e or o).strip()[-160:]}; aborted")
             say(f"merged {br} into {branch}"); integrated += 1
-        tree = git(wt, "rev-parse", "HEAD^{tree}")[1].strip()
+        tree = git(wt, "rev-parse", "HEAD^{tree}")[1].strip(); source = git(wt, "rev-parse", "HEAD")[1].strip()
         subj = git(wt, "log", "--format=%s", f"{base}..HEAD", "--no-merges")[1].splitlines()
         msg = f"{a.unit}: land {branch} ({len(subj)} commit(s), squashed)\n\n" + "\n".join(f"- {s}" for s in subj[:40]) + "\n"
         rc, new, e = git(wt, "commit-tree", tree, "-p", base, "-F", "-", inp=msg)
@@ -129,8 +133,82 @@ def cmd_land(cfg, a):
         if isinstance(wt, Where) and not pushed: say(f"note: {br} moved only in {wt} on {hn}: publish with `janus land {a.unit} --push` (the host needs access to {rem}), or fetch it: git fetch ssh://{wt.h['ssh']}{wt.path} {br}")
         if integrated: say(f"note: {br} had moved, so this integrated other work; the merge was clean, which does not prove the merged tree is right: run the tests that matter (janus run) if they do")
         if u.get("id"): Beads(cfg).comment(u["id"], f"{ts()} landed on {br} as {new[:9]}")
+        if pushed: record_publication(cfg, u, wt, rem, br, new, source)
+        elif not push: say(f"note: not published, so {a.unit}'s checklist item gets no evidence: that needs a verified push (janus land {a.unit} --push)")
         return 0
     raise Err(f"{br} kept moving: {LAND_TRIES} attempts; run janus land {a.unit} again when it settles")
+
+def on_remote(wt, rem, br, commit):
+    """Whether commit is in rem's br as fetched now (only FETCH_HEAD is written): True, False, or None when it cannot be told."""
+    if git(wt, "fetch", "-q", rem, f"refs/heads/{br}", timeout=120)[0]: return None
+    return {0: True, 1: False}.get(git(wt, "merge-base", "--is-ancestor", commit, "FETCH_HEAD")[0])
+
+def save_unit(cfg, u, **kv):
+    """Set kv on the unit's record as it is now: read again under the writer lock (held only for that), so what another command
+    changed meanwhile is kept. An open unit, else the latest closed record of its id."""
+    if cfg.run.dry or not u.get("id"): u.update(kv); return
+    with cfg.writer():   # the writer lock itself (an agent's call too: command_writer takes none for it); local work only, never ssh
+        bd = Beads(cfg); cur = next((x for x in bd.units() if x["id"] == u["id"]), None)
+        if cur is None: cfg.run.all_units = None; cur = next((x for x in all_units(cfg).values() if x.get("id") == u["id"]), None)
+        if cur is None: raise Err(f"{u['name']}: its record ({u['id']}) cannot be read now")
+        cur.update(kv); bd.save(cur)
+    u.update(kv)
+
+def record_publication(cfg, u, wt, rem, br, new, source):
+    """After a push: fetch rem's br again and require new in it; then the publication (source HEAD, published commit, remote and
+    its url, branch) on the unit's record, then the checklist evidence (land_writeback). Git runs before the lock is taken."""
+    ok = on_remote(wt, rem, br, new)
+    if not ok:
+        say(f"WARNING: pushed {new[:9]}, but {rem}/{br} {'could not be fetched' if ok is None else 'does not hold it'} now: no publication recorded and no checklist "
+            f"evidence written; janus land {u['name']} --push again verifies it (nothing is landed twice)"); return
+    url = git(wt, "remote", "get-url", rem)[1].strip()
+    rc, gd, _ = git(wt, "rev-parse", "--path-format=absolute", "--git-common-dir"); gd = Path(gd.strip())   # the repository, kept for a check after the worktree is gone
+    repo = str(gd.parent if gd.name == ".git" else gd) if rc == 0 and not isinstance(wt, Where) and gd.is_absolute() else None
+    pub = {"source": source, "commit": new, "remote": rem, **({"url": url} if url else {}), **({"repo": repo} if repo else {}), "branch": br, "at": int(now()), "writeback": "pending"}
+    try: save_unit(cfg, u, published=pub)
+    except Err as e:
+        say(f"WARNING: {new[:9]} is published, but the record of it was not saved ({e}): janus land {u['name']} --push again records it (nothing is landed twice)"); return
+    say(f"published: {new[:9]} is on {rem}/{br} (verified now); recorded on {u['name']}")
+    land_writeback(cfg, u, pub)
+
+def land_writeback(cfg, u, pub):
+    """The linked item's evidence cell gets the published sha; its status stays (a landing is partial work, not the item's
+    acceptance: janus backlog set <item> status=DONE --unit <unit>). The outcome is recorded on the unit (writeback done, or
+    incomplete with why): janus land <unit> again retries an incomplete one without landing again."""
+    items = sorted(unit_items(cfg, [u])); sha = pub["commit"][:12]
+    if cfg.run.dry: say(f"+ checklist {', '.join(items) or '(no item)'}: evidence {sha}"); return
+    if not items: res = "done"; say(f"note: {u['name']} names no backlog item (--item or ITEM:): no checklist evidence to write")
+    else:
+        try:
+            with cfg.writer(): did = [checklist_set(cfg, i, evidence=sha) for i in items]   # short: a read and a rename of the file
+            res = "done"; say(f"checklist: {', '.join(items)}: " + ("evidence " + sha if any(did) else f"evidence {sha} already there") + "; status unchanged")
+        except (Err, OSError) as e:
+            res = f"incomplete: {e}"[:300]
+            say(f"WARNING: checklist writeback incomplete for {', '.join(items)} ({e}): the landing is published; janus land {u['name']} again retries the writeback (nothing is landed again)")
+    try: save_unit(cfg, u, published={**pub, "writeback": res})
+    except Err as e: say(f"WARNING: the writeback state of {u['name']} was not recorded ({e})")
+
+def retry_writeback(cfg, u, wt, rem, br):
+    """janus land on a unit already landed: True when it finished the accounting a failure left (a publication not recorded, a
+    checklist writeback incomplete), after verifying the publication on the remote now; False when there is nothing to finish.
+    A publication not recorded is found by the landing commit's subject on the fetched branch, and taken only when the branch's
+    files have that commit's content."""
+    pub = u.get("published") or {}
+    if pub.get("commit") and pub.get("writeback") == "done": return False
+    if cfg.run.dry: say(f"+ {u['name']} is landed: verify its publication on {rem}/{br}, then retry the checklist writeback"); return True
+    if not pub.get("commit"):
+        if git(wt, "fetch", "-q", rem, f"refs/heads/{br}", timeout=120)[0]: return False
+        c = git(wt, "log", "-1", "--format=%H", f"--grep=^{re.escape(u['name'])}: land ", "FETCH_HEAD")[1].strip()
+        mb = git(wt, "merge-base", "HEAD", c)[1].strip() if c else ""
+        fs = [f for f in git(wt, "diff", "--name-only", mb, "HEAD")[1].splitlines() if f] if mb else []
+        if not fs or git(wt, "diff", "--quiet", c, "HEAD", "--", *fs)[0]: return False
+        say(f"{u['name']} is landed and published as {c[:9]} on {rem}/{br}, but it was not recorded: recording it now (nothing is landed again)")
+        record_publication(cfg, u, wt, rem, br, c, git(wt, "rev-parse", "HEAD")[1].strip()); return True
+    ok = on_remote(wt, rem, pub.get("branch") or br, pub["commit"])
+    if not ok: raise Err(f"{u['name']} is landed, but its publication {pub['commit'][:12]} {'cannot be verified' if ok is None else 'is not'} on {rem}/{pub.get('branch') or br} now: "
+                         "its checklist writeback stays incomplete (nothing was written); try again when the remote answers")
+    say(f"{u['name']} is already landed and published as {pub['commit'][:12]}: retrying the checklist writeback (nothing is landed again)")
+    land_writeback(cfg, u, pub); return True
 
 SECRETS = [re.compile(x.encode()) for x in ("sk" + "-ant-[A-Za-z0-9_-]{20,}", "sk" + "-or-[A-Za-z0-9_-]{20,}", "sk" + "-proj-[A-Za-z0-9_-]{20,}",
     "\\bsk" + "-[a-f0-9]{32,}\\b", "AK" + "IA[0-9A-Z]{16}", "gh" + "p_[A-Za-z0-9_-]{20,}", "xo" + "x[A-Za-z0-9_-]{10,}",

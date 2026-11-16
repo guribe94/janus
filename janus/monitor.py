@@ -9,7 +9,7 @@ calls none of check, status, sync, handoff, writer lock, ack or wake code. Nothi
 effect is the probe's own scratch under /tmp on each host, which `janus capacity` already makes. Standard library only."""
 import contextlib, dataclasses, datetime, json, os, queue, re, signal, sys, threading, time
 from pathlib import Path
-from janus.backlog import LOG_LABELS, LOG_RX
+from janus.backlog import LOG_LABELS, LOG_RX, checklist_line, checklist_totals, eligible_items, item_actors, item_holds, norm_item, unit_items
 from janus.beads import unit_record
 from janus.board import board_dir
 from janus.context import CONF, Cfg, Err, Run, handoff_path, sh
@@ -20,7 +20,7 @@ from janus.units import api_out, report_path, unit_state, verdict as unit_verdic
 try: import curses
 except ImportError: curses = None   # janus itself must still import where the curses module is missing; monitor then says so
 
-TABS = ("Active", "Backlog", "Finished", "Board", "Overview")
+TABS = ("Active", "Backlog", "Ended", "Board", "Overview")
 MIN_INTERVAL = 1.0      # seconds: every refresh is an ssh round trip per host
 FINISHED_KEEP = 40      # closed units shown (newest first)
 BOARD_TAIL = 400        # board log lines read
@@ -126,10 +126,27 @@ def collect_reports(cfg, units):
     for u in units:
         try:
             p = report_path(cfg, u)
+            h = cfg.hosts.get(u.get("host")); mt = p.stat().st_mtime if p.is_file() else None
             out[u["name"]] = {"verdict": clean(unit_verdict(cfg, u)) or None, "waiting": [clean(j) for j in waiting_line_jobs(cfg, u)],
-                              "path": clean(p), "limit": clean(api_out(cfg, u).get("subtype")) or None}
+                              "path": clean(p), "limit": clean(api_out(cfg, u).get("subtype")) or None,
+                              "mtime": mt, "remote": bool(h) and not h.get("local"), "synced": num(u.get("saved_at")),   # the file's own age, not when it was read
+                              "in_out": p.parent.resolve() == (cfg.p("out", "out") / u["name"]).resolve()}   # saved_at is when out/<unit>/ came from the host
         except Exception as e: out[u["name"]] = {"err": err_text(e)}
     return out
+
+def collect_checklist(cfg, units, backlog):
+    """The checklist's totals as janus report and status give them (backlog.checklist_totals) and the ready items without a usable
+    brief, by id (the selection fill uses, over what bd --readonly answered and the brief files). Reads only."""
+    from janus.actions.backlog import brief_dir, brief_index, usable_brief
+    iss = {i["external_ref"]: i for i in (backlog or {}).get("items", []) if str(i.get("external_ref") or "").startswith("backlog:")}   # bd --readonly's answer
+    tot = checklist_totals(cfg, units, iss)
+    if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(unit_items(cfg, units, iss))}
+    missing = None   # unknown while the backlog cannot be read
+    if backlog is not None:
+        items = eligible_items(iss, {i.get("id") for i in backlog["ready"]}, tot["cov"], item_actors(cfg, iss), item_holds(cfg, iss))
+        ever = {u["name"] for u in units} | {u["name"] for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u}
+        idx = brief_index(cfg); missing = [clean(it) for _, _, it, _ in sorted(items) if not usable_brief(cfg, it, idx, ever)]
+    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg)}
 
 def collect_host(cfg, name):
     p = probe(name, cfg.hosts[name], ro=True, cfg=cfg)
@@ -196,7 +213,8 @@ def collect_board(cfg):
         t, who, target, kind, to, text = m.groups()
         kind = "direction" if target else kind
         q = QREF.match(text); msgs.append({"key": f"L{at}", "t": t, "who": clean(who, 40), "to": clean(target or to, 40) or None, "raw": kind, "kind": POST_KINDS.get(kind, "UPDATE"),
-                                           "q": q.group(1) if q else None, "text": clean(text, 1000)})
+                                           "q": q.group(1) if q else None, "text": clean(text, 1000),
+                                           "full": clean(text) if target and text.startswith("[memory] ") else None})   # a memory change is grouped on its whole text, never the cut one
     qs = {}
     for f in sorted((bd / "questions").glob("q[0-9]*.md")) if (bd / "questions").is_dir() else []:
         d = read_fields(f)
@@ -249,7 +267,8 @@ class Collector:
             closed = self.step("closed", collect_closed, cfg)
             if units is not None: self.step("reports-open", collect_reports, cfg, units)
             if closed is not None: self.step("reports-closed", collect_reports, cfg, closed)
-            self.step("backlog", collect_backlog, cfg)
+            backlog = self.step("backlog", collect_backlog, cfg)
+            if units is not None: self.step("checklist", collect_checklist, cfg, units, backlog)
             self.step("board", collect_board, cfg)
             self.step("facts", collect_facts, cfg)
             self.step("handoff", collect_handoff, cfg)
@@ -295,6 +314,7 @@ class Row:
     style: str = ""
     detail: list = dataclasses.field(default_factory=list)
     stale: bool = False
+    keys: tuple = ()        # the board messages one row stands for, when more than its key (a grouped [memory] change)
 
 @dataclasses.dataclass
 class Model:
@@ -335,8 +355,8 @@ def classify(u, ps, agents, rep):
     taken as success: only a report that ends VERDICT: DONE says finished; no verdict is 'ended:no-verdict'."""
     via, name = u.get("via"), u.get("name")
     v = (rep or {}).get("verdict"); vw = (v or "").replace("VERDICT:", "").strip().split(" ")[0].upper()
-    if u.get("status") == "closed": return "Finished", "closed" + (f":{vw}" if vw else ""), "closed" + ("; no verdict" if not vw else "")
-    if via == "failed": return "Finished", "failed", "launch failed (no agent was started)"
+    if u.get("status") == "closed": return "Ended", "closed" + (f":{vw}" if vw else ""), "closed" + ("; no verdict" if not vw else "")
+    if via == "failed": return "Ended", "failed", "launch failed (no agent was started)"
     if via == "starting": return "Active", "starting", "launch has not finished"
     if u.get("closing"): return "Active", "closing", "a close is in progress"
     try: st = "unknown" if via == "herdr" and agents is None else unit_state(u, ps, agents or {})
@@ -347,25 +367,30 @@ def classify(u, ps, agents, rep):
     if st in ("working", "queued", "blocked", "idle", "unknown"): return "Active", st, "" if st != "unknown" else "the host or herdr cannot say now"
     if not ended: return "Active", st, f"scheduler status {st}"
     bad = st == "failed"
-    if rep and rep.get("err"): return "Finished", "failed" if bad else "ended:unverified", f"process {st}; report unreadable ({rep['err']})"
-    if bad: return "Finished", "failed", f"process failed" + (f"; the report says {v}, but a failed process is not success" if vw == "DONE" else "")
-    if not vw: return "Finished", "ended:no-verdict", f"process {st}; the report states no verdict (a process ending is not success)"
-    return "Finished", "finished" if vw == "DONE" else f"ended:{vw[:9]}", f"process {st}; report: {v}"
+    if rep and rep.get("err"): return "Ended", "failed" if bad else "ended:unverified", f"process {st}; report unreadable ({rep['err']})"
+    if bad: return "Ended", "failed", f"process failed" + (f"; the report says {v}, but a failed process is not success" if vw == "DONE" else "")
+    if not vw: return "Ended", "ended:no-verdict", f"process {st}; the report states no verdict (a process ending is not success)"
+    return "Ended", "finished" if vw == "DONE" else f"ended:{vw[:9]}", f"process {st}; report: {v}"
 
 def tool_model(tool, model):
     """The coding client and the model it runs, together: claude/opus; one alone when only that is known; '?' when neither."""
     t, m = clean(tool), clean(model)
     return f"{t}/{m}" if t and m else t or m or "?"
 
-def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None):
-    end = epoch(u.get("closed_at") or u.get("collected_at")) if tab == "Finished" else now
+def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at=None):
+    end = epoch(u.get("closed_at") or u.get("collected_at")) if tab == "Ended" else now
     t0 = epoch(u.get("started"))
     el = fmt_dur(end - t0) if end is not None and t0 is not None else "?"
     d = [f"Name:      {u.get('name')}", f"State:     {state}" + ("  (data is stale)" if stale else ""), f"Meaning:   {note}" if note else "",
          f"Host:      {clean(u.get('host')) or '?'}", f"Tool:      {tool or (card or {}).get('tool') or '?'}", f"Model:     {clean(u.get('model')) or '?'}", f"Via:       {clean(u.get('via')) or '?'}" + (f"  task {clean(u.get('task'))}" if u.get("task") is not None else ""),
-         f"Elapsed:   {el}" + ("  (start to close)" if tab == "Finished" and el != "?" else ""),
+         f"Elapsed:   {el}" + ("  (start to close)" if tab == "Ended" and el != "?" else ""),
          f"Started:   {time.strftime('%Y-%m-%d %H:%M', time.localtime(t0)) if t0 else '?'}", f"Worktree:  {clean(u.get('cwd')) or '?'}", f"Brief:     {clean(u.get('brief')) or '?'}",
-         f"Report:    {(rep or {}).get('path') or '?'}", f"Verdict:   {(rep or {}).get('verdict') or ('unknown (report unreadable)' if (rep or {}).get('err') else 'none')}"]
+         f"Report:    {(rep or {}).get('path') or '?'}" + ("  (local copy of the remote report)" if (rep or {}).get("remote") and (rep or {}).get("in_out") else ""),
+         f"Modified:  {fmt_dur(now - rep['mtime'])} ago (the report file itself)" if (rep or {}).get("mtime") else "",
+         f"Read:      {fmt_dur(now - read_at)} ago (when this view last read it)" if read_at is not None and rep is not NOT_READ else "",
+         (f"Output:    synced {time.strftime('%Y-%m-%d %H:%M', time.localtime(rep['synced']))} ({fmt_dur(now - rep['synced'])} ago) from its host, out/{u.get('name')}/"
+          + ("; this report with it" if rep.get("in_out") else "; this report is not in that folder: its own sync is not known")) if (rep or {}).get("remote") and (rep or {}).get("synced") else "",
+         f"Verdict:   {(rep or {}).get('verdict') or ('unknown (report unreadable)' if (rep or {}).get('err') else 'none')}"]
     if card and (card.get("step") or card.get("updated")): d.append(f"Progress:  {card.get('step') or '-'}  (posted {card.get('updated') or '?'})")
     rp = (rep or {}).get("path")
     if rp and rp != "?": d.append(f"Log dir:   {os.path.dirname(rp)}" + (f"  (task log: janus queue --log {clean(u.get('host'))}:{clean(u.get('task'))})" if u.get("via") == "pueue" and u.get("task") is not None else ""))
@@ -376,21 +401,25 @@ def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None):
     return Row(u["name"], (u["name"], state + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el),
                "warn" if stale and state_style(state) in ("ok", "dim") else state_style(state), [x for x in d if x], stale)
 
-def backlog_rows(data, units, now, stale):
-    ready = {i.get("id") for i in data.get("ready", [])}; covered = {u.get("item") for u in units or [] if u.get("item")}; rows = []
+def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs"):
+    """covered, missing: the checklist source's items open units cover (their --item or brief ITEM: line) and ready items without a
+    usable brief, as collected (render reads no file); briefs: the configured briefs folder a missing brief is written in."""
+    ready = {i.get("id") for i in data.get("ready", [])}; rows = []
+    covered = set(covered) | {norm_item(u.get("item")) for u in units or [] if u.get("item")}
+    nob = {norm_item(x) for x in missing or []}
     skip = {"unit", "instruction", "intent"}
     for i in data.get("items", []):
         labels = [clean(l) for l in i.get("labels") or []]
         if skip & set(labels) or labels and set(labels) & LOG_LABELS: continue
         ref = str(i.get("external_ref") or "")[8:]
         actor = next((l[6:] for l in labels if l.startswith("actor:")), "agent"); hold = next((l[5:] for l in labels if l.startswith("hold:")), None)
-        state = "launched" if ref in covered else "held" if hold else "owner" if actor != "agent" else "ready" if i.get("id") in ready else "waiting"
+        state = "open-unit" if norm_item(ref) in covered else "held" if hold else "owner" if actor != "agent" else ("no-brief" if norm_item(ref) in nob else "ready") if i.get("id") in ready else "waiting"
         t0 = epoch(i.get("created_at")); title = clean(i.get("title")) or ref or str(i.get("id"))
         d = [f"Item:      {title}", f"State:     {state}", f"Id:        {clean(i.get('id'))}", f"Ref:       {ref or '-'}", f"Actor:     {actor}", f"Labels:    {', '.join(labels) or '-'}",
-             f"Age:       {fmt_dur(now - t0) if t0 else '?'}", f"Meaning:   {'a unit works on it' if state == 'launched' else 'not blocked by beads: janus fill may launch it' if state == 'ready' else 'held on purpose: ' + hold if hold else 'someone else does it' if state == 'owner' else 'open, but beads does not list it ready (blocked or deferred)'}",
+             f"Age:       {fmt_dur(now - t0) if t0 else '?'}", f"Meaning:   {'an open unit covers it (open, not necessarily running)' if state == 'open-unit' else 'not blocked by beads: janus fill may launch it' if state == 'ready' else 'ready, but no usable brief: write ' + briefs + '/<unit>.md with ITEM: ' + ref if state == 'no-brief' else 'held on purpose: ' + hold if hold else 'someone else does it' if state == 'owner' else 'open, but beads does not list it ready (blocked or deferred)'}",
              "", clean(i.get("description"), 600)]
         rows.append(Row(f"i:{i.get('id')}", (title, state + (" STALE" if stale else ""), "-", "-", fmt_dur(now - t0) if t0 else "?"),
-                        "warn" if stale else {"ready": "ok", "held": "dim", "owner": "dim", "launched": "ok"}.get(state, ""), d, stale))
+                        "warn" if stale else {"ready": "ok", "held": "dim", "owner": "dim", "open-unit": "ok", "no-brief": "warn"}.get(state, ""), d, stale))
     ids = {i.get("id") for i in data.get("items", [])}
     for i in data.get("ready", []):   # ready work that is not a checklist item: it is queued work too
         labels = set(i.get("labels") or []); title = str(i.get("title", ""))
@@ -401,23 +430,36 @@ def backlog_rows(data, units, now, stale):
                         [f"Item:      {clean(title)}", "State:     ready", f"Id:        {clean(i.get('id'))}", "Meaning:   ready in beads; no unit works on it", "", clean(i.get("description"), 600)], stale))
     return sorted(rows, key=lambda r: (r.cells[1].split(" ")[0] != "ready", r.cells[0].lower()))
 
+def memory_row(ms, stale):
+    """One row for one [memory] change sent to each running unit (the log keeps a line per delivery): its key is the first
+    delivery's, so the selection holds while later deliveries join; keys holds every delivery, so one that joins is still new."""
+    m, n = ms[0], len(ms)
+    d = [f"Time:      {m['t']}", f"Kind:      MEMORY  (sent to {n} recipient{'s' if n != 1 else ''})", f"From:      {m['who']}", "Recipients:"] + [f"  {x['to']}  {x['t']}" for x in ms] + ["", m["full"]]
+    return Row(m["key"], ("", m["t"], "MEMORY", m["who"] + (f" -> {m['to']}" if n == 1 else f" -> {n} agents"), m["text"]), "ok", d, stale, tuple(x["key"] for x in ms))
+
 def message_rows(data, stale):
     msgs, qs = data["msgs"], data["questions"]; rows = []; shown = {m["q"] for m in msgs if m["q"]}
+    burst = {}   # author -> their latest [memory] burst: same minute and whole text, each recipient once; another change of theirs ends it
     for m in msgs:
+        if m.get("full") is not None:
+            b = burst.get(m["who"])
+            if b and b[0] == (m["t"], m["full"]) and m["to"] not in {x["to"] for x in b[1]}: b[1].append(m); continue
+            burst[m["who"]] = ((m["t"], m["full"]), [m]); rows.append(burst[m["who"]][1]); continue
         q = qs.get(m["q"]) if m["q"] else None; qstate = q["state"] if q else None
         label = m["kind"] if m["raw"] != "direction" or m["q"] else "DIRECTION"
         style = {"QUESTION": "warn" if qstate in (None, "open") else "dim", "BLOCKER": "bad", "ANSWER": "ok", "DIRECTION": "ok"}.get(label, "")
         d = [f"Time:      {m['t']}", f"Kind:      {label}" + (f"  ({qstate})" if qstate else ""), f"From:      {m['who']}" + (f"  to {m['to']}" if m["to"] else ""), "", m["text"]]
         if q and q.get("answer"): d += ["", f"Answer ({q.get('answered')}): {q['answer']}"]
         rows.append(Row(m["key"], ("", m["t"], label + ("*" if qstate == "open" else ""), m["who"] + (f" -> {m['to']}" if m["to"] else ""), m["text"]), style, d, stale))
+    rows = [memory_row(r, stale) if isinstance(r, list) else r for r in rows]
     rows.reverse()   # newest first
     for qid, q in qs.items():   # an open question older than the log window is still open
         if qid not in shown and q.get("state") == "open":
             rows.append(Row(f"Q{qid}", ("", q["asked"], "QUESTION*", q["agent"], f"[{qid}] {q['text']}"), "warn", [f"Time:      {q['asked']}", "Kind:      QUESTION  (open)", f"From:      {q['agent']}", "", q["text"]], stale))
     return rows
 
-PRIMARY = {"Active": ("units",), "Backlog": ("backlog",), "Finished": ("units", "closed"), "Board": ("board",), "Overview": ("handoff",)}   # what a tab's count needs
-EMPTY = {"Active": "Nothing is running, queued or parked", "Backlog": "Nothing is waiting to be launched", "Finished": "Nothing has finished or closed", "Board": "The board has no posts", "Overview": "Nothing to show yet"}
+PRIMARY = {"Active": ("units",), "Backlog": ("backlog",), "Ended": ("units", "closed"), "Board": ("board",), "Overview": ("handoff",)}   # what a tab's count needs
+EMPTY = {"Active": "Nothing is running, queued or parked", "Backlog": "Nothing is waiting to be launched", "Ended": "Nothing has ended or closed", "Board": "The board has no posts", "Overview": "Nothing to show yet"}
 
 def derive(view, now, interval):
     """The Model: every source read as what it means now, with its age and error beside it. Unknown stays '?' or 'unavailable'."""
@@ -434,7 +476,7 @@ def derive(view, now, interval):
         rep = (S("reports-open").data or {}).get(u["name"], NOT_READ)
         tab, state, note = classify(u, ps, ag, rep)
         rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or host_stale(u), rep,
-                                  tools.get(u.get("model")), cards.get(u["name"])))
+                                  tools.get(u.get("model")), cards.get(u["name"]), S("reports-open").ok_at))
         if tab == "Active" and u.get("host"):
             c = live.setdefault(u["host"], [0, 0])
             if state in ("working", "idle", "blocked"): c[0] += 1
@@ -443,16 +485,16 @@ def derive(view, now, interval):
     for u in closed or []:
         if u["name"] in names: continue   # reopened or relaunched: the open unit is the truth
         rep = (S("reports-closed").data or {}).get(u["name"], NOT_READ); tab, state, note = classify(u, ps, None, rep)
-        rows["Finished"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports-closed"), rep))
+        rows["Ended"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports-closed"), rep, read_at=S("reports-closed").ok_at))
     rows["Active"].sort(key=lambda r: (PRIO.get(r.cells[1].split(" ")[0], 8), r.cells[0].lower()))
-    rows["Finished"].sort(key=lambda r: (r.cells[1].startswith("closed"), r.cells[0].lower()))   # finished and waiting to be collected first
-    if S("backlog").data is not None: rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"))
+    rows["Ended"].sort(key=lambda r: (r.cells[1].startswith("closed"), r.cells[0].lower()))   # ended and waiting to be collected first
+    if S("backlog").data is not None: rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), (S("checklist").data or {}).get("cov", ()), (S("checklist").data or {}).get("missing"), (S("checklist").data or {}).get("briefs", "briefs"))
     if S("board").data is not None: rows["Board"] = message_rows(S("board").data, stale("board"))
     m.rows = rows
     herdr_used = any(u.get("via") == "herdr" for u in units or [])
     srcs = {"Active": [("units", "units"), ("reports-open", "local reports")] + ([("herdr", "herdr")] if herdr_used else []), "Backlog": [("backlog", "beads backlog")],
-            "Finished": [("units", "units"), ("closed", "closed units"), ("reports-closed", "closed reports")], "Board": [("board", "board")],
-            "Overview": [("handoff", "handoff"), ("facts", "tool facts")]}
+            "Ended": [("units", "units"), ("closed", "closed units"), ("reports-closed", "closed reports")], "Board": [("board", "board")],
+            "Overview": [("handoff", "handoff"), ("checklist", "checklist"), ("facts", "tool facts")]}
     for t in TABS:
         known = all(S(n).data is not None for n in PRIMARY[t]); m.counts[t] = len(rows[t]) if known else None
         m.banners[t] = general + [x for x in (source_note(lbl, S(n), now, limit) for n, lbl in srcs[t]) if x]
@@ -485,7 +527,9 @@ def overview_rows(m, rows, hand, now, view):
     for r in rows["Active"]: k = r.cells[1].split(" ")[0]; by[k] = by.get(k, 0) + 1
     known = m.counts.get("Active") is not None
     work = (", ".join(f"{v} {k}" for k, v in sorted(by.items(), key=lambda kv: PRIO.get(kv[0], 8))) or "nothing active") if known else "unknown"
-    R.append(Row("o:work", ("Work", f"{work}; {m.counts.get('Finished') if m.counts.get('Finished') is not None else '?'} finished"), "", [work]))
+    R.append(Row("o:work", ("Work", f"{work}; {m.counts.get('Ended') if m.counts.get('Ended') is not None else '?'} ended or closed"), "", [work]))
+    ck = view.get("checklist"); line = (ck.data or {}).get("line") if ck else None
+    R.append(Row("o:checklist", ("Checklist", line or ("unknown: " + (ck.err or "not read yet") if ck else "unknown: not read yet")), "" if line else "dim", [line or "unknown"]))
     for mr in m.machines: R.append(Row("o:" + mr.key, (mr.cells[0], f"{mr.cells[1]}  run/queued {mr.cells[2]}  admission {mr.cells[6]}  tools {mr.cells[7]}"), mr.style, [", ".join(map(str, mr.cells))]))
     bad = [f"{n}: {x.err}" for n, x in sorted(view.items()) if x.err]
     R.append(Row("o:problems", ("Data", "; ".join(bad) if bad else "every source read"), "warn" if bad else "ok", bad or ["every source read"]))
@@ -543,6 +587,7 @@ class UI:
     dkey: str | None = None                                   # the row whose details are open: details follow it, not the selection
     dcache: list = dataclasses.field(default_factory=list)
     seen: set | None = None                                   # board message keys the user has been shown; None until the first board read
+    marked: str | None = None                                 # the board row last marked read on selection (Enter marks it again)
     flash: str = ""
     filt: str = ""                                            # rows must hold this text (case-insensitive); / edits it
     typing: bool = False
@@ -550,9 +595,9 @@ class UI:
 
     def observe(self, model):
         """Board baseline: what is there when the board first loads is not new; later posts are, until they are selected."""
-        if self.seen is None and model.counts.get("Board") is not None: self.seen = {r.key for r in model.rows["Board"]}
-    def is_new(self, key): return self.seen is not None and key not in self.seen
-    def new_count(self, model): return sum(1 for r in model.rows["Board"] if self.is_new(r.key))
+        if self.seen is None and model.counts.get("Board") is not None: self.seen = {k for r in model.rows["Board"] for k in r.keys or (r.key,)}
+    def is_new(self, row): return self.seen is not None and not self.seen.issuperset(row.keys or (row.key,))
+    def new_count(self, model): return sum(1 for r in model.rows["Board"] if self.is_new(r))
 
     def sync(self, model, bh):
         """Keep the selection on the same row across refreshes (by key); a vanished row lands on its old position. Scroll so it stays visible."""
@@ -565,7 +610,8 @@ class UI:
         self.sel[t] = keys[i]; self.idx[t] = i
         top = min(max(top, i - bh + 1), i) if bh > 0 else 0
         self.top[t] = max(0, min(top, len(keys) - bh)) if len(keys) > bh else 0
-        if t == "Board" and self.seen is not None: self.seen.add(keys[i])
+        if t == "Board" and self.seen is not None and keys[i] != self.marked:   # read when selected; deliveries joining it while it stays selected stay new
+            self.seen.update(rows[i].keys or (keys[i],)); self.marked = keys[i]
 
     def move(self, model, d):
         t = TABS[self.tab]; rows = model.rows[t]
@@ -589,7 +635,7 @@ class UI:
             self.tab = (self.tab + (-1 if k in (K.KEY_BTAB, K.KEY_LEFT) else 1)) % len(TABS) if k not in map(ord, "12345") else k - ord("1")
             self.detail = False; return None
         if k in (10, 13, K.KEY_ENTER):
-            self.detail = not self.detail and bool(model.rows[TABS[self.tab]]); self.dscroll = 0; self.dkey = self.sel.get(TABS[self.tab]); return None
+            self.detail = not self.detail and bool(model.rows[TABS[self.tab]]); self.dscroll = 0; self.dkey = self.sel.get(TABS[self.tab]); self.marked = None; return None
         if k == 27:
             if self.detail: self.detail = False
             else: self.filt = ""
@@ -601,7 +647,7 @@ class UI:
         return None
 
 HELP = ["janus monitor: read-only (it writes nothing and runs nothing that does)", "",
-        "Tab / Left / Right / 1-5   switch tabs: Active, Backlog, Finished, Board, Overview", "Up / Down / j / k / PgUp / PgDn / g / G   select and scroll",
+        "Tab / Left / Right / 1-5   switch tabs: Active, Backlog, Ended, Board, Overview", "Up / Down / j / k / PgUp / PgDn / g / G   select and scroll",
         "Enter   details of the selected row (Esc or Enter: back)", "/       filter the rows of every tab by text (Enter keeps it, Esc clears it)",
         "r       refresh now", "q       quit", "", "Unknown stays '?': a host that does not answer is UNREACHABLE or STALE with the age of its last good data;",
         "a process that ended is not 'finished' until its report says VERDICT: DONE. Any key closes this help."]
@@ -671,8 +717,8 @@ def render(model, ui, h, w, now, status):
         top = ui.top.get(tab, 0)
         for j, r in enumerate(rows[top:top + max(bh, 0)], top):
             cells = list(r.cells)
-            if tab == "Board" and ui.is_new(r.key): cells[0] = "NEW"
-            style = "new bold" if tab == "Board" and ui.is_new(r.key) else r.style
+            if tab == "Board" and ui.is_new(r): cells[0] = "NEW"
+            style = "new bold" if tab == "Board" and ui.is_new(r) else r.style
             L.append([("> " if r.key == sel else "  ", "bold"), (cells_line(cells, lay), style)])
             if r.key == sel: L[-1] = [(t, s + " rev") for t, s in L[-1]]
     L = L[:h - 1]

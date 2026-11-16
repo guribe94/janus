@@ -3,7 +3,7 @@
 Every problem check reports is a Finding(key, text), derived from what is observed now: it appears while its condition holds and
 is gone when the condition clears. There is nothing to acknowledge, no deadline and no stored "open since". Its family is the key
 up to the first ':'; FAMILIES is the registry of the legal families: a one-line doc and whether the watcher prompts an idle
-orchestrator for it (urgent). A key of an unregistered family (a janus bug) is reported as an urgent `unregistered:<key>`
+orchestrator for it (urgent), and whether it wakes it again while it holds (recur: dispatch work). A key of an unregistered family (a janus bug) is reported as an urgent `unregistered:<key>`
 finding, so one bad key can never cost the pass its other findings. `janus check --json` serialises the findings."""
 from typing import NamedTuple
 
@@ -11,11 +11,12 @@ from typing import NamedTuple
 class Family(NamedTuple):
     doc: str
     urgent: bool = False
+    recur: bool = False   # dispatch work: while it holds, the watcher wakes an idle orchestrator again after the wake cooldown
 
 
 FAMILIES = {
     "age": Family("a lane job queued or running over its class age limit ([lanes] age)"),
-    "backlog": Family("the checklist is not imported; ready items held: briefed units fill cannot place"),
+    "backlog": Family("the checklist is not imported; ready items held (briefed units fill cannot place) or blocked by a beads dependency"),
     "beads": Family("bd is unavailable: units cannot be read", urgent=True),
     "blocked": Family("a host's jobs wait in an admission that says no or is paused (the cause is named)", urgent=True),
     "board": Family("a board card is blocked, has a question, is gone or silent; a host's posts wait unsynced over 3 min", urgent=True),
@@ -24,7 +25,7 @@ FAMILIES = {
     "git": Family("the project's repository is dirty, unpushed or has no upstream"),
     "host": Family("a host is unreachable (an unknown observation: nothing is moved, cancelled or relaunched for it)", urgent=True),
     "idle": Family("a host or lane has room while work waits"),
-    "idle-with-backlog": Family("ready backlog units with briefs would fit now (janus fill)", urgent=True),
+    "idle-with-backlog": Family("ready backlog units with briefs would fit now (janus fill); ready items without a usable brief (:nobrief)", urgent=True, recur=True),
     "ledger": Family("a provider ledger is malformed, implausible or holds unreconciled runs", urgent=True),
     "machine": Family("a job or tmux session on a shared host with no project id: listed, never acted on"),
     "margin": Family("a host is over its disk or memory-pressure margins", urgent=True),
@@ -34,6 +35,7 @@ FAMILIES = {
     "parked": Family("a parked unit's job can never finish, or its resume failed", urgent=True),
     "pressure": Family("a host's admission is paused by back-pressure", urgent=True),
     "provider": Family("a unit runs on a disabled provider"),
+    "question": Family("an open board question (janus answer q<N> <text>)", urgent=True),
     "scheduler": Family("job-running work outside a host's janus lanes", urgent=True),
     "spend": Family("a provider's committed spend is at its cap or over 80/90 % of it, or an API process janus did not start", urgent=True),
     "stalled": Family("queued work with free slots, or an old queue that does not drain", urgent=True),
@@ -55,6 +57,8 @@ class Finding(NamedTuple):
     def family(self): return family(self.key)
     @property
     def urgent(self): return FAMILIES[self.family].urgent
+    @property
+    def recur(self): return FAMILIES[self.family].recur
 
     def data(self): return {"key": self.key, "family": self.family, "text": self.text, "urgent": self.urgent}
 

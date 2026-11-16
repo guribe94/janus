@@ -36,6 +36,8 @@ args = []
 # ready = ["READY", "FIX"]   # statuses an agent can start; default every unfinished one. Others wait (on the owner, say)
 # actor_col = "actor"    # optional column: who does the item (agent, owner, hardware, ...); `janus backlog set <id> actor=owner`
 #                        # sets it too. Only agent items (the default) count as idle backlog or are launched by janus fill.
+# evidence_col = "evidence"   # the column janus land writes a verified published landing's sha into (the status stays; acceptance is
+#                        # `janus backlog set <id> status=DONE --unit <unit>`). Unset: no writeback (land says so)
 
 # [landing]
 # branch = "main"        # the landing branch (default: origin's HEAD branch)

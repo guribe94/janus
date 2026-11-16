@@ -123,7 +123,7 @@ def host_findings(cfg, hs, units):
     ready = []   # the ready work an agent could be launched on (titles), not every ready bead
     try: ready = [str(i.get("title", ""))[:40] for i in ready_work(cfg)]
     except Err: pass
-    work = f"{len(ready)} ready work item(s) in beads have no unit ({'; '.join(ready[:3])}{'...' if len(ready) > 3 else ''})"
+    work = f"{len(ready)} ready non-backlog beads work item(s) have no unit ({'; '.join(ready[:3])}{'...' if len(ready) > 3 else ''}; backlog items are janus fill's)"
     for n, p in hs.items():
         if not p["ok"]:
             qd = [u["name"] for u in units if u.get("host") == n]
@@ -135,7 +135,7 @@ def host_findings(cfg, hs, units):
         if mg or low:   # the key names the kinds (load, memory, disk), so an ack of one never hides another (H12)
             kinds = sorted({w.split()[0] for w in mg} | ({"memory"} if low else set()))
             F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}; launch elsewhere, or free it (janus tidy for disk)"))
-        elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} and {work}: write a brief for each and janus launch it"))
+        elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} and {work}: janus launch one an agent should do, or close or relabel it"))
         elif ready and (p.get("cap_pause") or "").strip():   # skill-fix52: the waiting work is said with the pause, never dropped
             F.append((f"idle:{n}", f"host {n} takes no work while its admission is paused ({p['cap_pause'].strip()}), and {work}: launch on another host, or when it clears"))
         hc = host_cap(cfg, n, p, units)
