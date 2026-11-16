@@ -31,6 +31,18 @@ def git(wt, *a, timeout=120, inp=None):
     if isinstance(wt, Where): return hrun(wt.h, "git -C " + qp(wt.path) + " " + " ".join(shlex.quote(str(x)) for x in a), timeout=timeout, inp=inp)
     return sh(["git", "-C", str(wt), *a], timeout=timeout, inp=inp)
 
+def follow_upstream(wt, br, dry=False):
+    """Keep the landing branch here at its upstream: fetch it and fast-forward br (move_local: ff-only in its checkout, else
+    update-ref), so what is judged landed here is what is published, and new units are cut from the current tip. The one
+    place for it: the orchestrator is refused `git merge` by hand (hooks GIT_MUT), and the branch lagged 67 commits once units
+    landed on their own hosts. (lag, error text or None); lag 0 when it has no upstream or is current. dry: nothing moves."""
+    rcu, ups, _ = git(wt, "rev-parse", "--abbrev-ref", f"{br}@{{upstream}}"); ups = ups.strip()
+    if rcu or "/" not in ups: return 0, None
+    if not dry and git(wt, "fetch", "-q", ups.split("/", 1)[0], timeout=120)[0]: say(f"note: git fetch {ups.split('/', 1)[0]} failed; comparing with {ups} as last fetched")
+    lag = int(git(wt, "rev-list", "--count", f"{br}..{ups}")[1].strip() or 0)
+    if not lag or dry: return lag, None
+    return lag, move_local(wt, br, git(wt, "rev-parse", ups)[1].strip(), tip(wt, br))
+
 def contained(wt, br):
     """True when every file the branch changed since it left br has br's tip content (squash-landed already: nothing to land)."""
     mb = git(wt, "merge-base", "HEAD", br)[1].strip()
@@ -86,11 +98,9 @@ def cmd_land(cfg, a):
     for attempt in range(1, LAND_TRIES + 1):
         base = tip(wt, br)
         if not base: raise Err(f"no branch {br}")
-        rcu, ups, _ = git(wt, "rev-parse", "--abbrev-ref", f"{br}@{{upstream}}"); ups = ups.strip()
-        if rcu == 0 and "/" in ups:   # the landing branch here may lag its upstream: landing on it would rewrite what is pushed
-            if not cfg.run.dry and git(wt, "fetch", "-q", ups.split("/", 1)[0], timeout=120)[0]: say(f"note: git fetch {ups.split('/', 1)[0]} failed; comparing with {ups} as last fetched")
-            lag = int(git(wt, "rev-list", "--count", f"{br}..{ups}")[1].strip() or 0)
-            if lag: raise Err(f"{br} here is {lag} commit(s) behind {ups} (already pushed): fast-forward {br} first (in its checkout: git merge --ff-only {ups}), then janus land {a.unit} again")
+        lag, err = follow_upstream(wt, br, cfg.run.dry)   # the landing branch here may lag its upstream (already pushed): fast-forwarded, never landed on stale
+        if err: raise Err(f"{br} here is {lag} commit(s) behind its upstream (already pushed) and did not fast-forward: {err}; then janus land {a.unit} again")
+        if lag: say(f"{br} here was {lag} commit(s) behind its upstream: fast-forwarded" if not cfg.run.dry else f"+ fast-forward {br} ({lag} behind its upstream)"); base = tip(wt, br)
         ahead = int(git(wt, "rev-list", "--count", f"{br}..HEAD")[1].strip() or 0); behind = int(git(wt, "rev-list", "--count", f"HEAD..{br}")[1].strip() or 0)
         if not ahead: raise Err(f"{branch} has no commits over {br}: nothing to land")
         if contained(wt, br):

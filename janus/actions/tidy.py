@@ -2,6 +2,7 @@
 remote copies, old test roots, cache entries over a host's disk budget)."""
 import os, re, shlex, tempfile
 from pathlib import Path
+from janus.actions.landing import follow_upstream
 from janus.actions.lifecycle import uncollected
 from janus.beads import Beads
 from janus.board import board, board_rows
@@ -137,20 +138,23 @@ def tidy_host(cfg, n, h, units, au):
             P.append(("cache", f"{n}:{path}", f"cache entry, {mb} MB, last changed {ts(mt)}: over the disk budget", mb)); over -= mb
     return P
 
+def tidy_repos(cfg):
+    """The repositories the worktrees belong to (their git common dir) plus [tidy] repos, sorted."""
+    repos = set(); wd = cfg.p("worktrees", "worktrees")
+    for d in list(wd.iterdir()) if wd.is_dir() else []:
+        if (d / ".git").is_file():
+            c = sh(["git", "-C", str(d), "rev-parse", "--path-format=absolute", "--git-common-dir"])[1].strip()
+            if c: repos.add(str(Path(c).parent))
+    return sorted(repos | {str(cfg.root / r) for r in cfg.c.get("tidy", {}).get("repos", [])})
+
 def tidy_branches(cfg, units):
     """[(kind, target, why, 0)]: branches matching [tidy] branches, not checked out in any worktree, contained in the landing
     branch (ancestor, or every file they changed has the tip's content); and the remote branch when its tip is the same commit."""
     pats = tset(cfg, "branches")
     if not pats: return []
     import fnmatch
-    repos = set(); wd = cfg.p("worktrees", "worktrees")
-    for d in list(wd.iterdir()) if wd.is_dir() else []:
-        if (d / ".git").is_file():
-            c = sh(["git", "-C", str(d), "rev-parse", "--path-format=absolute", "--git-common-dir"])[1].strip()
-            if c: repos.add(str(Path(c).parent))
-    repos |= {str(cfg.root / r) for r in cfg.c.get("tidy", {}).get("repos", [])}
     P, rem = [], tset(cfg, "remote")
-    for r in sorted(repos):
+    for r in tidy_repos(cfg):
         out_ = {l.split()[1][11:] for l in sh(["git", "-C", r, "worktree", "list", "--porcelain"])[1].splitlines() if l.startswith("branch refs/heads/")}
         refs = sh(["git", "-C", r, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"])[1].splitlines()
         rrefs = dict(l.split() for l in sh(["git", "-C", r, "for-each-ref", "--format=%(refname:short) %(objectname)", f"refs/remotes/{rem}"])[1].splitlines() if len(l.split()) == 2)
@@ -187,6 +191,10 @@ def tidy_roots(cfg):
 def tidy_all(cfg, units, hs=None):
     """Everything tidy would do: tidy_plan (worktrees, panes, cards) + branches + per-host items + test roots + per-worktree
     rebuildable artifacts."""
+    for r in tidy_repos(cfg):   # first: the landing branch at its upstream (what is landed is judged against what is published)
+        lag, err = follow_upstream(Path(r), landing_branch(cfg, Path(r)), cfg.run.dry or cfg.run.ro)
+        if err: say(f"note: {r}: {landing_branch(cfg, Path(r))} is {lag} behind its upstream and did not fast-forward: {err}")
+        elif lag: say(f"{r}: {landing_branch(cfg, Path(r))} {'is' if cfg.run.dry or cfg.run.ro else 'was'} {lag} commit(s) behind its upstream" + ("" if cfg.run.dry or cfg.run.ro else ": fast-forwarded"))
     au = all_units(cfg); P = ([(k, t, w, 0) for k, t, w in tidy_plan(cfg, units)] + tidy_branches(cfg, units)
                               + tidy_roots(cfg) + tidy_artifacts(cfg, units))
     for n, h in cfg.hosts.items():
