@@ -21,6 +21,9 @@ Every wake runs the whole loop, not only what changed; dispatch work (ready back
 
 Binding owner instructions (MEMORY.md, the owner's latest words) override an older brief or handoff line: follow the instruction, then fix the brief.
 
+## Stop and done
+When the owner says stop, pause or done, run `janus standby --reason "<their words>"` in that turn. The watcher then stops waking you and stops resuming, filling and restarting. No context reset runs, and the status, board and watcher tabs close. Running agents finish and their results are saved. When the owner says to stop all work now, run `janus standby --stop-units` instead: it stops every open unit and its jobs. When the owner says to resume, run `janus standby off`, then run the loop. Never leave standby on your own.
+
 ## The user comes first
 A message from the user is answered in the same turn, before housekeeping. If it is a standing instruction or a lasting decision, record it once: `janus remember --instruction "<text>" --key <subject>` (same key replaces; running agents are told). Restrictions on tools, models, providers or auth are not memory text: they are enforced from `janus.toml` (`[routing] allow_tools / allow_auth`, `[providers] enabled`). Never launch outside them or substitute a model silently; if the allowed route is unavailable, say so and ask.
 

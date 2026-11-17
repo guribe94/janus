@@ -2,7 +2,7 @@
 
 The PreToolUse shell rules parse the command (heredocs are data, substitutions are judged, wrappers are stripped); extend the
 parser, never replace it (section 9)."""
-import json, os, re, shlex, sys
+import contextlib, json, os, re, shlex, sys
 from pathlib import Path
 from janus.beads import Beads
 from janus.reset import stop_reset
@@ -397,8 +397,14 @@ def cmd_hook(ev):
         if not root: return
         cfg = Cfg(root); reg = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
         parts = reg.split(":", 2); pane = parts[2] if len(parts) > 2 else ""; age = pending_age(reg)
-        if age is None or age >= CLAIM_WINDOW: return
-        if pane and os.environ.get("HERDR_PANE_ID") != pane: return
+        # A session in the registered orchestrator pane is the orchestrator, whatever id it has: the owner may /resume an older
+        # session there, and without this every hook of it (guard, reset) would match no project.
+        reg_pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
+        if age is None and reg_pane and os.environ.get("HERDR_PANE_ID") == reg_pane:
+            with contextlib.suppress(OSError), cfg.f("watch.log").open("a") as f: f.write(f"{ts()} registered session followed to {sid[:12]} in pane {reg_pane} (was {reg[:12]})\n")
+        else:
+            if age is None or age >= CLAIM_WINDOW: return
+            if pane and os.environ.get("HERDR_PANE_ID") != pane: return
         atomic_write(cfg.f("session"), sid); atomic_write(cfg.f("session_kind"), hook_kind(d) + "\n")
         record_session_proc(cfg)
     else: cfg = Cfg(root)

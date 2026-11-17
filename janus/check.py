@@ -8,7 +8,7 @@ from janus.actions.lifecycle import fetch_remote_outputs, sync_remote_outputs   
 from janus.backlog import backlog_cfg, checklist_line, checklist_totals, ready_work
 from janus.beads import Beads
 from janus.board import board, board_dir, board_files, board_findings
-from janus.context import Err, hrun, is_orchestrator, now, ts
+from janus.context import Err, hrun, is_orchestrator, now, standby, ts
 from janus.findings import finding
 from janus.findings.hosts import host_findings, lane_findings, orphan_job_findings, pane_findings, sync_findings, tab_findings, thrash_findings, tidy_findings
 from janus.findings.units import card_findings, cap_findings, ledger_findings, spend_findings, unit_findings
@@ -123,4 +123,5 @@ def cmd_capacity(cfg, a):
     return 0, [cap_line(cfg, n, p, units) for n, p in hs.items()]
 
 def cmd_status(cfg, a):
-    F, live, *_ = run_check(cfg, cycle=False); return 0, [live]
+    F, live, *_ = run_check(cfg, cycle=False); sb = standby(cfg)
+    return 0, ([f"STANDBY since {ts(sb.get('since'))} ({sb.get('reason') or 'no reason given'}): no wakes, resumes, fills or resets; janus standby off resumes"] if sb else []) + [live]

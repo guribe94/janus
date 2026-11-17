@@ -59,6 +59,67 @@ class Restart(unittest.TestCase):
         self.cfg.jput("orch_wait.json", {"since": int(time.time()) - 21 * 60, "passes": 5, "why": "x"}); self.run_passes(["P2"])
         self.assertEqual((self.closed, self.started, self.cfg.f("pane").read_text()), (["P2"], ["orchestrator"], "P3"))
 
+    def test_standby_starts_wakes_and_resumes_nothing_but_keeps_the_board_in_sync(self):
+        """Catches: the owner said stop, and the watcher kept waking the orchestrator every 10 min, resuming parked units and
+        starting a new orchestrator."""
+        acted, synced = [], []
+        self.cfg.f("standby.json").write_text('{"since": 1, "reason": "owner: done"}')
+        acts = {k: (lambda k: lambda *a, **kw: acted.append(k) or [])(k) for k in ("board_alerts", "tend_parked", "tend_thrash", "tend_tidy", "orphan_jobs", "wake_on_change")}
+        with mock.patch.multiple(sys.modules["janus.watch"], board_sync=lambda cfg: synced.append(1), **acts):
+            self.run_passes([], 1)
+        self.assertEqual((self.started, acted), ([], []), "standby still acted")
+        self.assertEqual(synced, [1], "the board was not synced in standby")
+        self.cfg.f("standby.json").unlink(); self.run_passes([], 1)
+        self.assertEqual(self.started, ["orchestrator"], "off standby the restart came back")
+
+
+class Tabs(unittest.TestCase):
+    """Catches: the workspace filled with tabs of units whose job had ended or whose host was down (uncollected units keep their
+    record, so close never ran and the tab stayed)."""
+    def test_view_tabs_of_ended_units_close_and_live_or_agent_tabs_stay(self):
+        d, cfg = project(); closed, saved, logged = [], [], []
+        units = [{"name": "end", "via": "pueue", "state": "done", "tab": "t1", "pane": "p1"},
+                 {"name": "down", "via": "pueue", "state": "unknown", "tab": "t2", "pane": "p2"},
+                 {"name": "run", "via": "pueue", "state": "working", "tab": "t3", "pane": "p3"},
+                 {"name": "agent", "via": "herdr", "state": "done", "tab": "t4", "pane": "p4"}]
+        class B:
+            def __init__(self, cfg): pass
+            def save(self, u): saved.append(u["name"])
+        herdr = lambda *a: closed.append(a[2]) if a[:2] == ("tab", "close") else {}
+        with mock.patch.multiple(sys.modules["janus.watch"], Beads=B, orphan_tabs=lambda cfg, names: [("t9", "old", "old · m · here")]), \
+             mock.patch.multiple(sys.modules["janus.actions.launch"], herdr=herdr), mock.patch.multiple(sys.modules["janus.watch"], herdr=herdr):
+            janus.tend_tabs(cfg, units, logged.append)
+        self.assertEqual(sorted(closed), ["t1", "t2", "t9"]); self.assertEqual(saved, ["end", "down"])
+        self.assertNotIn("tab", units[0]); self.assertEqual(units[2]["tab"], "t3")
+
+
+class Standby(unittest.TestCase):
+    """janus standby closes the support tabs and reopens them on off; status says so; --stop-units stops each open unit."""
+    def test_on_and_off(self):
+        import argparse, io
+        from contextlib import redirect_stdout
+        d, cfg = project()
+        tabs = [{"tab_id": "t1", "label": "1"}, {"tab_id": "t2", "label": "status"}, {"tab_id": "t3", "label": "board"}, {"tab_id": "t9", "label": "u · m · here"}]
+        closed, created, stopped = [], [], []
+        def herdr(*a):
+            if a[:2] == ("tab", "list"): return {"tabs": [t for t in tabs if t["tab_id"] not in closed]}
+            if a[:2] == ("tab", "close"): closed.append(a[2]); return {}
+            if a[:2] == ("tab", "create"): created.append(a[a.index("--label") + 1]); return {"root_pane": {"pane_id": "p"}}
+            return {}
+        class B:
+            def __init__(self, cfg): pass
+            def units(self): return [{"name": "u", "host": "here", "via": "herdr"}]
+        stop = lambda cfg, a: stopped.append((a.unit, a.force))
+        ns = lambda **k: argparse.Namespace(**{"action": None, "reason": "done", "stop_units": False, "force": False, **k})
+        with mock.patch.multiple(sys.modules["janus.setup"], herdr=herdr, ws_id=lambda cfg, create=False: "W", Beads=B, probe=lambda n, h: {"ok": True}), \
+             mock.patch.object(sys.modules["janus.actions.lifecycle"], "cmd_stop", stop), redirect_stdout(io.StringIO()):
+            janus.cmd_standby(cfg, ns())
+            self.assertEqual(sorted(closed), ["t2", "t3"]); self.assertTrue(janus.standby(cfg)); self.assertEqual(stopped, [])
+            janus.cmd_standby(cfg, ns(action="off"))
+            self.assertIsNone(janus.standby(cfg)); self.assertEqual(sorted(created), ["board", "status", "watcher"])
+            janus.cmd_standby(cfg, ns(stop_units=True))
+            self.assertEqual(stopped, [("u", False)])
+
 
 if __name__ == "__main__":
     unittest.main()

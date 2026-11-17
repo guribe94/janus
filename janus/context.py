@@ -296,6 +296,11 @@ JANUS_SELF = Path(__file__).resolve().parent.parent / "janus.py"   # the install
 
 JANUS_MARK = "[janus] "   # every prompt janus itself sends starts with this, so UserPromptSubmit never files it as an instruction (M4)
 
+def standby(cfg):
+    """The project's standby record ({since, reason}) while `janus standby` is on, else None: the owner said stop or done, so
+    janus starts, wakes and resets nothing."""
+    return (cfg.jget("standby.json") or {"since": 0, "reason": "unreadable standby.json"}) if cfg.f("standby.json").exists() else None
+
 def handoff_path(cfg): return cfg.f("HANDOFF.md")
 
 def memory_path(cfg): return cfg.f("MEMORY.md")
@@ -315,4 +320,4 @@ def slug(t): return re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:40]
 def refuse_agent(what):
     if os.environ.get("JANUS_ROLE") == "agent": raise Err(f"refused: {what} is the orchestrator's (an agent proposes with board.sh post <you> learned <text>)")
 
-__all__ = ["SSH", "EXCL", "WAKE", "WAKE_CLEAR", "HANDOFF0", "wake", "wake_clear", "CONF", "old_layout", "memory_path", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "writer_lock", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "JANUS_SELF", "JANUS_MARK", "handoff_path", "DIFF_X", "slug", "refuse_agent"]
+__all__ = ["SSH", "EXCL", "WAKE", "WAKE_CLEAR", "HANDOFF0", "wake", "wake_clear", "CONF", "old_layout", "memory_path", "Run", "Err", "now", "ts", "say", "find_root", "Cfg", "ENV_KEEP", "clean_env", "sh", "hrun", "X", "herdr", "findkey", "fl", "ps_table", "ancestors", "AGENT_RX", "session_proc", "record_session_proc", "session_alive", "is_orchestrator", "projects", "session_root", "NUM", "Locked", "writer_lock", "FIXTURE_MARK", "secs", "pq", "qp", "atomic_write", "JANUS_SELF", "JANUS_MARK", "handoff_path", "standby", "DIFF_X", "slug", "refuse_agent"]

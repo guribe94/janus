@@ -76,6 +76,13 @@ class State(unittest.TestCase):
         self.assertIn("k", cfg.jget("acks.json"), "the check's write lost the ack made while it probed")
 
 
+    def test_no_backup_is_tried_for_a_unit_whose_host_is_down(self):
+        """Catches: every pass ssh'd to an unreachable host for each of its units and logged two failures per unit (watch.log flood)."""
+        d, cfg = project(); conf(d).write_text(conf(d).read_text() + '\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); cfg = janus.Cfg(d)
+        u = {"name": "u1", "host": "far", "via": "pueue", "task": 5, "saved_at": 0}
+        self.assertTrue(janus.refresh_due(cfg, {**u, "state": "working"}))
+        self.assertFalse(janus.refresh_due(cfg, {**u, "state": "unknown"}))
+
     def test_a_slow_backup_of_a_running_remote_unit_does_not_hold_the_writer_lock(self):
         """Catches ISSUES 54 (the periodic backup of a running remote unit, refresh_remote in the watcher's pass, rsynced under
         the state lock): an ack waited for the copy. The copy is made before the lock, once, and the unit is saved under it."""
@@ -92,7 +99,8 @@ class State(unittest.TestCase):
             def issues(self, *a): return []
             def run(self, *a, **k): return []
         def slow_save(cfg, x): copies.append(x["name"]); inside.set(); release.wait(30); return True
-        down = {n: {"ok": False, "name": n, "err": "x"} for n in ("here", "far")}
+        down = {"here": {"ok": False, "name": "here", "err": "x"},   # far answers (a down host's units are not copied): its unit runs
+                "far": {"ok": True, "name": "far", "pueue": {"tasks": {"5": {"status": {"Running": {}}}}}}}
         code = ("import sys; sys.path.insert(0, %r); from janus.context import Cfg, Err; from pathlib import Path\n"
                 "try:\n with Cfg(Path(%r)).writer(wait=3): print('got it')\nexcept Err as e: print('refused', e)") % (str(Path(janus.__file__).parent), str(d))
         with mock.patch.object(janus, "probe_all", lambda cfg: down), mock.patch.object(janus, "Beads", Bd), \

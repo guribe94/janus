@@ -710,6 +710,7 @@ def refresh_due(cfg, u):
     """True when refresh_remote brings a remote unit's output here now: its agent ended and it is unsaved, or its last backup is
     older than [collect] backup_min."""
     if cfg.hosts[u["host"]].get("local") or no_remote_copy(u): return False
+    if u.get("state") == "unknown": return False   # its host did not answer this pass's probe: an ssh per unit per pass only fails and floods watch.log
     return (u.get("state") in ENDED and u.get("saved") != saved_marker(u)) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60
 
 def fetch_unit(cfg, u):

@@ -10,7 +10,8 @@ size trigger: `janus watch --reset` is its explicit reset. Any other tool is rep
 Before it, at the turn's Stop, the orchestrator is asked once to bring HANDOFF.md up to date (MEMORY.md is always current);
 after it the new session is told to read both."""
 import json, os, subprocess, sys, time
-from janus.context import JANUS_MARK, JANUS_SELF, atomic_write, clean_env, herdr, memory_path, handoff_path, now, ts, wake_clear
+from datetime import datetime
+from janus.context import JANUS_MARK, JANUS_SELF, atomic_write, clean_env, herdr, memory_path, handoff_path, now, standby, ts, wake_clear
 
 # tool kind -> the slash command that starts a new session there (read from each binary's command table, not assumed)
 RESET_CMD = {"claude": "/clear", "codex": "/new", "opencode": "/new"}
@@ -53,6 +54,42 @@ def context_tokens(path):
         if t: return t
     return n // 4
 
+OWNER_QUIET_S = 15 * 60   # a reset waits this long after the owner's last prompt: /clear must not wipe an answer they are reading
+
+def owner_prompt_at(path):
+    """When the owner last typed a prompt in this transcript (epoch seconds), from the file's tail; 0 when none is found. A prompt
+    janus sent ([janus] mark), a tool result or a task notification is not the owner's."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2); n = f.tell(); f.seek(max(0, n - 1_000_000)); lines = f.read().decode(errors="replace").splitlines()
+    except OSError: return 0
+    for l in reversed(lines):
+        if '"user' not in l: continue
+        try: rec = json.loads(l)
+        except ValueError: continue
+        rec = _dict(rec); p = _dict(rec.get("payload")); m = _dict(rec.get("message"))
+        text = m.get("content") if rec.get("type") == "user" else p.get("message") if p.get("type") == "user_message" else None
+        if not isinstance(text, str) or rec.get("isMeta") or text.startswith((JANUS_MARK.strip(), "<")): continue
+        try: return datetime.fromisoformat(str(rec.get("timestamp")).replace("Z", "+00:00")).timestamp()
+        except ValueError: return 0
+    return 0
+
+def last_answer(path, cap=3000):
+    """The session's last assistant text (Claude transcript), cut to cap characters; '' when none. /clear wipes it from the
+    owner's screen, so the new session is handed it to repeat."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2); n = f.tell(); f.seek(max(0, n - 1_000_000)); lines = f.read().decode(errors="replace").splitlines()
+    except OSError: return ""
+    for l in reversed(lines):
+        if '"assistant"' not in l: continue
+        try: rec = _dict(json.loads(l))
+        except ValueError: continue
+        c = _dict(rec.get("message")).get("content")
+        t = c if isinstance(c, str) else "\n".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text") if isinstance(c, list) else ""
+        if rec.get("type") == "assistant" and t.strip(): return t.strip()[-cap:]
+    return ""
+
 def orch_tokens(cfg):
     tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
     return context_tokens(tr) if tr else 0
@@ -63,6 +100,10 @@ def stop_reset(cfg, d):
     `janus watch --reset` starts. Returns the reminder text to block with, or None. Never blocks twice, never in a user's wait."""
     tok = orch_tokens(cfg)
     if tok <= cfg.reset_tokens: return None
+    if standby(cfg): return None   # nothing will wake it: the owner's last answer stays on screen
+    tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
+    if tr and now() - owner_prompt_at(tr) < OWNER_QUIET_S:
+        log_line(cfg, f"context reset deferred: the owner wrote under {OWNER_QUIET_S // 60} min ago ({tok} tokens)"); return None
     if now() - cfg.mtime("reset_asked") < 600:
         log_line(cfg, f"context reset not repeated: one was asked under 10 min ago ({tok} tokens)"); return None
     asked = cfg.mtime("handoff_asked")
@@ -102,7 +143,11 @@ def reset_now(cfg, wait_s=60, verify_s=90):
         cur = cfg.f("session").read_text().strip() if cfg.f("session").exists() else ""
         tr = cfg.f("transcript").read_text().strip() if cfg.f("transcript").exists() else ""
         if cur and not cur.startswith("pending:") and cur != old and (tr != old_tr or kind == "opencode"):
-            if kind != "opencode": herdr("agent", "prompt", pane, JANUS_MARK + wake_clear(cfg, "the session was reset"))
+            if kind != "opencode":
+                said = last_answer(old_tr) if old_tr else ""
+                carry = (f" Your last message before the reset (now off the owner's screen) was:\n---\n{said}\n---\nIf it was for the owner "
+                         "(an answer, a question, a stop or done report), repeat it to them first.") if said else ""
+                herdr("agent", "prompt", pane, JANUS_MARK + wake_clear(cfg, "the session was reset") + carry)
             log_line(cfg, f"context reset verified: new session {cur[:12]} (was {old[:12]}), {kind} {cmd}"); return True
     atomic_write(cfg.f("session"), old)
     log_line(cfg, f"context reset NOT verified: no new session registered within {verify_s} s after {cmd}; the old registration is restored"); return False

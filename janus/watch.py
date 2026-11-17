@@ -6,13 +6,15 @@ orchestrator is woken when the set of urgent observations CHANGES, never repeate
 import argparse, os, threading, traceback
 from janus.actions.backlog import cmd_fill
 from janus.actions.jobs import cancel_job, orphan_jobs, tend_thrash
-from janus.actions.launch import new_tab, wait_shell
+from janus.actions.launch import close_tab, new_tab, wait_shell
+from janus.beads import Beads
+from janus.units import orphan_tabs
 from janus.actions.lifecycle import tend_parked
 from janus.actions.tidy import tend_tidy
 from janus.board import board, board_alerts, board_dir, board_files
 from janus.check import read_remote, run_check
 from janus.reset import reset_now
-from janus.context import CLAIM_WINDOW, Err, JANUS_MARK, LockLost, writer_lock, atomic_write, herdr, now, pending_age, session_alive, sh, ts, wake, wake_clear
+from janus.context import CLAIM_WINDOW, Err, JANUS_MARK, LockLost, writer_lock, atomic_write, herdr, now, pending_age, session_alive, sh, standby, ts, wake, wake_clear
 from janus.setup import heartbeat_beat
 
 def cmd_watch(cfg, a):
@@ -89,6 +91,9 @@ def watch_pass(cfg, log, pre=None):
     t0 = now(); F, live, hs, units = run_check(cfg, cycle=False, writer=True, pre=pre); STEP_S["check"] = now() - t0
     F = [f for f in F if f.family != "machine"]   # machine state (no project id) never wakes or starts an orchestrator
     step("heartbeat_beat", outside, cfg, heartbeat_beat, cfg)   # the watchdog host sees this pass (inert until heartbeat/ ships and [heartbeat] watchdog is set)
+    step("tend_tabs", tend_tabs, cfg, units, log)   # ended units' view tabs: the workspace shows only live work
+    if standby(cfg):   # the owner said stop or done: the check above saved results; the board stays in sync; nothing else acts
+        step("sync", outside, cfg, board_sync, cfg); return
     step("board_alerts", outside, cfg, board_alerts, cfg, log)   # the prompt and the alert lock wait never under the writer lock
     step("tend_parked", tend_parked, cfg, hs, units, log, pre[1] if pre else None)   # park, and resume when the jobs finished
     step("tend_thrash", tend_thrash, cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job
@@ -152,6 +157,22 @@ def watch_pass(cfg, log, pre=None):
         return
     if ag["agent"].get("agent_status") == "working": return
     wake_on_change(cfg, log, pane, F)
+
+TAB_GONE = ("done", "failed", "gone", "unknown")   # the job ended, or its host is down: its view tab shows nothing live
+
+def tend_tabs(cfg, units, log):
+    """Close the tab janus opened to view a pueue or tmux unit once its job ended or its host is unreachable (the record stays
+    for collect and close), and the tabs of units already closed (units.orphan_tabs). A herdr unit's tab is its agent: close,
+    park and stop close it, never this. Labels that are not janus's own are never touched."""
+    ended = [u for u in units if u.get("tab") and u.get("via") in ("pueue", "tmux") and u.get("state") in TAB_GONE]
+    bd = Beads(cfg) if ended else None
+    for u in ended:
+        with cfg.unlocked(): close_tab(cfg, u)
+        bd.save(u); log(f"closed the view tab of {u['name']} ({u['state']})")
+    with cfg.unlocked(): orphans = orphan_tabs(cfg, {u["name"] for u in units})
+    for t, n, lab in orphans:
+        with cfg.unlocked(): herdr("tab", "close", t)
+        log(f"closed tab {lab!r}: unit {n} is closed")
 
 def watch_fill(cfg, log, fc):
     """The watcher's janus fill ([fill] watcher = true): its output in watch.log; an error is the step's (watch_step counts it)."""

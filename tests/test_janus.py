@@ -243,6 +243,13 @@ class Registration(unittest.TestCase):
         """janus register without a session id writes pending:<ts> (no pane): the fallback still claims it."""
         self.cfg.f("session").write_text(f"pending:{int(time.time())}")
         self.assertEqual(self.hook("pane-B"), "sid")
+    def test_a_session_resumed_in_the_registered_pane_is_followed(self):
+        """The owner resumed an older session in the orchestrator's pane: its hooks matched no project (no guard, no reset)."""
+        self.cfg.f("session").write_text("old-sid"); self.cfg.f("pane").write_text("pane-A")
+        self.assertEqual(self.hook("pane-A"), "sid")
+    def test_a_session_in_another_pane_is_not_followed(self):
+        self.cfg.f("session").write_text("old-sid"); self.cfg.f("pane").write_text("pane-A")
+        self.assertEqual(self.hook("pane-B"), "old-sid")
 
 
 class Backlog(unittest.TestCase):

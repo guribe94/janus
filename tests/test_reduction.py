@@ -25,6 +25,24 @@ class Reduction(unittest.TestCase):
             self.assertIn("HANDOFF.md", janus.stop_reset(cfg, {}))             # one reminder to update the handoff
             self.assertIsNone(janus.stop_reset(cfg, {"stop_hook_active": True}))   # the re-fired stop passes: no loop, the reset is asked
 
+    def test_no_reset_while_the_owner_talks_or_in_standby_and_the_last_answer_is_carried(self):
+        """The reset's /clear wiped the orchestrator's answer to the owner off the screen (a stop report, a question)."""
+        import json, time
+        d, cfg = project(); cfg.state.mkdir(exist_ok=True)
+        tr = d / "t.jsonl"; cfg.f("transcript").write_text(str(tr))
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+        rec = lambda kind, text, t: json.dumps({"type": kind, "timestamp": iso(t), "message": {"role": kind, "content": text if kind == "user" else [{"type": "text", "text": text}]}})
+        big = mock.patch.object(janus, "orch_tokens", lambda c: 10**9)
+        with big, mock.patch.dict("os.environ", {"JANUS_IN_TESTS": "1"}):
+            tr.write_text("\n".join([rec("user", "stop everything", time.time() - 60), rec("assistant", "Everything is stopped.", time.time())]) + "\n")
+            self.assertIsNone(janus.stop_reset(cfg, {})); self.assertFalse(cfg.f("handoff_asked").exists())   # the owner just spoke
+            tr.write_text("\n".join([rec("user", "stop", time.time() - 3600), rec("user", "[janus] Wake (x)", time.time() - 60),
+                                     rec("assistant", "Everything is stopped.", time.time())]) + "\n")
+            self.assertIsNotNone(janus.stop_reset(cfg, {}))                    # only janus's wake since: the reset goes ahead
+            cfg.f("handoff_asked").unlink(); cfg.f("standby.json").write_text('{"since": 1}')
+            self.assertIsNone(janus.stop_reset(cfg, {})); self.assertFalse(cfg.f("handoff_asked").exists())   # standby: never
+        self.assertEqual(janus.last_answer(str(tr)), "Everything is stopped.")
+
     def test_a_denied_route_cannot_launch_or_be_substituted(self):
         d, cfg = project('[routing]\nallow_tools = ["claude"]\nallow_auth = ["api_key"]\nnormal = ["c", "m"]\n')
         self.assertFalse(janus.model_ok(cfg, "c")[0]); self.assertIn("allow_tools", janus.model_ok(cfg, "c")[1])

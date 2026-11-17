@@ -28,6 +28,7 @@ has `$JANUS_ROOT`.
 | `janus transcript UNIT`, `janus index`, `janus report` | grep/tail a transcript; the reports index; derived status view |
 | `janus backlog`, `janus ledger`, `janus tidy`, `janus commit-state` | checklist import; API spend ledger; clean up; commit and push state. `janus backlog set ITEM status=DONE --unit UNIT [--dry-run]`: explicit acceptance of a whole item, only with the unit's publication verified on the remote now: the row's status becomes DONE, its evidence cell gets the sha, then its beads issue closes |
 | `janus register`, `janus install-host H`, `janus watch` | register the orchestrator session; set a host up; the watcher pass (`--reset`: verified new session) |
+| `janus standby [--reason R] [--stop-units [--force]]`, `janus standby off` | the owner said stop or done: the watcher only syncs the board and saves results (no wake, resume, fill, restart), no context reset runs, the status/board/watcher tabs close; `--stop-units` also stops every open unit and its jobs; `off` resumes |
 
 `board.sh` (the agents' interface; the orchestrator uses `janus answer` and `janus send`): `post`, `send <agent> <text>` (one addressed message), `direct <agent> <text>`, `read`, `summary`,
 `questions`, `answer`, `digest`, `sync`. There is no broadcast.
@@ -86,6 +87,7 @@ the new session runs `janus register` (it reads `OPENCODE_SESSION_ID`), and Open
 size trigger and no end-to-end live run was made. Otherwise it says why and restores the old registration. Other tools are unsupported.
 Launch and resume command lines (`launch.tool_argv`) are the ones each client's `--help` shows: claude `--model/--resume`, codex `resume`/`-m`,
 opencode `run --model/--session`.
+The Stop hook defers the reset while the owner wrote in the last 15 min and never resets in standby; after a reset the new session is handed the old one's last message to repeat if it was for the owner. A hook from the registered orchestrator pane registers its session, whatever its id (an older session resumed there).
 
 ## Locks
 Host and herdr I/O never runs under the project writer lock (`.janus/write.lock`). A watcher pass holds a separate `.janus/watch.lock` (a second

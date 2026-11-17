@@ -12,7 +12,7 @@ from pathlib import Path
 from janus.backlog import LOG_LABELS, LOG_RX, checklist_line, checklist_totals, eligible_items, item_actors, item_holds, norm_item, unit_items
 from janus.beads import unit_record
 from janus.board import board_dir
-from janus.context import CONF, Cfg, Err, Run, handoff_path, sh
+from janus.context import CONF, Cfg, Err, Run, handoff_path, sh, standby
 from janus.ledger import model_tool
 from janus.platform import herdr, ps_table
 from janus.probe import probe
@@ -128,7 +128,7 @@ def collect_reports(cfg, units):
             p = report_path(cfg, u)
             h = cfg.hosts.get(u.get("host")); mt = p.stat().st_mtime if p.is_file() else None
             out[u["name"]] = {"verdict": clean(unit_verdict(cfg, u)) or None, "waiting": [clean(j) for j in waiting_line_jobs(cfg, u)],
-                              "path": clean(p), "limit": clean(api_out(cfg, u).get("subtype")) or None,
+                              "path": clean(p), "limit": clean(api_out(cfg, u).get("subtype")) or None, "progress": report_progress(p.read_text(errors="replace")) if mt else None,
                               "mtime": mt, "remote": bool(h) and not h.get("local"), "synced": num(u.get("saved_at")),   # the file's own age, not when it was read
                               "in_out": p.parent.resolve() == (cfg.p("out", "out") / u["name"]).resolve()}   # saved_at is when out/<unit>/ came from the host
         except Exception as e: out[u["name"]] = {"err": err_text(e)}
@@ -146,7 +146,7 @@ def collect_checklist(cfg, units, backlog):
         items = eligible_items(iss, {i.get("id") for i in backlog["ready"]}, tot["cov"], item_actors(cfg, iss), item_holds(cfg, iss))
         ever = {u["name"] for u in units} | {u["name"] for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u}
         idx = brief_index(cfg); missing = [clean(it) for _, _, it, _ in sorted(items) if not usable_brief(cfg, it, idx, ever)]
-    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg)}
+    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg), "done": tot["done"], "total": tot["total"]}
 
 def collect_host(cfg, name):
     p = probe(name, cfg.hosts[name], ro=True, cfg=cfg)
@@ -256,7 +256,8 @@ class Collector:
         try:
             try: cfg = fresh_cfg(self.root)
             except Exception as e: st.fail("config", err_text(e), self.clock()); return
-            st.ok("config", {"name": clean(cfg.name), "hosts": list(cfg.hosts), "tools": {m: clean(model_tool(c)) for m, c in cfg.models.items()}}, self.clock())
+            st.ok("config", {"name": clean(cfg.name), "hosts": list(cfg.hosts), "tools": {m: clean(model_tool(c)) for m, c in cfg.models.items()},
+                             "standby": standby(cfg)}, self.clock())
             done = queue.Queue()
             def host(n):
                 try: p = collect_host(cfg, n); done.put((n, p, None, self.clock()))
@@ -325,6 +326,8 @@ class Model:
     empty: dict = dataclasses.field(default_factory=dict)       # tab -> why there is nothing to list
     banners: dict = dataclasses.field(default_factory=dict)     # tab -> [source problems]
     problems: int = 0
+    done: tuple | None = None   # (checklist items DONE, total): the overall completeness in the header
+    standby: dict | None = None   # janus standby's record while it is on
 
 def source_state(s, now, limit):
     """none (not asked yet) | failed (never succeeded) | ok | stale (failed since its last success, or older than limit)."""
@@ -338,7 +341,7 @@ def source_note(label, s, now, limit):
     if k == "failed": return f"{label}: UNAVAILABLE, no data yet ({s.err})"
     return f"{label}: STALE, last good data {fmt_dur(now - s.ok_at)} old" + (f" ({s.err})" if s.err else " (no answer yet)")
 
-WORK_COLS = (("NAME", 24, 9, True), ("STATE", 22, 8, False), ("HOST", 10, 4, False), ("TOOL/MODEL", 20, 3, False), ("ELAPSED", 8, 6, False))
+WORK_COLS = (("NAME", 24, 9, True), ("STATE", 22, 8, False), ("HOST", 10, 4, False), ("TOOL/MODEL", 20, 3, False), ("ELAPSED", 8, 6, False), ("PROGRESS", 9, 7, False))
 OVERVIEW_COLS = (("ITEM", 14, 9, False), ("NOW", 60, 9, True))
 BOARD_COLS = (("NEW", 3, 7, False), ("TIME", 16, 5, False), ("KIND", 9, 8, False), ("AGENT", 24, 6, False), ("MESSAGE", 40, 9, True))
 HOST_COLS = (("HOST", 12, 9, False), ("STATE", 11, 8, False), ("RUN/QUEUED", 10, 7, False), ("AGENTS", 6, 6, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False),
@@ -364,6 +367,8 @@ def classify(u, ps, agents, rep):
     ended = st in ("done", "failed", "gone")
     pk = (u.get("parked") or {}).get("jobs") or ([] if v else ((rep or {}).get("waiting") or []) if ended or st == "idle" or via == "tmux" else [])
     if pk: return "Active", "parked", "waiting for " + ", ".join(map(str, pk[:4]))
+    if st == "unknown" and vw and via != "herdr" and not (ps or {}).get(u.get("host"), {}).get("ok"):   # its host is down: the report copied here still says how it ended
+        return "Active", f"host-down:{vw[:9]}", f"host {u.get('host')} unreachable; the last report copied here says {v}"
     if st in ("working", "queued", "blocked", "idle", "unknown"): return "Active", st, "" if st != "unknown" else "the host or herdr cannot say now"
     if not ended: return "Active", st, f"scheduler status {st}"
     bad = st == "failed"
@@ -376,6 +381,18 @@ def tool_model(tool, model):
     """The coding client and the model it runs, together: claude/opus; one alone when only that is known; '?' when neither."""
     t, m = clean(tool), clean(model)
     return f"{t}/{m}" if t and m else t or m or "?"
+
+CHECKBOX = re.compile(r"^\s*[-*] \[([ xX])\]", re.M)
+
+def report_progress(text):
+    """(done, total) of the plan checklist an agent keeps in its REPORT.md (- [ ] / - [x] lines), or None when it keeps none."""
+    marks = CHECKBOX.findall(text)
+    return (sum(1 for x in marks if x in "xX"), len(marks)) if marks else None
+
+def progress_cell(pr, done=False):
+    """3/7 43%; - without a checklist; done when the verdict is DONE (an agent's plan need not be fully ticked to finish)."""
+    if done: return "done"
+    return f"{pr[0]}/{pr[1]} {100 * pr[0] // pr[1]}%" if pr else "-"
 
 def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at=None):
     end = epoch(u.get("closed_at") or u.get("collected_at")) if tab == "Ended" else now
@@ -398,7 +415,8 @@ def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at
     if (u.get("parked") or {}).get("jobs"): d.append("Parked on: " + ", ".join(map(clean, u["parked"]["jobs"])))
     if (rep or {}).get("limit"): d.append(f"Stopped:   {rep['limit']}")
     if u.get("item"): d.append(f"Item:      {clean(u['item'])}")
-    return Row(u["name"], (u["name"], state + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el),
+    pc = progress_cell((rep or {}).get("progress"), state in ("finished", "closed:DONE"))
+    return Row(u["name"], (u["name"], state + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el, pc),
                "warn" if stale and state_style(state) in ("ok", "dim") else state_style(state), [x for x in d if x], stale)
 
 def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs"):
@@ -465,7 +483,9 @@ def derive(view, now, interval):
     """The Model: every source read as what it means now, with its age and error beside it. Unknown stays '?' or 'unavailable'."""
     limit = 3 * interval + 60.0; S = lambda n: view.get(n) or Source(); st = lambda n: source_state(S(n), now, limit); stale = lambda n: st(n) == "stale"
     m = Model(); cfg = S("config"); hosts = (cfg.data or {}).get("hosts", [])
-    if cfg.data: m.project = cfg.data["name"]
+    if cfg.data: m.project = cfg.data["name"]; m.standby = cfg.data.get("standby")
+    ck = S("checklist").data or {}
+    if ck.get("total"): m.done = (ck["done"], ck["total"])
     general = [f"{n}: {S(n).err}" for n in ("config", "collection") if S(n).err]
     ps = {n: S(f"host:{n}").data for n in hosts if S(f"host:{n}").data}
     units, closed, ag = S("units").data, S("closed").data, S("herdr").data
@@ -572,6 +592,8 @@ def layout(cols, width):
         i = max(ws, key=ws.get); ws[i] -= 1
     return [(i, ws[i]) for i in use]
 
+def bar(f, n=10): k = round(max(0.0, min(1.0, f)) * n); return "#" * k + "." * (n - k)
+
 def fit(s, n): s = str(s); return (s[:n - 1] + "~" if len(s) > n else s).ljust(n) if n > 1 else s[:n]
 
 def cells_line(cells, lay): return " ".join(fit(cells[i], w) for i, w in lay)
@@ -676,7 +698,11 @@ def render(model, ui, h, w, now, status):
     if ui.help: return [[(l[:w], "bold" if i == 0 else "")] for i, l in enumerate(wrap(HELP, w))][:h]
     L = []
     tab = TABS[ui.tab]
-    L.append([("janus monitor", "bold"), (f" {model.project}  ", ""), ("READ-ONLY", "info"), (f"  {status}"[:max(0, w - 30)], "dim")])
+    top = [("janus monitor", "bold"), (f" {model.project}  ", ""), ("READ-ONLY", "info")]
+    if model.standby: top.append(("  STANDBY", "warn"))
+    if model.done:
+        d, n = model.done; top.append((f"  done {d}/{n} {bar(d / n)} {100 * d // n}%", "ok"))
+    L.append(top + [(f"  {status}"[:max(0, w - sum(len(t) for t, _ in top))], "dim")])
     banners = model.banners.get(tab, [])[:2]
     foot = 1; tabbar = 1; colhead = 1
     spare = h - (1 + foot + tabbar + colhead + len(banners)) - 3   # keep three body lines

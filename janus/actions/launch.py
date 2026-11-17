@@ -291,7 +291,8 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
     rep = report or "REPORT.md"
     head = (f"<!-- janus: unit {name} runs on {hn} -->\n"
             f"**Report:** `{rep}` is the only report janus reads. Line 1 `VERDICT: PENDING`; update it at checkpoints; "
-            f"end with `VERDICT: DONE` or `VERDICT: BLOCKED` and the real exit codes.\n")
+            f"end with `VERDICT: DONE` or `VERDICT: BLOCKED` and the real exit codes. Keep your plan in it as a checklist "
+            f"(`- [ ] step`, ticked `- [x]` as each step is done): the monitor shows it as your progress.\n")
     if local:
         b = build or hn
         return (head + PARK_RULE.format(

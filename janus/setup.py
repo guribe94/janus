@@ -7,8 +7,10 @@ from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, wait_shell
 from janus.board import board_dir, board_script
 from janus.context import (CLAIM_WINDOW, CONF, old_layout, Err, JANUS_MARK, JANUS_SELF, SSH, atomic_write, clean_env, herdr, hrun, now, pending_age, qp,
-    record_session_proc, say, session_alive, sh, slug, wake_clear)
+    record_session_proc, refuse_agent, say, session_alive, sh, slug, standby, wake_clear)
+from janus.beads import Beads
 from janus.hooks import session_start_text
+from janus.reset import log_line
 from janus.ledger import ledger_read, read_secret, spend
 from janus.platform import pane_tool, watcher_loaded, watcher_service
 from janus.probe import discover, probe, pueue
@@ -33,15 +35,56 @@ def cmd_register(cfg, a):
     say("registered " + (sid or "(pending: the next hook event from this session claims it)") + f" ({kind})")
     if cfg.c.get("orchestrator", {}).get("kind", "claude") != kind:
         say(f"warning: janus.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}, but this session is {kind}: set it to {kind}")
-    ws = ws_id(cfg, create=True)
-    if ws:   # plain shell loops: `watch` is not installed on the Mac (M10)
-        have = {t.get("label") for t in (herdr("tab", "list", "--workspace", ws) or {}).get("tabs", [])}
-        for lab, cmd in (("status", "while :; do clear; janus status; sleep 60; done"),
-                         ("board", f"while :; do clear; BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} summary; sleep 60; done"),
-                         ("watcher", f"tail -f {shlex.quote(str(cfg.f('watch.log')))}")):
-            if lab in have: continue
-            r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root), "--no-focus")
-            if r: herdr("pane", "run", r["root_pane"]["pane_id"], cmd)
+    if not standby(cfg): support_tabs(cfg, True)
+
+SUPPORT_TABS = ("status", "board", "watcher")
+
+def support_tabs(cfg, want):
+    """Open (want=True) the status, board and watcher tabs in the project's herdr workspace, or close them (False, standby):
+    nothing loops in the background once the owner said stop. Returns the labels opened or closed."""
+    ws = ws_id(cfg, create=want)
+    if not ws: return []
+    tabs = (herdr("tab", "list", "--workspace", ws) or {}).get("tabs", [])
+    if not want:
+        gone = [t for t in tabs if t.get("label") in SUPPORT_TABS]
+        for t in gone: herdr("tab", "close", t["tab_id"])
+        return [t["label"] for t in gone]
+    have, made = {t.get("label") for t in tabs}, []
+    # plain shell loops: `watch` is not installed on the Mac (M10)
+    for lab, cmd in (("status", "while :; do clear; janus status; sleep 60; done"),
+                     ("board", f"while :; do clear; BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} summary; sleep 60; done"),
+                     ("watcher", f"tail -f {shlex.quote(str(cfg.f('watch.log')))}")):
+        if lab in have: continue
+        r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root), "--no-focus")
+        if r: herdr("pane", "run", r["root_pane"]["pane_id"], cmd); made.append(lab)
+    return made
+
+def cmd_standby(cfg, a):
+    """janus standby [--stop-units] [--reason] | janus standby off. The owner said stop or done: the watcher then only syncs the
+    board and saves results (no wake, resume, fill, restart), no context reset runs, and the support tabs close. Running agents
+    finish on their own unless --stop-units, which stops every open unit now (janus stop, with its lane jobs). off: back to work."""
+    refuse_agent("standby")
+    if a.action == "off":
+        if cfg.run.dry: say("+ standby off; reopen the status, board and watcher tabs"); return
+        cfg.f("standby.json").unlink(missing_ok=True); made = support_tabs(cfg, True)
+        log_line(cfg, "standby off")
+        say("standby off: the watcher wakes, resumes and fills again" + (f"; reopened {', '.join(made)}" if made else "")); return
+    if a.action: raise Err(f"janus standby {a.action}: only 'off' (or nothing, to go on standby)")
+    if cfg.run.dry: say("+ standby on; close the support tabs" + ("; stop every open unit" if a.stop_units else "")); return
+    atomic_write(cfg.f("standby.json"), json.dumps({"since": int(now()), "reason": a.reason or "", "stop_units": bool(a.stop_units)}))
+    log_line(cfg, f"standby on ({a.reason or 'no reason given'})")
+    gone = support_tabs(cfg, False)
+    say("standby on: no wakes, resumes, fills, restarts or context resets" + (f"; closed {', '.join(gone)}" if gone else ""))
+    if not a.stop_units: say("running agents finish on their own; their results are saved"); return 0
+    from janus.actions.lifecycle import cmd_stop
+    units = [u for u in Beads(cfg).units() if u.get("via") not in ("failed",)]
+    with cf.ThreadPoolExecutor(8) as ex: up = dict(zip(cfg.hosts, ex.map(lambda kv: probe(*kv)["ok"], cfg.hosts.items())))
+    rc = 0
+    for u in units:
+        if not up.get(u.get("host")): say(f"{u['name']}: not stopped, host {u.get('host')} unreachable"); rc = 1; continue
+        try: cmd_stop(cfg, argparse.Namespace(unit=u["name"], force=a.force))
+        except Err as e: say(f"{u['name']}: not stopped: {e}"); rc = 1
+    return rc
 
 # janus resume (imp-resume): continue the orchestration in a Claude or Codex session with nothing lost.
 #

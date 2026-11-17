@@ -90,6 +90,23 @@ class States(Base):
         self.assertIn("not success", why("exit0")); self.assertIn("not success", why("bad"))
         self.assertEqual(next(r for r in m.rows["Active"] if r.key == "park").detail[2], "Meaning:   waiting for here:9")
 
+    def test_a_unit_on_a_down_host_shows_its_last_report_not_unknown(self):
+        """Catches: every unit of an unreachable host shown 'unknown' for days although its report, copied here, says DONE."""
+        self.w.units = [unit("d", host="far", task=7), unit("n", host="far", task=8)]; self.w.fail.add("far"); self.w.report("d", "x\nVERDICT: DONE (landed)\n")
+        self.collect(); self.assertEqual(self.states(), {"d": "host-down:DONE", "n": "unknown"})
+
+    def test_each_task_shows_its_plan_progress_and_the_header_the_checklist_done(self):
+        """The owner asked for a progress indicator per task and for total completeness on the monitor."""
+        self.assertEqual(M.report_progress("VERDICT: PENDING\n- [x] a\n  - [ ] b\n* [X] c\n- [ ] d\n"), (2, 4))
+        self.assertIsNone(M.report_progress("VERDICT: PENDING\nno plan\n"))
+        self.w.units = [unit("p", task=1), unit("q", task=2)]
+        self.w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}}), "2": task(2, {"Running": {}})})
+        self.w.report("p", "VERDICT: PENDING\n- [x] a\n- [x] b\n- [ ] c\n"); self.w.report("q", "VERDICT: PENDING\n")
+        self.collect(); m = self.model()
+        self.assertEqual({r.cells[0]: r.cells[5] for r in m.rows["Active"]}, {"p": "2/3 66%", "q": "-"})
+        m.done = (3, 4); scr = "\n".join("".join(t for t, _ in l) for l in M.render(m, M.UI(), 30, 160, time.time(), ""))
+        self.assertIn("done 3/4", scr); self.assertIn("75%", scr); self.assertIn("PROGRESS", scr)
+
     def test_a_report_not_read_yet_is_unverified_not_no_verdict(self):
         """Catches: a unit's first screen, drawn before its report was read, saying 'no verdict' (or finished) of a report nobody read."""
         self.w.units = [unit("x", task=3)]; self.w.probes["here"] = probe_text(tasks={"3": task(3, {"Done": {"result": "Success"}})}); self.w.report("x", "VERDICT: DONE\n"); self.collect()
