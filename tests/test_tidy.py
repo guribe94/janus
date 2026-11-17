@@ -52,11 +52,11 @@ class Auto(unittest.TestCase):
     def test_auto_removes_only_the_safe_kinds(self):
         d, cfg = project("\n[tidy]\nauto = true\nevery_min = 0\n")
         calls = []
-        janus.tidy_all = lambda *a, **k: [("worktree", "/x/w", "why", 0), ("container", "h:c", "why", 0)]
+        janus.tidy_all = lambda *a, **k: [("worktree", "/x/w", "why", 0), ("container", "h:c", "why", 0), ("artifact", "/x/w2/target", "why", 0), ("disk", "h", "why", 9)]
         janus.tidy_do = lambda cfg2, kind, t: (calls.append((kind, t)), (0, ""))[1]
         B = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [{"name": "open", "cwd": "/x/open"}]})
         with mock.patch.object(janus, "Beads", B): janus.tend_tidy(cfg, {}, [], lambda m: None)
-        self.assertEqual(calls, [("worktree", "/x/w")])                                  # the container needs the orchestrator; a tree an open unit uses now is never removed
+        self.assertEqual(calls, [("worktree", "/x/w"), ("container", "h:c"), ("artifact", "/x/w2/target")])   # all it found, not only trees and branches (the orchestrator's hooks refuse hand removal); a disk row is a report
         calls.clear(); janus.tidy_all = lambda *a, **k: [("worktree", "/x/open", "why", 0)]
         with mock.patch.object(janus, "Beads", B): janus.tend_tidy(cfg, {}, [], lambda m: None)
         self.assertEqual(calls, [])
@@ -68,6 +68,28 @@ class Auto(unittest.TestCase):
         janus.tidy_do = lambda cfg2, kind, t: (calls.append((kind, t)), (0, ""))[1]
         janus.tend_tidy(cfg, {}, [], lambda m: None)
         self.assertEqual(calls, [])
+
+
+class Upstream(unittest.TestCase):
+    def test_landed_on_the_upstream_counts_when_the_local_landing_branch_lags(self):
+        """2026-11-17: the pass's fast-forward of main failed, main lagged origin/main by 11 commits, and tidy kept landed
+        worktrees and branches as 'not on the landing branch' while the disk filled."""
+        import subprocess
+        d, cfg = project('\n[landing]\nbranch = "main"\n[tidy]\nbranches = ["*"]\nrepos = ["repo"]\n')
+        g = lambda c, *a: subprocess.run(["git", "-C", str(c), *a], capture_output=True, text=True, check=True).stdout
+        bare = d / "remote.git"; g(d, "init", "-q", "--bare", "-b", "main", str(bare))
+        r = d / "repo"; g(d, "clone", "-q", str(bare), str(r))
+        for k, v in (("user.email", "t@t"), ("user.name", "t")): g(r, "config", k, v)
+        (r / "f").write_text("0"); g(r, "add", "f"); g(r, "commit", "-qm", "base"); g(r, "push", "-q", "-u", "origin", "main")
+        wt = d / "wt/done"; g(r, "worktree", "add", "-q", "-b", "done", str(wt))
+        (wt / "f").write_text("1"); g(wt, "commit", "-qam", "work"); g(wt, "push", "-q", "origin", "done:main")   # landed on the remote only
+        g(r, "fetch", "-q")
+        self.assertNotEqual(g(r, "rev-parse", "main"), g(r, "rev-parse", "origin/main"))                    # local main lags
+        with mock.patch.object(janus, "herdr_agents", lambda c: {}), mock.patch.object(janus, "board_rows", lambda c: {}), \
+                mock.patch.object(janus, "orphan_tabs", lambda c, n: []):
+            self.assertIn(("worktree", str(wt)), [(k, t) for k, t, _ in janus.tidy_plan(cfg, [])])
+            g(r, "worktree", "remove", str(wt))
+            self.assertIn(("branch", f"{r}:done"), [(k, t) for k, t, _, _ in janus.tidy_branches(cfg, [])])
 
 
 class Tabs(unittest.TestCase):

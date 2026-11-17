@@ -7,7 +7,7 @@ from janus.actions.lifecycle import uncollected
 from janus.beads import Beads
 from janus.board import board, board_rows
 from janus.context import FIXTURE_MARK, Err, LockLost, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
-from janus.branch import landed, landing_branch
+from janus.branch import contained, landed, landing_branch
 from janus.project import own_card
 from janus.transcripts import card_fields
 from janus.units import all_units, herdr_agents, orphan_tabs, ws_id
@@ -33,6 +33,8 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
         if br and any(l.startswith((f"WIP on {br}:", f"On {br}:")) for l in sh(["git", "-C", str(d), "stash", "list", "--format=%gs"])[1].splitlines()):
             keep(f"stashed changes on {br}"); continue
         lt = landed(cfg, {"cwd": str(d)})
+        ups = upstream_of(d, landing_branch(cfg, d)) if lt is not True else None
+        if ups and (sh(["git", "-C", str(d), "merge-base", "--is-ancestor", "HEAD", ups])[0] == 0 or contained(d, ups)): lt = True
         if lt is not True:
             mb = sh(["git", "-C", str(d), "merge-base", "HEAD", landing_branch(cfg, d)])[1].strip()
             n = len(sh(["git", "-C", str(d), "diff", "--name-only", mb, "HEAD"])[1].split()) if mb else 0
@@ -158,14 +160,20 @@ def tidy_branches(cfg, units):
         out_ = {l.split()[1][11:] for l in sh(["git", "-C", r, "worktree", "list", "--porcelain"])[1].splitlines() if l.startswith("branch refs/heads/")}
         refs = sh(["git", "-C", r, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"])[1].splitlines()
         rrefs = dict(l.split() for l in sh(["git", "-C", r, "for-each-ref", "--format=%(refname:short) %(objectname)", f"refs/remotes/{rem}"])[1].splitlines() if len(l.split()) == 2)
-        br_ = landing_branch(cfg, Path(r))
+        br_ = landing_branch(cfg, Path(r)); ups = upstream_of(r, br_)
         for l in refs:
             b, sha = l.split()
             if b in out_ or not any(fnmatch.fnmatch(b, p) for p in pats) or b == br_: continue
-            if sh(["git", "-C", r, "merge-base", "--is-ancestor", sha, br_])[0] != 0 and not branch_contained(r, sha, br_): continue
+            if not any(sh(["git", "-C", r, "merge-base", "--is-ancestor", sha, x])[0] == 0 or branch_contained(r, sha, x) for x in [br_] + ([ups] if ups else [])): continue
             P.append(("branch", f"{r}:{b}", f"contained in {br_}, not checked out", 0))
             if rrefs.get(f"{rem}/{b}") == sha: P.append(("remote-branch", f"{r}:{rem}/{b}", f"same commit as the local branch, contained in {br_}", 0))
     return P
+
+def upstream_of(repo, br):
+    """br's upstream (e.g. origin/main) as last fetched, or None. Landed is judged against it too: when the tidy pass's
+    fast-forward of br fails, a local br that lags its upstream kept landed worktrees and branches forever (disk filled)."""
+    rc, o, e = sh(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", f"{br}@{{upstream}}"]); o = o.strip()
+    return o if rc == 0 and "/" in o else None
 
 def branch_contained(repo, sha, br):
     mb = sh(["git", "-C", repo, "merge-base", sha, br])[1].strip()
@@ -202,13 +210,15 @@ def tidy_all(cfg, units, hs=None):
         P += tidy_host(cfg, n, h, units, au)
     return P
 
-# The kinds the watcher may remove on its own with [tidy] auto = true: a clean landed worktree and a landed branch. Every other
-# kind (a remote copy, a container, a cache entry, a board card, a pane, a tab) still needs the orchestrator's `janus tidy`.
-TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch")
+# The kinds the watcher removes on its own with [tidy] auto = true: every kind tidy finds, each already chosen by its safe rule
+# (clean and landed; closed and nothing uncollected; our own stopped container; older than keep_days; over the disk budget).
+# Only some once, and the rest waited for the orchestrator, whose hooks refuse hand removal: found waste filled the disk.
+TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch", "artifact", "remote-copy", "run-files", "container", "cache", "test-root", "pane", "tab", "card")
+TIDY_HOST_KINDS = ("remote-copy", "run-files", "container", "cache")
 
 def tend_tidy(cfg, hs, units, log):
-    """The watcher refreshes the reclaimable list every [tidy] every_min; with [tidy] auto = true it also removes the safe kinds
-    (a clean landed worktree, a landed branch) itself, so the tidy:<n> finding does not keep firing for bookkeeping nobody does."""
+    """The watcher refreshes the reclaimable list every [tidy] every_min; with [tidy] auto = true it also removes what it found
+    (TIDY_AUTO_KINDS) itself, so the tidy:<n> finding does not keep firing for bookkeeping nobody does."""
     if now() - cfg.jget("tidy.json").get("at", 0) < tset(cfg, "every_min") * 60: return
     try:
         with cfg.unlocked(): P = apply_holds(cfg, tidy_all(cfg, units, hs))   # the hosts' scan (ssh) and git: not under the writer lock
@@ -220,7 +230,10 @@ def tend_tidy(cfg, hs, units, log):
         except Err: return
         for kind, t, why, mb in P:
             if kind not in TIDY_AUTO_KINDS or (kind == "worktree" and str(Path(t).resolve()) in taken): continue
-            rc, e = tidy_do(cfg, kind, t); log(f"tidy auto {kind} {t}: {'removed' if rc == 0 else 'NOT removed ' + (e or '').strip()[:80]}")
+            if kind in TIDY_HOST_KINDS:
+                with cfg.unlocked(): rc, e = tidy_do(cfg, kind, t)   # a host's rm or podman over ssh: never under the writer lock
+            else: rc, e = tidy_do(cfg, kind, t)
+            log(f"tidy auto {kind} {t}: {'removed' if rc == 0 else 'NOT removed ' + (e or '').strip()[:80]}")
 
 def tidy_do(cfg, kind, t):
     """Carry out one tidy item; (rc, detail)."""
