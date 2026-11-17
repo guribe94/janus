@@ -15,7 +15,7 @@ from janus.ledger import ledger_done, model_ok, model_tool, read_secret, reserve
 from janus.memory import MEM_SECTIONS, mem_line, memory_read
 from janus.platform import herdr
 from janus.project import project_id, tag, tmux_name
-from janus.probe import probe_all, pueue, room
+from janus.probe import live_units, probe_all, pueue, room
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import transcript_of
 from janus.units import TAB_SEP, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
@@ -384,6 +384,26 @@ def resume_report(cfg, a, brief):
     if not p.parent.is_dir(): raise Err(f"report {p}: its folder does not exist")
     return None if p == (cfg.p("out", "out") / a.unit / "REPORT.md").resolve() else p
 
+def carry_patch(cfg, old, cwd, fresh):
+    """Apply out/<old>/backup.patch (the stranded unit's changes as last synced) to the relaunch's tree cwd. Returns the line its
+    seeded report gets: applied, or why not and where the patch is (the launch goes on either way). fresh: cwd was made by this
+    launch, so a failed 3-way merge is undone with a hard reset and clean of that tree only; otherwise only a clean apply is tried."""
+    p = cfg.p("out", "out") / old / "backup.patch"
+    if not p.is_file() or not p.stat().st_size: return f"RELAUNCH: no synced changes of {old} to carry (no {p.name}); start from this report."
+    g = lambda *x: sh(["git", "-C", str(cwd), *x], timeout=300)
+    if g("rev-parse", "--git-dir")[0]: return f"RELAUNCH: {old}'s changes were NOT applied ({cwd} is no git tree); they are in {p}."
+    if g("apply", "--check", str(p))[0] == 0:
+        rc, o, e = g("apply", str(p))
+        if rc == 0: return f"RELAUNCH: {old}'s changes as last synced ({p}) are applied to this tree, uncommitted."
+    elif fresh:
+        rc, o, e = g("apply", "--3way", str(p))
+        if rc == 0: return f"RELAUNCH: {old}'s changes as last synced ({p}) are applied to this tree with a 3-way merge, uncommitted."
+        g("reset", "-q", "--hard"); g("clean", "-qfd")   # the tree this launch made: back to its start, nothing half-applied
+    else: rc, e = 1, "it does not apply cleanly"
+    return f"RELAUNCH: {old}'s changes were NOT applied ({clean_line(e)}); they are in {p}: apply what still fits by hand."
+
+def clean_line(s): return " ".join(str(s or "").split())[:160] or "git gave no reason"
+
 def seed_report(cfg, a):
     """The report a unit continues FROM: out/<--resume-of>/REPORT.md, or the report of the unit the autopilot relaunches
     (a.seed_report). Launch copies it into the unit's own out/<unit>/REPORT.md (write_seed) and the unit writes only that copy
@@ -483,7 +503,7 @@ def cmd_launch(cfg, a):
     if getattr(a, "auto", False) and a.item:   # fill: the item may have been launched meanwhile (a manual launch while the hosts answered)
         try: iss = backlog_issues(cfg)
         except Err as e: raise Err(f"refused: beads cannot be read to recheck item {a.item} ({e}): not launched")
-        cov = [u["name"] for u in units if norm_item(a.item) in unit_items(cfg, [u], iss)]   # read under the writer lock, which is held until the record below
+        cov = [u["name"] for u in live_units(cfg, units) if norm_item(a.item) in unit_items(cfg, [u], iss)]   # read under the writer lock, which is held until the record below; a stranded host's unit no longer covers it
         if cov: raise Err(f"refused: item {a.item} is covered by open unit(s) {', '.join(cov)} now (launched while fill planned): not launched twice")
         why = item_eligible(cfg, a.item, units)   # and still ready, an agent's and not held, in beads now: an error refuses (fail closed)
         if why: raise Err(f"refused: item {a.item} is no longer eligible ({why}): not launched")
@@ -542,6 +562,9 @@ def cmd_launch(cfg, a):
         if cfg.run.dry: say(f"+ git -C {a.new_worktree} worktree add -b {name} {cwd} {ref}")
         else: cwd = new_worktree(Path(a.new_worktree).resolve(), cwd, name, ref)
         rcwd = str(cwd)
+    # a relaunch carries its stranded original's changes as last synced, applied before the tree is copied anywhere (they travel as
+    # uncommitted changes); a 3-way merge only in the tree made just now, which is rolled back whole if it does not apply
+    carried = carry_patch(cfg, a.relaunch_of, cwd, fresh=bool(getattr(a, "new_worktree", None))) if getattr(a, "relaunch_of", None) and not cfg.run.dry else None
     if not cfg.run.dry: outd.mkdir(parents=True, exist_ok=True)
     # Record the unit before anything starts (fixes5 item 10), claimed in_progress so bd ready never lists it (H7).
     pred = None
@@ -549,6 +572,7 @@ def cmd_launch(cfg, a):
          "cwd": str(cwd), "rcwd": rcwd, "started": int(now()), "via": "starting", "budget": budget}
     if not cfg.run.dry: u["busy"] = busy_mark("launch")   # the remote part below runs without the writer lock: this says so (check: unit:<n>:interrupted)
     if a.of: u["of"] = a.of   # the unit a review checks (review:<unit> for a critical unit needs a later review of it)
+    if getattr(a, "relaunch_of", None): u["relaunch_of"] = a.relaunch_of   # fill took over a stranded unit's item (close --duplicate-of reads it)
     if report: u["report"] = str(report); u["resume"] = True
     elif seed: u["resume"] = True   # its own out/<unit>/REPORT.md, seeded below
     item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
@@ -557,8 +581,14 @@ def cmd_launch(cfg, a):
     else:
         u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
         bd.run("update", u["id"], "--status", "in_progress"); bd.save(u)
+        old = next((x for x in units if x["name"] == getattr(a, "relaunch_of", None)), None)
+        if old: bd.save({**old, "relaunched": name})   # the stranded original names its relaunch: check and the monitor pair them when its host returns
     if seed and not cfg.run.dry: write_seed(seed, outd / "REPORT.md")
-    start = report if report and report.exists() else outd / "REPORT.md" if seed and not cfg.run.dry else None   # the report it starts from
+    if carried and not report:   # the relaunch's own report says what it carries (a fresh one when the original left none here)
+        rep = outd / "REPORT.md"; mt = rep.stat().st_mtime if seed else None
+        atomic_write(rep, (rep.read_text() if seed else "VERDICT: PENDING\n").rstrip("\n") + f"\n\n{carried}\n")
+        if mt: os.utime(rep, (mt, mt))   # the seed keeps the original's age (write_seed): its old lines still count for nothing
+    start = report if report and report.exists() else outd / "REPORT.md" if (seed or carried) and not cfg.run.dry else None   # the report it starts from
     env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root),
            **({"BOARD_DIR": str(board_dir(cfg))} if local else {})}   # remote: <root>/bin/board.sh finds <root>/board itself
     snap = dict(u)

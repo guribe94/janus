@@ -90,12 +90,47 @@ def probe_all(cfg):
     with cf.ThreadPoolExecutor(8) as ex:   # check refreshes the discovery (beside the probes) once it is older than discover_h
         fut = ex.submit(host_facts, cfg, "stale"); ps = list(ex.map(lambda kv: probe(*kv, ro=cfg.run.ro, cfg=cfg), cfg.hosts.items())); fut.result()
     d = {p["name"]: p for p in ps}
-    un = cfg.jget("hosts.json")
+    un = cfg.jget("hosts.json"); mk = cfg.jget(MARKS)
     for n, p in d.items():
         if p["ok"]: un.pop(n, None)
         else: un.setdefault(n, now())
     cfg.jput("hosts.json", un)
+    back = [n for n, p in d.items() if p["ok"] and mark_of(mk, n) == "returning"]   # it came back as the owner said: the mark has done its job
+    if back: cfg.jput(MARKS, {n: m for n, m in mk.items() if n not in back})
     return d
+
+# A host that stops answering is first only 'down': its units wait for it. Down longer than [capacity] down_after_min (per host
+# or project-wide), it is 'stranded': its open units no longer cover their backlog items (fill relaunches them elsewhere, seeded
+# from the local copy of their report and backup.patch) and no longer count against the caps. The owner's marks override the
+# clock: gone (retired, never coming back: stranded at once, whether it answers or not) and returning (down but coming back:
+# never stranded; cleared by the first good probe). hosts.json (first failed probe) is probe_all's; the marks are janus hosts --mark's.
+MARKS = "host-marks.json"
+MARK_KINDS = ("gone", "returning")
+
+def mark_of(mk, n):
+    m = mk.get(n); m = m.get("mark") if isinstance(m, dict) else None
+    return m if m in MARK_KINDS else None
+
+def host_liveness(cfg, at=None, un=None, mk=None):
+    """{host: (state, down since)}: up | down | stranded | returning | gone, from hosts.json and the marks (un, mk: those files
+    already read, for a caller that must not read twice). The one rule fill, check and the monitor share."""
+    at = now() if at is None else at; un = cfg.jget("hosts.json") if un is None else un; mk = cfg.jget(MARKS) if mk is None else mk
+    out = {}
+    for n, h in cfg.hosts.items():
+        m, s = mark_of(mk, n), un.get(n) if isinstance(un.get(n), (int, float)) else None
+        st = "gone" if m == "gone" else "up" if s is None else "returning" if m == "returning" else \
+             "stranded" if at - s >= capv(cfg, h, "down_after_min") * 60 else "down"
+        out[n] = (st, s)
+    return out
+
+def stranded_hosts(cfg, live=None):
+    """The hosts whose open units are given up on for now (stranded or gone)."""
+    return {n for n, (st, _) in (host_liveness(cfg) if live is None else live).items() if st in ("stranded", "gone")}
+
+def live_units(cfg, units, live=None):
+    """The open units that are not on a stranded host: those that cover items and count against the caps."""
+    gone = stranded_hosts(cfg, live)
+    return [u for u in units if u.get("host") not in gone] if gone else list(units)
 
 def margins(h, p, cleanup=False, cfg=None):
     """Why the host is over its disk or memory-pressure margins. A cleanup unit is exempt from the disk floor (it is what frees
@@ -119,7 +154,7 @@ def room(cfg, name, p, units, cleanup=False):
     caps = cfg.caps
     if caps.get("host", {}).get(name) is not None:
         n = min(n, caps["host"][name] - sum(1 for u in units if u.get("host") == name))
-    if caps.get("total") is not None: n = min(n, caps["total"] - len(units))
+    if caps.get("total") is not None: n = min(n, caps["total"] - len(live_units(cfg, units)))   # a stranded host's units hold no slot
     return (0, "; ".join(why) or "caps") if why or n < 1 else (int(n), "")
 
 def cap_line(cfg, name, p, units):
@@ -131,4 +166,5 @@ def cap_line(cfg, name, p, units):
             f"avail={av} load={p.get('load') or 'unknown'} psi={p.get('cap_psi') or p.get('psi') or '-'} disk={p.get('disk_gb')}G"
             + (f" PAUSED: {hc['pause']}" if hc["pause"] else "") + (f" FULL: {why}" if n < 1 else ""))
 
-__all__ = ["probe_extra", "BUILD_ERE", "pueue", "LIST_KEYS", "probe", "discover", "host_facts", "probe_all", "margins", "room", "cap_line"]
+__all__ = ["probe_extra", "BUILD_ERE", "pueue", "LIST_KEYS", "probe", "discover", "host_facts", "probe_all", "margins", "room", "cap_line", "MARKS", "MARK_KINDS",
+           "mark_of", "host_liveness", "stranded_hosts", "live_units"]

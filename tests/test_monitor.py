@@ -151,6 +151,78 @@ class States(Base):
         self.collect()
         self.assertEqual(self.states("Backlog"), {"plain ready work": "ready", "Item one": "open-unit", "Item two": "owner", "Item three": "ready", "Item four": "waiting"})
 
+    def test_every_row_has_one_cell_per_column(self):
+        """Catches: a tab whose rows have fewer cells than its columns (the Backlog tab crashed with IndexError once PROGRESS was added)."""
+        w = self.w; w.board("2026-11-13 09:00 ann status: started\n"); (self.d / ".janus/HANDOFF.md").write_text("Checkpoint: ~10% done\n")
+        w.ready = [{"id": "p-1", "title": "plain ready work", "labels": []}]
+        w.backlog = [{"id": "b-1", "title": "Item one", "labels": ["backlog"], "external_ref": "backlog:one"}, {"id": "b-2", "title": "Item two", "labels": ["backlog", "actor:owner"], "external_ref": "backlog:two"}]
+        w.units = [unit("u", item="one"), unit("f", host="far", task=2)]; w.closed = [{**unit("old"), "status": "closed", "closed_at": "2026-11-12T10:00:00Z"}]
+        w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})}); self.collect(); m = self.model()
+        for tab in M.TABS:
+            cols = {"Board": M.BOARD_COLS, "Overview": M.OVERVIEW_COLS}.get(tab, M.WORK_COLS)
+            self.assertTrue(m.rows[tab], tab)
+            for r in m.rows[tab]: self.assertEqual(len(r.cells), len(cols), (tab, r.key, r.cells))
+            for width in (60, 240):
+                ui = M.UI(); ui.tab = M.TABS.index(tab); M.render(m, ui, 40, width, time.time(), "")
+        for r in m.machines: self.assertEqual(len(r.cells), len(M.HOST_COLS), r.cells)
+        self.assertEqual(m.counts["Overview"], len(m.rows["Overview"]))   # it read 0 while its rows showed
+
+
+class Stranded(Base):
+    """A host down past [capacity] down_after_min, or marked by the owner: the monitor says what janus does about it."""
+    def down(self, n, minutes): (self.d / ".janus/hosts.json").write_text(json.dumps({n: time.time() - minutes * 60}))
+    def mark(self, n, m): (self.d / ".janus/host-marks.json").write_text(json.dumps({n: {"mark": m, "at": time.time()}}))
+
+    def test_a_long_down_host_is_dimmed_last_its_units_stranded_and_not_a_source_problem(self):
+        """Catches: a host down for hours shown like one that just missed a probe ('?' everywhere, its raw ssh error cut off), its
+        units a mix of unknown/host-down/parked, counted as a source problem forever, sorted among the live hosts."""
+        w = self.w; w.units = [unit("d", host="far", task=7), unit("n", host="far", task=8, relaunched="n-r2"), unit("p", host="far", task=9, parked={"jobs": ["far:9"]}), unit("live", task=1)]
+        w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})}); w.fail.add("far"); w.report("d", "x\nVERDICT: DONE (landed)\n"); w.board("2026-11-13 09:00 ann status: x\n")
+        self.down("far", 10); self.collect(); m = self.model()
+        self.assertEqual(self.states("Active", m), {"d": "host-down:DONE", "n": "unknown", "p": "parked", "live": "working"})   # briefly down: as before
+        self.assertEqual(next(r for r in m.machines if r.cells[0] == "far").cells[1], "UNREACHABLE"); self.assertEqual(m.down, 0)
+        self.down("far", 120); self.collect(); m = self.model()
+        self.assertEqual(self.states("Active", m), {"d": "stranded:DONE", "n": "stranded->n-r2", "p": "stranded", "live": "working"})
+        self.assertEqual([r.cells[0] for r in m.rows["Active"]][0], "live"); self.assertTrue(all(r.style == "dim" for r in m.rows["Active"][1:]))
+        self.assertIn("relaunched as n-r2", " ".join(next(r for r in m.rows["Active"] if r.key == "n").detail))
+        far = next(r for r in m.machines if r.cells[0] == "far")
+        self.assertTrue(far.cells[1].startswith("DOWN 2h"), far.cells); self.assertEqual((far.cells[2], far.cells[3], far.cells[4], far.cells[5], far.cells[6]), ("-", "3 stranded", "-", "-", "-"))
+        self.assertEqual(far.style, "dim"); self.assertIn("ssh timed out", far.cells[8]); self.assertNotIn("port 22", far.cells[8])
+        self.assertEqual((m.down, m.problems), (1, 0)); self.assertIn("1 host(s) down", M.status_line(self.store.view(), m, time.time(), 5))
+        self.assertIn("port 22", " ".join(m.rows["Overview"][-1].detail))   # the whole error is still on the screen somewhere
+        self.assertIn("stranded", " ".join(r.cells[1] for r in m.rows["Overview"] if r.key == "o:work"))
+
+    def test_marks_and_order(self):
+        """Catches: a gone host shown among the working ones (or as ok because it answers), a returning host's units relaunched."""
+        self.w.units = [unit("b", host="far", task=2)]; self.w.fail.add("far"); self.down("far", 300); self.mark("far", "returning"); self.collect(); m = self.model()
+        far = next(r for r in m.machines if r.cells[0] == "far"); self.assertTrue(far.cells[1].startswith("RETURNING 5h"), far.cells)
+        self.assertEqual(self.states("Active", m), {"b": "unknown"})   # it waits for its host
+        self.w.fail = set(); self.w.units = [unit("a", task=1)]; (self.d / ".janus/hosts.json").write_text("{}"); self.mark("here", "gone"); self.collect(); m = self.model()
+        self.assertEqual([r.cells[0] for r in m.machines], ["far", "here"]); self.assertEqual(m.machines[1].cells[1], "GONE")
+        self.assertIn("marked gone", m.machines[1].cells[8]); self.assertEqual(self.states("Active", m), {"a": "stranded"})
+
+    def test_a_launch_that_never_finished_is_stalled(self):
+        """Catches: a unit 'starting' for hours shown like a launch in progress."""
+        self.w.units = [unit("old", via="starting", started=time.time() - 3 * 3600), unit("new", via="starting", started=time.time() - 60)]
+        self.collect(); m = self.model()
+        self.assertEqual(self.states("Active", m), {"old": "starting STALLED", "new": "starting"})
+        self.assertIn("never finished", " ".join(next(r for r in m.rows["Active"] if r.key == "old").detail))
+
+    def test_backlog_says_which_items_are_relaunched_and_where_they_ran(self):
+        """Catches: an item covered only by a dead host's unit shown as 'open-unit' (in progress) for days; the covering host hidden;
+        owner items counted as queued agent work."""
+        w = self.w
+        w.ready = [{"id": "b-1", "title": "Item one", "labels": ["backlog"]}, {"id": "b-2", "title": "Item two", "labels": ["backlog"]}]
+        w.backlog = [{"id": "b-1", "title": "backlog: Item one", "labels": ["backlog"], "external_ref": "backlog:one"}, {"id": "b-2", "title": "Item two", "labels": ["backlog"], "external_ref": "backlog:two"},
+                     {"id": "b-3", "title": "Item three", "labels": ["backlog", "actor:owner"], "external_ref": "backlog:three"}]
+        w.units = [unit("s1", host="far", task=7, item="one"), unit("s2", host="far", task=8, item="two"), unit("l2", task=1, item="two")]
+        w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})}); w.fail.add("far"); self.down("far", 120); self.collect(); m = self.model()
+        rows = {r.cells[0]: r for r in m.rows["Backlog"]}
+        self.assertEqual({k: (r.cells[1], r.cells[2]) for k, r in rows.items()}, {"Item one": ("relaunch", "far"), "Item two": ("open-unit", "here"), "Item three": ("owner", "-")})
+        self.assertIn("Units:     s1 (far, host down)", rows["Item one"].detail); self.assertEqual(m.rows["Backlog"][0].cells[0], "Item one")   # what fill launches next first
+        ui = M.UI(); ui.tab = 1; scr = "\n".join("".join(t for t, _ in l) for l in M.render(m, ui, 30, 200, time.time(), ""))
+        self.assertIn("[Backlog (2 agent, 1 owner)]", scr)
+
 
 class ReadOnly(Base):
     def test_nothing_is_written_and_nothing_mutating_runs_whoever_asks(self):

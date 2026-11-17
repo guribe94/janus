@@ -8,7 +8,7 @@ from janus.board import board_script
 from janus.msgboard import STALE_MIN
 from janus.cap import capv, host_cap
 from janus.context import Err, fl, projects, ts, now
-from janus.probe import margins, room
+from janus.probe import host_liveness, margins, room
 from janus.units import orphan_tabs, ws_id
 
 def queue_waits(cfg, n, p, lands=(), most=8):
@@ -113,7 +113,7 @@ def other_projects(cfg):
     return out
 
 def host_findings(cfg, hs, units):
-    """host:, margin:, idle:<host>, pressure:, scheduler:, orphan:job: and orphan:tmux: from each host's probe."""
+    """host:, host:<h>:gone, duplicate:, margin:, idle:<host>, pressure:, scheduler:, orphan:job: and orphan:tmux: from each host's probe."""
     F = []; names = {u["name"] for u in units}; un = cfg.jget("hosts.json")
     orch_pid = (cfg.f("session_pid").read_text().split() or [""])[0] if cfg.f("session_pid").exists() else ""   # the orchestrator is not flagged
     others = other_projects(cfg); orch = {orch_pid, *(o for _, o in others)} - {""}; pid_self = project_id(cfg)
@@ -124,11 +124,24 @@ def host_findings(cfg, hs, units):
     try: ready = [str(i.get("title", ""))[:40] for i in ready_work(cfg)]
     except Err: pass
     work = f"{len(ready)} ready non-backlog beads work item(s) have no unit ({'; '.join(ready[:3])}{'...' if len(ready) > 3 else ''}; backlog items are janus fill's)"
+    live = host_liveness(cfg, un=un); byname = {u["name"]: u for u in units}
     for n, p in hs.items():
+        st, _ = live.get(n, ("up", None)); there = [u for u in units if u.get("host") == n]
+        if st == "gone" and there:   # retired by the owner: its units are relaunched by fill; what is left is closing them
+            F.append((f"host:{n}:gone", f"host {n} is marked gone; its {len(there)} open unit(s) are given up: " + ", ".join(u["name"] + (f" (relaunched as {u['relaunched']})" if u.get("relaunched") else "") for u in there[:12])
+                      + "; once each is relaunched (janus fill) or not needed, janus close <unit> --force (its copy there is lost)"))
         if not p["ok"]:
-            qd = [u["name"] for u in units if u.get("host") == n]
-            F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); units there: {', '.join(qd) or 'none'}; place new work elsewhere (unstarted jobs there: cancel and re-queue on another host)"))
+            back = f"; janus fill relaunches their items elsewhere after {capv(cfg, cfg.hosts[n], 'down_after_min'):g} min (janus hosts --mark {n} returning keeps them waiting, gone relaunches now)"
+            rel = [u["name"] + "->" + u["relaunched"] for u in there if u.get("relaunched")]; wait = [u["name"] for u in there if not u.get("relaunched")]
+            F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); "
+                      + ({"down": f"units there wait: {', '.join(wait) or 'none'}" + back, "returning": f"marked returning: its units wait for it: {', '.join(wait) or 'none'}"}.get(st)
+                         or f"{st}: its units no longer cover their items; relaunched: {', '.join(rel) or 'none'}; not yet: {', '.join(wait) or 'none'} (janus fill)")
+                      + "; place new work elsewhere (unstarted jobs there: cancel and re-queue on another host)"))
             continue
+        for u in there:   # it answers again while a relaunch of its unit is open: the work exists twice
+            if u.get("relaunched") in byname and st == "up":
+                F.append((f"duplicate:{u['name']}", f"{n} answers again: {u['name']} was relaunched as {u['relaunched']} while {n} was down; keep one: "
+                          f"janus collect {u['name']}, then land or close it by its verdict, or janus close {u['relaunched']} --duplicate-of {u['name']} once {u['relaunched']} is stopped"))
         r, why = room(cfg, n, p, units)
         mg = margins(cfg.hosts[n], p, cfg=cfg)
         low = r < 1 and p.get("avail_mb") and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6

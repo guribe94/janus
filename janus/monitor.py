@@ -9,13 +9,14 @@ calls none of check, status, sync, handoff, writer lock, ack or wake code. Nothi
 effect is the probe's own scratch under /tmp on each host, which `janus capacity` already makes. Standard library only."""
 import contextlib, dataclasses, datetime, json, os, queue, re, signal, sys, threading, time
 from pathlib import Path
-from janus.backlog import LOG_LABELS, LOG_RX, checklist_line, checklist_totals, eligible_items, item_actors, item_holds, norm_item, unit_items
+from janus.backlog import LOG_LABELS, LOG_RX, checklist_line, checklist_totals, covered_items, eligible_items, item_actors, item_holds, norm_item, unit_items
 from janus.beads import unit_record
+from janus.cap import capv
 from janus.board import board_dir
 from janus.context import CONF, Cfg, Err, Run, handoff_path, sh, standby
 from janus.ledger import model_tool
 from janus.platform import herdr, ps_table
-from janus.probe import probe
+from janus.probe import MARKS, host_liveness, probe, stranded_hosts
 from janus.units import api_out, report_path, unit_state, verdict as unit_verdict, waiting_line_jobs
 try: import curses
 except ImportError: curses = None   # janus itself must still import where the curses module is missing; monitor then says so
@@ -140,13 +141,29 @@ def collect_checklist(cfg, units, backlog):
     from janus.actions.backlog import brief_dir, brief_index, usable_brief
     iss = {i["external_ref"]: i for i in (backlog or {}).get("items", []) if str(i.get("external_ref") or "").startswith("backlog:")}   # bd --readonly's answer
     tot = checklist_totals(cfg, units, iss)
-    if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(unit_items(cfg, units, iss))}
+    gone = stranded_hosts(cfg); by = {}   # item -> [(unit, host, stranded)]: who covers it, for the Backlog tab's HOST column and details
+    for u in units:
+        for k in unit_items(cfg, [u], iss): by.setdefault(k, []).append((clean(u["name"]), clean(u.get("host")) or "?", u.get("host") in gone))
+    if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(covered_items(cfg, units, iss)), "by": by}
     missing = None   # unknown while the backlog cannot be read
     if backlog is not None:
         items = eligible_items(iss, {i.get("id") for i in backlog["ready"]}, tot["cov"], item_actors(cfg, iss), item_holds(cfg, iss))
         ever = {u["name"] for u in units} | {u["name"] for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u}
         idx = brief_index(cfg); missing = [clean(it) for _, _, it, _ in sorted(items) if not usable_brief(cfg, it, idx, ever)]
-    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg), "done": tot["done"], "total": tot["total"]}
+    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg), "done": tot["done"], "total": tot["total"], "by": by}
+
+def collect_liveness(cfg):
+    """{"live": {host: [up|down|stranded|returning|gone, down since]}, "after": {host: seconds}}: janus's own judgement of each host
+    (probe.host_liveness over .janus/hosts.json, which check writes, and the owner's marks), read directly; the monitor writes neither."""
+    def read(n):
+        p = cfg.f(n)
+        if not p.exists(): return {}
+        try: d = json.loads(p.read_text())
+        except (OSError, ValueError) as e: raise Err(f"{n} unreadable ({err_text(e)})")
+        if not isinstance(d, dict): raise Err(f"{n} unreadable (not an object)")
+        return d
+    live = host_liveness(cfg, un=read("hosts.json"), mk=read(MARKS))
+    return {"live": {n: [st, num(s)] for n, (st, s) in live.items()}, "after": {n: capv(cfg, h, "down_after_min") * 60 for n, h in cfg.hosts.items()}}
 
 def collect_host(cfg, name):
     p = probe(name, cfg.hosts[name], ro=True, cfg=cfg)
@@ -272,6 +289,7 @@ class Collector:
             if units is not None: self.step("checklist", collect_checklist, cfg, units, backlog)
             self.step("board", collect_board, cfg)
             self.step("facts", collect_facts, cfg)
+            self.step("liveness", collect_liveness, cfg)
             self.step("handoff", collect_handoff, cfg)
             known = units if units is not None else (prev.get("units", Source()).data or [])
             if any(u.get("via") == "herdr" for u in known): self.step("herdr", collect_herdr)
@@ -328,6 +346,8 @@ class Model:
     problems: int = 0
     done: tuple | None = None   # (checklist items DONE, total): the overall completeness in the header
     standby: dict | None = None   # janus standby's record while it is on
+    down: int = 0                 # hosts janus has given up on for now (stranded, gone) or that the owner said will return
+    labels: dict = dataclasses.field(default_factory=dict)      # tab -> what its count is made of, shown instead of the bare number
 
 def source_state(s, now, limit):
     """none (not asked yet) | failed (never succeeded) | ok | stale (failed since its last success, or older than limit)."""
@@ -344,22 +364,33 @@ def source_note(label, s, now, limit):
 WORK_COLS = (("NAME", 24, 9, True), ("STATE", 22, 8, False), ("HOST", 10, 4, False), ("TOOL/MODEL", 20, 3, False), ("ELAPSED", 8, 6, False), ("PROGRESS", 9, 7, False))
 OVERVIEW_COLS = (("ITEM", 14, 9, False), ("NOW", 60, 9, True))
 BOARD_COLS = (("NEW", 3, 7, False), ("TIME", 16, 5, False), ("KIND", 9, 8, False), ("AGENT", 24, 6, False), ("MESSAGE", 40, 9, True))
-HOST_COLS = (("HOST", 12, 9, False), ("STATE", 11, 8, False), ("RUN/QUEUED", 10, 7, False), ("AGENTS", 6, 6, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False),
+HOST_COLS = (("HOST", 12, 9, False), ("STATE", 15, 8, False), ("RUN/QUEUED", 10, 7, False), ("AGENTS", 11, 6, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False),
              ("ADMISSION", 22, 6, False), ("TOOLS (FACTS AGE)", 24, 3, False), ("NOTE", 30, 2, True))
 NOT_READ = {"err": "report not read yet"}   # a unit's report before its first read: unknown, never 'no verdict'
-PRIO = {"blocked": 0, "failed": 1, "working": 2, "idle": 3, "queued": 4, "parked": 5, "starting": 6, "closing": 6, "unknown": 7}
+PRIO = {"blocked": 0, "failed": 1, "working": 2, "idle": 3, "queued": 4, "parked": 5, "starting": 6, "closing": 6, "unknown": 7, "host-down": 7, "stranded": 9}
+
+def state_word(st):
+    """The state without its detail: 'stranded:DONE', 'stranded->x-r2' and 'stranded STALE' are all 'stranded'."""
+    return st.split(" ")[0].split(":")[0].split("->")[0]
 
 def state_style(st):
-    w = st.split(":")[0]
-    return "bad" if w in ("failed", "blocked") or st == "ended:BLOCKED" or st == "ended:FAILED" else "ok" if w in ("working", "finished") else "dim" if w == "closed" else "warn"
+    w = state_word(st)
+    return "bad" if w in ("failed", "blocked") or st == "ended:BLOCKED" or st == "ended:FAILED" else "ok" if w in ("working", "finished") else "dim" if w in ("closed", "stranded") else "warn"
 
-def classify(u, ps, agents, rep):
+def classify(u, ps, agents, rep, live=None):
     """(tab, state, note) of one unit. Queued, parked, failed, closed and finished stay distinct, and a process that ended is never
-    taken as success: only a report that ends VERDICT: DONE says finished; no verdict is 'ended:no-verdict'."""
+    taken as success: only a report that ends VERDICT: DONE says finished; no verdict is 'ended:no-verdict'. live: janus's judgement
+    of the hosts (collect_liveness): a unit on a stranded or gone host that does not answer now is 'stranded', whatever it was."""
     via, name = u.get("via"), u.get("name")
     v = (rep or {}).get("verdict"); vw = (v or "").replace("VERDICT:", "").strip().split(" ")[0].upper()
     if u.get("status") == "closed": return "Ended", "closed" + (f":{vw}" if vw else ""), "closed" + ("; no verdict" if not vw else "")
     if via == "failed": return "Ended", "failed", "launch failed (no agent was started)"
+    hst = ((live or {}).get(u.get("host")) or ["up"])[0]
+    if hst in ("stranded", "gone") and (hst == "gone" or not (ps or {}).get(u.get("host"), {}).get("ok")):
+        new = clean(u.get("relaunched")) or None
+        return "Active", "stranded" + (f"->{new}" if new else f":{vw[:9]}" if vw else ""), \
+            (f"host {u.get('host')} is {hst}: " + (f"relaunched as {new}" if new else "its item is relaunched elsewhere by janus fill (not yet)")
+             + (f"; its last report copied here says {v}" if v else "; no verdict in the report copied here"))
     if via == "starting": return "Active", "starting", "launch has not finished"
     if u.get("closing"): return "Active", "closing", "a close is in progress"
     try: st = "unknown" if via == "herdr" and agents is None else unit_state(u, ps, agents or {})
@@ -419,34 +450,46 @@ def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at
     return Row(u["name"], (u["name"], state + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el, pc),
                "warn" if stale and state_style(state) in ("ok", "dim") else state_style(state), [x for x in d if x], stale)
 
-def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs"):
-    """covered, missing: the checklist source's items open units cover (their --item or brief ITEM: line) and ready items without a
-    usable brief, as collected (render reads no file); briefs: the configured briefs folder a missing brief is written in."""
-    ready = {i.get("id") for i in data.get("ready", [])}; rows = []
-    covered = set(covered) | {norm_item(u.get("item")) for u in units or [] if u.get("item")}
+BACKLOG_ORDER = {"ready": 0, "relaunch": 1, "no-brief": 2, "open-unit": 3, "waiting": 4, "held": 5, "owner": 6}
+
+def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs", by=None):
+    """covered, missing: the checklist source's items live open units cover (their --item or brief ITEM: line; a unit on a stranded
+    host covers nothing) and ready items without a usable brief, as collected (render reads no file); briefs: the configured briefs
+    folder a missing brief is written in; by: item -> [(unit, host, stranded)] of every open unit that names it."""
+    ready = {i.get("id") for i in data.get("ready", [])}; rows = []; by = by or {}
+    gone = {n for v in by.values() for n, _, s in v if s}
+    covered = set(covered) | {norm_item(u.get("item")) for u in units or [] if u.get("item") and u.get("name") not in gone}
+    strand = {k for k, v in by.items() if v and all(s for _, _, s in v)} - covered   # only units on hosts janus gave up on: fill relaunches it
     nob = {norm_item(x) for x in missing or []}
     skip = {"unit", "instruction", "intent"}
     for i in data.get("items", []):
         labels = [clean(l) for l in i.get("labels") or []]
         if skip & set(labels) or labels and set(labels) & LOG_LABELS: continue
-        ref = str(i.get("external_ref") or "")[8:]
+        ref = str(i.get("external_ref") or "")[8:]; k = norm_item(ref)
         actor = next((l[6:] for l in labels if l.startswith("actor:")), "agent"); hold = next((l[5:] for l in labels if l.startswith("hold:")), None)
-        state = "open-unit" if norm_item(ref) in covered else "held" if hold else "owner" if actor != "agent" else ("no-brief" if norm_item(ref) in nob else "ready") if i.get("id") in ready else "waiting"
-        t0 = epoch(i.get("created_at")); title = clean(i.get("title")) or ref or str(i.get("id"))
+        state = "open-unit" if k in covered else "held" if hold else "owner" if actor != "agent" else \
+            ("relaunch" if k in strand else "no-brief" if k in nob else "ready") if i.get("id") in ready else "waiting"
+        us = by.get(k, []); t0 = epoch(i.get("created_at")); title = clean(i.get("title")).removeprefix("backlog: ") or ref or str(i.get("id"))   # every item's title starts so: the column is for the item
+        host = ",".join(dict.fromkeys(h for _, h, s in us if s == (state == "relaunch"))) if state in ("open-unit", "relaunch") else "-"
+        mean = {"open-unit": "an open unit on a host that answers covers it (open, not necessarily running)", "ready": "not blocked by beads: janus fill may launch it",
+                "relaunch": "only units on hosts that are down cover it: janus fill relaunches it on a host that answers, from their report and synced changes",
+                "no-brief": f"ready, but no usable brief: write {briefs}/<unit>.md with ITEM: {ref}", "owner": "someone else does it",
+                "waiting": "open, but beads does not list it ready (blocked or deferred)"}.get(state) or f"held on purpose: {hold}"
         d = [f"Item:      {title}", f"State:     {state}", f"Id:        {clean(i.get('id'))}", f"Ref:       {ref or '-'}", f"Actor:     {actor}", f"Labels:    {', '.join(labels) or '-'}",
-             f"Age:       {fmt_dur(now - t0) if t0 else '?'}", f"Meaning:   {'an open unit covers it (open, not necessarily running)' if state == 'open-unit' else 'not blocked by beads: janus fill may launch it' if state == 'ready' else 'ready, but no usable brief: write ' + briefs + '/<unit>.md with ITEM: ' + ref if state == 'no-brief' else 'held on purpose: ' + hold if hold else 'someone else does it' if state == 'owner' else 'open, but beads does not list it ready (blocked or deferred)'}",
-             "", clean(i.get("description"), 600)]
-        rows.append(Row(f"i:{i.get('id')}", (title, state + (" STALE" if stale else ""), "-", "-", fmt_dur(now - t0) if t0 else "?"),
-                        "warn" if stale else {"ready": "ok", "held": "dim", "owner": "dim", "open-unit": "ok", "no-brief": "warn"}.get(state, ""), d, stale))
+             f"Age:       {fmt_dur(now - t0) if t0 else '?'}", f"Meaning:   {mean}"]
+        if us: d.append("Units:     " + ", ".join(f"{n} ({h}" + (", host down)" if s else ")") for n, h, s in us))
+        rows.append(Row(f"i:{i.get('id')}", (title, state + (" STALE" if stale else ""), host or "-", "-", fmt_dur(now - t0) if t0 else "?", "-"),
+                        "warn" if stale else {"ready": "ok", "held": "dim", "owner": "dim", "open-unit": "ok", "no-brief": "warn", "relaunch": "warn"}.get(state, ""),
+                        d + ["", clean(i.get("description"), 600)], stale))
     ids = {i.get("id") for i in data.get("items", [])}
     for i in data.get("ready", []):   # ready work that is not a checklist item: it is queued work too
         labels = set(i.get("labels") or []); title = str(i.get("title", ""))
         if i.get("id") in ids or labels & ({"unit", "instruction", "backlog", "intent"} | LOG_LABELS) or any(str(l).startswith("actor:") and l != "actor:agent" for l in labels): continue
         if title.startswith(("unit:", "janus:", "instr:", "intent:")) or LOG_RX.match(title): continue
         t0 = epoch(i.get("created_at"))
-        rows.append(Row(f"i:{i.get('id')}", (clean(title) or str(i.get("id")), "ready" + (" STALE" if stale else ""), "-", "-", fmt_dur(now - t0) if t0 else "?"), "warn" if stale else "ok",
+        rows.append(Row(f"i:{i.get('id')}", (clean(title) or str(i.get("id")), "ready" + (" STALE" if stale else ""), "-", "-", fmt_dur(now - t0) if t0 else "?", "-"), "warn" if stale else "ok",
                         [f"Item:      {clean(title)}", "State:     ready", f"Id:        {clean(i.get('id'))}", "Meaning:   ready in beads; no unit works on it", "", clean(i.get("description"), 600)], stale))
-    return sorted(rows, key=lambda r: (r.cells[1].split(" ")[0] != "ready", r.cells[0].lower()))
+    return sorted(rows, key=lambda r: (BACKLOG_ORDER.get(state_word(r.cells[1]), 4), r.cells[0].lower()))   # what fill launches next first
 
 def memory_row(ms, stale):
     """One row for one [memory] change sent to each running unit (the log keeps a line per delivery): its key is the first
@@ -490,25 +533,34 @@ def derive(view, now, interval):
     ps = {n: S(f"host:{n}").data for n in hosts if S(f"host:{n}").data}
     units, closed, ag = S("units").data, S("closed").data, S("herdr").data
     tools = (cfg.data or {}).get("tools", {}); cards = (S("board").data or {}).get("cards", {})
-    rows = {t: [] for t in TABS}; live = {}   # live: host -> [agents known to be alive, agents whose state is unknown]
+    lv = (S("liveness").data or {}).get("live", {}); after = (S("liveness").data or {}).get("after", {})
+    rows = {t: [] for t in TABS}; live = {}   # live: host -> [agents known to be alive, agents whose state is unknown, units stranded there]
     def host_stale(u): return stale("herdr") if u.get("via") == "herdr" else stale(f"host:{u.get('host')}")
     for u in units or []:
         rep = (S("reports-open").data or {}).get(u["name"], NOT_READ)
-        tab, state, note = classify(u, ps, ag, rep)
-        rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or host_stale(u), rep,
+        tab, state, note = classify(u, ps, ag, rep, lv)
+        t0 = epoch(u.get("started")); wait = after.get(u.get("host"), 1800)
+        if state == "starting" and t0 is not None and now - t0 > wait:   # a launch takes minutes, never this long: it was interrupted
+            state, note = "starting STALLED", f"its launch began {fmt_dur(now - t0)} ago and never finished (interrupted?): janus check says why; close or relaunch it"
+        rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or (host_stale(u) and state_word(state) != "stranded"), rep,
                                   tools.get(u.get("model")), cards.get(u["name"]), S("reports-open").ok_at))
         if tab == "Active" and u.get("host"):
-            c = live.setdefault(u["host"], [0, 0])
+            c = live.setdefault(u["host"], [0, 0, 0])
             if state in ("working", "idle", "blocked"): c[0] += 1
-            elif state == "unknown": c[1] += 1
+            elif state == "unknown" or state.startswith("host-down"): c[1] += 1
+            elif state_word(state) == "stranded": c[2] += 1
     names = {u["name"] for u in units or []}
     for u in closed or []:
         if u["name"] in names: continue   # reopened or relaunched: the open unit is the truth
         rep = (S("reports-closed").data or {}).get(u["name"], NOT_READ); tab, state, note = classify(u, ps, None, rep)
         rows["Ended"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports-closed"), rep, read_at=S("reports-closed").ok_at))
-    rows["Active"].sort(key=lambda r: (PRIO.get(r.cells[1].split(" ")[0], 8), r.cells[0].lower()))
+    rows["Active"].sort(key=lambda r: (PRIO.get(state_word(r.cells[1]), 8), r.cells[0].lower()))
     rows["Ended"].sort(key=lambda r: (r.cells[1].startswith("closed"), r.cells[0].lower()))   # ended and waiting to be collected first
-    if S("backlog").data is not None: rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), (S("checklist").data or {}).get("cov", ()), (S("checklist").data or {}).get("missing"), (S("checklist").data or {}).get("briefs", "briefs"))
+    if S("backlog").data is not None:
+        rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"))
+        k = {}
+        for r in rows["Backlog"]: w = state_word(r.cells[1]); k[w if w in ("owner", "held") else "agent"] = k.get(w if w in ("owner", "held") else "agent", 0) + 1
+        if rows["Backlog"]: m.labels["Backlog"] = ", ".join(f"{k[x]} {x}" for x in ("agent", "owner", "held") if k.get(x))   # owner and held items are not queued agent work
     if S("board").data is not None: rows["Board"] = message_rows(S("board").data, stale("board"))
     m.rows = rows
     herdr_used = any(u.get("via") == "herdr" for u in units or [])
@@ -521,9 +573,14 @@ def derive(view, now, interval):
         if not rows[t]:
             bad = [x for x in m.banners[t] if "UNAVAILABLE" in x or "unreadable" in x]
             m.empty[t] = EMPTY[t] if known else (bad[0] if bad else "Loading...")
-    for n in hosts: m.machines.append(machine_row(n, S(f"host:{n}"), now, limit, None if units is None else live.get(n, [0, 0]), S("facts"), now))
-    if S("handoff").data is not None or S("handoff").err: m.rows["Overview"] = overview_rows(m, rows, S("handoff"), now, view)
-    m.problems = sum(1 for s in view.values() if source_state(s, now, limit) in ("failed", "stale"))
+    for n in hosts: m.machines.append(machine_row(n, S(f"host:{n}"), now, limit, None if units is None else live.get(n, [0, 0, 0]), S("facts"), now, lv.get(n)))
+    m.machines.sort(key=lambda r: r.style == "dim" and r.cells[1].startswith(KNOWN_DOWN))   # stable: the hosts given up on go last, in config order
+    if S("handoff").data is not None or S("handoff").err:
+        m.rows["Overview"] = overview_rows(m, rows, S("handoff"), now, view)
+        if m.counts.get("Overview") is not None: m.counts["Overview"] = len(m.rows["Overview"])   # counted above before its rows existed: it read 0
+    known = {f"host:{r.cells[0]}" for r in m.machines if r.cells[1].startswith(KNOWN_DOWN)}   # known down: counted as hosts down, not as a data problem
+    m.down = len(known)
+    m.problems = sum(1 for n, s in view.items() if n not in known and source_state(s, now, limit) in ("failed", "stale"))
     return m
 
 def tools_text(n, fs, now):
@@ -544,19 +601,42 @@ def overview_rows(m, rows, hand, now, view):
     if h.get("at"): cp += f"  (handoff updated {fmt_dur(now - h['at'])} ago)"
     R.append(Row("o:checkpoint", ("Checkpoint", cp), "ok" if h.get("pct") is not None else "dim", [cp]))
     by = {}
-    for r in rows["Active"]: k = r.cells[1].split(" ")[0]; by[k] = by.get(k, 0) + 1
+    for r in rows["Active"]: k = state_word(r.cells[1]); by[k] = by.get(k, 0) + 1
     known = m.counts.get("Active") is not None
     work = (", ".join(f"{v} {k}" for k, v in sorted(by.items(), key=lambda kv: PRIO.get(kv[0], 8))) or "nothing active") if known else "unknown"
     R.append(Row("o:work", ("Work", f"{work}; {m.counts.get('Ended') if m.counts.get('Ended') is not None else '?'} ended or closed"), "", [work]))
     ck = view.get("checklist"); line = (ck.data or {}).get("line") if ck else None
     R.append(Row("o:checklist", ("Checklist", line or ("unknown: " + (ck.err or "not read yet") if ck else "unknown: not read yet")), "" if line else "dim", [line or "unknown"]))
-    for mr in m.machines: R.append(Row("o:" + mr.key, (mr.cells[0], f"{mr.cells[1]}  run/queued {mr.cells[2]}  admission {mr.cells[6]}  tools {mr.cells[7]}"), mr.style, [", ".join(map(str, mr.cells))]))
+    for mr in m.machines:
+        line = (f"{mr.cells[1]}  {mr.cells[3]}  {mr.cells[8]}" if mr.cells[1].startswith(KNOWN_DOWN) else
+                f"{mr.cells[1]}  run/queued {mr.cells[2]}  admission {mr.cells[6]}  tools {mr.cells[7]}" + (f"  ({mr.cells[8]})" if mr.cells[8] else ""))
+        R.append(Row("o:" + mr.key, (mr.cells[0], line), mr.style, [", ".join(map(str, mr.cells))]))
     bad = [f"{n}: {x.err}" for n, x in sorted(view.items()) if x.err]
     R.append(Row("o:problems", ("Data", "; ".join(bad) if bad else "every source read"), "warn" if bad else "ok", bad or ["every source read"]))
     return R
 
-def machine_row(n, s, now, limit, agents, facts=None, _now=None):
+KNOWN_DOWN = ("DOWN", "GONE", "RETURNING")   # a host janus has given up on for now, or the owner said is retired or will return
+SSH_WHY = (("host is down", "host is down"), ("no route to host", "no route to host"), ("could not resolve hostname", "its name does not resolve"),
+           ("connection refused", "ssh refused"), ("timed out", "ssh timed out"), ("permission denied", "ssh login refused"))
+
+def short_err(e):
+    """Why a host does not answer, in a few words (the whole error stays in the Overview's Data row)."""
+    low = str(e or "").lower()
+    return next((w for k, w in SSH_WHY if k in low), clean(e, 60))
+
+def machine_row(n, s, now, limit, agents, facts=None, _now=None, live=None):
+    """One host's row. live: janus's judgement of it (collect_liveness): stranded, gone or returning while it does not answer is a
+    known-down host, dimmed, with '-' for what cannot be read (not '?': nothing is expected from it) and the units stranded there."""
     k = source_state(s, now, limit); p = s.data or {}
+    hl, since = (live or ["up", None])[:2]
+    if hl == "gone" or (hl in ("stranded", "returning") and k != "ok"):
+        d = fmt_dur(now - since) if since else "?"
+        why = short_err(s.err) if s.err and k != "ok" else "it answers, but is marked gone" if k == "ok" else ""
+        note = (f"{why}; " if why else "") + {"gone": f"marked gone: its work is relaunched elsewhere (janus hosts --mark {n} clear undoes)",
+                                              "stranded": "its work is relaunched elsewhere", "returning": "marked returning: its work waits for it"}[hl]   # the reason first: narrow screens cut the end
+        st = {"gone": "GONE", "stranded": f"DOWN {d}", "returning": f"RETURNING {d}"}[hl]
+        ag = "?" if agents is None else f"{agents[2]} stranded" if len(agents) > 2 and agents[2] else "0"
+        return Row(f"h:{n}", (n, st, "-", ag, "-", "-", "-", tools_text(n, facts, now) if facts is not None else "?", clean(note, 120)), "dim", [], False)
     run, qd = num(p.get("cap_rj")), None
     if p.get("pueue") is not None:
         tasks = list(((p.get("pueue") or {}).get("tasks") or {}).values()); w = [num(p.get("wait_jobs"))]
@@ -567,8 +647,9 @@ def machine_row(n, s, now, limit, agents, facts=None, _now=None):
     ag = "?" if agents is None else f"{agents[0]}" + ("+?" if agents[1] else "")
     age = f"last good {fmt_dur(now - s.ok_at)} ago" if s.ok_at is not None else ""
     pause = clean(p.get("cap_pause"), 60)
-    state, style, note = {"none": ("checking", "dim", "first probe running"), "failed": ("UNREACHABLE", "bad", s.err or ""),
-                          "stale": ("UNREACHABLE" if s.err else "STALE", "bad" if s.err else "warn", f"{s.err}; {age}" if s.err else f"no answer for a while; {age}"),
+    down = f"; no answer for {fmt_dur(now - since)}" if since else ""   # janus's record (hosts.json): longer than this monitor has run
+    state, style, note = {"none": ("checking", "dim", "first probe running"), "failed": ("UNREACHABLE", "bad", short_err(s.err) + down),
+                          "stale": ("UNREACHABLE" if s.err else "STALE", "bad" if s.err else "warn", f"{short_err(s.err)}; {age}{down}" if s.err else f"no answer for a while; {age}"),
                           "ok": ("PAUSED", "warn", "admission paused: " + pause) if pause else ("ok", "ok", "")}[k]
     adm = clean(p.get("cap_admit"), 40) if s.data is not None else ""
     adm = "?" if not adm else "admits" if adm == "yes" else "blocked: " + adm
@@ -672,7 +753,13 @@ HELP = ["janus monitor: read-only (it writes nothing and runs nothing that does)
         "Tab / Left / Right / 1-5   switch tabs: Active, Backlog, Ended, Board, Overview", "Up / Down / j / k / PgUp / PgDn / g / G   select and scroll",
         "Enter   details of the selected row (Esc or Enter: back)", "/       filter the rows of every tab by text (Enter keeps it, Esc clears it)",
         "r       refresh now", "q       quit", "", "Unknown stays '?': a host that does not answer is UNREACHABLE or STALE with the age of its last good data;",
-        "a process that ended is not 'finished' until its report says VERDICT: DONE. Any key closes this help."]
+        "a process that ended is not 'finished' until its report says VERDICT: DONE.", "",
+        "Hosts: DOWN <time> has not answered for longer than [capacity] down_after_min (default 30 min): its units are 'stranded'",
+        "and their backlog items 'relaunch' (janus fill starts them on a host that answers, from their report and synced changes).",
+        "GONE / RETURNING: the owner's mark (janus hosts --mark HOST gone|returning|clear): gone relaunches now, returning waits.",
+        "Hosts given up on are dimmed and listed last; they count as 'hosts down', not as source problems.",
+        "Units: stranded:<verdict> (not relaunched yet), stranded-><unit> (relaunched as that unit), starting STALLED (a launch",
+        "that never finished). Any key closes this help."]
 
 def filtered(model, text):
     """The model with every tab's rows reduced to those whose cells or details hold text (counts and machines stay whole)."""
@@ -725,7 +812,7 @@ def render(model, ui, h, w, now, status):
     sel = ui.sel.get(tab); i = ui.idx.get(tab, 0); new = ui.new_count(model)
     tabs = []
     for ti, t in enumerate(TABS):
-        n = model.counts.get(t); lab = f"{t} ({'?' if n is None else n}{f', {new} new' if t == 'Board' and new else ''})"
+        n = model.counts.get(t); lab = f"{t} ({'?' if n is None else model.labels.get(t) or n}{f', {new} new' if t == 'Board' and new else ''})"
         tabs.append((f"[{lab}]" if ti == ui.tab else f" {lab} ", "rev bold" if ti == ui.tab else "new" if t == "Board" and new else ""))
     L[tab_at] = tabs
     if ui.detail and not rows and ui.dcache: ui.detail = False
@@ -757,7 +844,7 @@ def render(model, ui, h, w, now, status):
 def status_line(store_view, model, now, interval):
     _, running, finished, _v = store_view
     s = "refreshing..." if running else "updated " + (fmt_dur(now - finished) + " ago" if finished else "never")
-    return f"{s}  every {interval:g}s" + (f"  {model.problems} source problem(s)" if model.problems else "")
+    return f"{s}  every {interval:g}s" + (f"  {model.down} host(s) down" if model.down else "") + (f"  {model.problems} source problem(s)" if model.problems else "")
 
 # ---------------------------------------------------------------- the terminal
 

@@ -32,7 +32,7 @@ A message from the user is answered in the same turn, before housekeeping. If it
 - `janus launch <unit> --kind implement|review|audit|cleanup`: an agent on a host with room. Builds and tests are explicit commands: `janus run --detach --host <h> --wt <tree> -- <cmd>`, then end the turn (`WAITING <ids>`); janus resumes the session when they finish. No broad suites without a reason.
 - Each host owns its trees: `janus land <unit>` merges, squashes and moves the branch there (expected ref; `--push` never forces). After it integrates moved work, a clean merge is not proof: run the tests that matter.
 - Board: `janus answer q<N> <text>` for questions; `janus send <agent> <text>` for one addressed message. No broadcasts.
-- An unreachable host is unknown: never cancel, move or relaunch its work because of it.
+- An unreachable host is unknown: never cancel, move or relaunch its work by hand. Past `[capacity] down_after_min` (or once the owner says it is gone or coming back: `janus hosts --mark <h> gone|returning`), `janus fill` relaunches its units' items on hosts that answer, seeded from their reports and synced changes; when it answers again, `duplicate:<unit>` asks you to keep one of each pair.
 
 ## Guarded operations
 The hook refuses what could destroy or cross another's work: `rm -r`, `kill`, `pueue` writes, history rewrites, edits of code outside the project's own folders. It names the janus command that does the job (a tracked agent, `janus run`, `janus cancel`, `janus stop`); use it. If the user explicitly asks for exactly the refused action, say what is blocked and why, and let them run it or authorize another way; do not work around the guard. Never print credentials.

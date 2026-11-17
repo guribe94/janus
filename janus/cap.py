@@ -17,7 +17,7 @@ from pathlib import Path
 
 CAP_DEFAULTS = {"cores": 4, "cores_per_job": 1, "ram_gb": 4, "services_gb": 0, "job_gb": 2, "agent_gb": 1.0, "psi_pause": 10,
                 "load_pause": 1.25, "hold_s": 60, "history_n": 5, "margin_pct": 15, "min_disk_gb": 10, "discover_h": 24,
-                "age_weight": 1, "expect_s": 600, "broad_min": 30, "overrun_x": 3}
+                "age_weight": 1, "expect_s": 600, "broad_min": 30, "overrun_x": 3, "down_after_min": 30}
 # imp-sched item 3 (CPU): a job reserves, and is capped at, its class's learned cores (CPU seconds / run time of its last runs, 1 to
 # cores_per_job); waiting jobs go shortest expected run time first, minus age_weight x seconds waited (aging); expect_s is the
 # expected run time of a class without history; broad_min: a class whose median run is longer needs --broad; overrun_x: check

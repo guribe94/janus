@@ -1,14 +1,14 @@
 """janus backlog (import, list, set actor) and janus fill (launch ready backlog units up to capacity)."""
 import argparse, os, re, stat
 from pathlib import Path
-from janus.actions.launch import brief_plan, choose, cmd_launch, pick_model
-from janus.backlog import backlog_cfg, backlog_issues, backlog_items, backlog_ready_ids, draft_holds, eligible_items, held_text, hold_drafts, item_actors, item_holds, norm_item, unit_items
+from janus.actions.launch import brief_plan, choose, cmd_launch, pick_model, place
+from janus.backlog import backlog_cfg, backlog_issues, backlog_items, backlog_ready_ids, covered_items, draft_holds, eligible_items, held_text, hold_drafts, item_actors, item_holds, norm_item, stranded_cover, unit_items
 from janus.beads import Beads
 from janus.branch import verify_published
 from janus.budgets import budget_for, finish_reserve
-from janus.context import Err, atomic_write, say, sh, slug
+from janus.context import Err, atomic_write, say, sh, slug, ts
 from janus.ledger import committed, reserved
-from janus.probe import probe_all
+from janus.probe import host_liveness, probe_all, stranded_hosts
 from janus.units import all_units, herdr_agents, unit_any, unit_state
 
 def cmd_backlog(cfg, a):
@@ -92,9 +92,9 @@ def fill_candidates(cfg, units, launch=False, missing=None, blocked=None, held=N
     blocked: eligible items bd ready does not list (they wait on a dependency). held: the items left out only by a hold, as
     [(item, reason, [where the hold is], unlaunched usable brief's unit name or None)]: never candidates, named so a held item with
     a brief is not mistaken for a missing one."""
-    src, hl = {}, []
+    src, hl = {}, []; iss = {}
     try:
-        iss = backlog_issues(cfg); cov = unit_items(cfg, units, iss)
+        iss = backlog_issues(cfg); cov = covered_items(cfg, units, iss)
         if not iss: raise Err("the checklist is not in beads (janus backlog import)")
         try: rdy = ready_ids(cfg)
         except Err:
@@ -103,14 +103,14 @@ def fill_candidates(cfg, units, launch=False, missing=None, blocked=None, held=N
         hold = item_holds(cfg, iss, src); items = eligible_items(iss, rdy, cov, item_actors(cfg, iss), hold, blocked, hl)
     except Err as e:
         if launch: raise Err(f"beads cannot say what is ready ({e}): nothing is launched from the unchecked checklist")
-        src.clear(); act = item_actors(cfg, {}); hold = item_holds(cfg, {}, src); cov = unit_items(cfg, units, {})
+        src.clear(); act = item_actors(cfg, {}); hold = item_holds(cfg, {}, src); cov = covered_items(cfg, units, {}); iss = {}
         rows = [(n, i, t) for n, (i, t, st, d, rd) in enumerate(backlog_items(cfg) or []) if rd and norm_item(i) not in cov and act.get(norm_item(i), "agent") == "agent"]
         items = [(2, n, i, t) for n, i, t in rows if norm_item(i) not in hold]; hl = [i for n, i, t in rows if norm_item(i) in hold]
-    ever = all_units(cfg); out = []; idx = brief_index(cfg); taken = set()
+    ever = all_units(cfg); out = []; idx = brief_index(cfg); taken = set(); strand = stranded_cover(cfg, units, iss)
     if held is not None:
         held.extend((i, hold[norm_item(i)], src.get(norm_item(i), []), (usable_brief(cfg, i, idx, ever) or (None, None))[1]) for i in hl)
     for pr, order, item, title in sorted(items):
-        hit = usable_brief(cfg, item, idx, ever, taken)
+        hit = usable_brief(cfg, item, idx, ever, taken) or (relaunch_brief(cfg, strand[norm_item(item)][0], ever, taken) if norm_item(item) in strand else None)
         if not hit:
             if missing is not None: missing.append(item)
             continue
@@ -130,14 +130,49 @@ def usable_brief(cfg, item, idx, ever, taken=()):
         return f, name, keys
     return None
 
-def fill_plan(cfg, hs, units, limit=None, launch=False, cands=None, missing=None, held=None):
+def relaunch_name(cfg, old, ever, taken=()):
+    """The next free name for a relaunch of unit old: <base>-r<N+1> (old ends in -r<N>), else <old>-r2; at most 32 characters,
+    never a name ever launched, taken by this plan, with output in out/ or with a brief of its own. None when none is free."""
+    m = re.fullmatch(r"(.+?)-r(\d+)", old); base, n = (m.group(1), int(m.group(2))) if m else (old, 1)
+    for k in range(n + 1, n + 50):
+        s = f"-r{k}"; name = base[:32 - len(s)].rstrip("-_") + s
+        if (re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name) and name not in ever and name not in taken and not out_used(cfg, name)
+                and not (cfg.p("briefs", "briefs") / f"{name}.md").exists()): return name
+    return None
+
+def relaunch_brief(cfg, u, ever, taken=()):
+    """(the stranded unit u's brief, a new unit name, its keys): the candidate fill relaunches u's item with when no unlaunched brief
+    is for it. cmd_fill writes the brief under the new name (relaunch_text) and seeds the unit from u (--resume-of). None when u's
+    brief is no longer readable here or no name is free."""
+    try:
+        f = Path(u["brief"])
+        with open(f, errors="replace") as fh: head = "".join(fh.readlines()[:12])
+    except (OSError, KeyError, TypeError): return None
+    name = relaunch_name(cfg, u["name"], ever, taken)
+    own = {k: str(u[x]) for k, x in (("KIND", "kind"), ("TIER", "tier")) if u.get(x)}   # what it was launched as, unless its brief says
+    return (f, name, {**own, **{k: v.rstrip(".,;") for k, v in BRIEF_KEYS.findall(head)}}) if name else None
+
+def relaunch_text(cfg, u, brief, live):
+    """The brief of a relaunch of the stranded unit u: its own brief, then why it was relaunched and what it starts from."""
+    st, since = live.get(u.get("host"), ("?", None))
+    patch = cfg.p("out", "out") / u["name"] / "backup.patch"
+    return (Path(brief).read_text().rstrip("\n") + f"\n\n## Relaunch of {u['name']} (janus fill)\n\n{u['name']} ran on {u.get('host')}, which is {st}"
+            + (f" (no answer since {ts(since)})" if since else "") + f". Your report starts from its last copy here (out/{u['name']}/REPORT.md)"
+            + (f", and its changes as last synced ({ts(u['saved_at']) if u.get('saved_at') else 'time unknown'}) were applied to your tree from out/{u['name']}/backup.patch"
+               " when they applied cleanly (your report says if they did not)" if patch.is_file() and patch.stat().st_size else "; no patch of its changes was synced, so start from the report")
+            + f". Work done on {u.get('host')} after that sync is not here: redo it. Do not touch {u['name']}'s copy on its host.\n")
+
+def fill_plan(cfg, hs, units, limit=None, launch=False, cands=None, missing=None, held=None, pinned=None):
     """(plan [(name, item, model, agent host, build host, budget, why)], stops [why the rest does not launch now]): candidates
     in priority order, each placed by choose() against the open units plus those planned before it, until the hosts'
     reservations or the provider budgets are used. limit (--max): at most that many per agent host. launch: see fill_candidates
     (beads unreadable: no plan, the stop says why). A unit placed on another host has its brief checked for that host
     (brief_plan) here, before anything exists: a brief it refuses is a stop with its reason, and the other candidates go on.
-    cands, missing, held: fill_candidates' result when the caller has it (held: named with a stop, never planned)."""
+    cands, missing, held: fill_candidates' result when the caller has it (held: named with a stop, never planned). pinned: gets
+    (unit, item, host) for each candidate its brief or [placement] pins to a stranded host: it is not moved (a pin is usually
+    hardware), it waits, and check names it."""
     plan, stops, virt, spent, keep = [], [], [dict(u) for u in units], {}, {}
+    down = stranded_hosts(cfg)
     if cands is None:
         missing = [] if missing is None else missing; held = [] if held is None else held
         try: cands = fill_candidates(cfg, units, launch, missing, held=held)
@@ -155,6 +190,11 @@ def fill_plan(cfg, hs, units, limit=None, launch=False, cands=None, missing=None
         if budget is not None and bl:
             try: budget = float(bl.lstrip("$"))
             except ValueError: stops.append((name, f"BUDGET: {bl} is not a number")); continue
+        if down:
+            _, pwhy, want = place(cfg, a, Path(f), mc, virt, hs)
+            if want in down:
+                if pinned is not None: pinned.append((name, item, want))
+                stops.append((name, f"pinned to {want} ({pwhy}), which is down: not moved (fix the host, or change the brief's TEST-HOST / [placement])")); continue
         hold = budget
         pv = cfg.prov.get(mc.get("provider"), {})
         if budget is not None and "cap_usd" in pv:
@@ -208,16 +248,30 @@ def cmd_fill(cfg, a):
     ag = herdr_agents(cfg)
     for u in units: u["state"] = unit_state(u, hs, ag)
     plan, stops = fill_plan(cfg, hs, units, a.max, launch=True)   # fail closed: only what beads says is ready, never the bare checklist
+    strand = stranded_cover(cfg, units); live = host_liveness(cfg)
+    def src(item, f):   # the stranded unit a launch continues: only a relaunch of its own brief (another brief for the item is other work, never mixed with it)
+        o = (strand.get(norm_item(item)) or [None])[0]
+        return o if o and Path(f).resolve() == Path(o.get("brief") or "/").resolve() else None
     say(f"fill: {len(plan)} unit(s) fit now" + (" (dry run: nothing launched)" if cfg.run.dry else ""))
     for name, item, m, hn, b, budget, why, kind, tier, f in plan:
-        say(f"  {name} [{item}] {kind}/{tier} model {m} on {hn}, builds on {b}" + (f", ${budget:g}" if budget is not None else "") + f": {why}")
+        o = src(item, f); was = [u["name"] for u in strand.get(norm_item(item), [])]
+        say(f"  {name} [{item}] {kind}/{tier} model {m} on {hn}, builds on {b}" + (f", ${budget:g}" if budget is not None else "") + f": {why}"
+            + (f"; relaunch of {o['name']} ({o.get('host')} {live.get(o.get('host'), ('?',))[0]})" if o else
+               f"; its own brief, not seeded from {', '.join(was)} (stranded; still open)" if was else ""))
     say("stops: " + "; ".join(dict.fromkeys(stops)))
     if cfg.run.dry: return 0
     if not plan and any(s.startswith("beads cannot say") for s in stops): raise Err("fill: " + stops[0])   # an error, so the watcher's step counts it
     rc = 0
     for name, item, m, hn, b, budget, why, kind, tier, f in plan:
+        o = src(item, f)
+        try:
+            if o:   # the stranded unit's own brief: written again under the new name
+                nb = cfg.p("briefs", "briefs") / f"{name}.md"; nb.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write(nb, relaunch_text(cfg, o, f, live)); f = nb
+        except (OSError, KeyError) as e: say(f"fill: {name} not launched: its brief could not be written ({e})"); rc = 1; continue
         la = argparse.Namespace(unit=name, kind=kind, tier=tier, host=None, model=m, brief=str(f), cwd=None, budget=budget, test_host=None,
-                                allow_main=False, of=None, report=None, resume_of=None, item=item, dry_run=False, auto=True,   # auto: launch rechecks the item
+                                allow_main=False, of=None, report=None, resume_of=o["name"] if o else None, relaunch_of=o["name"] if o else None,
+                                item=item, dry_run=False, auto=True,   # auto: launch rechecks the item
                                 new_worktree=fill_repo(cfg, name, f), from_ref=cfg.c.get("fill", {}).get("from"))   # row 83
         try: cmd_launch(cfg, la)
         except Err as e: say(f"fill: {name} not launched: {e}"); rc = 1

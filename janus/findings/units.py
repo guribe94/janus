@@ -6,6 +6,7 @@ from janus.board import board_questions, board_rows
 from janus.context import now
 from janus.ledger import ledger_read, recost_plan, spend
 from janus.platform import herdr
+from janus.probe import live_units
 from janus.project import project_id
 from janus.transcripts import card_fields
 from janus.units import ENDED, all_units, busy_dead, unit_runs, unit_state, verdict, waiting_line_jobs
@@ -98,8 +99,8 @@ def unit_findings(cfg, hs, units, ag):
 
 def cap_findings(cfg, units):
     """cap:total and cap:<host>: more agents than the owner's caps."""
-    F = []
-    if cfg.caps.get("total") is not None and len(units) > cfg.caps["total"]: F.append(("cap:total", f"{len(units)} agents over total cap {cfg.caps['total']}: launch nothing more; close finished units"))
+    F = []; n = len(live_units(cfg, units))   # a stranded host's units hold no slot (probe.room counts the same)
+    if cfg.caps.get("total") is not None and n > cfg.caps["total"]: F.append(("cap:total", f"{n} agents over total cap {cfg.caps['total']}: launch nothing more; close finished units"))
     for n, c in cfg.caps.get("host", {}).items():
         k = sum(1 for u in units if u.get("host") == n)
         if k > c: F.append((f"cap:{n}", f"{k} agents on {n} over its cap {c}"))

@@ -12,7 +12,7 @@ from janus.cap import cap_call, cap_lib, cap_nums, capv, class_rows, host_cap
 from janus.context import Err, LockLost, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
 from janus.platform import ARCH, CACHE_ENV, MAXRSS_PY, cache_env_sh
 from janus.project import own_label, tag, untagged
-from janus.probe import host_facts, probe, probe_all, pueue
+from janus.probe import MARK_KINDS, MARKS, host_facts, host_liveness, probe, probe_all, pueue
 from janus.templates import ADMIT
 from janus.units import agent_ended, unit_state
 
@@ -762,7 +762,9 @@ def clients_line(cfg, n, f):
 
 def cmd_hosts(cfg, a):
     """janus hosts: what each host is (discovered: OS, arch, cores, memory, disk, tools, agent logins, devices; cached, refreshed
-    by check after [capacity] discover_h, or now with --refresh)."""
+    by check after [capacity] discover_h, or now with --refresh). --mark HOST gone|returning|clear: the owner's word on a host
+    that does not answer (probe.host_liveness): gone redirects its work now, returning keeps it waiting, clear goes back to the clock."""
+    if getattr(a, "mark", None): return mark_host(cfg, *a.mark)
     cfg.run.ro = cfg.run.ro or not a.refresh   # only --refresh saves what it found
     fs = host_facts(cfg, refresh=True if a.refresh else "stale")
     with cf.ThreadPoolExecutor(8) as ex: hs = dict(zip(cfg.hosts, ex.map(lambda n: probe(n, cfg.hosts[n], ro=True, cfg=cfg), cfg.hosts)))
@@ -774,6 +776,17 @@ def cmd_hosts(cfg, a):
         L.append(facts_line(n, fs.get(n))); L.append(clients_line(cfg, n, fs.get(n)))
         L += [f"  {u['class']}: {u['runs']} runs, expect {m(u['expect_s'])}, {u['cores']} core(s)" for u in use[n][:8]]
     return 0, L
+
+def mark_host(cfg, name, mark):
+    if name not in cfg.hosts: raise Err(f"no host {name!r} in janus.toml (hosts: {', '.join(cfg.hosts)})")
+    if mark not in (*MARK_KINDS, "clear"): raise Err(f"mark {mark!r}: gone, returning or clear")
+    with cfg.writer():
+        mk = cfg.jget(MARKS)
+        if mark == "clear": mk.pop(name, None)
+        else: mk[name] = {"mark": mark, "at": now()}
+        cfg.jput(MARKS, mk)
+    st, since = host_liveness(cfg)[name]
+    return 0, [f"janus: {name} {'mark cleared' if mark == 'clear' else 'marked ' + mark}; now {st}" + (f" (down since {ts(since)})" if since else "")]
 
 def collect_job(cfg, ref):
     hn, _, tid = ref.partition(":")

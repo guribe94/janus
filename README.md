@@ -54,6 +54,7 @@ Order matters: the watcher acts on every project listed in `~/.config/janus/proj
 janus monitor                    # from PROJECT or any folder below it; --interval SECONDS (default 5)
 janus status                     # the state now;  janus check [--json]  for findings
 janus hosts [--refresh]          # what each host has;  janus capacity  for admission now
+janus hosts --mark H gone|returning|clear   # a down host: retired (relaunch its work now) or coming back (its work waits)
 janus launch UNIT --kind implement --new-worktree REPO    # agents are launched by the orchestrator or `janus fill`
 janus land UNIT [--push]         # merge and optionally push, never forced
 ```

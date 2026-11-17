@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from janus.beads import Beads
 from janus.context import Err, slug
+from janus.probe import live_units
 
 # The backlog lives in beads: `janus backlog import` turns every unfinished item of the project's status checklist into a beads
 # issue labelled backlog and status:<its status>, keyed by external ref backlog:<item id> (idempotent: a re-import updates
@@ -143,6 +144,21 @@ def unit_items(cfg, units, iss=None):
     ids = bead_items(iss)
     return {ids.get(x, x) for x in out}
 
+def covered_items(cfg, units, iss=None):
+    """The items open units cover for selection: unit_items of the units that are not on a stranded host (probe.host_liveness).
+    A unit on a host down past [capacity] down_after_min, or marked gone, no longer holds its item: fill relaunches it elsewhere."""
+    return unit_items(cfg, live_units(cfg, units), iss)
+
+def stranded_cover(cfg, units, iss=None):
+    """{item (norm_item form): the open units on stranded hosts that cover it, the work before its reviews, newest started first}
+    for the items no live unit covers: what fill relaunches, each from the first of them (its brief, report and backup.patch); a
+    review of work stranded with it is relaunched only when nothing else covered the item."""
+    live = live_units(cfg, units); ids = {id(u) for u in live}; cov = unit_items(cfg, live, iss); out = {}
+    for u in sorted((u for u in units if id(u) not in ids), key=lambda u: (u.get("kind") == "review", -(u.get("started") or 0))):
+        for k in unit_items(cfg, [u], iss):
+            if k not in cov: out.setdefault(k, []).append(u)
+    return out
+
 def eligible_items(iss, ready_ids, cov, act, hold, blocked=None, held=None):
     """The one selection fill, check and the monitor share: [(priority, order, item id, title)] of the backlog issues (by their
     external ref backlog:<id> only, never their title) that are open, labelled backlog-ready, of an agent, not held and not
@@ -173,7 +189,7 @@ def item_eligible(cfg, item, units):
     backlog-ready, of an agent, not held, not covered by units), else why not. Err when beads cannot be read (fail closed)."""
     try: iss = backlog_issues(cfg); rdy = backlog_ready_ids(cfg)
     except Err as e: raise Err(f"refused: beads cannot be read to recheck item {item} ({e}): not launched")
-    blocked = []; ok = eligible_items(iss, rdy, unit_items(cfg, units, iss), item_actors(cfg, iss), item_holds(cfg, iss), blocked)
+    blocked = []; ok = eligible_items(iss, rdy, covered_items(cfg, units, iss), item_actors(cfg, iss), item_holds(cfg, iss), blocked)
     if any(norm_item(x[2]) == norm_item(item) for x in ok): return None
     return "blocked by a beads dependency (bd ready does not list it)" if any(norm_item(x) == norm_item(item) for x in blocked) else \
         "not ready, held, not an agent's, closed or covered now (janus backlog list)"
@@ -185,7 +201,7 @@ def checklist_totals(cfg, units, iss=None):
     items = backlog_items(cfg)
     if items is None: return None
     act = {}; backlog_items(cfg, act); act = {norm_item(k): v for k, v in act.items()}
-    cov = unit_items(cfg, units or [], iss); left = [x for x in items if not x[3]]; actors = {}
+    cov = covered_items(cfg, units or [], iss); left = [x for x in items if not x[3]]; actors = {}
     for i, *_ in left: a = act.get(norm_item(i), "agent"); actors[a] = actors.get(a, 0) + 1
     return {"total": len(items), "done": len(items) - len(left), "left": [(i, t, st) for i, t, st, d, rd in left], "actors": actors,
             "covered": sum(1 for i, *_ in left if norm_item(i) in cov), "cov": cov, "act": act}

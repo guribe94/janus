@@ -33,13 +33,15 @@ def backlog_findings(cfg, hs, units):
                           f"write {brief_dir(cfg)}/<unit>.md with an ITEM: <id> line (janus fill launches it), or janus backlog set <id> hold=<reason>"))
     if blocked: F.append(("backlog:blocked", f"{len(blocked)} ready backlog item(s) wait on a beads dependency (bd ready does not list them): {', '.join(blocked[:12])}"))
     if not cands: return F
-    plan, stops = fill_plan(cfg, hs, units, cands=cands)
+    pinned = []; plan, stops = fill_plan(cfg, hs, units, cands=cands, pinned=pinned)
+    for name, item, h in pinned:   # its brief or [placement] names a host that is down: not moved for it (a pin is usually hardware)
+        F.append((f"backlog:pinned:{name}", f"{name} [{item}] is pinned to {h}, which is down: it waits for {h}; to run it elsewhere change its brief's TEST-HOST or [placement], or bring {h} back"))
     if plan:
         per = {}
         for x in plan: per[x[3]] = per.get(x[3], 0) + 1
         F.append(("idle-with-backlog", f"{len(plan)} ready backlog unit(s) with briefs fit now ({', '.join(f'{k}: {v}' for k, v in per.items())}): "
                   + ", ".join(x[0] for x in plan[:6]) + ("..." if len(plan) > 6 else "") + "; janus fill"))
-    held = [x[4] for x in cands if x[4] not in {p[0] for p in plan}]
+    held = [x[4] for x in cands if x[4] not in {p[0] for p in plan} | {p[0] for p in pinned}]
     if held: F.append(("backlog:held", f"{len(held)} ready backlog unit(s) with briefs do not launch now ({', '.join(held[:6])}): " + "; ".join(stops)[:300]))
     return F
 

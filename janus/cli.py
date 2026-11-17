@@ -41,7 +41,8 @@ def main():
         return p
     A = lambda *n, **k: (n, k)
     add("check", cmd_check, A("--brief", action="store_true"), A("--json", action="store_true", help="the findings as JSON (key, family, text, urgent)"))
-    add("hosts", cmd_hosts, A("--refresh", action="store_true", help="discover every host again now"), A("--json", action="store_true"))
+    add("hosts", cmd_hosts, A("--refresh", action="store_true", help="discover every host again now"), A("--json", action="store_true"),
+        A("--mark", nargs=2, metavar=("HOST", "MARK"), help="gone: retired, its work is relaunched elsewhere now; returning: down but coming back, its work waits; clear: back to [capacity] down_after_min"))
     add("monitor", cmd_monitor, A("--interval", type=interval_arg, default=5.0, metavar="SECONDS", help="seconds between refreshes, counted from the end of the last one (default 5, at least 1)"))
     add("capacity", cmd_capacity); add("status", cmd_status); add("watch", cmd_watch, A("--alert", action="store_true", help="only tell the orchestrator about new board questions and blocks"),
         A("--reset", action="store_true", help="the Stop hook's context reset: the tool's new-session command, verified, then the wake prompt"))
