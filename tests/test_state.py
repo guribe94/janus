@@ -233,6 +233,18 @@ class State(unittest.TestCase):
         F, _ = janus.unit_findings(cfg, {"here": {"ok": True, "name": "here"}}, [u], {})
         self.assertIn("unit:u:interrupted", [k for k, _ in F]); self.assertIsNone(janus.busy_dead({**u, "busy": {**dead, "pid": os.getpid(), "at": 1}}), "a live close is called dead (age alone must not)")
 
+    def test_an_agent_that_never_wrote_its_report_is_named_not_started(self):
+        """Catches (2026-11-18): agents at a startup prompt since launch read as working for half an hour; nothing said so until the
+        owner looked at their screens. The report janus seeds at launch, still untouched past silent_min, is the sign."""
+        d, cfg = project(); rep = d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True, exist_ok=True); rep.write_text(janus.REPORT_SEED + "\n")
+        hs = {"here": {"ok": True, "name": "here", "tmux": ["janus-u@t"]}}
+        u = lambda age: {"name": "u", "id": "1", "host": "here", "via": "tmux", "tmux": "janus-u@t", "started": int(janus.now()) - age}
+        keys = lambda x: [k for k, _ in janus.unit_findings(cfg, hs, [x], {})[0]]
+        self.assertIn("unit:u:not-started", keys(u(cfg.silent + 60)))
+        self.assertNotIn("unit:u:not-started", keys(u(cfg.silent - 60)))           # still within the first silent window
+        rep.write_text(janus.REPORT_SEED + "\n- [ ] read the brief\n"); self.assertNotIn("unit:u:not-started", keys(u(cfg.silent + 60)))
+        rep.write_text(janus.REPORT_SEED + "\n"); self.assertNotIn("unit:u:not-started", keys({**u(cfg.silent + 60), "tmux": "other"}))   # not running
+
 
 class UnitRecord(unittest.TestCase):
     def test_v1_record_migrates_to_v2(self):

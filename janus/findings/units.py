@@ -10,7 +10,7 @@ from janus.probe import live_units
 from janus.project import project_id
 from janus.rigor import review_gap
 from janus.transcripts import card_fields
-from janus.units import ENDED, all_units, busy_dead, unit_runs, unit_state, verdict, waiting_line_jobs
+from janus.units import ENDED, all_units, busy_dead, report_untouched, unit_runs, unit_state, verdict, waiting_line_jobs
 
 def unreconciled(cfg, pv, units):
     """[(run id, unit, budget, why)] of runs with a running row and no done row whose agent is gone: the unit is closed, the run
@@ -86,6 +86,11 @@ def unit_findings(cfg, hs, units, ag):
                 F.append((f"waiting:{u['name']}", f"{u['name']} is alive while its job(s) {', '.join(jw[:4])} wait for admission: "
                           f"janus park {u['name']} (stops it; it resumes, same session, when its jobs finish)"))
         if st in ("working", "queued", "parked"): running += 1
+        if st == "working" and age > cfg.silent and report_untouched(cfg, u):   # alive but silent since launch: it never began its brief
+            where = f"tmux attach -t {u.get('tmux')} on {u['host']}" if u.get("via") == "tmux" else f"its {u.get('via')} pane or task log"
+            F.append((f"unit:{u['name']}:not-started", f"{u['name']} has written nothing to its report in {int(age // 60)} min since launch: its "
+                      f"agent is likely stuck before its first turn (a startup prompt, a login, an error); look at its screen ({where}), "
+                      "answer it, or stop and relaunch it"))
         b = busy_dead(u)
         if b: F.append((f"unit:{u['name']}:interrupted", f"{u['name']}: its {b['op']} (pid {b.get('pid')}) stopped before it finished, so the unit is marked {'starting' if b['op'] == 'launch' else 'closing'}: "
                         + ("janus cancel / close it and launch again (its host copy and budget run are named in the record)" if b["op"] == "launch" else f"run janus close {u['name']} again (it skips the checks that already passed)")))

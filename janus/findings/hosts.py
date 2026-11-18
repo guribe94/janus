@@ -1,13 +1,14 @@
 """Findings about hosts: unreachable, margins, admission blocked or paused, lane stalls, idle slots and job ages, orphans, thrash
 acts, tidy and disk. Observations only: each clears when the condition does; nothing is stopped from here."""
-import time
+import functools, time
 from janus.actions.jobs import LANES, job_of, lane_age, lane_stall, lane_wait, orphan_jobs, slots
 from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
-from janus.backlog import ready_work, stranded_cover
+from janus.backlog import backlog_issues, norm_item, ready_work, stranded_cover, unit_items
 from janus.board import board_script
 from janus.msgboard import STALE_MIN
-from janus.cap import capv, host_cap
+from janus.cap import build_room, capv, host_cap
 from janus.context import Err, fl, projects, ts, now
+from janus.platform import launchd_exports
 from janus.probe import host_liveness, margins, room
 from janus.units import orphan_tabs, verdict, ws_id
 
@@ -135,13 +136,20 @@ def host_findings(cfg, hs, units):
             rel = [u["name"] + "->" + u["relaunched"] for u in there if u.get("relaunched")]; wait = [u["name"] for u in there if not u.get("relaunched")]
             fin = [x for x in wait if verdict(cfg, byname[x])]; todo = [x for x in wait if x not in fin]   # finished: never relaunched, only closed
             # fill relaunches an item from the first unit stranded_cover names for it: any other unfinished unit waits for nothing
-            lead = {v[0]["name"] for v in stranded_cover(cfg, units).values()} if st in ("stranded", "gone") and todo else set()
-            man = [x for x in todo if x not in lead]
+            lead, shut, closed_item = set(), set(), []
+            if st in ("stranded", "gone") and todo:   # an item closed in beads is never relaunched: its unit only needs closing
+                try: iss = backlog_issues(cfg)
+                except Err: iss = {}
+                shut = {norm_item(r[8:]) for r, i in iss.items() if i.get("status") == "closed"}
+                lead = {v[0]["name"] for k, v in stranded_cover(cfg, units, iss).items() if k not in shut}
+                closed_item = [x for x in todo if x not in lead and (its := unit_items(cfg, [byname[x]], iss)) and its <= shut]
+            man = [x for x in todo if x not in lead and x not in closed_item]
             F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); "
                       + ({"down": f"units there wait: {', '.join(wait) or 'none'}" + back, "returning": f"marked returning: its units wait for it: {', '.join(wait) or 'none'}"}.get(st)
                          or f"{st}: its units no longer cover their items; relaunched: {', '.join(rel) or 'none'}; awaiting relaunch: {', '.join(x for x in todo if x in lead) or 'none'} (janus fill)"
                             + (f"; not relaunched by janus fill (no backlog item of its own, or another unit's relaunch covers it): {', '.join(man)} "
                                "(janus launch <new> --resume-of <unit>, or close it)" if man else "")
+                            + (f"; its item closed (close it): {', '.join(closed_item)}" if closed_item else "")
                             + (f"; finished there, not relaunched (land or close them by their verdict): {', '.join(fin)}" if fin else ""))
                       + "; place new work elsewhere (unstarted jobs there: cancel and re-queue on another host)"))
             continue
@@ -152,13 +160,14 @@ def host_findings(cfg, hs, units):
         r, why = room(cfg, n, p, units)
         mg = margins(cfg.hosts[n], p, cfg=cfg)
         low = r < 1 and p.get("avail_mb") and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6
+        hc = host_cap(cfg, n, p, units)
         if mg or low:   # the key names the kinds (load, memory, disk), so an ack of one never hides another (H12)
             kinds = sorted({w.split()[0] for w in mg} | ({"memory"} if low else set()))
             F.append((f"margin:{n}:{'+'.join(kinds)}", f"host {n} over its margins: {'; '.join(mg) or why}; launch elsewhere, or free it (janus tidy for disk)"))
-        elif r > 0 and ready: F.append((f"idle:{n}", f"host {n} has room for {r} and {work}: janus launch one an agent should do, or close or relabel it"))
+        # idle means fill would launch there now: agent room (room) and a build reservation (build_room), the two checks fill makes
+        elif r > 0 and ready and build_room(cfg, n, hc)[0]: F.append((f"idle:{n}", f"host {n} has room for {r} and {work}: janus launch one an agent should do, or close or relabel it"))
         elif ready and (p.get("cap_pause") or "").strip():   # skill-fix52: the waiting work is said with the pause, never dropped
             F.append((f"idle:{n}", f"host {n} takes no work while its admission is paused ({p['cap_pause'].strip()}), and {work}: launch on another host, or when it clears"))
-        hc = host_cap(cfg, n, p, units)
         if hc["pause"]:   # back-pressure (janus-fixes8 item 2): reported, never acted on by killing
             F.append((f"pressure:{n}", f"host {n} admission PAUSED ({hc['pause']}): new jobs wait; its {hc['rj']} running job(s) are not killed; it resumes below the limits; place new work on another host meanwhile; it holds " + queue_waits(cfg, n, p)))
         # one scheduler per host (item 1): any other job-running process, or an old queue that still runs or holds work
@@ -170,6 +179,7 @@ def host_findings(cfg, hs, units):
         if sch: F.append((f"scheduler:{n}", f"host {n} has job-running work outside its janus lanes, which must be the only admission: "
                           + "; ".join(sch[:4])[:300] + ": retire the old queue (or move its jobs to janus run)"))
         info = {x.split()[0]: x.split(None, 3)[1:] for x in p.get("apiinfo", []) if x.split()}   # pid -> [tty, owner, root]
+        key_exported = functools.cache(lambda: launchd_exports("ANTHROPIC_API_KEY"))   # asked once, only when a process is reported
         for a in p.get("apiproc", []):   # spend safety: an API process janus did not start spends outside the ledger
             f = a.split(None, 3)
             if len(f) < 3 or not f[0].isdigit() or (cfg.hosts[n].get("local") and f[0] in orch): continue
@@ -181,7 +191,9 @@ def host_findings(cfg, hs, units):
             if not mine and (owner not in ("", "-") or tty not in ("", "-", "?", "??") or other_root(root)): continue
             F.append((f"spend:proc:{n}:{f[0]}", f"Claude/Anthropic API process pid {f[0]} on {n} ({f[2]}) was not started by janus (an API key, no JANUS_UNIT): "
                       f"it spends outside the ledger and the caps: {(f[3] if len(f) > 3 else '')[:70]}; launch API work through janus"
-                      + ("" if mine else "; reported only (not in this project's unit trees)")))
+                      + ("" if mine else "; reported only (not in this project's unit trees)")
+                      + ("; the key comes from the user launchd session, which gives it to everything it starts: launchctl unsetenv "
+                         "ANTHROPIC_API_KEY, then restart these processes" if cfg.hosts[n].get("local") and key_exported() else "")))
         for t in ((p.get("pueue") or {}).get("tasks") or {}).values():
             st = t.get("status"); k = st if isinstance(st, str) else next(iter(st), "")
             if k not in ("Running", "Queued"): continue

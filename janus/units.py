@@ -31,6 +31,13 @@ def unit_state(u, ps, agents):
         return {"Queued": "queued", "Running": "working"}.get(k, k.lower())
     return "unknown"
 
+REPORT_SEED = "VERDICT: PENDING"   # what launch writes as a new unit's report; the agent's first write replaces it
+
+def report_untouched(cfg, u):
+    """The unit's report is still the seed launch wrote: its agent has not written a word (a prompt it sits at, a crash)."""
+    try: return report_path(cfg, u).read_text().strip() == REPORT_SEED
+    except OSError: return False
+
 def verdict(cfg, u):
     """The unit's final VERDICT line: report.json's verdict when it states one (preferred over the prose), else the last
     'VERDICT:' line of its report (a resumed unit: its original report, report_path). A resumed report still holds the earlier
@@ -251,7 +258,7 @@ def unit_any(cfg, name):
     except Err: u = None
     return u or all_units(cfg).get(name)
 
-__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
+__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "REPORT_SEED", "report_untouched", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
 
 
 def no_remote_copy(u):

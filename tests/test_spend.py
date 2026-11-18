@@ -34,6 +34,16 @@ class SpendSafety(unittest.TestCase):
         be another project's or the owner's."""
         self.assertEqual(self.api(["4242 4242 01:10 claude -p --model x"], ["4242 ?? - /tmp"]), ["spend:proc:here:4242"])
 
+    def test_the_finding_names_a_key_exported_by_the_launchd_session(self):
+        """Catches (2026-11-18): four Claude Code daemon processes spent through an API key for two days; the finding named the
+        processes but not where the key came from (the user launchd session exports it to everything launchd starts)."""
+        hs = {"here": host_probe(apiproc=["4242 4242 01:10 claude daemon run"], apiinfo=["4242 ?? - /tmp"], avail_mb="64000", disk_gb="500", load="0")}
+        for exported in (True, False):
+            with mock.patch.object(janus, "ready_work", lambda cfg: []), mock.patch.object(janus, "other_projects", lambda cfg: []), \
+                 mock.patch.object(janus, "launchd_exports", lambda name: exported):
+                t = dict(janus.host_findings(self.cfg, hs, []))["spend:proc:here:4242"]
+            self.assertEqual("launchctl unsetenv ANTHROPIC_API_KEY" in t, exported, t)
+
     def test_other_projects_and_owner_sessions_are_never_flagged(self):
         """Catches (re-check N2): this project's watcher flagging another janus project's orchestrator or agent's tree, or the
         owner's own interactive claude session."""

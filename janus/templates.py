@@ -135,9 +135,9 @@ res=$p $c $m $t $k ${f##*/} $sc"
 res=- $CPJ $CAPMB - untracked $j"
   done
 }
-cap_measure() {  # PSI (macOS: the kernel's pressure level, warn = 50, critical = 100), LOAD (1 min), DF (GB free in RD)
-  if [ "$(uname)" = Darwin ]; then
-    case $(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) in 4) PSI=100;; 2) PSI=50;; *) PSI=0;; esac
+cap_measure() {  # PSI (macOS: 100 at the kernel's critical level, else 0; MEM names the level), LOAD (1 min), DF (GB free in RD)
+  if [ "$(uname)" = Darwin ]; then   # 2026-11-18: warn (compressed memory, some swap: everyday on a 16 GB Mac) paused every launch
+    case $(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) in 4) PSI=100; MEM=critical;; 2) PSI=0; MEM=warn;; *) PSI=0; MEM=normal;; esac
     LOAD=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
   else
     PSI=$(awk '/^some/{sub("avg10=", "", $2); print $2}' /proc/pressure/memory 2>/dev/null); LOAD=$(awk '{print $1}' /proc/loadavg)
@@ -209,7 +209,7 @@ cap_summary() {  # what janus needs of the history, computed by the rules above 
 }
 cap_report() {  # for janus's probe: the sums, the pause, each reservation, the last 300 history lines
   res_sum; cap_measure; cap_paused; cap_seen
-  echo "cap_rj=$RJ"; echo "cap_rc=$RC"; echo "cap_rm=$RM"; echo "cap_ra=$RA"; echo "cap_ram=$RAM"; echo "cap_pause=${PAUSE:-$SEEN}"; echo "cap_psi=$PSI"
+  echo "cap_rj=$RJ"; echo "cap_rc=$RC"; echo "cap_rm=$RM"; echo "cap_ra=$RA"; echo "cap_ram=$RAM"; echo "cap_pause=${PAUSE:-$SEEN}"; echo "cap_psi=$PSI"; echo "cap_mem=${MEM:-}"
   admit_ok job >/dev/null 2>&1; [ -n "$SEEN" ] && case " $BLK " in *" paused "*) ;; *) BLK="paused${BLK:+ $BLK}";; esac
   echo "cap_admit=${BLK:-yes}"   # the admission's own verdict for one more job now (yes, or what blocks it)
   [ -n "$RL" ] && printf '%%s\n' "$RL" | sed '/^$/d'

@@ -180,4 +180,10 @@ def parse_facts(text):
     return f
 
 
-__all__ = ["group_cpu_s", "tree_groups_sh", "run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts", "CACHE_ENV", "cache_env_sh"]
+def launchd_exports(name):
+    """True when the macOS user launchd session exports variable name to everything it starts (launchctl getenv); its value is
+    never returned or printed. False elsewhere (no launchctl) and when it is not set."""
+    rc, o, _ = run(["launchctl", "getenv", name], timeout=5)
+    return rc == 0 and bool(o.strip())
+
+__all__ = ["launchd_exports", "group_cpu_s", "tree_groups_sh", "run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts", "CACHE_ENV", "cache_env_sh"]

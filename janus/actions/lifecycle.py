@@ -17,7 +17,7 @@ from janus.project import project_id, tag, unit_tmux
 from janus.probe import host_liveness, probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
-from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, report_path, unit_runs, unit_spent, unit_state,
+from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, REPORT_SEED, report_path, unit_runs, unit_spent, unit_state,
     verdict, waiting_line_jobs)
 
 # Agents never pay to wait. An agent submits its builds and tests detached (`janus run --detach`, or its lane runner's
@@ -535,6 +535,21 @@ def resume_message(cfg, hs, u, jobs):
 class NoBudget(Err):
     """A resume refused because the unit's own budget cannot pay for it: the unit becomes resumable (item 7)."""
 
+def reopen_report(cfg, u):
+    """A unit resumed to do more: a final verdict on its report's line 1 goes back to PENDING where its agent writes the report
+    (here, or on its host: the next sync would bring the old line back), as launch does for a resumed report. 2026-11-18: a
+    resumed unit read DONE from its old line 1 until its agent rewrote it."""
+    p = report_path(cfg, u)
+    try:
+        t = p.read_text().split("\n", 1)
+        if FINAL_LINE.match(t[0]): atomic_write(p, REPORT_SEED + "\n" + (t[1] if len(t) > 1 else ""))
+    except OSError: pass
+    h = cfg.hosts[u["host"]]
+    if not h.get("local"):
+        X(cfg, h, f"sed -i -E '1s/^VERDICT: *(DONE|BLOCKED|FAILED).*$/{REPORT_SEED}/' {qp(h['root'])}/out/{u['name']}/REPORT.md 2>/dev/null; true")
+
+FINAL_LINE = re.compile(r"VERDICT:\s*(DONE|BLOCKED|FAILED)\b")
+
 def resume_unit(cfg, u, msg, budget=None):
     """Continue the unit's own agent session with msg (see above). budget: a new budget for this run (`janus resume --budget`,
     same tree), instead of the unit's remaining budget (item 24: a capped unit with an unpushed commit can be continued). The
@@ -542,6 +557,7 @@ def resume_unit(cfg, u, msg, budget=None):
     name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); mem = memory_text(cfg); text = JANUS_MARK + msg + (f"\n\nProject memory (binding; it may have changed since you started):\n{mem}" if mem else "")
     ok, why = route_ok(cfg, u.get("model"))   # the config's restrictions bind every resume as they bind a launch: a removed, unknown or disabled model fails closed; no other route is tried
     if not ok: raise Err(f"{name}: not resumed: model {u.get('model')} is not allowed now ({why})")
+    if not cfg.run.dry: reopen_report(cfg, u)
     if via == "herdr":
         if not cfg.run.dry: herdr("agent", "prompt", name, text)
         return f"{name}: " + ("prompted in its herdr pane" if not cfg.run.dry else "would prompt in its herdr pane")

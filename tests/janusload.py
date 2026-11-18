@@ -14,7 +14,7 @@ for _k, _v in (("NAME", "t"), ("EMAIL", "t@t")):
 # Hermetic admission (a Mac's live memory pressure refused ./install: the job scripts the suite runs read cap_measure's
 # kern.memorystatus_vm_pressure_level and vm.loadavg, so a Mac at warn paused every admission test). A `sysctl` ahead on PATH
 # answers those two keys with a calm machine (JANUS_TEST_PRESSURE overrides the level) and passes every other key to the first real `sysctl` on PATH other than itself (a probe may put its own dirs ahead of the stub: never re-exec the stub).
-# The production script and its thresholds are untouched; test_janus.Capacity proves that a warn level still pauses.
+# The production script and its thresholds are untouched; test_janus.Capacity proves that the critical level pauses.
 import atexit, shutil, tempfile
 _STUB = Path(tempfile.mkdtemp(prefix="janus-calm-"))
 (_STUB / "sysctl").write_text(f"""#!/bin/sh

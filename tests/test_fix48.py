@@ -136,3 +136,52 @@ def alive(pid):
 
 
 if __name__ == "__main__": unittest.main()
+
+
+class StartupDialogs(unittest.TestCase):
+    """2026-11-18: two agents started on another host (tmux over ssh) sat at Claude's "Do you trust this folder" prompt since launch;
+    only herdr panes were checked for startup dialogs, and the tmux session existing read as running."""
+    TRUST = "Do you trust the files in this folder?\n> 1. Yes, proceed"
+
+    def test_one_loop_gets_past_a_dialog_by_screen_alone_or_by_agent_status(self):
+        """Catches: a screen read before the client drew its dialog taken as clear; a dialog that never goes away taken as started."""
+        sent = []
+        with mock.patch("time.sleep", lambda s: None):
+            screens = iter(["", self.TRUST, "Claude Code\n> ", "Claude Code\n> "])
+            self.assertIsNone(janus.past_dialogs(lambda: next(screens), lambda *k: sent.append(k)))
+            self.assertEqual(sent, [("Enter",)])                                # answered once, then the screen settled
+            self.assertIn("still shown", janus.past_dialogs(lambda: self.TRUST, lambda *k: None))
+            self.assertIsNone(janus.past_dialogs(lambda: "{}", lambda *k: None, lambda: "working"))   # herdr: its status says started
+            self.assertIn("agent blocked", janus.past_dialogs(lambda: "x", lambda *k: None, lambda: "blocked"))
+
+    def test_a_tmux_start_answers_the_trust_prompt_on_its_host(self):
+        """Catches: the tmux start never looking at the agent's screen."""
+        d, cfg = project('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); h = cfg.hosts["far"]; cmds = []; screens = iter([self.TRUST, "ready", "ready"])
+        def hrun(h, s, **k):
+            cmds.append(s)
+            if "tmux new" in s: return 0, "4242\n", ""
+            if "capture-pane" in s: return 0, next(screens, "ready"), ""
+            return 0, "", ""
+        with mock.patch.object(janus, "hrun", hrun), mock.patch("time.sleep", lambda s: None):
+            self.assertEqual(janus.start_tmux(cfg, h, "janus-u@t", "cd /r && exec claude"), 4242)
+        self.assertTrue(any("send-keys -t janus-u@t Enter" in c for c in cmds), cmds)
+        self.assertTrue(any("has-session" in c for c in cmds))
+
+
+class ResumeReopensReport(unittest.TestCase):
+    def test_a_resumed_unit_does_not_read_done_from_its_old_line_one(self):
+        """Catches (2026-11-18): a unit resumed with more to do kept its report's old `VERDICT: DONE` on line 1, so it read finished
+        until its agent rewrote the line; launch already reopens a resumed report, a resume did not. Remote: reset where the agent
+        writes (its host), or the next sync brings the old line back."""
+        d, cfg = project('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); rep = d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True)
+        rep.write_text("VERDICT: DONE (landed)\nhistory\nWAITING here:3\n"); sent = []
+        u = {"name": "u", "host": "here", "via": "herdr", "model": "m"}
+        with mock.patch.object(janus, "herdr", lambda *a, **k: sent.append(a)), mock.patch.object(janus, "route_ok", lambda *a: (True, "")):
+            janus.resume_unit(cfg, u, "your jobs finished")
+        self.assertEqual(rep.read_text().splitlines()[:2], ["VERDICT: PENDING", "history"]); self.assertTrue(sent)
+        cmds = []; rep.write_text("VERDICT: BLOCKED x\n")
+        with mock.patch.object(janus, "X", lambda cfg, h, s, **k: cmds.append(s) or (0, "", "")), mock.patch.object(janus, "hrun", lambda h, s, **k: (0, "", "")), \
+             mock.patch.object(janus, "route_ok", lambda *a: (True, "")):
+            janus.resume_unit(cfg, {"name": "u", "host": "far", "via": "tmux", "tmux": "t", "model": "m"}, "go on")
+        self.assertTrue(any("/r/out/u/REPORT.md" in c and "VERDICT: PENDING" in c for c in cmds), cmds)
+        self.assertTrue(rep.read_text().startswith("VERDICT: PENDING"))

@@ -19,7 +19,7 @@ from janus.rigor import DEFAULT, R, agent_text, check_level, level_of
 from janus.probe import probe_all, pueue, room
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import transcript_of
-from janus.units import TAB_SEP, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
+from janus.units import REPORT_SEED, TAB_SEP, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
 
 def tool_argv(mc, prompt, session=None):
     """The coding client's command line for a launch, or for continuing `session`. Each form was read from the installed client's
@@ -429,15 +429,45 @@ DIALOGS = [   # startup dialogs janus gets past (fixes5 item 10): (text in the p
     (r"Update available|new version of Codex|Skip until next version", ["Down", "Enter"]),
     (r"Press Enter to continue", ["Enter"])]
 
-def past_dialogs(name, pane):
-    for _ in range(6):
-        r = herdr("pane", "read", pane, "--source", "visible", "--lines", "40") or {}
-        txt = json.dumps(r)
+def past_dialogs(read, send, status=None, tries=10):
+    """Get a coding client past its startup dialogs (DIALOGS): None once its screen shows none, else why not. read(): the screen
+    text (None: nothing to read, the caller's own check decides); send(*keys); status(): the agent's status where the pane tool
+    reports one (herdr). Without a status (tmux on another host) the screen must settle, non-empty and the same on two reads, so
+    a dialog drawn a moment after the start is still seen. 2026-11-18: two agents on another host sat at the trust prompt since
+    launch: only herdr panes were checked, and a tmux session that existed read as running."""
+    last = hit = None
+    for _ in range(tries):
+        txt = read()
+        if txt is None: return None
         hit = next((k for rx, k in DIALOGS if re.search(rx, txt, re.I)), None)
-        st = ((herdr("agent", "get", name) or {}).get("agent") or {}).get("agent_status")
-        if not hit: return None if st in ("idle", "working", "done", None) else f"agent {st} at start: {txt[-200:]}"
-        herdr("pane", "send-keys", pane, *hit); time.sleep(2)
-    return "startup dialog still shown after 6 tries"
+        if hit: send(*hit); last = None; time.sleep(2); continue
+        if status is not None:
+            st = status()
+            return None if st in ("idle", "working", "done", None) else f"agent {st} at start: {txt[-200:]}"
+        if txt.strip() and txt == last: return None
+        last = txt; time.sleep(2)
+    return f"startup dialog still shown after {tries} tries" if hit else None   # a screen that never settles: started, check watches it
+
+def herdr_screen(name, pane):
+    """past_dialogs' (read, send, status) for an agent in a herdr pane."""
+    return (lambda: json.dumps(herdr("pane", "read", pane, "--source", "visible", "--lines", "40") or {}),
+            lambda *k: herdr("pane", "send-keys", pane, *k),
+            lambda: ((herdr("agent", "get", name) or {}).get("agent") or {}).get("agent_status"))
+
+def start_tmux(cfg, h, tm, inner):
+    """Start an agent in tmux session tm on host h, get it past its startup dialogs and confirm the session is alive: its pane pid.
+    Err when the session cannot start, ends at once (a broken command line) or still shows a dialog."""
+    pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '; q = shlex.quote(tm)
+    rc, o, er = X(cfg, h, pre + f"tmux new -d -s {q} {shlex.quote(inner)} && tmux display -p -t {q} '#{{pane_pid}}'")
+    if rc: raise Err("tmux start failed: " + er.strip()[:100])
+    pid = int(o.strip() or 0)
+    if cfg.run.dry: return pid
+    def read():
+        r = hrun(h, pre + f"tmux capture-pane -p -t {q}"); return r[1] if r[0] == 0 else None
+    d = past_dialogs(read, lambda *k: hrun(h, pre + f"tmux send-keys -t {q} " + " ".join(k)))
+    if hrun(h, pre + f"tmux has-session -t {q}")[0] or not pid: raise Err(f"the agent's tmux session {tm} ended at once; nothing is running")
+    if d: raise Err(f"{tm}: {d}")
+    return pid
 
 def unit_tab(cfg, u, mname, hn, h):
     """One labelled tab per running unit (<unit> · <model> · <host>) that follows its pueue log (fixes5 item 3)."""
@@ -631,9 +661,9 @@ def cmd_launch(cfg, a):
                 put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred, repo=u.get("repo"), level=level) + btext, "644")
                 if start:   # a resumed unit starts from the report it continues; there it writes <root>/out/<unit>/REPORT.md, its own
                     put_script(cfg, h, f"{root}/out/{name}/REPORT.md", start.read_text(), "644")
-                else: X(cfg, h, f"[ -s {qp(env['JANUS_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['JANUS_REPORT'])}")
+                else: X(cfg, h, f"[ -s {qp(env['JANUS_REPORT'])} ] || echo {shlex.quote(REPORT_SEED)} > {qp(env['JANUS_REPORT'])}")
             rep = outd / "REPORT.md"
-            if not report and not rep.exists() and not cfg.run.dry: rep.write_text("VERDICT: PENDING\n")
+            if not report and not rep.exists() and not cfg.run.dry: rep.write_text(REPORT_SEED + "\n")
             if local:   # the brief with janus's header (the park rule) as the agent reads it: out/<unit>/<brief name>
                 rbrief = str(outd / (brief.name if (outd / brief.name).resolve() != brief.resolve() else "janus-" + brief.name))
                 if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["JANUS_REPORT"], brief_text=btext, pred=pred, level=level) + brief.read_text())
@@ -674,7 +704,7 @@ def cmd_launch(cfg, a):
                           + "; ".join(f"export {k}={shlex.quote(v)}" for k, v in envs.items()) + f"; echo env-'{name}'")
                     sh(["herdr", "pane", "wait-output", pane, "--match", f"env-{name}", "--timeout", "10000"], timeout=15)
                     r = sh(["herdr", "agent", "start", name, "--kind", mc["kind"], "--pane", pane, "--timeout", "90000", "--", *mc.get("args", [])], timeout=100)
-                    d = past_dialogs(name, pane)
+                    d = past_dialogs(*herdr_screen(name, pane), tries=6)
                     if r[0] and d: raise Err("herdr agent start failed: " + (r[2] or d)[:160])
                     if d: raise Err(f"{name}: {d}")
                     herdr("agent", "prompt", name, prompt)
@@ -685,16 +715,9 @@ def cmd_launch(cfg, a):
                 e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
                 mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -- " if mm else ""   # fixes5 item 7
                 inner = f"cd {qp(rcwd)} && exec env {e} {sd}{shlex.join(tool_argv(mc, prompt))}"
-                pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
                 tm = tmux_name(cfg, name)
-                rc, o, er = X(cfg, h, pre + f"tmux new -d -s {shlex.quote(tm)} {shlex.quote(inner)} && tmux display -p -t {shlex.quote(tm)} '#{{pane_pid}}'")
-                if rc: raise Err("tmux start failed: " + er.strip()[:100])
-                u.update(via="tmux", tmux=tm, pid=int(o.strip() or 0))
-                if not cfg.run.dry:   # launched means the agent's session is alive a moment later (a broken command line ends it at once)
-                    time.sleep(3)
-                    if hrun(h, pre + f"tmux has-session -t {shlex.quote(tm)}")[0] or not u["pid"]:
-                        raise Err(f"the agent's tmux session {tm} ended at once; nothing is running")
-                    u["start_state"] = "running"
+                u.update(via="tmux", tmux=tm, pid=start_tmux(cfg, h, tm, inner))   # launched: alive and past its startup dialogs
+                if not cfg.run.dry: u["start_state"] = "running"
                 if not cfg.run.dry: agent_res(cfg, hn, h, name, u["pid"])
                 if not cfg.run.dry:
                     pane, tab = new_tab(cfg, TAB_SEP.join((name, mname, hn)), cwd)

@@ -656,6 +656,11 @@ class Texts(unittest.TestCase):
              mock.patch.object(janus, "room", lambda *a, **k: (2, "")):
             F = dict(janus.host_findings(cfg, hs, []))
         t = F["idle:here"]; self.assertIn("non-backlog beads work", t); self.assertIn("fix the flaky probe", t); self.assertNotIn("write a brief", t)
+        # 2026-11-18: the host had agent room but its build capacity was full, so fill refused while check called it idle
+        with mock.patch.object(janus, "ready_work", lambda cfg: [{"title": "fix the flaky probe"}]), mock.patch.object(janus, "other_projects", lambda cfg: []), \
+             mock.patch.object(janus, "room", lambda *a, **k: (2, "")), mock.patch.object(janus, "build_room", lambda *a, **k: (False, "here build capacity full")):
+            F = dict(janus.host_findings(cfg, hs, []))
+        self.assertNotIn("idle:here", F)
 
     def test_missing_brief_messages_and_the_hook_use_the_configured_folder(self):
         for conf, rel in ((CONF, ".janus/briefs"), (CONF + '[paths]\nbriefs = "work/briefs"\n', "work/briefs")):

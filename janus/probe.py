@@ -163,7 +163,7 @@ def cap_line(cfg, name, p, units):
     av = f"{fl(p.get('avail_mb')) / 1024:.1f}G" if p.get("avail_mb") else "unknown"
     return (f"{name} room={n} build: {hc['rj']} running ({hc['rc']}/{hc['cores']} cores, {hc['rm']}/{hc['memcap']} MB reserved), "
             f"{hc['queued']} queued, {len(hc['agents'])} agent(s) for {hc['slots']} slot(s), free {hc['free']} x {hc['jmb']} MB; "
-            f"avail={av} load={p.get('load') or 'unknown'} psi={p.get('cap_psi') or p.get('psi') or '-'} disk={p.get('disk_gb')}G"
+            f"avail={av} load={p.get('load') or 'unknown'} psi={p.get('cap_psi') or p.get('psi') or '-'}{' memory ' + p['cap_mem'] if p.get('cap_mem') else ''} disk={p.get('disk_gb')}G"
             + (f" PAUSED: {hc['pause']}" if hc["pause"] else "") + (f" FULL: {why}" if n < 1 else ""))
 
 __all__ = ["probe_extra", "BUILD_ERE", "pueue", "LIST_KEYS", "probe", "discover", "host_facts", "probe_all", "margins", "room", "cap_line", "MARKS", "MARK_KINDS",
