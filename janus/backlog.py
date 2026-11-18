@@ -6,6 +6,7 @@ from pathlib import Path
 from janus.beads import Beads
 from janus.context import Err, slug
 from janus.probe import live_units
+from janus.units import verdict
 
 # The backlog lives in beads: `janus backlog import` turns every unfinished item of the project's status checklist into a beads
 # issue labelled backlog and status:<its status>, keyed by external ref backlog:<item id> (idempotent: a re-import updates
@@ -144,16 +145,24 @@ def unit_items(cfg, units, iss=None):
     ids = bead_items(iss)
     return {ids.get(x, x) for x in out}
 
+def holding_units(cfg, units):
+    """The open units that hold their item: those not on a stranded host (probe.live_units), and a stranded host's units that
+    finished (a final VERDICT here) or were already relaunched once. 2026-11-17: a stranded unit whose report said DONE (its work
+    on main) was relaunched, the relaunch found nothing to do and was closed, and fill relaunched it again (r3, r5, r6 ...).
+    Closing such a unit is the orchestrator's call; capacity still counts only live_units."""
+    live = live_units(cfg, units); ids = {id(u) for u in live}
+    return live + [u for u in units if id(u) not in ids and (u.get("relaunched") or verdict(cfg, u))]
+
 def covered_items(cfg, units, iss=None):
-    """The items open units cover for selection: unit_items of the units that are not on a stranded host (probe.host_liveness).
-    A unit on a host down past [capacity] down_after_min, or marked gone, no longer holds its item: fill relaunches it elsewhere."""
-    return unit_items(cfg, live_units(cfg, units), iss)
+    """The items open units cover for selection: unit_items of holding_units. A unit on a host down past [capacity]
+    down_after_min, or marked gone, no longer holds its item unless it finished or was relaunched: fill relaunches it elsewhere."""
+    return unit_items(cfg, holding_units(cfg, units), iss)
 
 def stranded_cover(cfg, units, iss=None):
     """{item (norm_item form): the open units on stranded hosts that cover it, the work before its reviews, newest started first}
-    for the items no live unit covers: what fill relaunches, each from the first of them (its brief, report and backup.patch); a
-    review of work stranded with it is relaunched only when nothing else covered the item."""
-    live = live_units(cfg, units); ids = {id(u) for u in live}; cov = unit_items(cfg, live, iss); out = {}
+    for the items no holding unit covers: what fill relaunches, each from the first of them (its brief, report and backup.patch);
+    a review of work stranded with it is relaunched only when nothing else covered the item."""
+    hold = holding_units(cfg, units); ids = {id(u) for u in hold}; cov = unit_items(cfg, hold, iss); out = {}
     for u in sorted((u for u in units if id(u) not in ids), key=lambda u: (u.get("kind") == "review", -(u.get("started") or 0))):
         for k in unit_items(cfg, [u], iss):
             if k not in cov: out.setdefault(k, []).append(u)

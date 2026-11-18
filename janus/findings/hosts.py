@@ -9,7 +9,7 @@ from janus.msgboard import STALE_MIN
 from janus.cap import capv, host_cap
 from janus.context import Err, fl, projects, ts, now
 from janus.probe import host_liveness, margins, room
-from janus.units import orphan_tabs, ws_id
+from janus.units import orphan_tabs, verdict, ws_id
 
 def queue_waits(cfg, n, p, lands=(), most=8):
     """What host n's unfinished lane jobs are, lane by lane in queue order ('jobs: n:5 unit:a running, ...')."""
@@ -133,9 +133,11 @@ def host_findings(cfg, hs, units):
         if not p["ok"]:
             back = f"; janus fill relaunches their items elsewhere after {capv(cfg, cfg.hosts[n], 'down_after_min'):g} min (janus hosts --mark {n} returning keeps them waiting, gone relaunches now)"
             rel = [u["name"] + "->" + u["relaunched"] for u in there if u.get("relaunched")]; wait = [u["name"] for u in there if not u.get("relaunched")]
+            fin = [x for x in wait if verdict(cfg, byname[x])]; todo = [x for x in wait if x not in fin]   # finished: never relaunched, only closed
             F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); "
                       + ({"down": f"units there wait: {', '.join(wait) or 'none'}" + back, "returning": f"marked returning: its units wait for it: {', '.join(wait) or 'none'}"}.get(st)
-                         or f"{st}: its units no longer cover their items; relaunched: {', '.join(rel) or 'none'}; not yet: {', '.join(wait) or 'none'} (janus fill)")
+                         or f"{st}: its units no longer cover their items; relaunched: {', '.join(rel) or 'none'}; awaiting relaunch: {', '.join(todo) or 'none'} (janus fill)"
+                            + (f"; finished there, not relaunched (land or close them by their verdict): {', '.join(fin)}" if fin else ""))
                       + "; place new work elsewhere (unstarted jobs there: cancel and re-queue on another host)"))
             continue
         for u in there:   # it answers again while a relaunch of its unit is open: the work exists twice

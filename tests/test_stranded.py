@@ -23,10 +23,10 @@ class Base(unittest.TestCase):
     def down(self, host, minutes): self.cfg.jput("hosts.json", {**self.cfg.jget("hosts.json"), host: time.time() - minutes * 60})
     def mark(self, host, m): self.cfg.jput("host-marks.json", {**self.cfg.jget("host-marks.json"), host: {"mark": m, "at": time.time()}})
     def brief(self, name, item, extra=""): (self.d / f".janus/briefs/{name}.md").write_text(f"# {name}\nITEM: {item}\n{extra}")
-    def stranded(self, name="x1-a", item="X1", host="far", **k):
-        """An open unit on host for item, with its brief and its report copied here."""
+    def stranded(self, name="x1-a", item="X1", host="far", report="VERDICT: PENDING\nthe old work\n", **k):
+        """An open unit on host for item, with its brief and its report (unfinished by default) copied here."""
         self.brief(name, item); (self.d / f".janus/out/{name}").mkdir(parents=True, exist_ok=True)
-        (self.d / f".janus/out/{name}/REPORT.md").write_text("VERDICT: DONE\nthe old work\n")
+        (self.d / f".janus/out/{name}/REPORT.md").write_text(report)
         u = {"id": f"u-{name}", "title": f"unit:{name}", "name": name, "host": host, "item": item, "brief": str(self.d / f".janus/briefs/{name}.md"),
              "started": int(time.time()) - 7200, "kind": "implement", "tier": "normal", "via": "pueue", **k}
         self.w.units.append(u); return u
@@ -76,6 +76,17 @@ class Redirect(Base):
         self.mark("far", "returning"); self.assertEqual(janus.fill_candidates(self.cfg, self.w.units), [])
         self.mark("far", "gone"); self.assertEqual([x[4] for x in janus.fill_candidates(self.cfg, self.w.units)], ["x1-a-r2"])
         F = dict(janus.backlog_findings(self.cfg, self.hs, self.w.units)); self.assertIn("x1-a-r2", F.get("idle-with-backlog", ""))   # the watcher's fill trigger
+
+    def test_finished_or_once_relaunched_stranded_work_is_not_relaunched_again(self):
+        """Catches the 2026-11-17 loop: a stranded unit that had already reported DONE (its work on main) was relaunched, the
+        relaunch found nothing to do and was closed, and fill relaunched the same unit again (r3, r5, r6, r7 ...). Finished or
+        already relaunched once, it keeps holding its item: closing it is the orchestrator's call."""
+        self.w.issue("X1"); self.w.issue("X2"); self.w.issue("X3"); self.down("far", 45)
+        self.stranded(name="x1-done", item="X1", report="VERDICT: PENDING\nwork\nVERDICT: DONE (landed)\n")
+        self.stranded(name="x2-again", item="X2", relaunched="x2-again-r2")   # its relaunch since closed: not in the open units
+        self.stranded(name="x3-open", item="X3")
+        self.assertEqual([(x[2], x[4]) for x in janus.fill_candidates(self.cfg, self.w.units)], [("X3", "x3-open-r2")])
+        self.assertEqual(set(janus.stranded_cover(self.cfg, self.w.units)), {"x3"})
 
     def test_relaunch_names(self):
         """Catches: a relaunch name over 32 characters, one already spent, one whose brief the orchestrator already wrote."""
@@ -184,13 +195,13 @@ class Findings(Base):
     def test_host_findings_say_what_happens_and_pair_on_return(self):
         """Catches: the host finding saying nothing moves while fill relaunches its items; a gone host's units never named for
         closing; the original and its relaunch both running on with nobody told when the host answers again."""
-        self.stranded(name="s1", relaunched="s1-r2"); self.stranded(name="s2", item="X2")
+        self.stranded(name="s1", relaunched="s1-r2"); self.stranded(name="s2", item="X2"); self.stranded(name="s3", item="X3", report="VERDICT: DONE\n")
         self.w.units.append({"id": "u-r", "title": "unit:s1-r2", "name": "s1-r2", "host": "here", "item": "X1", "brief": "/none"})
         hs = dict(self.hs, here={**self.hs["here"], "ok": True})
         self.down("far", 10); F = dict(janus.host_findings(self.cfg, hs, self.w.units))
         self.assertIn("units there wait", F["host:far"]); self.assertIn("after 30 min", F["host:far"])
         self.down("far", 45); F = dict(janus.host_findings(self.cfg, hs, self.w.units))
-        self.assertIn("stranded: its units no longer cover their items; relaunched: s1->s1-r2; not yet: s2", F["host:far"])
+        self.assertIn("stranded: its units no longer cover their items; relaunched: s1->s1-r2; awaiting relaunch: s2 (janus fill); finished there, not relaunched (land or close them by their verdict): s3", F["host:far"])
         self.mark("far", "gone"); F = dict(janus.host_findings(self.cfg, hs, self.w.units)); self.assertIn("janus close <unit> --force", F["host:far:gone"])
         self.cfg.jput("host-marks.json", {}); self.cfg.jput("hosts.json", {})
         F = dict(janus.host_findings(self.cfg, dict(hs, far=host_probe(name="far")), self.w.units))

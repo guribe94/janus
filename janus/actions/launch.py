@@ -3,7 +3,7 @@
 import argparse, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
-from janus.backlog import backlog_issues, item_eligible, norm_item, unit_items
+from janus.backlog import backlog_issues, holding_units, item_eligible, norm_item, unit_items
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_shipped
 from janus.branch import landing_branch
@@ -15,7 +15,7 @@ from janus.ledger import ledger_done, model_ok, model_tool, read_secret, reserve
 from janus.memory import MEM_SECTIONS, mem_line, memory_read
 from janus.platform import herdr
 from janus.project import project_id, tag, tmux_name
-from janus.probe import live_units, probe_all, pueue, room
+from janus.probe import probe_all, pueue, room
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import transcript_of
 from janus.units import TAB_SEP, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
@@ -503,7 +503,7 @@ def cmd_launch(cfg, a):
     if getattr(a, "auto", False) and a.item:   # fill: the item may have been launched meanwhile (a manual launch while the hosts answered)
         try: iss = backlog_issues(cfg)
         except Err as e: raise Err(f"refused: beads cannot be read to recheck item {a.item} ({e}): not launched")
-        cov = [u["name"] for u in live_units(cfg, units) if norm_item(a.item) in unit_items(cfg, [u], iss)]   # read under the writer lock, which is held until the record below; a stranded host's unit no longer covers it
+        cov = [u["name"] for u in holding_units(cfg, units) if norm_item(a.item) in unit_items(cfg, [u], iss)]   # read under the writer lock, which is held until the record below; a stranded host's unit covers it only when finished or relaunched
         if cov: raise Err(f"refused: item {a.item} is covered by open unit(s) {', '.join(cov)} now (launched while fill planned): not launched twice")
         why = item_eligible(cfg, a.item, units)   # and still ready, an agent's and not held, in beads now: an error refuses (fail closed)
         if why: raise Err(f"refused: item {a.item} is no longer eligible ({why}): not launched")
