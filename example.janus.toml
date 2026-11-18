@@ -39,6 +39,9 @@ args = []
 # evidence_col = "evidence"   # the column janus land writes a verified published landing's sha into (the status stays; acceptance is
 #                        # `janus backlog set <id> status=DONE --unit <unit>`). Unset: no writeback (land says so)
 
+# [rigor]
+# level = "lean"         # how much units test and are reviewed: ship | quick | lean | careful | thorough (docs/REFERENCE.md, Tests
+#                        # and rigor); one unit: a brief's RIGOR: line or janus launch --rigor
 # [landing]
 # branch = "main"        # the landing branch (default: origin's HEAD branch)
 # push = false           # true: janus land also pushes the landing commit, never forced

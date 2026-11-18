@@ -14,6 +14,7 @@ from janus.beads import unit_record
 from janus.cap import capv
 from janus.board import board_dir
 from janus.context import CONF, Cfg, Err, Run, handoff_path, sh, standby
+from janus.rigor import project_level
 from janus.ledger import model_tool
 from janus.platform import herdr, ps_table
 from janus.probe import MARKS, host_liveness, probe, stranded_hosts
@@ -274,7 +275,7 @@ class Collector:
             try: cfg = fresh_cfg(self.root)
             except Exception as e: st.fail("config", err_text(e), self.clock()); return
             st.ok("config", {"name": clean(cfg.name), "hosts": list(cfg.hosts), "tools": {m: clean(model_tool(c)) for m, c in cfg.models.items()},
-                             "standby": standby(cfg)}, self.clock())
+                             "standby": standby(cfg), "rigor": rigor_name(cfg)}, self.clock())
             done = queue.Queue()
             def host(n):
                 try: p = collect_host(cfg, n); done.put((n, p, None, self.clock()))
@@ -346,6 +347,7 @@ class Model:
     problems: int = 0
     done: tuple | None = None   # (checklist items DONE, total): the overall completeness in the header
     standby: dict | None = None   # janus standby's record while it is on
+    rigor: str = ""               # the project's rigor level ([rigor] level), or what is wrong with it
     down: int = 0                 # hosts janus has given up on for now (stranded, gone) or that the owner said will return
     labels: dict = dataclasses.field(default_factory=dict)      # tab -> what its count is made of, shown instead of the bare number
 
@@ -526,7 +528,7 @@ def derive(view, now, interval):
     """The Model: every source read as what it means now, with its age and error beside it. Unknown stays '?' or 'unavailable'."""
     limit = 3 * interval + 60.0; S = lambda n: view.get(n) or Source(); st = lambda n: source_state(S(n), now, limit); stale = lambda n: st(n) == "stale"
     m = Model(); cfg = S("config"); hosts = (cfg.data or {}).get("hosts", [])
-    if cfg.data: m.project = cfg.data["name"]; m.standby = cfg.data.get("standby")
+    if cfg.data: m.project = cfg.data["name"]; m.standby = cfg.data.get("standby"); m.rigor = cfg.data.get("rigor", "")
     ck = S("checklist").data or {}
     if ck.get("total"): m.done = (ck["done"], ck["total"])
     general = [f"{n}: {S(n).err}" for n in ("config", "collection") if S(n).err]
@@ -787,6 +789,7 @@ def render(model, ui, h, w, now, status):
     tab = TABS[ui.tab]
     top = [("janus monitor", "bold"), (f" {model.project}  ", ""), ("READ-ONLY", "info")]
     if model.standby: top.append(("  STANDBY", "warn"))
+    if model.rigor: top.append((f"  rigor {model.rigor}", "warn" if model.rigor.startswith("?") else "dim"))
     if model.done:
         d, n = model.done; top.append((f"  done {d}/{n} {bar(d / n)} {100 * d // n}%", "ok"))
     L.append(top + [(f"  {status}"[:max(0, w - sum(len(t) for t, _ in top))], "dim")])
@@ -840,6 +843,11 @@ def render(model, ui, h, w, now, status):
     foot = f"/{ui.filt}_" if ui.typing else (f"filter: {ui.filt}  " if ui.filt else "") + (ui.flash or "Tab tabs  Up/Down select  Enter details  / filter  ? help  r refresh  q quit")
     L.append([(foot[:max(0, w - len(pos) - 1)], "dim"), (pos, "dim")])
     return [[(t[:w], s) for t, s in line] for line in L][:h]
+
+def rigor_name(cfg):
+    """The project's rigor level for the header; '?<why>' when [rigor] level names no level (shown, never fatal)."""
+    try: return project_level(cfg)
+    except Err as e: return "?" + str(e)[:40]
 
 def status_line(store_view, model, now, interval):
     _, running, finished, _v = store_view

@@ -29,8 +29,8 @@ A message from the user is answered in the same turn, before housekeeping. If it
 
 ## Work
 - `janus status` / `janus check`: what is true now; act on what matters, nothing needs acknowledging.
-- `janus launch <unit> --kind implement|review|audit|cleanup`: an agent on a host with room. Builds and tests are explicit commands: `janus run --detach --host <h> --wt <tree> -- <cmd>`, then end the turn (`WAITING <ids>`); janus resumes the session when they finish. No broad suites without a reason.
-- Each host owns its trees: `janus land <unit>` merges, squashes and moves the branch there (expected ref; `--push` never forces). After it integrates moved work, a clean merge is not proof: run the tests that matter.
+- `janus launch <unit> --kind implement|review|audit|cleanup`: an agent on a host with room. Builds and tests are explicit commands: `janus run --detach --host <h> --wt <tree> -- <cmd>`, then end the turn (`WAITING <ids>`); janus resumes the session when they finish. How much to test and review is the rigor level your session text states (`[rigor] level`; a brief's `RIGOR:` line for one unit): follow it, not habit. At `careful` and `thorough` launch the reviews `review:<unit>` asks for (`--kind review --of <unit>`) before landing.
+- Each host owns its trees: `janus land <unit>` merges, squashes and moves the branch there (expected ref; `--push` never forces). After it integrates moved work, a clean merge is not proof: run what the rigor level says.
 - Board: `janus answer q<N> <text>` for questions; `janus send <agent> <text>` for one addressed message. No broadcasts.
 - An unreachable host is unknown: never cancel, move or relaunch its work by hand. Past `[capacity] down_after_min` (or once the owner says it is gone or coming back: `janus hosts --mark <h> gone|returning`), `janus fill` relaunches its units' items on hosts that answer, seeded from their reports and synced changes; when it answers again, `duplicate:<unit>` asks you to keep one of each pair.
 

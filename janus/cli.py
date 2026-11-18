@@ -50,7 +50,8 @@ def main():
         A("--host"), A("--model"), A("--brief"), A("--cwd"), A("--new-worktree", metavar="REPO", help="make a fresh worktree of this repo (a new branch named after the unit) for the unit, under .janus/worktrees"), A("--from", dest="from_ref", metavar="REF", help="--new-worktree: the branch or commit to start from (default main)"), A("--budget", type=float, help="USD budget for this unit (overrides the provider's budget_per_unit)"),
         A("--test-host", help="host where the unit's builds and tests run; the agent is placed there"), A("--allow-main", action="store_true", help="allow a main checkout as cwd"), A("--of", help="unit whose implementer's vendor a review must avoid"),
         A("--report", help="a resumed unit: the report it continues (default out/<unit>/REPORT.md)"), A("--resume-of", help="a resumed unit: the unit whose report it continues"),
-        A("--item", help="the backlog item this unit works on (janus backlog)"), dry=True)
+        A("--item", help="the backlog item this unit works on (janus backlog)"),
+        A("--rigor", choices=["ship", "quick", "lean", "careful", "thorough"], help="how much this unit tests and how it is reviewed (default: the brief's RIGOR: line, else [rigor] level, else lean)"), dry=True)
     add("api-run", cmd_api_run, A("unit"), A("--run", required=True), A("--model", required=True), A("--budget", type=float, required=True), A("--brief", required=True),
         A("--cwd", required=True), A("--report"), A("--resume-session", help="continue this agent session"), A("--prompt-file", help="the prompt (default: the brief's)"))
     add("park", cmd_park, A("unit"), dry=True)
@@ -85,7 +86,8 @@ def main():
     add("cancel", cmd_cancel, A("job", help="<host>:<task id> of a janus run job"), A("--force", action="store_true", help="cancel although its files could not be saved"), dry=True)
     add("fill", cmd_fill, A("--max", type=int, help="launch at most this many on each host"), dry=True)
     add("report", cmd_report, A("--brief", action="store_true", help="summary lines only"))
-    add("land", cmd_land, A("unit"), A("--host", help="land on this host (default: the unit's own host when its tree is there, else here)"), A("--push", action="store_true", help="also push the landing commit, never forced (default: [landing] push)"), dry=True)
+    add("land", cmd_land, A("unit"), A("--host", help="land on this host (default: the unit's own host when its tree is there, else here)"), A("--push", action="store_true", help="also push the landing commit, never forced (default: [landing] push)"),
+        A("--force-review", action="store_true", help="land although the unit lacks the reviews its rigor level requires"), dry=True)
     add("close", cmd_close, A("unit"), A("--force", action="store_true"), A("--reason"),
         A("--duplicate-of", metavar="UNIT", help="close a stopped relaunch that duplicated this open unit: no verdict needed, never --force"), dry=True)
     add("commit-state", cmd_commit_state, A("-m", "--message", default="janus: state"), dry=True)

@@ -23,7 +23,7 @@ has `$JANUS_ROOT`.
 | `janus queue`, `janus cancel`, `janus busy`, `janus thrash` | read queues; cancel one job; is a tree in use; shared-host thrash acts |
 | `janus park`, `janus resume [UNIT]` | park a unit on its jobs / resume it; with no unit, continue the orchestration in a new session |
 | `janus collect`, `janus stop`, `janus close` | bring back a unit's output, stop it, close it (checks nothing is lost). `janus collect UNIT --subdir PATH` (remote units only): a verified patch of one relative subtree of the copy, paths kept relative to the copy, in `out/UNIT/changes-scoped.patch`; partial, so the unit is not recorded collected and stop/close still need a full collect |
-| `janus land UNIT [--host H] [--push]` | merge the landing branch into the unit's branch, squash, move the branch from the tip merged (expected ref), optionally push (never forced); on the unit's own host. A requested push that stays refused exits non-zero (`NOT PUBLISHED`): the integrated result stays on the unit's branch and the remote is untouched. A verified push records the publication (source HEAD, commit, remote, branch) on the unit and writes the sha into the linked item's checklist evidence cell (status unchanged); `janus land` again finishes an incomplete writeback without landing again. `janus close` of a squash-landed unit accepts its unpushed commits only when its tree is contained in that publication, verified now |
+| `janus land UNIT [--host H] [--push] [--force-review]` | merge the landing branch into the unit's branch, squash, move the branch from the tip merged (expected ref), optionally push (never forced); on the unit's own host. A requested push that stays refused exits non-zero (`NOT PUBLISHED`): the integrated result stays on the unit's branch and the remote is untouched. A verified push records the publication (source HEAD, commit, remote, branch) on the unit and writes the sha into the linked item's checklist evidence cell (status unchanged); `janus land` again finishes an incomplete writeback without landing again. `janus close` of a squash-landed unit accepts its unpushed commits only when its tree is contained in that publication, verified now |
 | `janus remember`, `janus forget`, `janus memory` | MEMORY.md: `--instruction`, `--decision`, `--fact`, `--pitfall`, `--key` replaces |
 | `janus answer q<N> TEXT`, `janus send AGENT TEXT`, `janus board-close AGENT` | answer a board question; one addressed message; archive a card |
 | `janus transcript UNIT`, `janus index`, `janus report` | grep/tail a transcript; the reports index; derived status view |
@@ -76,10 +76,22 @@ it commits on its own branch (`janus/<unit>` when the source tree was on the lan
 back with `janus collect`). Publication needs that host to reach the remote; without one the result stays in the host's repository (fetch it
 over ssh). Closing still checks the copy was collected.
 
-## Tests
-There are no generated gates. Tests are the project's own explicit commands, run with `janus run` through ordinary admission; a whole-suite
-run needs `--broad REASON`. Landing runs none: after `janus land` reports it integrated moved work, a clean merge does not prove the merged
-tree is right; run the tests that matter.
+## Tests and rigor
+There are no generated gates. Tests are the project's own explicit commands, run with `janus run` through ordinary admission. How much a
+unit tests, and whether it is reviewed before landing, is its rigor level: `[rigor] level` in janus.toml (default `lean`), or for one unit
+a brief's `RIGOR:` line or `janus launch --rigor`. The level is written into the agent's brief header and the orchestrator's session text.
+
+| level | tests written | tests run | reviews before `janus land` | whole-suite run (agents) |
+|---|---|---|---|---|
+| `ship` | none | none; the Stop hook takes DONE without exit codes | none | refused |
+| `quick` | none | a compile or typecheck of the changed code | none | refused |
+| `lean` | only where no existing test would catch the break; extend, do not add fixtures; remove obsolete ones | the one targeted check that proves the change | none | refused |
+| `careful` | one per changed behavior | the touched packages' tests | 1 for a critical unit | `--broad REASON` |
+| `thorough` | plus edge cases | the full suite | 2 for critical (one by another vendor), 1 for normal | allowed, low priority |
+
+A review counts when it is a unit launched `--kind review --of UNIT` whose report says `VERDICT: DONE`; until then check raises
+`review:<unit>` and `janus land` refuses (`--force-review` lands anyway). The orchestrator's own `janus run` keeps `--broad REASON` at every
+level. Landing runs no tests: after `janus land` reports it integrated moved work, a clean merge does not prove the merged tree is right.
 
 ## Reset
 `janus watch --reset` uses the tool's own new-session command (Claude Code `/clear`, Codex `/new`, OpenCode `/new`; read from each binary), marks
@@ -108,6 +120,7 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 | `board` | a card is blocked, has a question, is gone or silent; posts wait unsynced |
 | `cap` | more agents than the owner's caps |
 | `disk` | a host is over its disk budget |
+| `review` | a finished unit lacks the DONE reviews its rigor level requires (`careful`: 1 for critical; `thorough`: 2 for critical, one by another vendor, 1 for normal); `janus land` refuses it until then (`--force-review`) |
 | `duplicate` | a stranded unit's host answers again while its relaunch is open: keep one (collect and land or close the original, or `close <relaunch> --duplicate-of <original>`) |
 | `git` | the project repository is dirty / unpushed |
 | `host` | a host is unreachable. Past `[capacity] down_after_min` (default 30) or marked `gone` it is stranded: its open units no longer cover their backlog items or hold cap slots, and `janus fill` relaunches each item on a host that answers (a new unit `<name>-rN`, `--resume-of` the original: its report copied here and its synced `backup.patch` applied); a brief pinned to it waits (`backlog:pinned:<unit>`). `host:<h>:gone` lists a gone host's units to close |

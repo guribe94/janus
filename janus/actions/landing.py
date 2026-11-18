@@ -15,6 +15,7 @@ from janus.backlog import unit_items
 from janus.beads import Beads
 from janus.branch import landing_branch, unapplied_patch
 from janus.context import Err, hrun, now, qp, say, sh, ts
+from janus.rigor import review_gap
 from janus.units import all_units, own_tree
 
 LAND_TRIES = 3
@@ -77,6 +78,8 @@ def cmd_land(cfg, a):
     ld = cfg.c.get("landing", {})
     u = next((x for x in Beads(cfg).units() if x["name"] == a.unit), None) or all_units(cfg).get(a.unit)
     if not u: raise Err(f"no unit {a.unit}")
+    gap = review_gap(cfg, u)   # the unit's rigor level may require reviews first (rigor.R); below careful it never does
+    if gap and not getattr(a, "force_review", False): raise Err(f"refused: {gap}; janus land {a.unit} --force-review lands it anyway")
     hn = getattr(a, "host", None) or (u.get("host") if u.get("rcwd") and not cfg.hosts.get(u.get("host"), {}).get("local") and u.get("host") in cfg.hosts else None)
     if hn and not cfg.hosts.get(hn, {}).get("local"):   # the unit's tree is on another host: its git, there
         if hn not in cfg.hosts: raise Err(f"unknown host {hn}")

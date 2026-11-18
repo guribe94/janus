@@ -4,6 +4,7 @@ janus run / janus cancel / janus busy / janus thrash, and the job queries every 
 job_state, unit_jobs, orphan_jobs)."""
 import argparse, calendar, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
+from janus.rigor import LEVELS, R, project_level
 from janus.beads import Beads
 from janus.board import board
 from janus.cache import cache_key, input_hashes, lookup as cache_lookup, record as cache_record, settle as cache_settle
@@ -407,9 +408,14 @@ def cmd_run(cfg, a):
         a.host = best; print(f"janus: placed on {best} (" + "; ".join(lines) + ")", file=sys.stderr)
     hn = a.host; h = cfg.hosts[hn]
     broad = getattr(a, "broad", None)
-    if a.lane == "jobs" and not broad:
-        why = broad_why(cfg, hn, h, cmd)
-        if why: raise Err(f"refused: a whole-suite run ({why}) needs --broad <reason>: it then runs at low priority (nice 19, after shorter jobs); or narrow it (one package, a test filter)")
+    if a.lane == "jobs":   # the whole-suite guard, by the rigor level (rigor.R broad): an agent's own level, else the project's
+        agent = os.environ.get("JANUS_ROLE") == "agent"; lv = os.environ.get("JANUS_RIGOR", "")
+        lv = lv if agent and lv in LEVELS else project_level(cfg); pol = R[lv]["broad"]
+        refuse = agent and pol == "refuse"   # below careful an agent never runs a whole suite; the orchestrator keeps --broad <reason>
+        why = broad_why(cfg, hn, h, cmd) if refuse or not broad else None
+        if why and refuse: raise Err(f"refused: a whole-suite run ({why}) is not run at rigor {lv}: run the one targeted check (one package, a test filter)")
+        if why and pol == "free": broad = a.broad = f"rigor {lv}"   # thorough: no reason needed, still low priority
+        elif why: raise Err(f"refused: a whole-suite run ({why}) needs --broad <reason>: it then runs at low priority (nice 19, after shorter jobs); or narrow it (one package, a test filter)")
     if broad: print(f"janus: broad run ({broad}): low priority", file=sys.stderr)
     if cfg.run.dry: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
     if not h.get("local"): sync_wt(cfg, hn, h, src, name)

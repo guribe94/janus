@@ -15,6 +15,7 @@ from janus.ledger import ledger_done, model_ok, model_tool, read_secret, reserve
 from janus.memory import MEM_SECTIONS, mem_line, memory_read
 from janus.platform import herdr
 from janus.project import project_id, tag, tmux_name
+from janus.rigor import DEFAULT, R, agent_text, check_level, level_of
 from janus.probe import probe_all, pueue, room
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import transcript_of
@@ -48,7 +49,7 @@ def pick_model(cfg, tier, kind, host=None, note=None):
         why.append(f"{m}: {w}")
     raise Err("no model available for " + tier + "/" + kind + " (" + ("; ".join(why) or "none configured") + ")" + ("" if cfg.route.get("fallback") is True or len(lst) < 2 else "; no fallback to the later entries unless [routing] fallback = true"))
 
-def agent_prompt(cfg, unit, brief, hn, report=None, budget=None):
+def agent_prompt(cfg, unit, brief, hn, report=None, budget=None, level=None):
     """The first prompt of a unit. It names the report path the unit must keep (row 26: a resumed unit continues its original
     report, which janus reads; the agent must not guess it from the brief) and the one instruction that matters (keep it
     current; the VERDICT line). The report.json contract lives in the brief header (quality_block) and is not repeated here
@@ -59,6 +60,7 @@ def agent_prompt(cfg, unit, brief, hn, report=None, budget=None):
     board_rule = f" {o.strip()}" if o.strip() else ""
     return (f"Read {brief} (absolute path) and carry out its instructions. Report in {rp}, updated at checkpoints (a result, a decision, a "
             f"blocker): line 1 'VERDICT: PENDING' until done, then 'VERDICT: DONE' or 'VERDICT: BLOCKED' with the real exit codes.{board_rule}"
+            + (f" Rigor: {level} (the brief header says what to test and run)." if level else "")
             + (f" {budget_note(cfg, budget)}" if budget else ""))
 
 def wait_shell(pane, unit):
@@ -243,7 +245,7 @@ def seed_repo(cfg, h, name, cwd, rcwd):
     if rc: return None, f"preparing the repository on the host failed: {(e or o).strip()[-160:]}"
     return {"branch": ub, "landing": br, "base": base}, ""
 
-def lane_runner(cfg, hn, h, name, rcwd):
+def lane_runner(cfg, hn, h, name, rcwd, level=DEFAULT):
     """The unit's `lane` command on host h (<root>/run/<unit>.lane) and its settings (<unit>.lane.json): `lane [--detach] [--broad
     REASON] <command>` is janus/lane.py (shipped to <root>/bin) run there. It applies the guard `janus run` applies and queues through
     the same queue_job, with the job script this module generates (job_script: admission by the host's own cap.sh, history,
@@ -252,7 +254,7 @@ def lane_runner(cfg, hn, h, name, rcwd):
     crd = in_container(h, runs_dir(cfg, h))   # the runs dir as the job sees it
     mk = lambda **k: job_script(cfg, hn, h, argparse.Namespace(**{**vars(a), **k}), name, f"bash {qp(crd + '/__JID__.cmd')}", "__JID__", wd=rcwd, clsrc='"$(cat "$R.cmd")"')
     conf = {"host": hn, "unit": name, "wt": rcwd, "label": tag(cfg, "unit:" + name), "rd": h["_rd"], "pueue": pueue(h), "ensure": ensure_lanes(h, cfg),
-            "script": mk(), "script_broad": mk(broad="lane --broad"), "patterns": cfg.capc.get("broad_patterns", lane.BROAD_PATTERNS), "broad_min": capv(cfg, h, "broad_min")}
+            "script": mk(), "script_broad": mk(broad="lane --broad"), "patterns": cfg.capc.get("broad_patterns", lane.BROAD_PATTERNS), "broad_min": capv(cfg, h, "broad_min"), "broad_policy": R[level]["broad"], "rigor": level}
     return (f"#!/bin/sh\nexec python3 {qp(h['root'] + '/bin/lane.py')} {qp(h['root'] + f'/run/{name}.lane.json')} \"$@\"\n", json.dumps(conf))
 
 PARK_RULE = ("**Builds and tests (janus):** submit with `{submit}`; it prints the job id (`<host>:<task>`) at once. Then write "
@@ -279,12 +281,12 @@ def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
           "- Another agent's transcript: ask with a board question; the orchestrator reads it for you.", ""]
     return "\n".join(L)
 
-def report_block(report=None):
-    """Run only the tests the change can affect, and the structured report janus reads before the prose."""
-    return ("**Tests (janus):** run only the tests your change can affect, through the lane (a whole-suite run needs `--broad <reason>`). "
+def report_block(report=None, level=DEFAULT):
+    """The level's tests to write and to run (rigor.R), and the structured report janus reads before the prose."""
+    return (agent_text(level) + " Run builds and tests through the lane. "
             f"Also write `report.json` beside {report or 'REPORT.md'} (verdict, files_changed, jobs with exit codes, left): janus reads it first.\n")
 
-def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None, repo=None):
+def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None, repo=None, level=DEFAULT):
     """The header every unit's brief gets: the absolute report path once, prominently (the one thing janus reads; a runtime that
     wrote it elsewhere lost its report), where it runs and how it submits builds and tests (detached, then WAITING), its report,
     the test rule, then the project memory and the shared-knowledge pointers (swarm_header)."""
@@ -297,7 +299,7 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
         b = build or hn
         return (head + PARK_RULE.format(
             submit=f"janus run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=rep)
-            + report_block(report) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
+            + report_block(report, level) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
     git = (f"**Git (janus):** `{rcwd}` is a git checkout on branch `{repo['branch']}`, cut from `{repo['landing']}` at {repo['base'][:9]}; commit your work "
            f"there. `janus land {name}` merges the landing branch, squashes and publishes from this host (a plain, never forced push); "
@@ -308,7 +310,7 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
             f"brings back a patch of your changes, your REPORT and logs). {git}Run every build and test through this host's pueue lane: "
             f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
             f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=rep)
-            + report_block(report) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
+            + report_block(report, level) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
 
 def place(cfg, a, brief, mc, units, hs):
     """Host for the agent: --host; else where its builds and tests run (--test-host, a 'TEST-HOST: <h>' line in the brief, the
@@ -577,6 +579,9 @@ def cmd_launch(cfg, a):
     elif seed: u["resume"] = True   # its own out/<unit>/REPORT.md, seeded below
     item = a.item or (re.search(r"^ITEM:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]
     if item: u["item"] = item
+    rig = getattr(a, "rigor", None) or (re.search(r"^RIGOR:\s*(\S+)", brief.read_text(), re.M) or [None, None])[1]   # --rigor, else the brief's RIGOR: line
+    if rig: u["rigor"] = check_level(rig.lower(), "--rigor" if getattr(a, "rigor", None) else f"RIGOR: in {brief.name}")
+    level = level_of(cfg, u)
     if cfg.run.dry: say(f"+ bd create unit:{name}; bd update --status in_progress")
     else:
         u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
@@ -589,7 +594,7 @@ def cmd_launch(cfg, a):
         atomic_write(rep, (rep.read_text() if seed else "VERDICT: PENDING\n").rstrip("\n") + f"\n\n{carried}\n")
         if mt: os.utime(rep, (mt, mt))   # the seed keeps the original's age (write_seed): its old lines still count for nothing
     start = report if report and report.exists() else outd / "REPORT.md" if (seed or carried) and not cfg.run.dry else None   # the report it starts from
-    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root),
+    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root), "JANUS_RIGOR": level,
            **({"BOARD_DIR": str(board_dir(cfg))} if local else {})}   # remote: <root>/bin/board.sh finds <root>/board itself
     snap = dict(u)
     try:
@@ -611,13 +616,13 @@ def cmd_launch(cfg, a):
                 if repo: u.update(repo=repo)
                 else: say(f"note: {name}'s copy on {hn} is a snapshot without git ({why_repo}); its changes come back with janus collect")
                 if not cfg.run.dry: write_cap(cfg, hn, h)   # the lane's admission and the agent's reservation use it
-                lsh, lcf = lane_runner(cfg, hn, h, name, rcwd)
+                lsh, lcf = lane_runner(cfg, hn, h, name, rcwd, level)
                 put_script(cfg, h, f"{root}/run/{name}.lane", lsh); put_script(cfg, h, f"{root}/run/{name}.lane.json", lcf, "644")
                 put_script(cfg, h, f"{root}/bin/lane.py", (Path(lane.__file__)).read_text(), "644")   # the shared queueing core, run there
                 if not cfg.paths.get("board"):
                     for n, t in board_shipped(cfg): put_script(cfg, h, f"{root}/bin/{n}", t)   # the shipped board there (outbox)
                 ship_context(cfg, h, name, bcopy)
-                put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred, repo=u.get("repo")) + btext, "644")
+                put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred, repo=u.get("repo"), level=level) + btext, "644")
                 if start:   # a resumed unit starts from the report it continues; there it writes <root>/out/<unit>/REPORT.md, its own
                     put_script(cfg, h, f"{root}/out/{name}/REPORT.md", start.read_text(), "644")
                 else: X(cfg, h, f"[ -s {qp(env['JANUS_REPORT'])} ] || echo 'VERDICT: PENDING' > {qp(env['JANUS_REPORT'])}")
@@ -625,9 +630,9 @@ def cmd_launch(cfg, a):
             if not report and not rep.exists() and not cfg.run.dry: rep.write_text("VERDICT: PENDING\n")
             if local:   # the brief with janus's header (the park rule) as the agent reads it: out/<unit>/<brief name>
                 rbrief = str(outd / (brief.name if (outd / brief.name).resolve() != brief.resolve() else "janus-" + brief.name))
-                if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["JANUS_REPORT"], brief_text=btext, pred=pred) + brief.read_text())
+                if not cfg.run.dry: atomic_write(Path(rbrief), brief_header(cfg, hn, h, name, rcwd, True, build, env["JANUS_REPORT"], brief_text=btext, pred=pred, level=level) + brief.read_text())
             u["rbrief"] = rbrief
-            prompt = agent_prompt(cfg, name, rbrief, hn, env["JANUS_REPORT"], budget=budget)
+            prompt = agent_prompt(cfg, name, rbrief, hn, env["JANUS_REPORT"], budget=budget, level=level)
             u["rcwd"] = rcwd
             if mc["kind"] == "api":
                 X(cfg, h, ensure_lanes(h, cfg))

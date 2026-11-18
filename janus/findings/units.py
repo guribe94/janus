@@ -8,6 +8,7 @@ from janus.ledger import ledger_read, recost_plan, spend
 from janus.platform import herdr
 from janus.probe import live_units
 from janus.project import project_id
+from janus.rigor import review_gap
 from janus.transcripts import card_fields
 from janus.units import ENDED, all_units, busy_dead, unit_runs, unit_state, verdict, waiting_line_jobs
 
@@ -93,6 +94,9 @@ def unit_findings(cfg, hs, units, ag):
             F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}; answer it (board.sh direct) or relaunch with what it needs"))
         elif st in ("done", "failed", "gone", "idle"):
             F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
+        if v and v.startswith("VERDICT: DONE"):   # finished work that its rigor level wants reviewed before it lands (rigor.review_gap)
+            gap = review_gap(cfg, u, units)
+            if gap: F.append((f"review:{u['name']}", f"{u['name']}: {gap}; janus land refuses it until then"))
         if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}: stop it, or relaunch it on an enabled model"))
     return F, running

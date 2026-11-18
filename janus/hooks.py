@@ -6,9 +6,10 @@ import contextlib, json, os, re, shlex, sys
 from pathlib import Path
 from janus.beads import Beads
 from janus.reset import stop_reset
-from janus.context import (CLAIM_WINDOW, Cfg, atomic_write, find_root, handoff_path, pending_age, record_session_proc,
+from janus.context import (CLAIM_WINDOW, Cfg, Err, atomic_write, find_root, handoff_path, pending_age, record_session_proc,
     session_alive, session_root, ts)
 from janus.memory import memory_text
+from janus.rigor import orchestrator_text
 from janus.units import main_checkout, own_tree
 
 # PreToolUse shell rules (audit H2, M5). The command is parsed, not pattern-matched: heredoc bodies are data unless fed to a
@@ -360,6 +361,7 @@ def agent_hook(ev, d):
     waiting = [i for i, l in enumerate(lines) if AGENT_WAIT.match(l)]
     # finished: a VERDICT line and the real exit codes (janus reads the last VERDICT line; line 1 stays PENDING until then)
     if verdict and re.search(r"exit(\s+code)?s?\b", t, re.I): return
+    if verdict and os.environ.get("JANUS_RIGOR") == "ship": return   # rigor ship: nothing was run, so there are no exit codes to report
     # parked (PARK_RULE): the last 'WAITING <job ids>' line is newer than any verdict line
     if waiting and (not verdict or waiting[-1] > verdict[-1]): return
     # One reminder at most: the runtime re-fires Stop with stop_hook_active once the hook has blocked, and then it passes. A stop
@@ -377,6 +379,8 @@ def session_start_text(cfg):
              f"Below: (1) MEMORY.md, the binding instructions and durable decisions; (2) HANDOFF.md, your curated objective, decisions, "
              f"blockers and next actions. Then run janus status."]
     mt = memory_text(cfg)
+    try: parts.append(orchestrator_text(cfg))   # the project's rigor level: how much reviewing and testing before landing
+    except Err as e: parts.append(f"[janus] {e}: the default (lean) applies until it is fixed")
     if mt: parts += ["## 1 MEMORY.md", mt]
     hp = handoff_path(cfg)
     if hp.exists() and hp.read_text().strip(): parts += ["## 2 HANDOFF.md", hp.read_text()]

@@ -12,7 +12,7 @@ read-only monitor shows everything. Python standard library only.
 - **Verified reset**: the tool's own new-session command, counted done only when a new session registers.
 - **Monitor**: `janus monitor`, read-only.
 
-There are no generated gates, mandatory reviews or deadlines: findings (`janus check`) are observations that clear when the condition does.
+There are no generated gates or deadlines: findings (`janus check`) are observations that clear when the condition does. How much units test and whether they are reviewed before landing is one setting, `[rigor] level` (`ship` to `thorough`, default `lean`: one targeted check per unit, no reviews).
 
 ## Prerequisites
 - Required on the coordinating machine: Python 3.11+, `git`, `rsync`, `ssh`, `bd` ([beads](https://github.com/steveyegge/beads)), `pueue` (its daemon `pueued` running).
