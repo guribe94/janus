@@ -151,6 +151,15 @@ def own_tree(cfg, u, units):
     c = Path(u["cwd"]).resolve()
     return c != cfg.root.resolve() and not any(Path(x.get("cwd", "/")).resolve() == c for x in units if x["id"] != u["id"])
 
+def force_close_refusal(cfg, u, units):
+    """Why `janus close <u> --force` is refused, else None: the one rule close and the guard hook share. A tree of its own is
+    refused only when it is a main checkout with linked worktrees. A unit with no tree of its own (the project root, or another
+    open unit's tree) is allowed: close never touches that tree, and it keeps the checks that matter there (its agent stopped,
+    its remote copy collected) except on a host the owner marked gone, whose copy that mark declares lost. 2026-11-18: --force
+    was refused for every such unit, so four units of a gone host could not be closed at all."""
+    if own_tree(cfg, u, units) and main_checkout(Path(u["cwd"])): return f"{u['cwd']} is a main checkout with linked worktrees"
+    return None
+
 ENDED = ("done", "failed", "gone", "idle")
 
 WAIT_RX = re.compile(r"^[\s*>-]*WAITING\b\**:?\s*(.*)$", re.M)
@@ -242,7 +251,7 @@ def unit_any(cfg, name):
     except Err: u = None
     return u or all_units(cfg).get(name)
 
-__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
+__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
 
 
 def no_remote_copy(u):

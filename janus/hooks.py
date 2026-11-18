@@ -10,7 +10,7 @@ from janus.context import (CLAIM_WINDOW, Cfg, Err, atomic_write, find_root, hand
     session_alive, session_root, ts)
 from janus.memory import memory_text
 from janus.rigor import orchestrator_text
-from janus.units import main_checkout, own_tree
+from janus.units import force_close_refusal
 
 # PreToolUse shell rules (audit H2, M5). The command is parsed, not pattern-matched: heredoc bodies are data unless fed to a
 # shell or ssh; $( ), backticks and <( ) are judged as commands of their own; the rest is split on ; && || | & ( ) and newlines,
@@ -91,8 +91,25 @@ def split_heredocs(c):
             i += 1; docs.append((l, "\n".join(body)))
     return "\n".join(out), docs
 
+def drop_fd_numbers(c):
+    """c without the file-descriptor number written against a redirection (the 2 of `2>&1`, `2>f`; outside quotes, at the start
+    of a word): shlex splits `2>&1` into `2 >& 1`, and the 2 was judged as the command's argument (2026-11-18: `pueue --version
+    2>&1` refused as "pueue 2"). `echo 2 > f` keeps its 2, an argument."""
+    out, i, q = [], 0, None
+    while i < len(c):
+        ch = c[i]
+        if q: out.append(ch); q = None if ch == q else q; i += 1; continue
+        if ch == "\\": out.append(c[i:i + 2]); i += 2; continue
+        if ch in "'\"": q = ch; out.append(ch); i += 1; continue
+        if ch.isdigit() and (i == 0 or c[i - 1] in " \t\n;&|("):
+            j = i
+            while j < len(c) and c[j].isdigit(): j += 1
+            if c[j:j + 1] in ("<", ">"): i = j; continue
+        out.append(ch); i += 1
+    return "".join(out)
+
 def words_of(text):
-    lx = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>"); lx.whitespace_split = True; lx.commenters = ""
+    lx = shlex.shlex(drop_fd_numbers(text), posix=True, punctuation_chars=";&|()<>"); lx.whitespace_split = True; lx.commenters = ""
     try: return list(lx)
     except ValueError: return text.split()
 
@@ -219,10 +236,9 @@ def git_sub(args):
 MUTATORS = {"rm", "mv", "cp", "ln", "rsync", "touch", "chmod", "chown", "install", "rmdir", "unlink", "tee"}
 
 def force_close_ok(cfg, args):
-    """janus close <unit> --force on the unit's own worktree (not the project root, no other open unit's cwd, not a main checkout
-    with linked worktrees) is the orchestrator's to run (janus-fixes10 item 5). The unit being closed is the first positional
-    name after `close` (finding 13), so a unit named elsewhere (a --reason value, a stray token like the `2` of `2>&1`) never
-    approves a close of another unit."""
+    """janus close <unit> --force on an open unit that units.force_close_refusal allows (the rule janus close itself applies, so
+    the two never disagree) is the orchestrator's to run (janus-fixes10 item 5). The unit being closed is the first positional
+    name after `close` (finding 13), so a unit named elsewhere (a --reason value) never approves a close of another unit."""
     names = [x for x in args[1:] if not x.startswith("-")]
     if "--reason" in args:
         i = args.index("--reason")
@@ -231,7 +247,7 @@ def force_close_ok(cfg, args):
     name = names[0]
     try:
         units = Beads(cfg).units(); u = next((x for x in units if x["name"] == name), None)
-        return bool(u and u.get("cwd") and own_tree(cfg, u, units) and not main_checkout(Path(u["cwd"])))
+        return bool(u and u.get("cwd")) and force_close_refusal(cfg, u, units) is None
     except Exception: return False
 
 JANUS_READ = {"check", "status", "queue", "transcript", "memory", "report", "capacity", "busy", "doctor", "hosts", "thrash"}
@@ -245,7 +261,7 @@ DENY_ALT = (
     (r"editing files by hand|in-place edit|writing .* by hand|destructive ", "brief an agent (janus launch)"),
     (r"janus api-run", "janus launch"),
     (r"board\.sh close", "janus board-close <agent> (an open unit: janus close <unit>)"),
-    (r"janus close --force", "janus close <unit> (--force only on the unit's own worktree)"),
+    (r"janus close --force", "janus close <unit> (--force closes without a verdict once its agent is stopped and its copy collected; never a main checkout)"),
 )
 
 def deny_alt(why):
@@ -421,8 +437,8 @@ def cmd_hook(ev):
         if why: deny_log(cfg, d, why)
         if why: out({"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny",
                      "permissionDecisionReason": f"[janus] Refused: {why}. The orchestrator does not operate by hand. Instead: "
-                         f"{deny_alt(why)}. If this refusal is wrong, say so in the handoff (denied.log has it) and carry on "
-                         f"another way; do not retry variants of the command."}})
+                         f"{deny_alt(why)}. If this refusal is wrong, report it as a janus problem (the handoff; denied.log has it) and continue "
+                         f"with other work; do not run this step another way (no variants, renamed files or split words)."}})
     elif ev == "Stop":
         r = stop_reset(cfg, d)   # at most one reminder to update the handoff, only over the context threshold; never blocks otherwise
         if r: block(r)

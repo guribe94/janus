@@ -191,6 +191,43 @@ class Carry(Base):
         self.assertTrue(rep.startswith("VERDICT: PENDING\n"), rep); self.assertIn("the old work", rep); self.assertIn("RELAUNCH: old's changes", rep)
 
 
+class Close(Base):
+    """A unit with no tree of its own (its recorded cwd is the project root) on a host the owner marked gone."""
+    def setUp(self):
+        super().setUp(); self.ssh, self.settled = [], []
+        for name, fn in (("hrun", lambda h, s, **k: self.ssh.append(s) or (255, "", "ssh: connect to host far: Host is down")),
+                         ("probe", lambda n, h, **k: {"name": n, "ok": False, "err": "Host is down"}), ("herdr_agents", lambda cfg: {}),
+                         ("close_tab", lambda cfg, u: None), ("settle_run", lambda cfg, u, why: self.settled.append(u["name"]))):
+            p = mock.patch.object(janus, name, fn); p.start(); self.addCleanup(p.stop)
+        self.stranded(name="g1", report="VERDICT: PENDING\nhalf done\n", cwd=str(self.d), task=7, run="r-1")
+
+    def close(self):
+        return out(janus.cmd_close, self.cfg, argparse.Namespace(unit="g1", force=True, reason="host gone", handover=False, duplicate_of=None))
+
+    def test_force_closes_a_gone_hosts_unit_without_a_tree_and_touches_nothing(self):
+        """Catches (2026-11-18): four units of a host marked gone could not be closed at all (plain close: its copy cannot be read;
+        --force: refused as the shared project root), while the host finding told the orchestrator to run exactly that --force."""
+        with self.assertRaises(janus.Err) as e: self.close()                     # not marked: its agent's state is unknown
+        self.assertIn("stop it first", str(e.exception)); self.assertNotIn(("close", "u-g1"), [w[:2] for w in self.w.writes])
+        self.mark("far", "gone"); self.ssh.clear()
+        self.close()
+        self.assertIn(("close", "u-g1"), [w[:2] for w in self.w.writes])
+        self.assertEqual([s for s in self.ssh if "board.sh" not in s], [])     # the gone host is not asked for anything
+        self.assertEqual(self.settled, ["g1"])                                   # its budget run is settled, never left open
+        self.assertTrue((self.d / ".janus/out/g1/REPORT.md").is_file())          # its report and synced output stay here
+        self.assertTrue(janus.force_close_ok(self.cfg, ["close", "g1", "--force"]))
+
+    def test_force_on_a_host_that_answers_still_needs_a_stopped_agent_and_a_collected_copy(self):
+        """Catches: --force on a unit without a tree of its own closing a running agent, or dropping a copy not collected."""
+        p = mock.patch.object(janus, "probe", lambda n, h, **k: {"name": n, "ok": True, "pueue": {"tasks": {"7": {"status": {"Running": {}}}}}}); p.start(); self.addCleanup(p.stop)
+        with self.assertRaises(janus.Err) as e: self.close()
+        self.assertIn("still working", str(e.exception))
+        p2 = mock.patch.object(janus, "probe", lambda n, h, **k: {"name": n, "ok": True, "pueue": {"tasks": {"7": {"status": {"Done": {"result": "Success"}}}}}}); p2.start(); self.addCleanup(p2.stop)
+        p3 = mock.patch.object(janus, "uncollected", lambda cfg, u: "its copy on far has changes or output not collected yet"); p3.start(); self.addCleanup(p3.stop)
+        with self.assertRaises(janus.Err) as e: self.close()
+        self.assertIn("not collected", str(e.exception)); self.assertNotIn(("close", "u-g1"), [w[:2] for w in self.w.writes])
+
+
 class Findings(Base):
     def test_host_findings_say_what_happens_and_pair_on_return(self):
         """Catches: the host finding saying nothing moves while fill relaunches its items; a gone host's units never named for

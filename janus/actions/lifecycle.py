@@ -14,10 +14,10 @@ from janus.context import (DIFF_X, Err, JANUS_MARK, LockLost, JANUS_SELF, SSH, X
 from janus.memory import memory_text
 from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, route_ok, run_cost, settle_run
 from janus.project import project_id, tag, unit_tmux
-from janus.probe import probe, probe_all, pueue
+from janus.probe import host_liveness, probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
-from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, own_tree, report_path, unit_runs, unit_spent, unit_state,
+from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, report_path, unit_runs, unit_spent, unit_state,
     verdict, waiting_line_jobs)
 
 # Agents never pay to wait. An agent submits its builds and tests detached (`janus run --detach`, or its lane runner's
@@ -377,10 +377,20 @@ def duplicate_check(cfg, u, units, orig):
     if not o: raise Err(f"--duplicate-of {orig}: no other open unit of that name")
     if u.get("relaunch_of") != orig and o.get("relaunched") != u["name"]: raise Err(f"{u['name']} is not a relaunch of {orig} (janus recorded none): close it by its verdict")
     if cfg.run.dry: return
+    why = agent_running(cfg, u)
+    if why: raise Err(why)
+
+def agent_running(cfg, u):
+    """Why u's agent may still run (asked of its host now), else None: still working, queued or blocked, or its host cannot say."""
     with cfg.unlocked(): ps = probe(u["host"], cfg.hosts[u["host"]])
     st = unit_state(u, {u["host"]: ps}, herdr_agents(cfg))
     if st in ("working", "queued", "blocked", "unknown"):
-        raise Err(f"{u['name']}: its agent is " + (f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)") + f"; stop it first (janus stop {u['name']})")
+        return f"{u['name']}: its agent is " + (f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)") + f"; stop it first (janus stop {u['name']})"
+    return None
+
+def host_gone(cfg, u):
+    """The owner marked u's host gone (janus hosts --mark H gone): its copy there is lost by that word."""
+    return host_liveness(cfg).get(u.get("host"), ("up", None))[0] == "gone"
 
 def tree_changed(cfg, cwd, head0):
     """Why the unit's tree is no longer what close checked (uncommitted changes now, or its HEAD moved from head0), else None."""
@@ -397,7 +407,13 @@ def cmd_close(cfg, a):
     if dup and a.force: raise Err("--duplicate-of with --force: --duplicate-of is the close without --force")
     mine = own_tree(cfg, u, units) or handover   # item 13: a successor took its tree, so --force is right
     head0 = None   # the tree's HEAD the git checks saw: rechecked before the cleanup, after the lock was let go
-    if a.force and not mine: raise Err(f"--force refused: {u['cwd']} is shared (project root or another open unit's cwd)")
+    gone = host_gone(cfg, u)
+    if a.force:
+        why = force_close_refusal(cfg, u, units)
+        if why: raise Err(f"--force refused: {why}")
+    # the uncollected guard: --force skips it for a tree of its own (as before) and for a gone host's copy (lost); a unit without a
+    # tree of its own on a host that answers keeps it, since its host copy is the only copy of its work
+    skip_guard = a.force and not handover and (mine or gone)
     if mine:
         dirty, state_repo = unit_dirty(cfg, u["cwd"])
         if dirty and not a.force: raise Err(f"{u['cwd']} has uncommitted changes ({', '.join(dirty[:3])}); commit and push, or --force")
@@ -410,12 +426,15 @@ def cmd_close(cfg, a):
             say(f"{u['name']}: its commits are squash-landed in the published {u['published']['commit'][:12]} (verified now)")
         head0 = sh(["git", "rev-parse", "HEAD"], cwd=u["cwd"])[1].strip() or None
     elif dup: duplicate_check(cfg, u, units, dup)   # soak 43: a stopped duplicate has no verdict to give and no tree of its own
+    elif a.force:   # no tree of its own: --force closes without a verdict, never while its agent may still run (a gone host's never will)
+        why = None if gone or cfg.run.dry else agent_running(cfg, u)
+        if why: raise Err(why)
     elif not verdict(cfg, u) and u.get("via") != "failed":   # no tree of its own (H10): the git state is not the unit's; its REPORT is
         raise Err(f"{u['name']} has no final VERDICT line in {report_path(cfg, u)}")
     # A handover is never a reason to skip the uncollected guard (finding 3): a remote predecessor's dirty tree is its copy on
     # the host, so removing it without collect loses work. Only a plain --force skips the guard.
     with cfg.unlocked():   # the fingerprint and the probe ask the unit's host: an ack must not wait for them
-        why = None if (a.force and not handover) or cfg.run.dry or redo else uncollected(cfg, u)
+        why = None if skip_guard or cfg.run.dry or redo else uncollected(cfg, u)
         st = unit_state(u, probe_all(cfg), herdr_agents(cfg)) if handover and not cfg.run.dry else None
     if why: raise Err(f"refused: {u['name']}: {why}")
     if handover and not cfg.run.dry:   # never close a predecessor whose agent is still running (finding 3; finding 5: unknown too)
@@ -429,7 +448,7 @@ def cmd_close(cfg, a):
     say(f"close {u['name']}" + ("" if mine else " (no worktree of its own: git checks skipped)"))
     why2 = None
     with cfg.unlocked():   # the host's cleanup, its probe and the task log take as long as the host does: the unit is recorded closing, busy
-        if not ((a.force and not handover) or cfg.run.dry or redo):   # revalidate: the guard above ran before the lock was let go; collect now refuses this unit, so a fresh fingerprint against the current record is final
+        if not (skip_guard or cfg.run.dry or redo):   # revalidate: the guard above ran before the lock was let go; collect now refuses this unit, so a fresh fingerprint against the current record is final
             why2 = uncollected(cfg, {**u, "closing": False, "busy": None})
     if why2:   # something changed since the guard: nothing was removed; undo the marks and refuse
         u = next((x for x in bd.units() if x["id"] == u["id"]), u); u.pop("closing", None); u.pop("busy", None); bd.save(u)
@@ -440,16 +459,18 @@ def cmd_close(cfg, a):
         raise Err(f"refused: {u['name']}: {why3} (it changed while the close was starting): commit and push, or land it, then close again")
     with cfg.unlocked():
         close_tab(cfg, u)
-        if not h.get("local"):
+        if gone: say(f"{u['host']} is marked gone: its copy there is not removed, and its task log not saved (out/{u['name']}/ keeps what was synced)")
+        elif not h.get("local"):
             root = h["root"]; n = u["name"]
             others = [x["name"] for x in units if x["id"] != u["id"] and x.get("host") == u["host"] and x.get("rcwd") == u.get("rcwd")]
             if others: say(f"keeping {u.get('rcwd')} on {u['host']}: open unit(s) {', '.join(others)} use it")
             else: X(cfg, h, f"cd {qp(root)} && rm -rf worktrees/{n} base/{n} briefs/{n}.md out/{n} run/{n}.* && rmdir worktrees base briefs out run 2>/dev/null; true")
-        if u.get("via") == "pueue":   # the task's log is kept under out/<unit>/ before the task is removed
+        if u.get("via") == "pueue" and not gone:   # the task's log is kept under out/<unit>/ before the task is removed
             if not cfg.run.dry: save_task_log(cfg, h, u, u["task"])
             X(cfg, h, f"{pueue(h)} remove {int(u['task'])} 2>/dev/null; true")
         X(cfg, {"local": True}, f"BOARD_DIR={shlex.quote(str(board_dir(cfg)))} {shlex.quote(str(board_script(cfg)))} close {u['name']} 2>/dev/null; true")
-        ended = bool(u.get("run")) and not cfg.run.dry and unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown")
+        # a gone host's run ended with the host: settled now, or it stayed open in the ledger for good (its state reads unknown)
+        ended = bool(u.get("run")) and not cfg.run.dry and (gone or unit_state(u, {u["host"]: probe(u["host"], h)}, {}) not in ("working", "queued", "unknown"))
     if cfg.run.dry: return
     u = next((x for x in bd.units() if x["id"] == u["id"]), u)   # as it is now: the run is settled and the issue closed on the current record
     if ended: settle_run(cfg, u, "closed")

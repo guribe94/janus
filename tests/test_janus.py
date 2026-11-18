@@ -920,10 +920,25 @@ class Tidy(unittest.TestCase):
         real = janus.Beads.units; janus.Beads.units = lambda s: units
         try:
             self.assertIsNone(j("janus close u --force --reason 'capped; continued elsewhere'"))
-            self.assertIsNotNone(j("janus close v --force"))             # the project root: shared
-            units.append({"id": "x-3", "name": "w", "cwd": str(wt)}); self.assertIsNotNone(j("janus close u --force"))   # shared tree
+            # no tree of its own (the project root, a shared tree): close itself stops for a running agent or an uncollected copy
+            self.assertIsNone(j("janus close v --force"))
+            units.append({"id": "x-3", "name": "w", "cwd": str(wt)}); self.assertIsNone(j("janus close u --force 2>&1"))
+            r = d / "main"; r.mkdir(); subprocess.run(["git", "init", "-q", str(r)], check=True)   # a main checkout with a linked worktree
+            subprocess.run(["git", "-C", str(r), "commit", "-q", "--allow-empty", "-m", "x"], check=True, env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+            subprocess.run(["git", "-C", str(r), "worktree", "add", "-q", str(d / "lw")], check=True)
+            units.append({"id": "x-4", "name": "m", "cwd": str(r)}); self.assertIsNotNone(j("janus close m --force"))
             self.assertIsNotNone(j("janus close nosuch --force"))
         finally: janus.Beads.units = real
+
+    def test_an_fd_number_is_part_of_its_redirection(self):
+        """Catches (2026-11-18): `pueue --version 2>&1` refused as "pueue 2 by hand": shlex split 2>&1 into 2 >& 1 and the 2 was judged
+        as the command's argument, so a read-only command with stderr redirected was refused and the orchestrator worked around it."""
+        d, cfg = project(); j = lambda c: janus.judge(cfg, c, str(d), janus.edit_ok_dirs(cfg))
+        for c in ("pueue --version 2>&1", "pueue status 2>/dev/null", "ssh h 'pueue status' 2>&1 | tail -3", "git log 2>&1 | head"):
+            self.assertIsNone(j(c), c)
+        for c in ("pueue kill 3 2>&1", '"pu""eue" kill 3', "pueue kill 3 >/dev/null 2>&1"): self.assertIsNotNone(j(c), c)
+        self.assertEqual(janus.segments("echo 2 > f")[0], (["echo", "2"], ["f"]))   # spaced: an argument and a redirection
+        self.assertEqual(janus.segments("echo x 2>f 1>&2")[0], (["echo", "x"], ["f"]))
 
 class Fixtures(unittest.TestCase):
     """fixes10 item 6: a live check skips the suite's process fixtures (marked by their root); the suite still sees them."""

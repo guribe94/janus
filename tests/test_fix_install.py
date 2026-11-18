@@ -704,7 +704,7 @@ class Item13ForceClose(unittest.TestCase):
         W = base / "wt"; g("worktree", "add", "-q", str(W), "-b", "u1")
         d, cfg = project()
         u1 = {"id": "t-1", "name": "u1", "cwd": str(W)}
-        u2 = {"id": "t-2", "name": "u2", "cwd": str(d)}   # the project root: shared, not its own tree
+        u2 = {"id": "t-2", "name": "u2", "cwd": str(R)}   # a main checkout with a linked worktree: --force refused
         real = janus.Beads; janus.Beads = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [u1, u2]})
         try:
             self.assertTrue(janus.force_close_ok(cfg, ["close", "u1", "--force"]))
