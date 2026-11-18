@@ -186,3 +186,18 @@ class ResumeReopensReport(unittest.TestCase):
             janus.resume_unit(cfg, {"name": "u", "host": "far", "via": "tmux", "tmux": "t", "model": "m"}, "go on")
         self.assertIn("VERDICT: PENDING\nnotes\n", [i for c, i in cmds if "/r/out/u/REPORT.md" in c], cmds)   # written on the host, by the file it read there
         self.assertTrue(rep.read_text().startswith("VERDICT: PENDING"))
+
+
+class JobProgress(unittest.TestCase):
+    def test_a_jobs_state_age_and_usual_time_come_from_one_reading(self):
+        """Catches: the job-age finding and the monitor each working out a job's age their own way (they disagreed once the
+        monitor started showing it); a waiting job timed from its start instead of its enqueue."""
+        t0 = int(time.time()) - 840; q = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t0 - 60))
+        hs = {"h": {"ok": True, "waitjob": ["j8"], "res": [f"4242 1 512 {t0} cargo_test j9.res -"], "cls": ["cargo_test 12 120 1"],
+                    "pueue": {"tasks": {"9": {"status": {"Running": {}}, "command": "bash /x/runs/j9.sh"},
+                                        "8": {"status": {"Running": {"start": q}}, "command": "bash /x/runs/j8.sh"},
+                                        "7": {"status": {"Queued": {"enqueued_at": q}}, "command": "bash /x/runs/j7.sh"}}}}}
+        st, rc, since, usual = janus.job_progress(hs, "h:9"); self.assertEqual((st, since, usual), ("running", t0, 120))
+        st, _, since, usual = janus.job_progress(hs, "h:8"); self.assertEqual(st, "admission"); self.assertIsNone(since)   # held: timed from its enqueue, which pueue did not give
+        st, _, since, _ = janus.job_progress(hs, "h:7"); self.assertEqual((st, int(since)), ("queued", t0 - 60))
+        self.assertEqual(janus.job_progress(hs, "h:5")[0], "gone"); self.assertEqual(janus.job_progress({"h": {"ok": False}}, "h:9")[0], "unknown")

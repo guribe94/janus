@@ -38,6 +38,20 @@ def job_state(hs, ref):
     if k == "Running": return ("admission" if job_of(t) in p.get("waitjob", []) else "running"), None
     return k.lower(), None
 
+def job_progress(hs, ref):
+    """(state, exit code, since, usual) of job <host>:<task>: job_state's answer; since: when it started running, or was queued
+    while it waits (pueue queue or admission), in epoch seconds, None when unknown; usual: the median seconds of its job class
+    on that host (the host's own cap.sh history), None without one. The one reading the age finding and the monitor share."""
+    st, rc = job_state(hs, ref); hn, _, tid = ref.partition(":"); p = hs.get(hn) or {}
+    t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid) or {}
+    s = t.get("status"); info = next(iter(s.values()), {}) if isinstance(s, dict) else {}; waits = st in ("queued", "admission")
+    try: since = time.mktime(time.strptime(((not waits and info.get("start")) or info.get("enqueued_at") or "")[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError: since = None
+    res = next((f for f in (l.split() for l in p.get("res", [])) if len(f) > 5 and f[5] == f"{job_of(t)}.res"), None)   # pid cores mb start class file
+    if since is None and res and not waits and res[3].isdigit(): since = int(res[3])
+    usual = next((c["expect_s"] for c in class_rows(p) if res and c["class"] == res[4]), None)
+    return st, rc, since, usual
+
 def unit_jobs(cfg, hs, name):
     """The unit's own jobs that have not finished (pueue label unit:<name>@<project>, any host): ['<host>:<task>']."""
     return [f"{hn}:{tid}" for hn, p in hs.items() for tid, t in ((p.get("pueue") or {}).get("tasks") or {}).items()

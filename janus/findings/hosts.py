@@ -1,7 +1,7 @@
 """Findings about hosts: unreachable, margins, admission blocked or paused, lane stalls, idle slots and job ages, orphans, thrash
 acts, tidy and disk. Observations only: each clears when the condition does; nothing is stopped from here."""
 import functools, time
-from janus.actions.jobs import LANES, job_of, lane_age, lane_stall, lane_wait, orphan_jobs, slots
+from janus.actions.jobs import LANES, job_of, job_progress, lane_age, lane_stall, lane_wait, orphan_jobs, slots
 from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
 from janus.backlog import STRANDED, backlog_issues, ready_work, stranded_status
 from janus.board import board_script
@@ -77,11 +77,9 @@ def lane_findings(cfg, hs, units=()):
             # no mark (started by an older release) cannot be judged and is left alone.
             live = dict(l.split()[:2] for l in p.get("live", []) if len(l.split()) >= 2)
             for x in mine:
-                s = x["status"]; info = s.get(st(x), {}) if isinstance(s, dict) else {}
                 if st(x) not in ("Queued", "Running") or own_label(cfg, x) is None: continue   # own jobs only
-                waits = st(x) == "Queued" or job_of(x) in p.get("waitjob", []); ref = f"{n}:{x['id']}"
-                try: since = time.mktime(time.strptime(((not waits and info.get("start")) or info.get("enqueued_at", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
-                except ValueError: continue
+                ref = f"{n}:{x['id']}"; js, _, since, _ = job_progress(hs, ref); waits = js in ("queued", "admission")
+                if since is None: continue
                 mins = int((now() - since) / 60); tok = job_of(x); quiet = fl(live.get(tok)) if live.get(tok) is not None else None
                 if waits:
                     if mins > lane_wait(cfg, lane):

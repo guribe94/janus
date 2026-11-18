@@ -11,9 +11,9 @@ FAR = '\n[hosts.far]\nssh = "far"\nroot = "/x"\n'
 MUTATING_BD = {"update", "create", "close", "comments", "comment", "remember", "forget", "delete", "sync", "init", "reopen", "label", "dep", "import", "export"}
 
 
-def probe_text(avail=8192, load="1.50", rj=2, pause="", tasks=None, waits=(1, 0), admit="yes"):
+def probe_text(avail=8192, load="1.50", rj=2, pause="", tasks=None, waits=(1, 0), admit="yes", extra=""):
     return (f"avail_mb={avail}\nload={load}\nos=linux\ndisk_gb=100\nwait_jobs={waits[0]}\nwait_gates={waits[1]}\ncap_rj={rj}\ncap_rc=2\ncap_rm=1024\ncap_ra=0\ncap_ram=0\n"
-            f"cap_pause={pause}\ncap_admit={admit}\n--pueue\n{json.dumps({'tasks': tasks or {}, 'groups': {}})}\n--tmux\n")
+            f"cap_pause={pause}\ncap_admit={admit}\n{extra}--pueue\n{json.dumps({'tasks': tasks or {}, 'groups': {}})}\n--tmux\n")
 
 
 def task(i, status, group="agents"): return {"id": i, "group": group, "label": f"t{i}", "status": status}
@@ -66,7 +66,7 @@ class Base(unittest.TestCase):
     def model(self, offset=0):
         v = self.store.view()[0]; return M.derive(v, time.time() + offset, 5)
     def states(self, tab="Active", m=None):
-        m = m or self.model(); return {r.cells[0]: r.cells[1] for r in m.rows[tab]}
+        m = m or self.model(); return {r.cells[0]: (r.state + (" STALE" if r.stale else "")) if r.state else r.cells[1] for r in m.rows[tab]}
 
 
 class States(Base):
@@ -88,7 +88,26 @@ class States(Base):
         self.assertEqual(m.rows["Ended"][-1].cells[0], "old")   # closed units after those still waiting to be collected
         why = lambda n: " ".join(next(r for r in m.rows["Ended"] if r.key == n).detail)
         self.assertIn("not success", why("exit0")); self.assertIn("not success", why("bad"))
-        self.assertEqual(next(r for r in m.rows["Active"] if r.key == "park").detail[2], "Meaning:   waiting for here:9")
+        self.assertEqual(next(r for r in m.rows["Active"] if r.key == "park").detail[2], "Meaning:   waiting for job here:9: no longer in the queue")
+
+    def test_each_state_says_in_plain_words_what_is_happening(self):
+        """Catches (owner 2026-11-18): 'parked', 'idle' and 'queued' said nothing about what the unit waits for, how long it has
+        waited or whether that is long: the reason sat in the details only. The cell now says it; the state code is unchanged."""
+        w = self.w; t0 = int(time.time()) - 840
+        w.units = [unit("run", task=1), unit("que", task=2), unit("park", task=1, parked={"jobs": ["here:9"], "since": 1}),
+                   unit("hold", task=1, parked={"jobs": ["here:8"], "since": 1}), unit("idl", via="herdr")]
+        job = lambda i, j: {**task(i, {"Running": {}}, "jobs"), "command": f"bash /x/runs/{j}.sh"}
+        w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}}), "2": task(2, "Queued"), "9": job(9, "j9"), "8": job(8, "j8")}, pause="memory critical",
+                                      extra=f"res=4242 1 512 {t0} cargo_test j9.res -\ncls=cargo_test 12 120 1\nwaitjob=j8\n")
+        w.agents = [{"name": "idl", "agent_status": "idle", "pane_id": "p1"}]
+        self.collect(); m = self.model(); cell = {r.key: r.cells[1] for r in m.rows["Active"]}
+        self.assertEqual(self.states("Active", m), {"run": "working", "que": "queued", "park": "parked", "hold": "parked", "idl": "idle"})
+        self.assertEqual(cell["run"], "agent working")
+        self.assertTrue(cell["que"].startswith("waiting for a free agent slot"), cell["que"])
+        self.assertEqual(cell["park"], "waiting for job here:9: running 14m, usually 2m")
+        self.assertIn("waiting for job here:8: held by admission (memory critical)", cell["hold"])
+        self.assertTrue(cell["idl"].startswith("agent stopped"), cell["idl"])
+        self.assertEqual(next(r for r in m.rows["Active"] if r.key == "park").style, "warn")   # 7 times its class's usual time
 
     def test_a_unit_on_a_down_host_shows_its_last_report_not_unknown(self):
         """Catches: every unit of an unreachable host shown 'unknown' for days although its report, copied here, says DONE."""

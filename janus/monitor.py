@@ -11,7 +11,8 @@ import contextlib, dataclasses, datetime, json, os, queue, re, signal, sys, thre
 from pathlib import Path
 from janus.backlog import LOG_LABELS, LOG_RX, STRANDED, checklist_line, checklist_totals, covered_items, eligible_items, item_actors, item_holds, norm_item, stranded_status, unit_items
 from janus.beads import unit_record
-from janus.cap import capv
+from janus.actions.jobs import job_progress
+from janus.cap import CAP_DEFAULTS, capv
 from janus.board import board_dir
 from janus.context import CONF, Cfg, Err, Run, handoff_path, sh, standby
 from janus.rigor import project_level
@@ -366,7 +367,7 @@ def source_note(label, s, now, limit):
     if k == "failed": return f"{label}: UNAVAILABLE, no data yet ({s.err})"
     return f"{label}: STALE, last good data {fmt_dur(now - s.ok_at)} old" + (f" ({s.err})" if s.err else " (no answer yet)")
 
-WORK_COLS = (("NAME", 24, 9, True), ("STATE", 22, 8, False), ("HOST", 10, 4, False), ("TOOL/MODEL", 20, 3, False), ("ELAPSED", 8, 6, False), ("PROGRESS", 9, 7, False))
+WORK_COLS = (("NAME", 24, 9, True), ("STATE", 54, 8, False), ("HOST", 10, 4, False), ("TOOL/MODEL", 20, 3, False), ("ELAPSED", 8, 6, False), ("PROGRESS", 9, 7, False))
 OVERVIEW_COLS = (("ITEM", 14, 9, False), ("NOW", 60, 9, True))
 BOARD_COLS = (("NEW", 3, 7, False), ("TIME", 16, 5, False), ("KIND", 9, 8, False), ("AGENT", 24, 6, False), ("MESSAGE", 40, 9, True))
 HOST_COLS = (("HOST", 12, 9, False), ("STATE", 15, 8, False), ("RUN/QUEUED", 10, 7, False), ("AGENTS", 11, 6, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False),
@@ -382,36 +383,57 @@ def state_style(st):
     w = state_word(st)
     return "bad" if w in ("failed", "blocked") or st == "ended:BLOCKED" or st == "ended:FAILED" else "ok" if w in ("working", "finished") else "dim" if w in ("closed", "stranded") else "warn"
 
-def classify(u, ps, agents, rep, live=None, strand=None):
-    """(tab, state, note) of one unit. Queued, parked, failed, closed and finished stay distinct, and a process that ended is never
+def job_words(ps, ref, now):
+    """(what job <host>:<task> is doing, in words; whether it runs past its class's usual time): from jobs.job_progress."""
+    st, rc, since, usual = job_progress(ps or {}, ref); p = (ps or {}).get(ref.partition(":")[0]) or {}
+    el = now - since if since else None; took = f" {fmt_dur(el)}" if el is not None else ""
+    if st == "running":
+        return f"running{took}" + (f", usually {fmt_dur(usual)}" if usual else ""), bool(el and usual and el > CAP_DEFAULTS["overrun_x"] * usual)
+    pause = (p.get("cap_pause") or "").strip()
+    return ({"unknown": "its host is not answering", "done": f"finished (exit {rc}): janus resumes the unit", "gone": "no longer in the queue",
+             "queued": f"queued{took}", "admission": "held by admission " + (f"({pause})" if pause else "(the host's build capacity is full)")}.get(st, st), False)
+
+def state_words(state, note):
+    """The STATE cell: what is happening, in words (the state code stays on the row for sorting and counting)."""
+    if state.startswith("starting STALLED"): return "launch stuck: " + note
+    return {"working": "agent working", "idle": "agent stopped: its turn ended with no job and no verdict", "blocked": "agent blocked: it asks a question",
+            "queued": f"waiting for a free agent slot {note}", "parked": note, "unknown": f"unknown: {note}", "starting": "launching",
+            "closing": "closing"}.get(state, state)
+
+def classify(u, ps, agents, rep, live=None, strand=None, now=None):
+    """(tab, state, note, slow) of one unit; slow: a job it waits for runs past its usual time. Queued, parked, failed, closed and finished stay distinct, and a process that ended is never
     taken as success: only a report that ends VERDICT: DONE says finished; no verdict is 'ended:no-verdict'. live: janus's judgement
     of the hosts (collect_liveness): a unit on a stranded or gone host that does not answer now is 'stranded', whatever it was."""
     via, name = u.get("via"), u.get("name")
     v = (rep or {}).get("verdict"); vw = (v or "").replace("VERDICT:", "").strip().split(" ")[0].upper()
-    if u.get("status") == "closed": return "Ended", "closed" + (f":{vw}" if vw else ""), "closed" + ("; no verdict" if not vw else "")
-    if via == "failed": return "Ended", "failed", "launch failed (no agent was started)"
+    if u.get("status") == "closed": return "Ended", "closed" + (f":{vw}" if vw else ""), "closed" + ("; no verdict" if not vw else ""), False
+    if via == "failed": return "Ended", "failed", "launch failed (no agent was started)", False
     hst = ((live or {}).get(u.get("host")) or ["up"])[0]
     if hst in ("stranded", "gone") and (hst == "gone" or not (ps or {}).get(u.get("host"), {}).get("ok")):
         new = clean(u.get("relaunched")) or None
         return "Active", "stranded" + (f"->{new}" if new else f":{vw[:9]}" if vw else ""), \
             (f"host {u.get('host')} is {hst}: " + (f"relaunched as {new}" if new else ": ".join(x for x in STRANDED[strand] if x) if strand in STRANDED else "what janus fill does with it is not read yet")
-             + (f"; its last report copied here says {v}" if v else "; no verdict in the report copied here"))
-    if via == "starting": return "Active", "starting", "launch has not finished"
-    if u.get("closing"): return "Active", "closing", "a close is in progress"
+             + (f"; its last report copied here says {v}" if v else "; no verdict in the report copied here")), False
+    if via == "starting": return "Active", "starting", "launch has not finished", False
+    if u.get("closing"): return "Active", "closing", "a close is in progress", False
     try: st = "unknown" if via == "herdr" and agents is None else unit_state(u, ps, agents or {})
     except Exception: st = "unknown"
     ended = st in ("done", "failed", "gone")
     pk = (u.get("parked") or {}).get("jobs") or ([] if v else ((rep or {}).get("waiting") or []) if ended or st == "idle" or via == "tmux" else [])
-    if pk: return "Active", "parked", "waiting for " + ", ".join(map(str, pk[:4]))
+    if pk:
+        w = [job_words(ps, str(j), time.time() if now is None else now) for j in pk[:4]]
+        return "Active", "parked", "waiting for job " + "; job ".join(f"{j}: {t}" for j, (t, _) in zip(pk, w)), any(o for _, o in w)
+    if st == "queued": return "Active", st, f"on {clean(u.get('host')) or '?'}", False
+    if st == "idle": return "Active", st, "its turn ended with no job and no verdict: janus resumes it, or check names it", False
     if st == "unknown" and vw and via != "herdr" and not (ps or {}).get(u.get("host"), {}).get("ok"):   # its host is down: the report copied here still says how it ended
-        return "Active", f"host-down:{vw[:9]}", f"host {u.get('host')} unreachable; the last report copied here says {v}"
-    if st in ("working", "queued", "blocked", "idle", "unknown"): return "Active", st, "" if st != "unknown" else "the host or herdr cannot say now"
-    if not ended: return "Active", st, f"scheduler status {st}"
+        return "Active", f"host-down:{vw[:9]}", f"host {u.get('host')} unreachable; the last report copied here says {v}", False
+    if st in ("working", "queued", "blocked", "idle", "unknown"): return "Active", st, "" if st != "unknown" else "the host or herdr cannot say now", False
+    if not ended: return "Active", st, f"scheduler status {st}", False
     bad = st == "failed"
-    if rep and rep.get("err"): return "Ended", "failed" if bad else "ended:unverified", f"process {st}; report unreadable ({rep['err']})"
-    if bad: return "Ended", "failed", f"process failed" + (f"; the report says {v}, but a failed process is not success" if vw == "DONE" else "")
-    if not vw: return "Ended", "ended:no-verdict", f"process {st}; the report states no verdict (a process ending is not success)"
-    return "Ended", "finished" if vw == "DONE" else f"ended:{vw[:9]}", f"process {st}; report: {v}"
+    if rep and rep.get("err"): return "Ended", "failed" if bad else "ended:unverified", f"process {st}; report unreadable ({rep['err']})", False
+    if bad: return "Ended", "failed", f"process failed" + (f"; the report says {v}, but a failed process is not success" if vw == "DONE" else ""), False
+    if not vw: return "Ended", "ended:no-verdict", f"process {st}; the report states no verdict (a process ending is not success)", False
+    return "Ended", "finished" if vw == "DONE" else f"ended:{vw[:9]}", f"process {st}; report: {v}", False
 
 def tool_model(tool, model):
     """The coding client and the model it runs, together: claude/opus; one alone when only that is known; '?' when neither."""
@@ -430,7 +452,7 @@ def progress_cell(pr, done=False):
     if done: return "done"
     return f"{pr[0]}/{pr[1]} {100 * pr[0] // pr[1]}%" if pr else "-"
 
-def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at=None):
+def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at=None, slow=False):
     end = epoch(u.get("closed_at") or u.get("collected_at")) if tab == "Ended" else now
     t0 = epoch(u.get("started"))
     el = fmt_dur(end - t0) if end is not None and t0 is not None else "?"
@@ -452,8 +474,8 @@ def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at
     if (rep or {}).get("limit"): d.append(f"Stopped:   {rep['limit']}")
     if u.get("item"): d.append(f"Item:      {clean(u['item'])}")
     pc = progress_cell((rep or {}).get("progress"), state in ("finished", "closed:DONE"))
-    return Row(u["name"], (u["name"], state + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el, pc),
-               "warn" if stale and state_style(state) in ("ok", "dim") else state_style(state), [x for x in d if x], stale)
+    return Row(u["name"], (u["name"], state_words(state, note) + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el, pc),
+               "warn" if slow or stale and state_style(state) in ("ok", "dim") else state_style(state), [x for x in d if x], stale, state=state)
 
 BACKLOG_ORDER = {"ready": 0, "relaunch": 1, "no-brief": 2, "open-unit": 3, "waiting": 4, "held": 5, "owner": 6}
 
@@ -543,12 +565,12 @@ def derive(view, now, interval):
     def host_stale(u): return stale("herdr") if u.get("via") == "herdr" else stale(f"host:{u.get('host')}")
     for u in units or []:
         rep = (S("reports-open").data or {}).get(u["name"], NOT_READ)
-        tab, state, note = classify(u, ps, ag, rep, lv, (ck.get("strand") or {}).get(u["name"]))
+        tab, state, note, slow = classify(u, ps, ag, rep, lv, (ck.get("strand") or {}).get(u["name"]), now)
         t0 = epoch(u.get("started")); wait = after.get(u.get("host"), 1800)
         if state == "starting" and t0 is not None and now - t0 > wait:   # a launch takes minutes, never this long: it was interrupted
             state, note = "starting STALLED", f"its launch began {fmt_dur(now - t0)} ago and never finished (interrupted?): janus check says why; close or relaunch it"
         rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or (host_stale(u) and state_word(state) != "stranded"), rep,
-                                  tools.get(u.get("model")), cards.get(u["name"]), S("reports-open").ok_at))
+                                  tools.get(u.get("model")), cards.get(u["name"]), S("reports-open").ok_at, slow))
         if tab == "Active" and u.get("host"):
             c = live.setdefault(u["host"], [0, 0, 0])
             if state in ("working", "idle", "blocked"): c[0] += 1
@@ -557,10 +579,10 @@ def derive(view, now, interval):
     names = {u["name"] for u in units or []}
     for u in closed or []:
         if u["name"] in names: continue   # reopened or relaunched: the open unit is the truth
-        rep = (S("reports-closed").data or {}).get(u["name"], NOT_READ); tab, state, note = classify(u, ps, None, rep)
+        rep = (S("reports-closed").data or {}).get(u["name"], NOT_READ); tab, state, note, slow = classify(u, ps, None, rep, now=now)
         rows["Ended"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports-closed"), rep, read_at=S("reports-closed").ok_at))
-    rows["Active"].sort(key=lambda r: (PRIO.get(state_word(r.cells[1]), 8), r.cells[0].lower()))
-    rows["Ended"].sort(key=lambda r: (r.cells[1].startswith("closed"), r.cells[0].lower()))   # ended and waiting to be collected first
+    rows["Active"].sort(key=lambda r: (PRIO.get(state_word(r.state), 8), r.cells[0].lower()))
+    rows["Ended"].sort(key=lambda r: (r.state.startswith("closed"), r.cells[0].lower()))   # ended and waiting to be collected first
     if S("backlog").data is not None:
         rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"), ck.get("lead", ()))
         k = {}
@@ -606,7 +628,7 @@ def overview_rows(m, rows, hand, now, view):
     if h.get("at"): cp += f"  (handoff updated {fmt_dur(now - h['at'])} ago)"
     R.append(Row("o:checkpoint", ("Checkpoint", cp), "ok" if h.get("pct") is not None else "dim", [cp]))
     by = {}
-    for r in rows["Active"]: k = state_word(r.cells[1]); by[k] = by.get(k, 0) + 1
+    for r in rows["Active"]: k = state_word(r.state); by[k] = by.get(k, 0) + 1
     known = m.counts.get("Active") is not None
     work = (", ".join(f"{v} {k}" for k, v in sorted(by.items(), key=lambda kv: PRIO.get(kv[0], 8))) or "nothing active") if known else "unknown"
     R.append(Row("o:work", ("Work", f"{work}; {m.counts.get('Ended') if m.counts.get('Ended') is not None else '?'} ended or closed"), "", [work]))
@@ -763,8 +785,11 @@ HELP = ["janus monitor: read-only (it writes nothing and runs nothing that does)
         "and their backlog items 'relaunch' (janus fill starts them on a host that answers, from their report and synced changes).",
         "GONE / RETURNING: the owner's mark (janus hosts --mark HOST gone|returning|clear): gone relaunches now, returning waits.",
         "Hosts given up on are dimmed and listed last; they count as 'hosts down', not as source problems.",
-        "Units: stranded:<verdict> (not relaunched yet), stranded-><unit> (relaunched as that unit), starting STALLED (a launch",
-        "that never finished). Any key closes this help."]
+        "Units: agent working (its agent is running); waiting for job <host>:<id> (its agent stopped while its build or test runs:",
+        "janus resumes it when the job finishes; shown with the job's state, how long it has run and how long that class usually",
+        "takes, in warning colour past 3x); waiting for a free agent slot (its run is queued); agent stopped (its turn ended with no",
+        "job and no verdict); launching / launch stuck; stranded:<verdict> or stranded-><unit> (its host is gone: relaunched as",
+        "that unit, or what janus does with it). Enter shows the full reason. Any key closes this help."]
 
 def filtered(model, text):
     """The model with every tab's rows reduced to those whose cells or details hold text (counts and machines stay whole)."""
