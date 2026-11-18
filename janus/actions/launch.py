@@ -481,6 +481,12 @@ def settle_launch(bd, u, snap):
     if cur is None: raise Err(f"{u['name']}: its record was closed while it started; nothing recorded (stop its agent: janus cancel {u['name']})")
     return {**cur, **{k: v for k, v in u.items() if snap.get(k) != v}}
 
+def release_unqueued(cfg, mc, u):
+    """A failed launch's budget reservation, released (done row, cost 0) when its run was never queued: nothing can spend it, and
+    the record that would name it is closed or left starting. A queued run may be running: it is left for collect or reconcile.
+    2026-11-18: three launches that failed between the reservation and the queue held $54 as running for days."""
+    if u.get("run") and u.get("task") is None: ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], u["name"], 0, "launch-failed")
+
 def cmd_launch(cfg, a):
     name = a.unit
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
@@ -696,9 +702,13 @@ def cmd_launch(cfg, a):
     except Err as ex:
         if isinstance(ex, LockLost): raise   # the launch is done, the record stays starting + busy: check names it interrupted
         if not cfg.run.dry:
+            release_unqueued(cfg, mc, u)
             u = settle_launch(bd, u, snap); u["via"] = "failed"; u.pop("busy", None); bd.save(u); bd.comment(u["id"], f"{ts()} launch failed: {ex}")
             bd.run("close", u["id"], "--reason", "launch failed")
             if u.get("tab"): herdr("tab", "close", u["tab"])
+        raise
+    except Exception:   # a crash: the record stays starting + busy (check names it interrupted); a budget never queued is released
+        if not cfg.run.dry: release_unqueued(cfg, mc, u)
         raise
     if cfg.run.dry: return
     u = settle_launch(bd, u, snap); u.pop("busy", None)

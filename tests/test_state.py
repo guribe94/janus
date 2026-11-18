@@ -166,7 +166,9 @@ class State(unittest.TestCase):
         if fail:   # the failing launch blocks on the same hook, then pueue refuses
             X0 = X
             def X(cfg, h, cmd, **k):
-                if "pueue add" in cmd: inside.set(); release.wait(30); recs["1"] = {**recs["1"], "note": "kept"}; return 1, "", "boom"
+                if "pueue add" in cmd:
+                    inside.set(); release.wait(30); recs["1"] = {**recs["1"], "note": "kept"}
+                    return (1, "", "boom") if fail is True else (0, "no task id\n", "")   # garbled: the launch crashes after its reservation
                 return 0, "", ""
         hs = {"here": {"name": "here", "ok": True, "avail_mb": "64000", "disk_gb": "100", "load": "0"}}
         a = argparse.Namespace(unit="u", kind="implement", tier="normal", host="here", model="m", brief=None, cwd=str(d), budget=0.5, test_host=None,
@@ -207,6 +209,14 @@ class State(unittest.TestCase):
         self.assertTrue(err and "pueue add failed" in str(err[0]), err)
         r = recs["1"]; self.assertEqual((r["via"], r.get("note")), ("failed", "kept")); self.assertNotIn("busy", r)
         self.assertIn(("close", "1", "--reason", "launch failed"), calls); self.assertIn("launch-failed", ledger, "the budget run was not released")
+
+    def test_a_launch_that_crashes_before_its_run_is_queued_releases_the_budget(self):
+        """Catches (2026-11-18): a launch that failed after reserving its budget and before its task was queued (any failure but a
+        refused pueue add, or a crash) left the ledger row running for good: $54 held as spend nobody made, a ledger finding."""
+        out, recs, ledger, seen, calls, err = self._two_phase("launch", fail="garbled")
+        self.assertTrue(err and isinstance(err[0], ValueError), err)
+        self.assertIn("launch-failed", ledger, "the budget run was not released")
+        self.assertEqual(recs["1"]["via"], "starting")   # a crash leaves the record starting + busy: check names it interrupted
 
     def test_a_slow_close_does_not_hold_the_writer_lock_and_collect_refuses_a_closing_unit(self):
         """Catches ISSUES 54 (close removed the host copy under the lock): an ack waited for the host. The unit is marked closing
