@@ -108,6 +108,20 @@ def write_cap(cfg, hn, h):
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True); atomic_write(Path(rd) / "cap.sh", cap_lib(cfg, hn, h)); return 0, "", ""
     d = qp(rd); return hrun(h, f"mkdir -p {d} && cat > {d}/.cap.sh.$$ && mv -f {d}/.cap.sh.$$ {d}/cap.sh", inp=cap_lib(cfg, hn, h))
 
+def tend_cap(cfg, hs, log):
+    """Rewrite each reachable host's runs/cap.sh when the rule janus renders for it differs from the one last written there (a
+    new release, or a [capacity] or [hosts] change): jobs waiting for admission re-read it at their next poll. Without this a rule
+    change reached a host only with its next launch or job, and a host paused by the old rule took none."""
+    done = cfg.jget("cap-written.json"); new = dict(done)
+    for hn, h in cfg.hosts.items():
+        if not (hs.get(hn) or {}).get("ok"): continue
+        digest = hashlib.sha1(cap_lib(cfg, hn, h).encode()).hexdigest()
+        if done.get(hn) == digest: continue
+        with cfg.unlocked(): rc, _, e = write_cap(cfg, hn, h)
+        if rc == 0: new[hn] = digest; log(f"capacity rule rewritten on {hn}")
+        else: log(f"capacity rule not written on {hn}: {e.strip()[:120]}")
+    if new != done: cfg.jput("cap-written.json", new)
+
 def ctr(h):
     """A podman host's container settings ([hosts.<h>.container]): image, mount (host dir, default the host's root), mount_at
     (default /f), args, usb_args, usb_lock, host_dirs, name_prefixes. Its --cpus is the job's admitted cores."""

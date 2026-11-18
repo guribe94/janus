@@ -5,7 +5,7 @@ orchestrator is woken when the set of urgent observations CHANGES, never repeate
 (ready backlog that fits, ready items without a brief), which wakes it again after the cooldown while it waits."""
 import argparse, os, threading, traceback
 from janus.actions.backlog import cmd_fill
-from janus.actions.jobs import cancel_job, orphan_jobs, tend_thrash
+from janus.actions.jobs import cancel_job, orphan_jobs, tend_cap, tend_thrash
 from janus.actions.launch import close_tab, new_tab, wait_shell
 from janus.beads import Beads
 from janus.units import orphan_tabs
@@ -98,6 +98,7 @@ def watch_pass(cfg, log, pre=None):
     step("tend_parked", tend_parked, cfg, hs, units, log, pre[1] if pre else None)   # park, and resume when the jobs finished
     step("tend_thrash", tend_thrash, cfg, hs, units, log)   # shared hosts that thrash: stop and re-queue this project's newest job
     step("tend_tidy", tend_tidy, cfg, hs, units, log)     # what tidy can reclaim, for check (tidy:<n>, disk:<host>)
+    step("tend_cap", tend_cap, cfg, hs, log)     # every host's admission rule as this release and config render it
     step("sync", outside, cfg, board_sync, cfg)   # push what this pass wrote to every host
     for r, why in step("orphan_jobs", orphan_jobs, cfg, hs, units) or []:   # nothing whose owner is gone keeps running or waiting
         try:

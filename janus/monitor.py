@@ -381,7 +381,8 @@ def state_word(st):
 
 def state_style(st):
     w = state_word(st)
-    return "bad" if w in ("failed", "blocked") or st == "ended:BLOCKED" or st == "ended:FAILED" else "ok" if w in ("working", "finished") else "dim" if w in ("closed", "stranded") else "warn"
+    return ("bad" if w in ("failed", "blocked") or st == "ended:BLOCKED" or st == "ended:FAILED" else "ok" if w in ("working", "finished")
+            else "dim" if w in ("closed", "stranded") else "" if w in ("parked", "queued") else "warn")   # waiting is normal; a slow job warns
 
 def job_words(ps, ref, now):
     """(what job <host>:<task> is doing, in words; whether it runs past its class's usual time): from jobs.job_progress."""
@@ -396,6 +397,7 @@ def job_words(ps, ref, now):
 def state_words(state, note):
     """The STATE cell: what is happening, in words (the state code stays on the row for sorting and counting)."""
     if state.startswith("starting STALLED"): return "launch stuck: " + note
+    if state_word(state) in ("stranded", "host-down"): return note   # its host and what happens to it
     return {"working": "agent working", "idle": "agent stopped: its turn ended with no job and no verdict", "blocked": "agent blocked: it asks a question",
             "queued": f"waiting for a free agent slot {note}", "parked": note, "unknown": f"unknown: {note}", "starting": "launching",
             "closing": "closing"}.get(state, state)

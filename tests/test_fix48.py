@@ -201,3 +201,15 @@ class JobProgress(unittest.TestCase):
         st, _, since, usual = janus.job_progress(hs, "h:8"); self.assertEqual(st, "admission"); self.assertIsNone(since)   # held: timed from its enqueue, which pueue did not give
         st, _, since, _ = janus.job_progress(hs, "h:7"); self.assertEqual((st, int(since)), ("queued", t0 - 60))
         self.assertEqual(janus.job_progress(hs, "h:5")[0], "gone"); self.assertEqual(janus.job_progress({"h": {"ok": False}}, "h:9")[0], "unknown")
+
+
+class CapacityRuleFollowsReleases(unittest.TestCase):
+    def test_the_watcher_rewrites_a_hosts_rule_when_janus_or_its_config_changes_it(self):
+        """Catches: a new release (or a [capacity] change) reached a host's runs/cap.sh only with its next launch or job, so a
+        host paused by the old rule took no work and stayed paused."""
+        d, cfg = project(); hs = {"here": {"ok": True}}; log = []; f = Path(cfg.hosts["here"]["_rd"]) / "cap.sh"
+        janus.tend_cap(cfg, hs, log.append); self.assertTrue(f.is_file()); self.assertEqual(len(log), 1)
+        janus.tend_cap(cfg, hs, log.append); self.assertEqual(len(log), 1)            # the same rule: not written again
+        cfg.capc["psi_pause"] = 20; janus.tend_cap(cfg, hs, log.append)
+        self.assertEqual(len(log), 2); self.assertIn("PSIP=20", f.read_text())
+        janus.tend_cap(cfg, {"here": {"ok": False}}, log.append); self.assertEqual(len(log), 2)   # a host that does not answer: next pass
