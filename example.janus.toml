@@ -179,7 +179,7 @@ age_weight = 1           # waiting jobs go shortest expected run time first, min
 expect_s = 600           # the expected run time of a job class with no history
 broad_min = 30           # a jobs-lane run whose class takes this many minutes (median) is whole-suite: it needs --broad <reason>
 overrun_x = 3            # check flags a job running this many times its class's expected run time (overrun:<host>:<job>)
-discover_h = 24          # janus check discovers each host again after this many hours (janus hosts --refresh: now)
+discover_h = 1           # janus check discovers each host again after this many hours: a new login or tool is seen within it (janus hosts --refresh: now)
 down_after_min = 30      # a host that has not answered this long is stranded: janus fill relaunches its units' items on hosts that answer
                          # (per host too; janus hosts --mark H gone: now, --mark H returning: never while it is down)
 # broad_patterns = ['\bcargo\s+test\b.*\s--workspace\b']   # regexes of whole-suite commands (default: cargo ... --workspace/--all, bare pytest)

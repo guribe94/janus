@@ -25,6 +25,17 @@ class Discovery(unittest.TestCase):
         self.assertEqual(janus.capv(cfg, cfg.hosts["here"], "cores"), os.cpu_count())   # discovered, not assumed
         cfg.hosts["here"]["cores"] = 3; self.assertEqual(janus.capv(cfg, cfg.hosts["here"], "cores"), 3)   # janus.toml still wins
 
+    def test_check_sees_a_new_login_within_the_hour(self):
+        """Catches: a login made on a host (owner 2026-11-18: claude on a build host) unseen for a day, until someone said so."""
+        from unittest import mock
+        d, cfg = project(); seen = []
+        stub = lambda n, h: seen.append(n) or {"tools": ["claude"], "logins": ["claude"], "at": int(time.time())}
+        with mock.patch.object(janus, "discover", stub):
+            cfg.jput(janus.FACTS, {"here": {"tools": ["claude"], "logins": [], "at": time.time() - 1800}}); janus.host_facts(cfg, "stale")
+            self.assertEqual(seen, [])                                           # half an hour old: kept
+            cfg.jput(janus.FACTS, {"here": {"tools": ["claude"], "logins": [], "at": time.time() - 7200}})
+            self.assertEqual(janus.host_facts(cfg, "stale")["here"]["logins"], ["claude"]); self.assertEqual(seen, ["here"])
+
 def facts(os_, arch, cores=8, mem_mb=8192, tools=(), devices=()):
     return {"os": os_, "arch": arch, "cores": cores, "mem_mb": mem_mb, "disk_gb": 100, "tools": list(tools), "logins": [], "devices": list(devices),
             "features": sorted({os_, arch, *tools}), "at": 2**40}
