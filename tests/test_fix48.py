@@ -100,12 +100,13 @@ class TidyKeepsAnOpenUnitsOwnTrees(unittest.TestCase):
         (worktrees were matched to open units by exact name only)."""
         d, cfg = project('\n[landing]\nbranch = "main"\n[paths]\nworktrees = "wts"\n'); r = d / "repo"; r.mkdir(); w = d / "wts"; w.mkdir()
         git(r, "init", "-q", "-b", "main"); (r / "a").write_text("1\n"); git(r, "add", "a"); git(r, "commit", "-qm", "base")
-        for n in ("u1-proof", "u10", "gone"): git(r, "worktree", "add", "-q", "-b", f"wk/{n}", str(w / n))
+        for n in ("u1-proof", "u10", "gone", "u1-r3", "u1-r5"): git(r, "worktree", "add", "-q", "-b", f"wk/{n}", str(w / n))
         cfg.run.all_units = {"u1": {"status": "open"}}; kept = []
         with mock.patch.object(janus, "ws_id", lambda cfg, create=False: "w1"):
-            P = janus.tidy_plan(cfg, [{"name": "u1", "cwd": str(d)}], {}, {}, kept)
-        self.assertEqual(sorted(Path(t).name for k, t, _ in P if k == "worktree"), ["gone", "u10"], "an open unit's own proof tree is offered for removal")
-        self.assertIn("u1-proof", [Path(t).name for t, _ in kept])
+            P = janus.tidy_plan(cfg, [{"name": "u1", "cwd": str(d)}, {"name": "u1-r5", "cwd": str(d)}], {}, {}, kept)
+        # 2026-11-18: u1-r3, a closed relaunch of the open (stranded) u1, was kept as u1's own tree: four 700 MB trees on a full disk
+        self.assertEqual(sorted(Path(t).name for k, t, _ in P if k == "worktree"), ["gone", "u1-r3", "u10"], "an open unit's own proof tree is offered for removal")
+        self.assertIn("u1-proof", [Path(t).name for t, _ in kept]); self.assertIn("u1-r5", [Path(t).name for t, _ in kept])
 
 
 class LaunchPlacementNeedsGit(unittest.TestCase):

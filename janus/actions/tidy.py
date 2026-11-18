@@ -26,8 +26,9 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
         if not (d / ".git").is_file() or d.resolve() in used or d.resolve() == cfg.root.resolve(): continue
         keep = (lambda why: kept.append((str(d), why))) if kept is not None else (lambda why: None)
         br = sh(["git", "-C", str(d), "symbolic-ref", "-q", "--short", "HEAD"])[1].strip()
-        # row 235: a tree an open unit made for its own jobs (<unit>-proof) is that unit's too
-        own = next((u for n in (d.name, br) for u in sorted(names) if n == u or n.startswith(u + "-")), None)
+        # row 235: a tree an open unit made for its own jobs (<unit>-proof) is that unit's too; a relaunch's tree (<unit>-r<N>,
+        # relaunch_name) is the relaunch's own, never its stranded original's (2026-11-18: closed relaunches kept on a full disk)
+        own = next((u for n in (d.name, br) for u in sorted(names) if n == u or n.startswith(u + "-") and not re.fullmatch(r"-r\d+", n[len(u):])), None)
         if own: keep(f"open unit {own}'s worktree (its folder or branch has, or starts with, the unit's name)"); continue
         rc, o, e = sh(["git", "-C", str(d), "status", "--porcelain", "--ignore-submodules=none"])
         if rc or o.strip(): keep(f"{len(o.splitlines())} uncommitted change(s)" if not rc else "git status failed"); continue
