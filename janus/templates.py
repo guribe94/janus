@@ -136,7 +136,7 @@ res=- $CPJ $CAPMB - untracked $j"
   done
 }
 cap_measure() {  # PSI (macOS: 100 at the kernel's critical level, else 0; MEM names the level), LOAD (1 min), DF (GB free in RD)
-  if [ "$(uname)" = Darwin ]; then   # 2026-11-18: warn (compressed memory, some swap: everyday on a 16 GB Mac) paused every launch
+  if [ "$(uname)" = Darwin ]; then   # warn (compressed memory, some swap) is everyday on a Mac: only critical pauses
     case $(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) in 4) PSI=100; MEM=critical;; 2) PSI=0; MEM=warn;; *) PSI=0; MEM=normal;; esac
     LOAD=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
   else

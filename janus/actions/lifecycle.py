@@ -4,7 +4,7 @@ import ast, contextlib, os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import (collect_job, job_of, job_state, patch_scope, patch_scope_desc, patch_scope_sh, recorded_jid, runs_dir, save_task_log,
     task_rc, task_status, unit_jobs)
-from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken, tool_argv
+from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken, put_script, tool_argv
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
 from janus.branch import published_contains
@@ -17,7 +17,7 @@ from janus.project import project_id, tag, unit_tmux
 from janus.probe import host_liveness, probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
-from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, REPORT_SEED, report_path, unit_runs, unit_spent, unit_state,
+from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, reopened, report_path, unit_runs, unit_spent, unit_state,
     verdict, waiting_line_jobs)
 
 # Agents never pay to wait. An agent submits its builds and tests detached (`janus run --detach`, or its lane runner's
@@ -536,19 +536,18 @@ class NoBudget(Err):
     """A resume refused because the unit's own budget cannot pay for it: the unit becomes resumable (item 7)."""
 
 def reopen_report(cfg, u):
-    """A unit resumed to do more: a final verdict on its report's line 1 goes back to PENDING where its agent writes the report
-    (here, or on its host: the next sync would bring the old line back), as launch does for a resumed report. 2026-11-18: a
-    resumed unit read DONE from its old line 1 until its agent rewrote it."""
+    """A unit resumed to do more: a final verdict on its report's line 1 goes back to PENDING (units.reopened) where its agent
+    writes the report: here, and on its host, or the next sync would bring the old line back."""
     p = report_path(cfg, u)
     try:
-        t = p.read_text().split("\n", 1)
-        if FINAL_LINE.match(t[0]): atomic_write(p, REPORT_SEED + "\n" + (t[1] if len(t) > 1 else ""))
+        t = reopened(p.read_text())
+        if t is not None: atomic_write(p, t)
     except OSError: pass
     h = cfg.hosts[u["host"]]
     if not h.get("local"):
-        X(cfg, h, f"sed -i -E '1s/^VERDICT: *(DONE|BLOCKED|FAILED).*$/{REPORT_SEED}/' {qp(h['root'])}/out/{u['name']}/REPORT.md 2>/dev/null; true")
-
-FINAL_LINE = re.compile(r"VERDICT:\s*(DONE|BLOCKED|FAILED)\b")
+        rp = f"{h['root']}/out/{u['name']}/REPORT.md"; rc, o, _ = hrun(h, f"cat {qp(rp)}")
+        t = reopened(o) if rc == 0 else None
+        if t is not None: put_script(cfg, h, rp, t, "644")
 
 def resume_unit(cfg, u, msg, budget=None):
     """Continue the unit's own agent session with msg (see above). budget: a new budget for this run (`janus resume --budget`,

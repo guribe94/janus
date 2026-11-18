@@ -241,7 +241,10 @@ class Findings(Base):
         self.down("far", 10); F = dict(janus.host_findings(self.cfg, hs, self.w.units))
         self.assertIn("units there wait", F["host:far"]); self.assertIn("after 30 min", F["host:far"])
         self.down("far", 45); F = dict(janus.host_findings(self.cfg, hs, self.w.units))
-        self.assertIn("stranded: its units no longer cover their items; relaunched: s1->s1-r2; awaiting relaunch: s2 (janus fill); not relaunched by janus fill (no backlog item of its own, or another unit's relaunch covers it): s4, s5 (janus launch <new> --resume-of <unit>, or close it); its item closed (close it): s6; finished there, not relaunched (land or close them by their verdict): s3", F["host:far"])
+        self.assertIn("stranded: its units no longer cover their items; relaunched: s1->s1-r2; awaiting relaunch: s2 (janus fill); "
+                      "finished there: s3 (land or close it by its verdict); its item is closed: s6 (close it); "
+                      "another unit covers its item: s5 (close it, or relaunch it by hand: janus launch <new> --resume-of <unit>); "
+                      "no backlog item of its own: s4 (relaunch it by hand (janus launch <new> --resume-of <unit>) or close it)", F["host:far"])
         self.mark("far", "gone"); F = dict(janus.host_findings(self.cfg, hs, self.w.units)); self.assertIn("janus close <unit> --force", F["host:far:gone"])
         self.cfg.jput("host-marks.json", {}); self.cfg.jput("hosts.json", {})
         F = dict(janus.host_findings(self.cfg, dict(hs, far=host_probe(name="far")), self.w.units))

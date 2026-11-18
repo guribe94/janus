@@ -4,8 +4,7 @@ agent's brief header (tests to write, tests to run), the orchestrator's session 
 codes), the whole-suite guard (janus run and a remote unit's lane) and the review gate (check's review:<unit>, janus land).
 
 The level: a brief's `RIGOR:` line or `janus launch --rigor` (recorded on the unit), else `[rigor] level` in janus.toml, else
-`lean`. Owner 2026-11-17: land fast was asked for many times and not followed, because the rules were prose in several places
-that pulled against each other; the default is strict and small (low wall time, only high-signal tests, no bloat). A stricter
+`lean`: strict and small (low wall time, only high-signal tests, no bloat), one rule instead of prose in several places. A stricter
 rule in the project's own instructions (MEMORY.md, AGENTS.md) still binds."""
 from janus.context import Err
 from janus.units import all_units, verdict

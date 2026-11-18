@@ -19,7 +19,7 @@ from janus.rigor import DEFAULT, R, agent_text, check_level, level_of
 from janus.probe import probe_all, pueue, room
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import transcript_of
-from janus.units import REPORT_SEED, TAB_SEP, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
+from janus.units import REPORT_SEED, TAB_SEP, reopened, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
 
 def tool_argv(mc, prompt, session=None):
     """The coding client's command line for a launch, or for continuing `session`. Each form was read from the installed client's
@@ -433,8 +433,7 @@ def past_dialogs(read, send, status=None, tries=10):
     """Get a coding client past its startup dialogs (DIALOGS): None once its screen shows none, else why not. read(): the screen
     text (None: nothing to read, the caller's own check decides); send(*keys); status(): the agent's status where the pane tool
     reports one (herdr). Without a status (tmux on another host) the screen must settle, non-empty and the same on two reads, so
-    a dialog drawn a moment after the start is still seen. 2026-11-18: two agents on another host sat at the trust prompt since
-    launch: only herdr panes were checked, and a tmux session that existed read as running."""
+    a dialog drawn a moment after the start is still seen."""
     last = hit = None
     for _ in range(tries):
         txt = read()
@@ -513,8 +512,7 @@ def settle_launch(bd, u, snap):
 
 def release_unqueued(cfg, mc, u):
     """A failed launch's budget reservation, released (done row, cost 0) when its run was never queued: nothing can spend it, and
-    the record that would name it is closed or left starting. A queued run may be running: it is left for collect or reconcile.
-    2026-11-18: three launches that failed between the reservation and the queue held $54 as running for days."""
+    the record that would name it is closed or left starting. A queued run may be running: it is left for collect or reconcile."""
     if u.get("run") and u.get("task") is None: ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], u["name"], 0, "launch-failed")
 
 def cmd_launch(cfg, a):
@@ -593,8 +591,8 @@ def cmd_launch(cfg, a):
     # unit records it, so check and the Stop hook read that report.
     report = resume_report(cfg, a, brief); seed = None if report else seed_report(cfg, a)
     if report and report.exists():
-        t = report.read_text().split("\n", 1)
-        if t[0].startswith("VERDICT:") and "PENDING" not in t[0] and not cfg.run.dry: atomic_write(report, "VERDICT: PENDING\n" + (t[1] if len(t) > 1 else ""))
+        r = reopened(report.read_text())
+        if r is not None and not cfg.run.dry: atomic_write(report, r)
     if getattr(a, "new_worktree", None):   # item 16b (finding 12): make the tree only now, after every refusal check
         ref = getattr(a, "from_ref", None) or cfg.c.get("landing", {}).get("branch") or "main"
         if cfg.run.dry: say(f"+ git -C {a.new_worktree} worktree add -b {name} {cwd} {ref}")

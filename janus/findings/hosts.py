@@ -3,7 +3,7 @@ acts, tidy and disk. Observations only: each clears when the condition does; not
 import functools, time
 from janus.actions.jobs import LANES, job_of, lane_age, lane_stall, lane_wait, orphan_jobs, slots
 from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
-from janus.backlog import backlog_issues, norm_item, ready_work, stranded_cover, unit_items
+from janus.backlog import STRANDED, backlog_issues, ready_work, stranded_status
 from janus.board import board_script
 from janus.msgboard import STALE_MIN
 from janus.cap import build_room, capv, host_cap
@@ -133,24 +133,18 @@ def host_findings(cfg, hs, units):
                       + "; once each is relaunched (janus fill) or not needed, janus close <unit> --force (its copy there is lost)"))
         if not p["ok"]:
             back = f"; janus fill relaunches their items elsewhere after {capv(cfg, cfg.hosts[n], 'down_after_min'):g} min (janus hosts --mark {n} returning keeps them waiting, gone relaunches now)"
-            rel = [u["name"] + "->" + u["relaunched"] for u in there if u.get("relaunched")]; wait = [u["name"] for u in there if not u.get("relaunched")]
-            fin = [x for x in wait if verdict(cfg, byname[x])]; todo = [x for x in wait if x not in fin]   # finished: never relaunched, only closed
-            # fill relaunches an item from the first unit stranded_cover names for it: any other unfinished unit waits for nothing
-            lead, shut, closed_item = set(), set(), []
-            if st in ("stranded", "gone") and todo:   # an item closed in beads is never relaunched: its unit only needs closing
+            wait = [u["name"] for u in there if not u.get("relaunched")]
+            sts = {}
+            if st in ("stranded", "gone") and there:   # what happens to each unit there: backlog.stranded_status, the rule fill acts on
                 try: iss = backlog_issues(cfg)
-                except Err: iss = {}
-                shut = {norm_item(r[8:]) for r, i in iss.items() if i.get("status") == "closed"}
-                lead = {v[0]["name"] for k, v in stranded_cover(cfg, units, iss).items() if k not in shut}
-                closed_item = [x for x in todo if x not in lead and (its := unit_items(cfg, [byname[x]], iss)) and its <= shut]
-            man = [x for x in todo if x not in lead and x not in closed_item]
+                except Err: iss = None
+                sts = stranded_status(cfg, units, iss)
+            of = lambda k: [x["name"] + (f"->{x['relaunched']}" if k == "relaunched" else "") for x in there if sts.get(x["name"]) == k]
+            parts = [f"{STRANDED[k][0]}: {', '.join(of(k))} ({STRANDED[k][1]})" for k in ("finished", "item-closed", "behind", "no-item") if of(k)]
             F.append((f"host:{n}", f"host {n} unreachable since {ts(un.get(n))} ({p['err']}); "
                       + ({"down": f"units there wait: {', '.join(wait) or 'none'}" + back, "returning": f"marked returning: its units wait for it: {', '.join(wait) or 'none'}"}.get(st)
-                         or f"{st}: its units no longer cover their items; relaunched: {', '.join(rel) or 'none'}; awaiting relaunch: {', '.join(x for x in todo if x in lead) or 'none'} (janus fill)"
-                            + (f"; not relaunched by janus fill (no backlog item of its own, or another unit's relaunch covers it): {', '.join(man)} "
-                               "(janus launch <new> --resume-of <unit>, or close it)" if man else "")
-                            + (f"; its item closed (close it): {', '.join(closed_item)}" if closed_item else "")
-                            + (f"; finished there, not relaunched (land or close them by their verdict): {', '.join(fin)}" if fin else ""))
+                         or f"{st}: its units no longer cover their items; relaunched: {', '.join(of('relaunched')) or 'none'}; awaiting relaunch: {', '.join(of('lead')) or 'none'} (janus fill)"
+                            + "".join("; " + x for x in parts))
                       + "; place new work elsewhere (unstarted jobs there: cancel and re-queue on another host)"))
             continue
         for u in there:   # it answers again while a relaunch of its unit is open: the work exists twice

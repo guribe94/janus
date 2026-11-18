@@ -33,6 +33,13 @@ def unit_state(u, ps, agents):
 
 REPORT_SEED = "VERDICT: PENDING"   # what launch writes as a new unit's report; the agent's first write replaces it
 
+def reopened(text):
+    """text with a final verdict on its line 1 put back to the seed (PENDING), or None when line 1 holds none: a resumed unit's
+    report, before its agent writes it again (launch, resume)."""
+    t = text.split("\n", 1)
+    if not t[0].startswith("VERDICT:") or NONFINAL.search(t[0]): return None
+    return REPORT_SEED + "\n" + (t[1] if len(t) > 1 else "")
+
 def report_untouched(cfg, u):
     """The unit's report is still the seed launch wrote: its agent has not written a word (a prompt it sits at, a crash)."""
     try: return report_path(cfg, u).read_text().strip() == REPORT_SEED
@@ -61,8 +68,8 @@ def verdict(cfg, u):
     # Finding 1 (fix-install6): ONE reader for both readers -- the park jobs come from park_jobs, which reads the ids on the park
     # line or on the line(s) after it (WAIT_RX's `\s*` spans the line break), so a unit parked with its ids on the next line is
     # judged parked here exactly as waiting_line_jobs yields them.
-    # 2026-11-18: a park whose jobs janus has all handled (it resumed the agent on them) is history, not a park: a report that
-    # keeps its verdict on line 1 above a checkpoint log (as the brief asks) read as parked forever, its DONE never seen.
+    # A park whose jobs janus has all handled (it resumed the agent on them) is history, not a park: a report may keep its
+    # verdict on line 1 above a checkpoint log, as the brief asks.
     vi = next((i for i in range(len(t) - 1, -1, -1) if t[i].startswith("VERDICT:")), None)
     pi, pj = park_jobs(cfg, text)
     if pi is not None and (vi is None or pi > vi) and not set(pj) <= set(u.get("handled_jobs", [])): return None
@@ -162,8 +169,7 @@ def force_close_refusal(cfg, u, units):
     """Why `janus close <u> --force` is refused, else None: the one rule close and the guard hook share. A tree of its own is
     refused only when it is a main checkout with linked worktrees. A unit with no tree of its own (the project root, or another
     open unit's tree) is allowed: close never touches that tree, and it keeps the checks that matter there (its agent stopped,
-    its remote copy collected) except on a host the owner marked gone, whose copy that mark declares lost. 2026-11-18: --force
-    was refused for every such unit, so four units of a gone host could not be closed at all."""
+    its remote copy collected) except on a host the owner marked gone, whose copy that mark declares lost."""
     if own_tree(cfg, u, units) and main_checkout(Path(u["cwd"])): return f"{u['cwd']} is a main checkout with linked worktrees"
     return None
 
@@ -258,7 +264,7 @@ def unit_any(cfg, name):
     except Err: u = None
     return u or all_units(cfg).get(name)
 
-__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "REPORT_SEED", "report_untouched", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
+__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "REPORT_SEED", "reopened", "report_untouched", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
 
 
 def no_remote_copy(u):

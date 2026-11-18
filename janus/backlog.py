@@ -147,8 +147,7 @@ def unit_items(cfg, units, iss=None):
 
 def holding_units(cfg, units):
     """The open units that hold their item: those not on a stranded host (probe.live_units), and a stranded host's units that
-    finished (a final VERDICT here) or were already relaunched once. 2026-11-17: a stranded unit whose report said DONE (its work
-    on main) was relaunched, the relaunch found nothing to do and was closed, and fill relaunched it again (r3, r5, r6 ...).
+    finished (a final VERDICT here) or were already relaunched once: relaunching those would redo done work over and over.
     Closing such a unit is the orchestrator's call; capacity still counts only live_units."""
     live = live_units(cfg, units); ids = {id(u) for u in live}
     return live + [u for u in units if id(u) not in ids and (u.get("relaunched") or verdict(cfg, u))]
@@ -166,6 +165,27 @@ def stranded_cover(cfg, units, iss=None):
     for u in sorted((u for u in units if id(u) not in ids), key=lambda u: (u.get("kind") == "review", -(u.get("started") or 0))):
         for k in unit_items(cfg, [u], iss):
             if k not in cov: out.setdefault(k, []).append(u)
+    return out
+
+STRANDED = {   # status -> (what is true, what to do): stranded_status's words, shown by the host finding and the monitor
+    "relaunched": ("relaunched", ""), "lead": ("janus fill relaunches its item on a host that answers", ""),
+    "finished": ("finished there", "land or close it by its verdict"), "item-closed": ("its item is closed", "close it"),
+    "behind": ("another unit covers its item", "close it, or relaunch it by hand: janus launch <new> --resume-of <unit>"),
+    "no-item": ("no backlog item of its own", "relaunch it by hand (janus launch <new> --resume-of <unit>) or close it")}
+
+def stranded_status(cfg, units, iss=None):
+    """{unit name: one of STRANDED} for each open unit on a host janus gave up on (probe.live_units leaves it out): the one rule
+    fill, the host finding and the monitor read. A unit that finished or was relaunched holds its item (holding_units); fill
+    relaunches an open item from the first unit stranded_cover names for it."""
+    live = {id(u) for u in live_units(cfg, units)}
+    lead = {id(v[0]) for v in stranded_cover(cfg, units, iss).values()}
+    shut = {norm_item(r[8:]) for r, i in (iss or {}).items() if i.get("status") == "closed"}
+    out = {}
+    for u in units:
+        if id(u) in live: continue
+        its = unit_items(cfg, [u], iss)
+        out[u["name"]] = ("relaunched" if u.get("relaunched") else "finished" if verdict(cfg, u) else "item-closed" if its and its <= shut
+                          else "lead" if id(u) in lead else "behind" if its else "no-item")
     return out
 
 def eligible_items(iss, ready_ids, cov, act, hold, blocked=None, held=None):

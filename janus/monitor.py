@@ -9,7 +9,7 @@ calls none of check, status, sync, handoff, writer lock, ack or wake code. Nothi
 effect is the probe's own scratch under /tmp on each host, which `janus capacity` already makes. Standard library only."""
 import contextlib, dataclasses, datetime, json, os, queue, re, signal, sys, threading, time
 from pathlib import Path
-from janus.backlog import LOG_LABELS, LOG_RX, checklist_line, checklist_totals, covered_items, eligible_items, item_actors, item_holds, norm_item, unit_items
+from janus.backlog import LOG_LABELS, LOG_RX, STRANDED, checklist_line, checklist_totals, covered_items, eligible_items, item_actors, item_holds, norm_item, stranded_status, unit_items
 from janus.beads import unit_record
 from janus.cap import capv
 from janus.board import board_dir
@@ -145,13 +145,15 @@ def collect_checklist(cfg, units, backlog):
     gone = stranded_hosts(cfg); by = {}   # item -> [(unit, host, stranded)]: who covers it, for the Backlog tab's HOST column and details
     for u in units:
         for k in unit_items(cfg, [u], iss): by.setdefault(k, []).append((clean(u["name"]), clean(u.get("host")) or "?", u.get("host") in gone))
-    if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(covered_items(cfg, units, iss)), "by": by}
+    strand = stranded_status(cfg, units, iss)   # the rule fill acts on, for the Active tab's text and the Backlog's relaunch rows
+    lead = sorted({k for u in units if strand.get(u["name"]) == "lead" for k in unit_items(cfg, [u], iss)})
+    if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(covered_items(cfg, units, iss)), "by": by, "strand": strand, "lead": lead}
     missing = None   # unknown while the backlog cannot be read
     if backlog is not None:
         items = eligible_items(iss, {i.get("id") for i in backlog["ready"]}, tot["cov"], item_actors(cfg, iss), item_holds(cfg, iss))
         ever = {u["name"] for u in units} | {u["name"] for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u}
         idx = brief_index(cfg); missing = [clean(it) for _, _, it, _ in sorted(items) if not usable_brief(cfg, it, idx, ever)]
-    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg), "done": tot["done"], "total": tot["total"], "by": by}
+    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg), "done": tot["done"], "total": tot["total"], "by": by, "strand": strand, "lead": lead}
 
 def collect_liveness(cfg):
     """{"live": {host: [up|down|stranded|returning|gone, down since]}, "after": {host: seconds}}: janus's own judgement of each host
@@ -335,6 +337,7 @@ class Row:
     detail: list = dataclasses.field(default_factory=list)
     stale: bool = False
     keys: tuple = ()        # the board messages one row stands for, when more than its key (a grouped [memory] change)
+    state: str = ""         # a unit row's state code (classify), which sorting and counting read; the STATE cell says it in words
 
 @dataclasses.dataclass
 class Model:
@@ -379,7 +382,7 @@ def state_style(st):
     w = state_word(st)
     return "bad" if w in ("failed", "blocked") or st == "ended:BLOCKED" or st == "ended:FAILED" else "ok" if w in ("working", "finished") else "dim" if w in ("closed", "stranded") else "warn"
 
-def classify(u, ps, agents, rep, live=None):
+def classify(u, ps, agents, rep, live=None, strand=None):
     """(tab, state, note) of one unit. Queued, parked, failed, closed and finished stay distinct, and a process that ended is never
     taken as success: only a report that ends VERDICT: DONE says finished; no verdict is 'ended:no-verdict'. live: janus's judgement
     of the hosts (collect_liveness): a unit on a stranded or gone host that does not answer now is 'stranded', whatever it was."""
@@ -391,7 +394,7 @@ def classify(u, ps, agents, rep, live=None):
     if hst in ("stranded", "gone") and (hst == "gone" or not (ps or {}).get(u.get("host"), {}).get("ok")):
         new = clean(u.get("relaunched")) or None
         return "Active", "stranded" + (f"->{new}" if new else f":{vw[:9]}" if vw else ""), \
-            (f"host {u.get('host')} is {hst}: " + (f"relaunched as {new}" if new else "its item is relaunched elsewhere by janus fill (not yet)")
+            (f"host {u.get('host')} is {hst}: " + (f"relaunched as {new}" if new else ": ".join(x for x in STRANDED[strand] if x) if strand in STRANDED else "what janus fill does with it is not read yet")
              + (f"; its last report copied here says {v}" if v else "; no verdict in the report copied here"))
     if via == "starting": return "Active", "starting", "launch has not finished"
     if u.get("closing"): return "Active", "closing", "a close is in progress"
@@ -454,14 +457,14 @@ def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at
 
 BACKLOG_ORDER = {"ready": 0, "relaunch": 1, "no-brief": 2, "open-unit": 3, "waiting": 4, "held": 5, "owner": 6}
 
-def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs", by=None):
+def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs", by=None, lead=()):
     """covered, missing: the checklist source's items live open units cover (their --item or brief ITEM: line; a unit on a stranded
     host covers nothing) and ready items without a usable brief, as collected (render reads no file); briefs: the configured briefs
     folder a missing brief is written in; by: item -> [(unit, host, stranded)] of every open unit that names it."""
     ready = {i.get("id") for i in data.get("ready", [])}; rows = []; by = by or {}
     gone = {n for v in by.values() for n, _, s in v if s}
     covered = set(covered) | {norm_item(u.get("item")) for u in units or [] if u.get("item") and u.get("name") not in gone}
-    strand = {k for k, v in by.items() if v and all(s for _, _, s in v)} - covered   # only units on hosts janus gave up on: fill relaunches it
+    strand = set(lead) - covered   # the items fill relaunches (backlog.stranded_status)
     nob = {norm_item(x) for x in missing or []}
     skip = {"unit", "instruction", "intent"}
     for i in data.get("items", []):
@@ -540,7 +543,7 @@ def derive(view, now, interval):
     def host_stale(u): return stale("herdr") if u.get("via") == "herdr" else stale(f"host:{u.get('host')}")
     for u in units or []:
         rep = (S("reports-open").data or {}).get(u["name"], NOT_READ)
-        tab, state, note = classify(u, ps, ag, rep, lv)
+        tab, state, note = classify(u, ps, ag, rep, lv, (ck.get("strand") or {}).get(u["name"]))
         t0 = epoch(u.get("started")); wait = after.get(u.get("host"), 1800)
         if state == "starting" and t0 is not None and now - t0 > wait:   # a launch takes minutes, never this long: it was interrupted
             state, note = "starting STALLED", f"its launch began {fmt_dur(now - t0)} ago and never finished (interrupted?): janus check says why; close or relaunch it"
@@ -559,7 +562,7 @@ def derive(view, now, interval):
     rows["Active"].sort(key=lambda r: (PRIO.get(state_word(r.cells[1]), 8), r.cells[0].lower()))
     rows["Ended"].sort(key=lambda r: (r.cells[1].startswith("closed"), r.cells[0].lower()))   # ended and waiting to be collected first
     if S("backlog").data is not None:
-        rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"))
+        rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"), ck.get("lead", ()))
         k = {}
         for r in rows["Backlog"]: w = state_word(r.cells[1]); k[w if w in ("owner", "held") else "agent"] = k.get(w if w in ("owner", "held") else "agent", 0) + 1
         if rows["Backlog"]: m.labels["Backlog"] = ", ".join(f"{k[x]} {x}" for x in ("agent", "owner", "held") if k.get(x))   # owner and held items are not queued agent work

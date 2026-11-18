@@ -27,7 +27,7 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
         keep = (lambda why: kept.append((str(d), why))) if kept is not None else (lambda why: None)
         br = sh(["git", "-C", str(d), "symbolic-ref", "-q", "--short", "HEAD"])[1].strip()
         # row 235: a tree an open unit made for its own jobs (<unit>-proof) is that unit's too; a relaunch's tree (<unit>-r<N>,
-        # relaunch_name) is the relaunch's own, never its stranded original's (2026-11-18: closed relaunches kept on a full disk)
+        # relaunch_name) is the relaunch's own, never its stranded original's
         own = next((u for n in (d.name, br) for u in sorted(names) if n == u or n.startswith(u + "-") and not re.fullmatch(r"-r\d+", n[len(u):])), None)
         if own: keep(f"open unit {own}'s worktree (its folder or branch has, or starts with, the unit's name)"); continue
         rc, o, e = sh(["git", "-C", str(d), "status", "--porcelain", "--ignore-submodules=none"])
@@ -110,8 +110,7 @@ OUT_KEEP = {"REPORT.md", "report.json", "backup.patch", "changes.patch"}   # wha
 
 def tidy_out_bulk(cfg, units):
     """[(kind, target, why, mb)]: bulky files (OUT_BULK_MB and more) and repository clones in the output folder (out/<unit>) of a
-    CLOSED unit, unchanged for [tidy] keep_days; never OUT_KEEP files, never an open unit's output. 2026-11-17: out/ held 5.4 GB
-    of old bundles, snapshot diffs and clones nothing reclaimed."""
+    CLOSED unit, unchanged for [tidy] keep_days; never OUT_KEEP files, never an open unit's output."""
     od = cfg.p("out", "out"); au = all_units(cfg); names = {u["name"] for u in units}; P = []
     cut = now() - tset(cfg, "keep_days") * 86400
     for d in sorted(od.iterdir()) if od.is_dir() else []:

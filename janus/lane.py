@@ -95,6 +95,15 @@ def local_run(script, inp=None):
     r = subprocess.run(["sh", "-c", script], input=inp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     return r.returncode, r.stdout, r.stderr
 
+def broad_decision(why, pol, level, broad):
+    """(the --broad reason to run with, or None; the refusal, or None) for a command that is a whole-suite run for why (None: it
+    is not one), by the rigor level's policy pol: refuse (never), reason (a --broad reason), free (no reason needed, still at low
+    priority). The one rule of janus run and of a remote unit's lane."""
+    if not why: return broad, None
+    if pol == "refuse": return None, f"a whole-suite run ({why}) is not run at rigor {level}: run the one targeted check (one package, a test filter)"
+    if broad or pol == "free": return broad or f"rigor {level}", None
+    return None, f"a whole-suite run ({why}) needs --broad <reason>: it then runs at low priority (after shorter jobs); or narrow it (one package, a test filter)"
+
 def main(argv):
     """The remote unit's `lane [--detach] [--broad REASON] <command>`: guard, record, queue in this host's jobs lane through the
     same functions `janus run` uses; wait for the exit code unless --detach. argv[0]: the unit's lane.json (written at launch:
@@ -107,20 +116,16 @@ def main(argv):
         else: print("lane: --broad needs a reason", file=sys.stderr); return 2
     if not a: print("usage: lane [--detach] [--broad REASON] <command>", file=sys.stderr); return 2
     cmd = a[0] if len(a) == 1 else shlex.join(a); rd = os.path.expandvars(c["rd"]); unit = c["unit"]
-    pol = c.get("broad_policy", "reason")   # the unit's rigor level (rigor.R broad): refuse below careful, free at thorough
-    if not broad or pol == "refuse":   # the whole-suite guard of `janus run`; the class and its median come from this host's own cap.sh
+    pol = c.get("broad_policy", "reason")   # the unit's rigor level (rigor.R broad)
+    why = None
+    if not broad or pol == "refuse":   # the class and its median come from this host's own cap.sh
         cls = secs = None
         r = subprocess.run(["sh", "-c", '[ -f "$1/cap.sh" ] || exit 0; RD=$1; . "$1/cap.sh"; k=$(cap_class "$2"); echo "$k"; cap_secs "$k"', "sh", rd, cmd],
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout.split()
         if r: cls = r[0]; secs = int(r[1]) if len(r) > 1 and r[1].isdigit() else None
         why = broad_why(cmd, c["patterns"], c["broad_min"], cls, secs)
-        if why and pol == "refuse":
-            print(f"lane: refused: a whole-suite run ({why}) is not run at rigor {c.get('rigor')}: run the one targeted check (one package, a test filter)", file=sys.stderr)
-            return 2
-        if why and pol == "free": broad = f"rigor {c.get('rigor')}"   # thorough: no reason needed, still low priority
-        elif why:
-            print(f"lane: refused: a whole-suite run ({why}) needs --broad <reason>: `lane --broad '<reason>' <command>` runs it at low priority; or narrow it (one package, a test filter)", file=sys.stderr)
-            return 2
+    broad, no = broad_decision(why, pol, c.get("rigor"), broad)
+    if no: print(f"lane: refused: {no}", file=sys.stderr); return 2
     jid = f"{unit}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
     os.makedirs(rd, exist_ok=True)
     n = 1

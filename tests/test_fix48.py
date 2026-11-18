@@ -180,8 +180,9 @@ class ResumeReopensReport(unittest.TestCase):
             janus.resume_unit(cfg, u, "your jobs finished")
         self.assertEqual(rep.read_text().splitlines()[:2], ["VERDICT: PENDING", "history"]); self.assertTrue(sent)
         cmds = []; rep.write_text("VERDICT: BLOCKED x\n")
-        with mock.patch.object(janus, "X", lambda cfg, h, s, **k: cmds.append(s) or (0, "", "")), mock.patch.object(janus, "hrun", lambda h, s, **k: (0, "", "")), \
+        remote = lambda h, s, **k: (0, "VERDICT: DONE (on the host)\nnotes\n", "") if s.startswith("cat ") else (0, "", "")
+        with mock.patch.object(janus, "X", lambda cfg, h, s, **k: cmds.append((s, k.get("inp"))) or (0, "", "")), mock.patch.object(janus, "hrun", remote), \
              mock.patch.object(janus, "route_ok", lambda *a: (True, "")):
             janus.resume_unit(cfg, {"name": "u", "host": "far", "via": "tmux", "tmux": "t", "model": "m"}, "go on")
-        self.assertTrue(any("/r/out/u/REPORT.md" in c and "VERDICT: PENDING" in c for c in cmds), cmds)
+        self.assertIn("VERDICT: PENDING\nnotes\n", [i for c, i in cmds if "/r/out/u/REPORT.md" in c], cmds)   # written on the host, by the file it read there
         self.assertTrue(rep.read_text().startswith("VERDICT: PENDING"))

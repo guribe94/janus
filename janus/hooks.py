@@ -9,7 +9,7 @@ from janus.reset import stop_reset
 from janus.context import (CLAIM_WINDOW, Cfg, Err, atomic_write, find_root, handoff_path, pending_age, record_session_proc,
     session_alive, session_root, ts)
 from janus.memory import memory_text
-from janus.rigor import orchestrator_text
+from janus.rigor import R, orchestrator_text
 from janus.units import force_close_refusal
 
 # PreToolUse shell rules (audit H2, M5). The command is parsed, not pattern-matched: heredoc bodies are data unless fed to a
@@ -93,8 +93,8 @@ def split_heredocs(c):
 
 def drop_fd_numbers(c):
     """c without the file-descriptor number written against a redirection (the 2 of `2>&1`, `2>f`; outside quotes, at the start
-    of a word): shlex splits `2>&1` into `2 >& 1`, and the 2 was judged as the command's argument (2026-11-18: `pueue --version
-    2>&1` refused as "pueue 2"). `echo 2 > f` keeps its 2, an argument."""
+    of a word): shlex splits `2>&1` into `2 >& 1`, and the 2 would be judged as the command's argument. `echo 2 > f` keeps its 2,
+    an argument."""
     out, i, q = [], 0, None
     while i < len(c):
         ch = c[i]
@@ -377,7 +377,7 @@ def agent_hook(ev, d):
     waiting = [i for i, l in enumerate(lines) if AGENT_WAIT.match(l)]
     # finished: a VERDICT line and the real exit codes (janus reads the last VERDICT line; line 1 stays PENDING until then)
     if verdict and re.search(r"exit(\s+code)?s?\b", t, re.I): return
-    if verdict and os.environ.get("JANUS_RIGOR") == "ship": return   # rigor ship: nothing was run, so there are no exit codes to report
+    if verdict and not R.get(os.environ.get("JANUS_RIGOR", ""), {}).get("exits", True): return   # a level that runs nothing has no exit codes
     # parked (PARK_RULE): the last 'WAITING <job ids>' line is newer than any verdict line
     if waiting and (not verdict or waiting[-1] > verdict[-1]): return
     # One reminder at most: the runtime re-fires Stop with stop_hook_active once the hook has blocked, and then it passes. A stop
@@ -396,7 +396,7 @@ def session_start_text(cfg):
              f"blockers and next actions. Then run janus status."]
     mt = memory_text(cfg)
     try: parts.append(orchestrator_text(cfg))   # the project's rigor level: how much reviewing and testing before landing
-    except Err as e: parts.append(f"[janus] {e}: the default (lean) applies until it is fixed")
+    except Err as e: parts.append(f"[janus] {e}: janus check, launch, land and run refuse until it is fixed")
     if mt: parts += ["## 1 MEMORY.md", mt]
     hp = handoff_path(cfg)
     if hp.exists() and hp.read_text().strip(): parts += ["## 2 HANDOFF.md", hp.read_text()]
