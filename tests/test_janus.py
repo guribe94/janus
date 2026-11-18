@@ -683,6 +683,8 @@ class Park(unittest.TestCase):
         # finding 1 (fix-install3): a park line after the last VERDICT line means parked; a closing VERDICT: DONE after it is
         r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\n"); self.assertIsNone(janus.verdict(cfg, u))
         r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\nVERDICT: DONE\n"); self.assertEqual(janus.verdict(cfg, u), "VERDICT: DONE")
+        # a park whose jobs janus already handled (it resumed the agent on them) is history: line 1 DONE above a checkpoint log stands
+        u["handled_jobs"] = ["here:7", "here:8"]; r.write_text("VERDICT: DONE\nexit codes: 0\nWAITING here:8\n"); self.assertEqual(janus.verdict(cfg, u), "VERDICT: DONE")
 
     def test_uncollected_guard(self):
         """item 4: a remote copy with changes or output that collect has not brought here refuses stop/close; a fresh copy does not."""

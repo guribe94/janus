@@ -54,9 +54,11 @@ def verdict(cfg, u):
     # Finding 1 (fix-install6): ONE reader for both readers -- the park jobs come from park_jobs, which reads the ids on the park
     # line or on the line(s) after it (WAIT_RX's `\s*` spans the line break), so a unit parked with its ids on the next line is
     # judged parked here exactly as waiting_line_jobs yields them.
+    # 2026-11-18: a park whose jobs janus has all handled (it resumed the agent on them) is history, not a park: a report that
+    # keeps its verdict on line 1 above a checkpoint log (as the brief asks) read as parked forever, its DONE never seen.
     vi = next((i for i in range(len(t) - 1, -1, -1) if t[i].startswith("VERDICT:")), None)
-    pi, _ = park_jobs(cfg, text)
-    if pi is not None and (vi is None or pi > vi): return None
+    pi, pj = park_jobs(cfg, text)
+    if pi is not None and (vi is None or pi > vi) and not set(pj) <= set(u.get("handled_jobs", [])): return None
     last = t[vi] if vi is not None else None                                  # the report's last VERDICT line decides
     if last is not None and NONFINAL.search(last): return None                # ends parked/pending: not finished
     v, present = verdict_line(j)

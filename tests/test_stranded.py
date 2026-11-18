@@ -197,11 +197,13 @@ class Findings(Base):
         closing; the original and its relaunch both running on with nobody told when the host answers again."""
         self.stranded(name="s1", relaunched="s1-r2"); self.stranded(name="s2", item="X2"); self.stranded(name="s3", item="X3", report="VERDICT: DONE\n")
         self.w.units.append({"id": "u-r", "title": "unit:s1-r2", "name": "s1-r2", "host": "here", "item": "X1", "brief": "/none"})
+        self.w.units.append({"id": "u-n", "title": "unit:s4", "name": "s4", "host": "far", "brief": "/none"})   # no item: fill never relaunches it
+        self.stranded(name="s5", item="X2", started=0)   # X2 is relaunched from s2, the newer
         hs = dict(self.hs, here={**self.hs["here"], "ok": True})
         self.down("far", 10); F = dict(janus.host_findings(self.cfg, hs, self.w.units))
         self.assertIn("units there wait", F["host:far"]); self.assertIn("after 30 min", F["host:far"])
         self.down("far", 45); F = dict(janus.host_findings(self.cfg, hs, self.w.units))
-        self.assertIn("stranded: its units no longer cover their items; relaunched: s1->s1-r2; awaiting relaunch: s2 (janus fill); finished there, not relaunched (land or close them by their verdict): s3", F["host:far"])
+        self.assertIn("stranded: its units no longer cover their items; relaunched: s1->s1-r2; awaiting relaunch: s2 (janus fill); not relaunched by janus fill (no backlog item of its own, or another unit's relaunch covers it): s4, s5 (janus launch <new> --resume-of <unit>, or close it); finished there, not relaunched (land or close them by their verdict): s3", F["host:far"])
         self.mark("far", "gone"); F = dict(janus.host_findings(self.cfg, hs, self.w.units)); self.assertIn("janus close <unit> --force", F["host:far:gone"])
         self.cfg.jput("host-marks.json", {}); self.cfg.jput("hosts.json", {})
         F = dict(janus.host_findings(self.cfg, dict(hs, far=host_probe(name="far")), self.w.units))
