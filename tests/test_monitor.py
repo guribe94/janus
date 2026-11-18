@@ -167,6 +167,32 @@ class States(Base):
         for r in m.machines: self.assertEqual(len(r.cells), len(M.HOST_COLS), r.cells)
         self.assertEqual(m.counts["Overview"], len(m.rows["Overview"]))   # it read 0 while its rows showed
 
+    def test_no_shape_size_or_key_crashes_the_screen(self):
+        """Catches: an IndexError or the like in render for some data shape (nothing read yet, a down host with stranded units, relaunch,
+        held and no-brief items, unreadable sources), terminal size, tab or mode (details, help, a filter that matches or not)."""
+        w = self.w; shapes = [("nothing read", self.model())]
+        w.board("2026-11-13 09:00 ann status: started\n2026-11-13 09:05 bob question: why?\n"); (self.d / ".janus/HANDOFF.md").write_text("Checkpoint: ~10% done\n")
+        w.ready = [{"id": "p-1", "title": "plain ready work", "labels": []}, {"id": "b-1", "title": "Item one", "labels": ["backlog"]}, {"id": "b-4", "title": "Item four", "labels": ["backlog"]}]
+        w.backlog = [{"id": "b-1", "title": "Item one", "labels": ["backlog"], "external_ref": "backlog:one"}, {"id": "b-2", "title": "Item two", "labels": ["backlog", "actor:owner"], "external_ref": "backlog:two"},
+                     {"id": "b-3", "title": "Item three", "labels": ["backlog", "hold:owner says"], "external_ref": "backlog:three"}, {"id": "b-4", "title": "Item four", "labels": ["backlog"], "external_ref": "backlog:four"}]
+        w.units = [unit("u", item="one", task=1), unit("d", host="far", task=7, item="one"), unit("n", host="far", task=8, relaunched="n-r2")]
+        w.closed = [{**unit("old"), "status": "closed", "closed_at": "2026-11-12T10:00:00Z"}]; w.report("d", "x\nVERDICT: DONE\n")
+        w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})}); self.collect(); shapes.append(("live", self.model()))
+        w.fail.add("far"); (self.d / ".janus/hosts.json").write_text(json.dumps({"far": time.time() - 7200})); (self.d / ".janus/hosts-facts.json").write_text("{not json")
+        self.collect(); shapes.append(("far down", self.model()))
+        K = M.curses; keys = {"list": [], "end": [K.KEY_END], "details": [10], "details scrolled": [10, K.KEY_NPAGE, K.KEY_END], "help": [ord("?")],
+                              "filter hit": [ord("/"), ord("i"), 10], "filter miss": [ord("/"), *map(ord, "zzzq"), 10]}
+        for name, m in shapes:
+            for tab in range(len(M.TABS)):
+                for mode, ks in keys.items():
+                    for h, wd in ((3, 24), (5, 30), (9, 40), (14, 80), (40, 120), (60, 300)):
+                        ui = M.UI(); ui.tab = tab
+                        try:
+                            for k in ks: ui.key(M.filtered(m, ui.filt), k, h)
+                            out = M.render(M.filtered(m, ui.filt), ui, h, wd, time.time(), "status")
+                        except Exception as e: self.fail(f"{name}, {M.TABS[tab]}, {mode}, {h}x{wd}: {e!r}")
+                        self.assertLessEqual(len(out), h, (name, M.TABS[tab], mode, h, wd))   # paint clips the width
+
 
 class Stranded(Base):
     """A host down past [capacity] down_after_min, or marked by the owner: the monitor says what janus does about it."""
