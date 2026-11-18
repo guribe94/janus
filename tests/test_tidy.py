@@ -61,6 +61,20 @@ class Auto(unittest.TestCase):
         with mock.patch.object(janus, "Beads", B): janus.tend_tidy(cfg, {}, [], lambda m: None)
         self.assertEqual(calls, [])
 
+    def test_notes_reach_the_log_and_a_low_disk_tidies_early(self):
+        """Catches: the landing branch's failed fast-forward printed to the watcher's stdout, which nothing keeps (2026-11-16/17:
+        main lagged 11 commits unnoticed); a disk under its floor waiting the full every_min for the next tidy."""
+        import time
+        d, cfg = project("\n[tidy]\nevery_min = 60\n"); logs = []
+        def tidy_all(*a, **k): print("note: repo: main is 11 behind its upstream and did not fast-forward: No space left"); return []
+        janus.tidy_all = tidy_all
+        janus.tend_tidy(cfg, {}, [], logs.append)
+        self.assertTrue(any("did not fast-forward" in l for l in logs), logs)
+        cfg.jput("tidy.json", {"at": int(time.time()) - 6 * 60}); logs.clear()
+        janus.tend_tidy(cfg, {"here": {"ok": True, "disk_gb": "50"}}, [], logs.append); self.assertEqual(logs, [])   # 6 min, disk fine: waits for every_min
+        janus.tend_tidy(cfg, {"here": {"ok": True, "disk_gb": "3"}}, [], logs.append)
+        self.assertTrue(any("disk under its floor on here" in l for l in logs), logs)
+
     def test_auto_off_removes_nothing(self):
         d, cfg = project("\n[tidy]\nevery_min = 0\n")
         calls = []
@@ -68,6 +82,36 @@ class Auto(unittest.TestCase):
         janus.tidy_do = lambda cfg2, kind, t: (calls.append((kind, t)), (0, ""))[1]
         janus.tend_tidy(cfg, {}, [], lambda m: None)
         self.assertEqual(calls, [])
+
+
+class OutBulk(unittest.TestCase):
+    def setUp(self):
+        self.real = janus.all_units
+
+    def tearDown(self):
+        janus.all_units = self.real
+
+    def test_only_old_bulk_of_closed_units_goes_and_never_the_report(self):
+        """Catches: out/ growing without bound (5.4 GB on 2026-11-17: bundles, snapshot diffs, repository clones of units closed long
+        ago); and the opposite failures: a report, report.json or patch removed, an open unit's output touched, a fresh file taken."""
+        import os, time
+        d, cfg = project("\n[tidy]\nkeep_days = 14\n"); od = d / ".janus/out"; old = time.time() - 20 * 86400
+        def f(p, mb, t=old):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "wb") as h: h.truncate(mb << 20)
+            os.utime(p, (t, t)); return p
+        big = f(od / "gone/integration/a.bundle", 60); f(od / "gone/REPORT.md", 60); f(od / "gone/backup.patch", 60)
+        f(od / "gone/small.txt", 1); fresh = f(od / "gone/fresh.diff", 60, time.time())
+        (od / "gone/integration/repo/.git").mkdir(parents=True); f(od / "gone/integration/repo/x", 1); os.utime(od / "gone/integration/repo/.git", (old, old))
+        f(od / "live/a.bundle", 60); f(od / "openrec/a.bundle", 60)
+        janus.all_units = lambda c: {"gone": {"status": "closed"}, "live": {"status": "closed"}, "openrec": {"status": "in_progress"}}
+        P = janus.tidy_out_bulk(cfg, [{"name": "live"}])
+        self.assertEqual(sorted(t for _, t, _, _ in P), sorted([str(big), str(od / "gone/integration/repo")]))
+        for _, t, _, _ in P: self.assertEqual(janus.tidy_do(cfg, "out-bulk", t)[0], 0)
+        self.assertFalse(big.exists()); self.assertFalse((od / "gone/integration/repo").exists())
+        self.assertTrue((od / "gone/REPORT.md").exists()); self.assertTrue((od / "gone/backup.patch").exists()); self.assertTrue(fresh.exists())
+        self.assertEqual(janus.tidy_do(cfg, "out-bulk", str(od / "gone/REPORT.md"))[0], 1)   # never a kept file, even when asked
+        self.assertEqual(janus.tidy_do(cfg, "out-bulk", str(od / "gone"))[0], 1)             # never the output folder itself
 
 
 class Upstream(unittest.TestCase):

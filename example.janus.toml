@@ -48,7 +48,7 @@ args = []
 # auto = true            # the watcher removes clean landed worktrees and landed branches and everything else janus tidy finds, each by its own safe rule
 # artifacts = ["target", "node_modules"]   # rebuildable build output inside closed units' worktrees that janus tidy removes
 # remote = "origin"
-# keep_days = 14         # job run files and test roots older than this
+# keep_days = 14         # job run files and test roots older than this; bulky files (50 MB+) and clones in closed units' out/ unchanged this long
 # every_min = 60         # the watcher refreshes the reclaimable list (check: tidy:<n>, disk:<host>)
 # per host: disk_budget_gb = 200; cache_dirs = ["/home/me/build/target"]   # over budget: oldest cache entries go
 

@@ -6,6 +6,7 @@ from janus.actions.landing import follow_upstream
 from janus.actions.lifecycle import uncollected
 from janus.beads import Beads
 from janus.board import board, board_rows
+from janus.cap import capv
 from janus.context import FIXTURE_MARK, Err, LockLost, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
 from janus.branch import contained, landed, landing_branch
 from janus.project import own_card
@@ -101,6 +102,31 @@ def tidy_artifacts(cfg, units):
         for pat in pats:
             for m in d.glob(pat):
                 if m.is_dir(): P.append(("artifact", str(m), f"rebuildable output ({pat}) in closed unit {d.name}'s worktree", 0))
+    return P
+
+OUT_BULK_MB = 50   # a file in a closed unit's output at least this big is bulk (bundles, snapshots), never its report
+OUT_KEEP = {"REPORT.md", "report.json", "backup.patch", "changes.patch"}   # what a closed unit's output is kept for
+
+def tidy_out_bulk(cfg, units):
+    """[(kind, target, why, mb)]: bulky files (OUT_BULK_MB and more) and repository clones in the output folder (out/<unit>) of a
+    CLOSED unit, unchanged for [tidy] keep_days; never OUT_KEEP files, never an open unit's output. 2026-11-17: out/ held 5.4 GB
+    of old bundles, snapshot diffs and clones nothing reclaimed."""
+    od = cfg.p("out", "out"); au = all_units(cfg); names = {u["name"] for u in units}; P = []
+    cut = now() - tset(cfg, "keep_days") * 86400
+    for d in sorted(od.iterdir()) if od.is_dir() else []:
+        if not d.is_dir() or d.is_symlink() or d.name in names or au.get(d.name, {}).get("status") != "closed": continue
+        for root, dirs, files in os.walk(d):
+            r = Path(root)
+            if ".git" in dirs:
+                dirs.remove(".git")
+                if r != d and (r / ".git").stat().st_mtime < cut:   # a nested clone (the output folder itself is never removed)
+                    P.append(("out-bulk", str(r), f"repository clone in closed unit {d.name}'s output, unchanged {tset(cfg, 'keep_days')} days", 0)); dirs[:] = []; continue
+            for f in files:
+                q = r / f
+                try: st = q.lstat()
+                except OSError: continue
+                if f in OUT_KEEP or q.is_symlink() or st.st_size < OUT_BULK_MB << 20 or st.st_mtime >= cut: continue
+                P.append(("out-bulk", str(q), f"{st.st_size >> 20} MB in closed unit {d.name}'s output, unchanged {tset(cfg, 'keep_days')} days", st.st_size >> 20))
     return P
 
 TIDY_HOST = r'''root=%(root)s; rd=%(rd)s; kd=%(kd)d
@@ -204,7 +230,7 @@ def tidy_all(cfg, units, hs=None):
         if err: say(f"note: {r}: {landing_branch(cfg, Path(r))} is {lag} behind its upstream and did not fast-forward: {err}")
         elif lag: say(f"{r}: {landing_branch(cfg, Path(r))} {'is' if cfg.run.dry or cfg.run.ro else 'was'} {lag} commit(s) behind its upstream" + ("" if cfg.run.dry or cfg.run.ro else ": fast-forwarded"))
     au = all_units(cfg); P = ([(k, t, w, 0) for k, t, w in tidy_plan(cfg, units)] + tidy_branches(cfg, units)
-                              + tidy_roots(cfg) + tidy_artifacts(cfg, units))
+                              + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units))
     for n, h in cfg.hosts.items():
         if hs is not None and not (hs.get(n) or {}).get("ok"): continue
         P += tidy_host(cfg, n, h, units, au)
@@ -213,17 +239,27 @@ def tidy_all(cfg, units, hs=None):
 # The kinds the watcher removes on its own with [tidy] auto = true: every kind tidy finds, each already chosen by its safe rule
 # (clean and landed; closed and nothing uncollected; our own stopped container; older than keep_days; over the disk budget).
 # Only some once, and the rest waited for the orchestrator, whose hooks refuse hand removal: found waste filled the disk.
-TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch", "artifact", "remote-copy", "run-files", "container", "cache", "test-root", "pane", "tab", "card")
+TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch", "artifact", "remote-copy", "run-files", "container", "cache", "test-root", "out-bulk", "pane", "tab", "card")
 TIDY_HOST_KINDS = ("remote-copy", "run-files", "container", "cache")
+
+LOW_DISK_MIN = 5   # a host under [capacity] min_disk_gb is tidied this often (a pass scans every host: tens of seconds)
 
 def tend_tidy(cfg, hs, units, log):
     """The watcher refreshes the reclaimable list every [tidy] every_min; with [tidy] auto = true it also removes what it found
     (TIDY_AUTO_KINDS) itself, so the tidy:<n> finding does not keep firing for bookkeeping nobody does."""
-    if now() - cfg.jget("tidy.json").get("at", 0) < tset(cfg, "every_min") * 60: return
+    low = [n for n, p in (hs or {}).items() if p.get("ok") and p.get("disk_gb") and n in cfg.hosts
+           and fl(p["disk_gb"]) < capv(cfg, cfg.hosts[n], "min_disk_gb")]   # a disk under its floor: tidy within LOW_DISK_MIN, not every_min
+    if now() - cfg.jget("tidy.json").get("at", 0) < min(tset(cfg, "every_min"), LOW_DISK_MIN if low else 1e9) * 60: return
+    import io, contextlib
+    buf = io.StringIO()   # tidy_all's notes (a landing branch that did not fast-forward) went to the watcher's stdout, which nothing keeps
     try:
-        with cfg.unlocked(): P = apply_holds(cfg, tidy_all(cfg, units, hs))   # the hosts' scan (ssh) and git: not under the writer lock
+        with cfg.unlocked(), contextlib.redirect_stdout(buf): P = apply_holds(cfg, tidy_all(cfg, units, hs))   # the hosts' scan (ssh) and git: not under the writer lock
     except LockLost: raise
     except Exception as e: log(f"tidy pass failed: {e}"); return
+    finally:
+        for l in buf.getvalue().splitlines():
+            if l.strip(): log(f"tidy: {l.strip()[:300]}")
+    if low: log(f"tidy: disk under its floor on {', '.join(low)}: tidy pass early")
     cfg.jput("tidy.json", {"at": int(now()), "plan": [list(x) for x in P]})
     if tset(cfg, "auto") and not cfg.run.dry and not cfg.run.ro:
         try: taken = {str(Path(u["cwd"]).resolve()) for u in Beads(cfg).units() if u.get("cwd")}   # units read again: a tree launched into meanwhile is never removed
@@ -263,6 +299,12 @@ def tidy_do(cfg, kind, t):
     if kind == "cache":
         if not any(x.startswith(c.rstrip("/") + "/") for c in h.get("cache_dirs", [])): return 1, "not under a cache_dirs entry"
         return hrun(h, f"rm -rf {qp(x)}", timeout=600)[0], ""
+    if kind == "out-bulk":
+        od = cfg.p("out", "out").resolve(); q = Path(t)   # only under a unit's output folder, never the folder itself or a kept file
+        if q.is_symlink() or q.name in OUT_KEEP or not q.resolve().is_relative_to(od) or q.resolve().parent == od: return 1, "not a unit's bulky output"
+        if q.is_dir():
+            import shutil; shutil.rmtree(t, ignore_errors=True); return 0, ""
+        q.unlink(missing_ok=True); return 0, ""
     if kind == "artifact":
         wd = cfg.p("worktrees", "worktrees").resolve(); q = Path(t)
         if not (q.is_dir() and q.resolve().is_relative_to(wd)): return 1, "not a worktree artifact"
@@ -288,7 +330,7 @@ def cmd_tidy(cfg, a):
     if not cfg.run.dry: refuse_agent("janus tidy")   # --dry-run only reads
     free0 = disk_free_gb(cfg.root)
     units = Beads(cfg).units(); kept = []; au = all_units(cfg)
-    P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg) + tidy_artifacts(cfg, units)
+    P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units)
     for n, h in cfg.hosts.items(): P += tidy_host(cfg, n, h, units, au)
     P = apply_holds(cfg, P)
     for d, why in kept: say(f"kept worktree {d}: {why}")
