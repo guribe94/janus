@@ -13,7 +13,7 @@ from janus.cap import FACTS, build_room, cap_call, cap_nums, capv, host_cap, rec
 from janus.context import EXCL, Err, LockLost, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, model_tool, read_secret, reserve_budget, run_cost
 from janus.memory import MEM_SECTIONS, mem_line, memory_read
-from janus.platform import herdr
+from janus.platform import herdr, herdr_text
 from janus.project import project_id, tag, tmux_name
 from janus.rigor import DEFAULT, R, agent_text, check_level, level_of
 from janus.probe import probe_all, pueue, room
@@ -456,7 +456,7 @@ def past_dialogs(read, send, status=None, tries=10):
 
 def herdr_screen(name, pane):
     """past_dialogs' (read, send, status) for an agent in a herdr pane."""
-    return (lambda: json.dumps(herdr("pane", "read", pane, "--source", "visible", "--lines", "40") or {}),
+    return (lambda: herdr_text("pane", "read", pane, "--source", "visible", "--lines", "40") or "",
             lambda *k: herdr("pane", "send-keys", pane, *k),
             lambda: ((herdr("agent", "get", name) or {}).get("agent") or {}).get("agent_status"))
 
@@ -574,11 +574,15 @@ def release_unqueued(cfg, mc, u):
     the record that would name it is closed or left starting. A queued run may be running: it is left for collect or reconcile."""
     if u.get("run") and u.get("task") is None: ledger_done(cfg, cfg.prov[mc["provider"]], u["run"], u["name"], 0, "launch-failed")
 
+def already_launched(cfg, prev):
+    from janus.actions.backlog import relaunch_cmd
+    return f"{prev['name']} already launched on {prev.get('host')} (an open unit); to start it again: {relaunch_cmd(cfg, prev)}"
+
 def cmd_launch(cfg, a):
     name = a.unit
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
     bd = Beads(cfg); units = bd.units(); prev = next((u for u in units if u["name"] == name), None)
-    if prev and a.kind != "review": raise Err(f"{name} already launched on {prev.get('host')}")
+    if prev and a.kind != "review": raise Err(already_launched(cfg, prev))
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
     of = next((u for u in units if u["name"] == (a.of or name)), None)
@@ -594,7 +598,7 @@ def cmd_launch(cfg, a):
     if not hs:
         with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers: not under the writer lock; the units are read again after it (another launch may have taken the name or the room)
         units = bd.units(); prev = next((u for u in units if u["name"] == name), None); of = next((u for u in units if u["name"] == (a.of or name)), None)
-        if prev and a.kind != "review": raise Err(f"{name} already launched on {prev.get('host')}")
+        if prev and a.kind != "review": raise Err(already_launched(cfg, prev))
     if getattr(a, "auto", False) and a.item:   # fill: the item may have been launched meanwhile (a manual launch while the hosts answered)
         try: iss = backlog_issues(cfg)
         except Err as e: raise Err(f"refused: beads cannot be read to recheck item {a.item} ({e}): not launched")
@@ -608,6 +612,9 @@ def cmd_launch(cfg, a):
     h = cfg.hosts[hn]; local = h.get("local", False)
     if getattr(a, "new_worktree", None) and a.cwd:   # finding 12: --new-worktree makes its own tree
         raise Err("--cwd with --new-worktree: --new-worktree makes its own worktree (drop --cwd)")
+    if not (a.cwd or getattr(a, "new_worktree", None) or getattr(a, "allow_main", False) or a.of or a.kind == "review"):   # the repository fill uses (REPO:, [fill] repo): the same tree on every host; never for a review, which reads the tree it reviews
+        from janus.actions.backlog import fill_repo
+        a.new_worktree = fill_repo(cfg, name, brief)
     cwd, no_tree = launch_cwd(cfg, a, name)
     shared, handover = cwd_taken(cfg, units, cwd, name, getattr(a, "resume_of", None), getattr(a, "share_with", None))
     if shared and not (local and a.kind in ("review", "audit")):

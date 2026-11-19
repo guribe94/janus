@@ -24,6 +24,13 @@ def norm_item(x):
     brief's ITEM: line name the same item whatever their case or a trailing full stop (an ITEM: x1 brief is for checklist row X1)."""
     return str(x or "").strip().rstrip(".,;").lower()
 
+def run_once(cfg, key, fn):
+    """fn()'s answer, read once while run_check keeps cfg.run.reads, else fn() every time."""
+    r = cfg.run.reads
+    if r is None: return fn()
+    if key not in r: r[key] = fn()
+    return r[key]
+
 def ready_work(cfg):
     """Ready work items in beads: not units (launched work), not janus's decision log (the `janus-log`/`orch-log` label, or a
     `janus:`/`orch: decisions`/`log` title -- only those; a bead whose title or label merely contains log is real work,
@@ -31,7 +38,7 @@ def ready_work(cfg):
     actor:<owner|hardware|...>): only what an agent could be launched on (skill-fix52)."""
     skip = {"unit", "instruction", "backlog", "intent"}   # backlog items have their own finding (idle with backlog)
     out = []
-    for i in Beads(cfg).run("ready"):
+    for i in run_once(cfg, "ready", lambda: Beads(cfg).run("ready")):
         labels = set(i.get("labels") or []); title = str(i.get("title", ""))
         if skip & labels or labels & LOG_LABELS or any(l.startswith("actor:") and l != "actor:agent" for l in labels): continue
         if title.startswith(("unit:", "janus:", "instr:", "intent:")) or LOG_RX.match(title): continue
@@ -119,7 +126,7 @@ def item_holds(cfg, iss=None, src=None):
     return hs
 
 def backlog_issues(cfg):
-    r = Beads(cfg).run("list", "--label", "backlog", "--all", "-n", "0")
+    r = run_once(cfg, "backlog", lambda: Beads(cfg).run("list", "--label", "backlog", "--all", "-n", "0"))
     r = r.get("issues", r) if isinstance(r, dict) else r
     return {i.get("external_ref"): i for i in r if str(i.get("external_ref", "")).startswith("backlog:")}
 
@@ -208,17 +215,21 @@ def stranded_status(cfg, units, iss=None):
                           else "lead" if id(u) in lead else "behind" if its else "no-item")
     return out
 
-def eligible_items(iss, ready_ids, cov, act, hold, blocked=None, held=None):
+def eligible_items(iss, ready_ids, cov, act, hold, blocked=None, held=None, covered=None):
     """The one selection fill, check and the monitor share: [(priority, order, item id, title)] of the backlog issues (by their
     external ref backlog:<id> only, never their title) that are open, labelled backlog-ready, of an agent, not held and not
     covered by an open unit. ready_ids: the ids bd ready lists (no open blocker); an item it does not list is dependency-blocked
     (appended to blocked) and not eligible. None: membership unknown (not checked). held: the items left out only by their hold
-    (open, backlog-ready, an agent's, not covered) are appended to it, so fill and status can say why they wait."""
+    (open, backlog-ready, an agent's, not covered) are appended to it, so fill and status can say why they wait; covered: the
+    items left out because an open unit covers them."""
     out = []
     for n, (r, i) in enumerate(iss.items()):
         item = r[8:]; k = norm_item(item)
         if i.get("status") not in ("open", "in_progress") or "backlog-ready" not in (i.get("labels") or []): continue
-        if k in cov or act.get(k, "agent") != "agent": continue
+        if act.get(k, "agent") != "agent": continue
+        if k in cov:
+            if covered is not None: covered.append(item)
+            continue
         if k in hold:
             if held is not None: held.append(item)
             continue

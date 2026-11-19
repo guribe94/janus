@@ -100,10 +100,13 @@ def run_check(cfg, cycle=True, writer=None, pre=None):
         bd_err = None; units = []; bd = None
         try: bd = Beads(cfg); units = bd.units()   # read again under the lock: the records the sync judges and saves are current
         except Err as e: bd_err = str(e)
-        F = collect_findings(cfg, hs, units, ag, bd_err, bd, fetched)
-        if not cfg.run.ro:
-            with cfg.unlocked(): tune_pueue(cfg, hs, units)   # ssh to every host: not under the state lock
-        live = status_text(cfg, hs, units, F)
+        cfg.run.reads = {}   # the backlog and ready lists, read once for every finding and the status text (nothing below writes them)
+        try:
+            F = collect_findings(cfg, hs, units, ag, bd_err, bd, fetched)
+            if not cfg.run.ro:
+                with cfg.unlocked(): tune_pueue(cfg, hs, units)   # ssh to every host: not under the state lock
+            live = status_text(cfg, hs, units, F)
+        finally: cfg.run.reads = None
     return F, live, hs, units
 
 def cmd_check(cfg, a):

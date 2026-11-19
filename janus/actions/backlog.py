@@ -1,8 +1,8 @@
 """janus backlog (import, list, set actor) and janus fill (launch ready backlog units up to capacity)."""
-import argparse, os, re, stat
+import argparse, os, re, shlex, stat
 from pathlib import Path
 from janus.actions.launch import brief_plan, choose, cmd_launch, pick_model, place
-from janus.backlog import backlog_cfg, backlog_issues, backlog_items, backlog_ready_ids, covered_items, draft_holds, eligible_items, held_text, hold_drafts, item_actors, item_holds, norm_item, stranded_cover, unit_items
+from janus.backlog import backlog_cfg, backlog_issues, ready_work, backlog_items, backlog_ready_ids, covered_items, draft_holds, eligible_items, held_text, hold_drafts, item_actors, item_holds, norm_item, stranded_cover, unit_items
 from janus.beads import Beads
 from janus.branch import landing_branch, verify_published
 from janus.budgets import budget_for, finish_reserve
@@ -81,7 +81,7 @@ def brief_dir(cfg):
     p = cfg.p("briefs", "briefs")
     return str(p.relative_to(cfg.root)) if p.is_relative_to(cfg.root) else str(p)
 
-def fill_candidates(cfg, units, launch=False, missing=None, blocked=None, held=None):
+def fill_candidates(cfg, units, launch=False, missing=None, blocked=None, held=None, covered=None):
     """Ready backlog items with a brief and no unit, highest priority first: [(priority, order, item, brief path, unit name,
     kind, tier)]. Items: backlog.eligible_items over the beads backlog (open, backlog-ready, listed by bd ready, of an agent, not
     held, not covered by an open unit; priority from beads). launch (an unattended launch): beads must answer and hold the
@@ -91,7 +91,7 @@ def fill_candidates(cfg, units, launch=False, missing=None, blocked=None, held=N
     brief wins. missing: the eligible items with no usable brief, by id (fill and check name them; they were left out in silence).
     blocked: eligible items bd ready does not list (they wait on a dependency). held: the items left out only by a hold, as
     [(item, reason, [where the hold is], unlaunched usable brief's unit name or None)]: never candidates, named so a held item with
-    a brief is not mistaken for a missing one."""
+    a brief is not mistaken for a missing one. covered: [(item, [open units that cover it])], so fill can say why it waits."""
     src, hl = {}, []; iss = {}
     try:
         iss = backlog_issues(cfg); cov = covered_items(cfg, units, iss)
@@ -100,7 +100,8 @@ def fill_candidates(cfg, units, launch=False, missing=None, blocked=None, held=N
         except Err:
             if launch: raise
             rdy = None   # a plan or a finding only: membership unknown
-        hold = item_holds(cfg, iss, src); items = eligible_items(iss, rdy, cov, item_actors(cfg, iss), hold, blocked, hl)
+        cv = []; hold = item_holds(cfg, iss, src); items = eligible_items(iss, rdy, cov, item_actors(cfg, iss), hold, blocked, hl, cv)
+        if covered is not None: covered.extend((i, [u["name"] for u in units if norm_item(i) in unit_items(cfg, [u], iss)]) for i in cv)
     except Err as e:
         if launch: raise Err(f"beads cannot say what is ready ({e}): nothing is launched from the unchecked checklist")
         src.clear(); act = item_actors(cfg, {}); hold = item_holds(cfg, {}, src); cov = covered_items(cfg, units, {}); iss = {}
@@ -129,6 +130,13 @@ def usable_brief(cfg, item, idx, ever, taken=()):
         if name in ever or name in taken or out_used(cfg, name) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): continue
         return f, name, keys
     return None
+
+def relaunch_cmd(cfg, u):
+    """The command that relaunches open unit u as its successor: a stopped unit is never launched again under its own name."""
+    n = relaunch_name(cfg, u["name"], set(all_units(cfg))) or f"{u['name']}-r<N>"
+    flags = [("--kind", u.get("kind") or "implement"), ("--tier", u.get("tier")), ("--model", u.get("model")), ("--host", u.get("host")), ("--of", u.get("of")),
+             ("--item", u.get("item")), ("--resume-of", u["name"]), ("--brief", u.get("brief")), ("--cwd", u.get("cwd"))]
+    return shlex.join(["janus", "launch", n, *[x for k, v in flags if v for x in (k, str(v))]])
 
 def relaunch_name(cfg, old, ever, taken=()):
     """The next free name for a relaunch of unit old: <base>-r<N+1> (old ends in -r<N>), else <old>-r2; at most 32 characters,
@@ -172,15 +180,21 @@ def fill_plan(cfg, hs, units, limit=None, launch=False, cands=None, missing=None
     (unit, item, host) for each candidate its brief or [placement] pins to a stranded host: it is not moved (a pin is usually
     hardware), it waits, and check names it."""
     plan, stops, virt, spent, keep = [], [], [dict(u) for u in units], {}, {}
-    down = stranded_hosts(cfg)
+    down = stranded_hosts(cfg); covered, blocked = [], []   # named only when this plan reads the candidates itself
     if cands is None:
         missing = [] if missing is None else missing; held = [] if held is None else held
-        try: cands = fill_candidates(cfg, units, launch, missing, held=held)
+        try: cands = fill_candidates(cfg, units, launch, missing, blocked, held, covered)
         except Err as e: return plan, [str(e)]
     bd = brief_dir(cfg)
     miss = f"; ready without a usable brief: {', '.join(missing[:8])}{'...' if len(missing) > 8 else ''} (write {bd}/<unit>.md with an ITEM: <id> line)" if missing else ""
     hel = held_text(held) if held else ""
-    if not cands: return plan, [f"no ready backlog item has an unlaunched brief (a brief is for an item when {bd}/<unit>.md has an ITEM: <id> line)" + miss] + ([hel] if hel else [])
+    wait = [x for x in ("; ".join(f"{i} is covered by open unit(s) {', '.join(us) or '?'}" for i, us in covered or []),
+                       f"waiting on a dependency (bd ready does not list them): {', '.join(blocked)}" if blocked else "") if x]   # why each ready item launches nothing
+    if not cands:
+        try: other = [str(i.get("title", ""))[:40] for i in ready_work(cfg)]
+        except Err: other = []
+        if other: wait.append(f"{len(other)} ready bead(s) are not backlog items, and fill launches backlog items only: {', '.join(other[:8])}")
+        return plan, [f"no ready backlog item has an unlaunched brief (a brief is for an item when {bd}/<unit>.md has an ITEM: <id> line)" + miss] + wait + ([hel] if hel else [])
     for pr, order, item, f, name, kind, tier in cands:
         a = argparse.Namespace(unit=name, host=None, test_host=None, kind=kind, tier=tier)
         try: m = pick_model(cfg, tier, kind)   # unattended: the first route entry or a stated refusal, a fallback only where [routing] fallback = true
@@ -216,6 +230,7 @@ def fill_plan(cfg, hs, units, limit=None, launch=False, cands=None, missing=None
         virt.append({"name": name, "host": hn, "build": b, "state": "working", "item": item})
     if not stops: stops.append("every ready candidate is planned")
     if miss: stops.append(miss[2:])
+    stops += wait
     if hel: stops.append(hel)
     grp = {}   # one line per reason: the candidates it holds back
     for s in stops:
@@ -405,7 +420,10 @@ def accept_item(cfg, item, status, unit, commit=None):
     if not xs: raise Err(f"refused: no backlog issue for {item} in beads (janus backlog import first): nothing changed")
     if len(xs) > 1: raise Err(f"refused: ambiguous: {len(xs)} backlog issues for {item} ({', '.join(str(i.get('id')) for i in xs)}): nothing changed")
     x = xs[0]
-    if norm_item(item) not in unit_items(cfg, [u], iss): raise Err(f"{unit} is not linked to item {item} (its --item or its brief's ITEM: line): refused")
+    if norm_item(item) not in unit_items(cfg, [u], iss):
+        ln = sorted(n for n, v in all_units(cfg).items() if norm_item(item) in unit_items(cfg, [v], iss))
+        raise Err(f"{unit} is not linked to item {item} (its --item or its brief's ITEM: line names {', '.join(sorted(unit_items(cfg, [u], iss))) or 'nothing known'}): refused; "
+                  f"units linked to {item}: {', '.join(ln) or 'none'}")
     pub = u.get("published") or {}
     if commit:
         if pub.get("commit"): raise Err(f"{unit}'s publication is recorded ({pub['commit'][:12]}): --commit is only for a unit pushed without janus land")

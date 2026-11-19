@@ -43,6 +43,7 @@ class Run:
     rates: dict | None = None
     briefless: list | None = None   # the ready backlog items check found without a usable brief (status names them)
     held: list | None = None   # the backlog items check found left out only by a hold: (item, reason, sources, brief) (status names them)
+    reads: dict | None = None   # run_check's beads reads, each made once per check (bd answers one call at a time across processes); None: not kept
 
 class Err(Exception): pass
 

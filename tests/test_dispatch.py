@@ -125,6 +125,26 @@ class Selection(unittest.TestCase):
         F = dict(janus.backlog_findings(self.cfg, hs, []))
         self.assertNotIn("idle-with-backlog", F); self.assertIn("X2", F["idle-with-backlog:nobrief"]); self.assertIn("x1-a", F["backlog:held"])
 
+    def test_a_check_reads_the_backlog_and_ready_lists_once(self):
+        """Catches (2026-11-19): janus status made 7 bd calls, the backlog list and bd ready twice each; bd answers one call at a
+        time across processes, so each repeat waited behind the watcher and the monitor."""
+        self.w.issue("X1"); calls = []; real = janus.Beads
+        class Count(real):
+            def run(s, *a): calls.append(a); return real.run(s, *a)
+        with mock.patch.object(janus, "Beads", Count), mock.patch.object(janus, "read_remote", lambda cfg: ({"here": host_probe(name="here")}, {})), \
+             mock.patch.object(janus, "herdr_agents", lambda cfg: {}):
+            janus.run_check(self.cfg, writer=False)
+        self.assertEqual(sum(1 for a in calls if a[:3] == ("list", "--label", "backlog")), 1, calls)
+        self.assertLessEqual(sum(1 for a in calls if a == ("ready",)), 1, calls)
+        self.assertIsNone(self.cfg.run.reads)                                   # kept for the check only: what runs after reads afresh
+
+    def test_fill_says_which_open_unit_covers_a_ready_item(self):
+        """Catches (2026-11-19): fill launched nothing and said only 'no ready backlog item has an unlaunched brief', while both
+        ready items were covered by open units: it never said so, nor that the ready beads it skipped were not backlog items."""
+        self.w.issue("X1"); self.brief("x1-a", "X1"); hs = {"here": host_probe(name="here")}
+        plan, stops = janus.fill_plan(self.cfg, hs, [{"name": "cov", "item": "X1", "host": "here", "brief": "/none"}])
+        self.assertEqual(plan, []); self.assertIn("X1 is covered by open unit(s) cov", " | ".join(stops))
+
     def test_repeated_passes_and_a_competing_manual_launch_never_duplicate(self):
         """Catches: a fill launch for an item another launch covered while fill probed the hosts (no lock was held then), and a
         second pass relaunching an item whose unit is open."""
@@ -326,6 +346,13 @@ class Landing(LandingBase):
             rc, txt = self.land(); self.assertEqual(rc, 0, txt)
         self.assertEqual(self.remote_count(), n, "landed again"); self.assertEqual(self.u["published"]["writeback"], "done")
         self.assertIn(self.u["published"]["commit"][:12], (self.d / "S.md").read_text())
+
+    def test_done_for_an_unlinked_unit_names_the_units_that_are_linked(self):
+        """Catches (2026-11-19): 'u is not linked to item X2' named nothing, so the orchestrator guessed which unit to give."""
+        self.w.issue("X1"); self.w.issue("X2"); self.w.units = [self.u, {"id": "v1", "title": "unit:v", "notes": json.dumps({"item": "X2"})}]
+        with self.assertRaises(janus.Err) as e:
+            out(janus.cmd_backlog, self.cfg, type("A", (), {"action": "set", "args": ["X2", "status=DONE"], "unit": "u", "commit": None})())
+        self.assertIn("names x1", str(e.exception)); self.assertIn("units linked to X2: v", str(e.exception))
 
     def test_explicit_done_needs_verified_publication_and_repeats_cleanly(self):
         self.w.issue("X1")

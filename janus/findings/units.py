@@ -1,11 +1,11 @@
 """Findings about units, boards and spend: parked units that cannot resume, board cards (blocked, question, gone, silent),
 agent caps, the provider ledgers and committed spend. Each is derived from what is observed now and clears when it clears."""
-import json, time
+import time
 from janus.actions.jobs import job_state, unit_jobs
 from janus.board import board_questions, board_rows
 from janus.context import now
 from janus.ledger import ledger_read, recost_plan, spend
-from janus.platform import herdr
+from janus.platform import herdr, herdr_text
 from janus.probe import live_units
 from janus.project import project_id
 from janus.rigor import review_gap
@@ -96,8 +96,9 @@ def unit_findings(cfg, hs, units, ag):
         if b: F.append((f"unit:{u['name']}:interrupted", f"{u['name']}: its {b['op']} (pid {b.get('pid')}) stopped before it finished, so the unit is marked {'starting' if b['op'] == 'launch' else 'closing'}: "
                         + ("janus cancel / close it and launch again (its host copy and budget run are named in the record)" if b["op"] == "launch" else f"run janus close {u['name']} again (it skips the checks that already passed)")))
         if st == "blocked":
-            r = herdr("agent", "read", u["name"], "--source", "detection") or {}
-            F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}; answer it (board.sh direct) or relaunch with what it needs"))
+            scr = [l.strip() for l in (herdr_text("agent", "read", u["name"], "--source", "visible", "--lines", "40") or "").splitlines() if l.strip(" ─│╭╮╰╯")]
+            F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked on: {' / '.join(scr[-6:])[-300:] or 'its screen could not be read'}; "
+                      "a question: answer it (board.sh direct); a prompt only a person may answer (never sent keys): the owner answers it, or janus stop and relaunch (Claude Code's own removal safety check times out by itself)"))
         elif st in ("done", "failed", "gone", "idle") and not silent:
             F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
         if v and v.startswith("VERDICT: DONE"):   # finished work that its rigor level wants reviewed before it lands (rigor.review_gap)

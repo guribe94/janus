@@ -247,6 +247,15 @@ class State(unittest.TestCase):
         rep.write_text(janus.REPORT_SEED + "\n- [ ] read the brief\n"); self.assertNotIn("unit:u:not-started", keys(u(cfg.silent + 60)))
         rep.write_text(janus.REPORT_SEED + "\n"); self.assertNotIn("unit:u:not-started", keys({**u(cfg.silent + 60), "tmux": "other"}))   # not running
 
+    def test_a_blocked_agent_says_what_it_is_blocked_on(self):
+        """Catches (2026-11-19): an agent at a permission prompt read 'blocked: {}': herdr prints a pane's screen as text, which
+        janus parsed as JSON, so the screen was dropped (past_dialogs saw '{}' on every herdr pane too)."""
+        d, cfg = project(); u = {"name": "u", "id": "1", "host": "here", "via": "herdr", "started": int(janus.now())}
+        scr = "⏺ Bash(rm \"$ST/$f\")\n\n Dangerous rm operation on possibly-empty variable path\n ❯ 1. Yes\n   2. No\n"
+        with mock.patch.object(janus, "run", lambda cmd, **k: (0, scr, "") if cmd[:3] == ["herdr", "agent", "read"] else (1, "", "")):
+            F = dict(janus.unit_findings(cfg, {"here": {"ok": True}}, [u], {"u": {"agent_status": "blocked"}})[0])
+        self.assertIn("Dangerous rm operation on possibly-empty variable path", F["unit:u:blocked"])
+
 
 class UnitRecord(unittest.TestCase):
     def test_v1_record_migrates_to_v2(self):

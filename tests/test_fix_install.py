@@ -695,6 +695,28 @@ class Item12NewWorktree(unittest.TestCase):
         self.assertIn("worktree add -b u1", out.getvalue())
         self.assertIn("develop", out.getvalue(), "the new worktree did not start from [landing] branch")
 
+    def test_a_launch_without_a_tree_uses_the_configured_repo(self):
+        """Catches (2026-11-19): janus launch without --new-worktree ran in the project root (a note on the Mac, a refusal on a
+        remote host), though the brief's REPO: line named the repository fill uses: every host now gets the same new worktree."""
+        base, R, g = git_repo("u3r")
+        d, cfg = launch_cfg('\n[models.c]\nprovider = "api"\nkind = "claude"\n'); cfg.run.dry = True
+        b = d / ".janus/briefs/u1.md"; b.write_text(f"REPO: {R}\nTIER: NORMAL\nSCOPE: x\nREPORT.md\nDONE-WHEN: done\n")
+        saved = janus.Beads, janus.herdr; janus.Beads = FakeBeads; janus.herdr = lambda *a, **k: None
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                try: janus.cmd_launch(cfg, self._ns("u1", model="c", brief=str(b), allow_main=False))
+                except janus.Err: pass
+        finally: janus.Beads, janus.herdr = saved
+        self.assertIn(f"git -C {R.resolve()} worktree add -b u1", out.getvalue())
+        out = io.StringIO(); janus.Beads = FakeBeads; janus.herdr = lambda *a, **k: None
+        try:
+            with contextlib.redirect_stdout(out):
+                try: janus.cmd_launch(cfg, self._ns("u1", kind="review", model="c", brief=str(b), allow_main=False))
+                except janus.Err: pass
+        finally: janus.Beads, janus.herdr = saved
+        self.assertNotIn("worktree add", out.getvalue())                    # a review reads the tree it reviews: never a fresh copy of main
+
 
 class Item13ForceClose(unittest.TestCase):
     def test_force_close_approves_only_the_unit_being_closed(self):

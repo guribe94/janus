@@ -563,9 +563,13 @@ def resume_unit(cfg, u, msg, budget=None):
     name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); mem = memory_text(cfg); text = JANUS_MARK + msg + (f"\n\nProject memory (binding; it may have changed since you started):\n{mem}" if mem else "")
     ok, why = route_ok(cfg, u.get("model"))   # the config's restrictions bind every resume as they bind a launch: a removed, unknown or disabled model fails closed; no other route is tried
     if not ok: raise Err(f"{name}: not resumed: model {u.get('model')} is not allowed now ({why})")
-    if not cfg.run.dry: reopen_report(cfg, u)
+    ag = herdr("agent", "list") if via == "herdr" and not cfg.run.dry else None   # None: herdr did not answer, so nothing is known gone
+    if ag is not None and name not in {a.get("name") for a in ag.get("agents", [])}:   # stopped, or its pane closed: a prompt reaches nobody
+        from janus.actions.backlog import relaunch_cmd
+        raise Err(f"{name}: its herdr agent is gone: nothing prompted; relaunch it: {relaunch_cmd(cfg, u)}")
+    if not cfg.run.dry: reopen_report(cfg, u); u.pop("saved", None)   # saved: this turn's end is brought here again (a tmux unit's marker never changes)
     if via == "herdr":
-        if not cfg.run.dry: herdr("agent", "prompt", name, text)
+        if not cfg.run.dry and herdr("agent", "prompt", name, text) is None: raise Err(f"{name}: herdr did not take the prompt (its agent waits at a dialog or prompt, or is gone): janus check names what it is blocked on")
         return f"{name}: " + ("prompted in its herdr pane" if not cfg.run.dry else "would prompt in its herdr pane")
     if via == "tmux":
         tm = shlex.quote(unit_tmux(u)); pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '

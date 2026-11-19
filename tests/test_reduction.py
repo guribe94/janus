@@ -97,6 +97,7 @@ class Reduction(unittest.TestCase):
         hs = {"here": {"ok": True, "pueue": {"tasks": {"5": {"status": {"Done": {"result": "Success"}}}}}}}
         prompts, free, again, ran = [], [], [], []
         def slow_host_io(*a, **k):                                     # the herdr prompt stands for ssh/tmux/queueing: it takes as long as the host does
+            if a[:2] == ("agent", "list"): return {"agents": [{"name": "u"}]}   # its agent is there
             prompts.append(a); f = open(cfg.f("write.lock"), "a")
             try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); free.append(True)   # another command could write now
             except BlockingIOError: free.append(False)
@@ -104,6 +105,7 @@ class Reduction(unittest.TestCase):
             janus.tend_parked(cfg, hs, [dict(rec, state="idle", _park=["here:5"])], again.append, {})   # a second pass meets the busy mark
             try: janus.resume_outside_lock(cfg, B(cfg), dict(rec), lambda: "again")                    # so does a manual resume
             except janus.Err as e: again.append(str(e))
+            return {}                                                  # herdr's answer: the prompt was taken
         with mock.patch.object(janus, "Beads", B), mock.patch.object(janus, "herdr", slow_host_io), mock.patch.object(janus, "job_result", lambda *a: (0, "/x.log")):
             with cfg.writer(): janus.tend_parked(cfg, hs, [dict(rec, state="idle", _park=["here:5"])], again.append, {})
         self.assertEqual(len(prompts), 1, again); self.assertEqual(free, [True])      # lock free during the host I/O; one resume only

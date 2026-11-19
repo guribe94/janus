@@ -257,7 +257,8 @@ class ResumeReopensReport(unittest.TestCase):
         d, cfg = project('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); rep = d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True)
         rep.write_text("VERDICT: DONE (landed)\nhistory\nWAITING here:3\n"); sent = []
         u = {"name": "u", "host": "here", "via": "herdr", "model": "m"}
-        with mock.patch.object(janus, "herdr", lambda *a, **k: sent.append(a)), mock.patch.object(janus, "route_ok", lambda *a: (True, "")):
+        answer = lambda *a, **k: sent.append(a) or ({"agents": [{"name": "u"}]} if a[:2] == ("agent", "list") else {})
+        with mock.patch.object(janus, "herdr", answer), mock.patch.object(janus, "route_ok", lambda *a: (True, "")):
             janus.resume_unit(cfg, u, "your jobs finished")
         self.assertEqual(rep.read_text().splitlines()[:2], ["VERDICT: PENDING", "history"]); self.assertTrue(sent)
         cmds = []; rep.write_text("VERDICT: BLOCKED x\n")
@@ -268,6 +269,31 @@ class ResumeReopensReport(unittest.TestCase):
             janus.resume_unit(cfg, {"name": "u", "host": "far", "via": "tmux", "tmux": "t", "model": "m"}, "go on")
         self.assertIn("VERDICT: PENDING\nnotes\n", [i for c, i in cmds if "/r/out/u/REPORT.md" in c], cmds)   # written on the host, by the file it read there
         self.assertTrue(rep.read_text().startswith("VERDICT: PENDING"))
+
+    def test_a_resumed_tmux_units_next_turn_end_is_brought_here(self):
+        """Catches (2026-11-19): a tmux unit's output was brought here once, when its turn ended on WAITING; its marker never changes
+        (no task id), so after the resume its DONE stayed on its host, the local report read PENDING for backup_min, and the
+        orchestrator resumed a finished unit by hand (reopening its report each time)."""
+        d, cfg = project('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n')
+        u = {"name": "u", "host": "far", "via": "tmux", "tmux": "t", "model": "m", "saved": "tmux", "saved_at": int(time.time())}
+        self.assertFalse(janus.refresh_due(cfg, {**u, "state": "idle"}))      # its WAITING turn's end: brought here already
+        screens = iter([TmuxAgents.IDLE, TmuxAgents.BUSY])
+        remote = lambda h, s, **k: (0, next(screens), "") if "capture-pane" in s else (0, "", "")
+        with mock.patch.object(janus, "X", lambda *a, **k: (0, "", "")), mock.patch.object(janus, "hrun", remote), \
+             mock.patch.object(janus, "route_ok", lambda *a: (True, "")), mock.patch("time.sleep", lambda s: None):
+            janus.resume_unit(cfg, u, "your jobs finished")
+        self.assertTrue(janus.refresh_due(cfg, {**u, "state": "idle"}))       # the resumed turn's end is brought here when it ends
+
+    def test_a_herdr_unit_whose_agent_is_gone_is_refused_with_its_relaunch(self):
+        """Catches (2026-11-19): after janus stop, a resume said 'prompted in its herdr pane' though herdr had no such agent (its
+        answer was ignored), and reopened the report; launch --resume-of under the same name said only 'already launched'."""
+        d, cfg = project(); rep = d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True); rep.write_text("VERDICT: DONE\n"); sent = []
+        u = {"name": "u", "host": "here", "via": "herdr", "model": "m", "kind": "audit", "tier": "critical", "item": "X1", "brief": "/b/u.md", "cwd": "/w/u"}
+        answer = lambda *a, **k: sent.append(a) or ({"agents": [{"name": "other"}]} if a[:2] == ("agent", "list") else None)
+        with mock.patch.object(janus, "herdr", answer), mock.patch.object(janus, "route_ok", lambda *a: (True, "")), mock.patch.object(janus, "all_units", lambda cfg: {"u": u}):
+            with self.assertRaises(janus.Err) as e: janus.resume_unit(cfg, u, "go on")
+        self.assertIn("janus launch u-r2 --kind audit --tier critical --model m --host here --item X1 --resume-of u --brief /b/u.md --cwd /w/u", str(e.exception))
+        self.assertNotIn("prompt", [x[1] for x in sent]); self.assertEqual(rep.read_text(), "VERDICT: DONE\n")   # nothing sent, the report kept
 
 
 class JobProgress(unittest.TestCase):

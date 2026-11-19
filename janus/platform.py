@@ -43,6 +43,11 @@ def herdr(*a, timeout=20):
     try: return json.loads(o).get("result", {}) if rc == 0 else None
     except Exception: return None
 
+def herdr_text(*a, timeout=20):
+    """A herdr read that prints the screen as text (pane read, agent read), not JSON: its text, or None."""
+    rc, o, e = run(["herdr", *a], timeout=timeout)
+    return o if rc == 0 else None
+
 
 def secret_get(item):
     """(rc, secret) from the OS secret store: the macOS keychain (`security`), else the freedesktop store (`secret-tool lookup
@@ -186,4 +191,4 @@ def launchd_exports(name):
     rc, o, _ = run(["launchctl", "getenv", name], timeout=5)
     return rc == 0 and bool(o.strip())
 
-__all__ = ["launchd_exports", "group_cpu_s", "tree_groups_sh", "run", "ps_table", "secs", "herdr", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts", "CACHE_ENV", "cache_env_sh"]
+__all__ = ["launchd_exports", "group_cpu_s", "tree_groups_sh", "run", "ps_table", "secs", "herdr", "herdr_text", "secret_get", "watcher_service", "watcher_loaded", "pane_tool", "HOST_FACTS", "ARCH", "parse_facts", "CACHE_ENV", "cache_env_sh"]
