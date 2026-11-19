@@ -1,6 +1,6 @@
 """A unit's life after launch: janus stop, collect, close, park, resume, board-close; saving its output, task log and
 transcript; the watcher's tend_parked (resume a parked unit when its jobs finished)."""
-import ast, contextlib, os, re, shlex, sys, time
+import argparse, ast, contextlib, os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import (collect_job, job_of, job_state, patch_scope, patch_scope_desc, patch_scope_sh, recorded_jid, runs_dir, save_task_log,
     task_rc, task_status, unit_jobs)
@@ -399,6 +399,11 @@ def tree_changed(cfg, cwd, head0):
     head = sh(["git", "rev-parse", "HEAD"], cwd=cwd)[1].strip() or None
     return f"its HEAD moved ({(head0 or '?')[:9]} -> {(head or '?')[:9]})" if head != head0 else None
 
+def close_reason(cfg, u):
+    """What a close without --reason records: done, else the report's own final verdict, else that it had none."""
+    v = verdict(cfg, u)
+    return "done" if str(v).startswith("VERDICT: DONE") else (v or "no final verdict")[:200]
+
 def cmd_close(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
     handover = bool(getattr(a, "handover", False)); dup = getattr(a, "duplicate_of", None)
@@ -474,7 +479,7 @@ def cmd_close(cfg, a):
     if cfg.run.dry: return
     u = next((x for x in bd.units() if x["id"] == u["id"]), u)   # as it is now: the run is settled and the issue closed on the current record
     if ended: settle_run(cfg, u, "closed")
-    bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or "done")
+    bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or close_reason(cfg, u))
     say("closed")
 
 def job_result(cfg, hs, ref, agent_host):
@@ -667,6 +672,18 @@ def resume_outside_lock(cfg, bd, u, make_msg, budget=None):
         raise
     u.pop("busy", None)
     return line
+
+def answer_unit(cfg, name, q, text):
+    """janus answer's delivery to the unit that asked: an agent whose turn ended on its question never reads the board again, so it
+    is resumed with the answer (cmd_resume, with every guard of a resume). A herdr agent is prompted only when idle: working, it
+    reads the board itself; gone or unknown, a prompt reaches nobody and the resume would still reopen its report."""
+    try: _, u = get_unit(cfg, name)
+    except Err: return   # not an open unit (the orchestrator's own agent, a closed unit): the board answer is all
+    st = unit_state(u, {}, herdr_agents(cfg)) if u.get("via") == "herdr" else None
+    if st not in (None, "idle"): return say(f"{name} not resumed with the answer: its herdr agent is {st}" + (" and reads it on the board" if st == "working" else ""))
+    try: cmd_resume(cfg, argparse.Namespace(unit=name, message=f"The answer to your question {q}: {text}", force=False, budget=None))
+    except LockLost: raise
+    except Err as e: say(f"{name} not resumed with the answer: {e}")
 
 def cmd_resume(cfg, a):
     """Resume a unit's own session now: parked (its jobs' results, when they finished), or with --message.

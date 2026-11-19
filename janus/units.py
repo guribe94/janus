@@ -46,7 +46,8 @@ def report_untouched(cfg, u):
     except OSError: return False
 
 def verdict(cfg, u):
-    """The unit's final VERDICT line: report.json's verdict when it states one (preferred over the prose), else the last
+    """The unit's final VERDICT line: report.json's verdict when it states one (preferred over the prose, unless an earlier run of
+    the unit wrote it: written before this run started, resumed_at or started), else the last
     'VERDICT:' line of its report (a resumed unit: its original report, report_path). A resumed report still holds the earlier
     run's verdict, so only a verdict written after the resume started counts, and a line 1 that is still PENDING means not
     finished. A report whose LAST VERDICT line is PENDING or WAITING is not finished (item 11, finding 2): whatever earlier
@@ -76,7 +77,7 @@ def verdict(cfg, u):
     last = t[vi] if vi is not None else None                                  # the report's last VERDICT line decides
     if last is not None and NONFINAL.search(last): return None                # ends parked/pending: not finished
     v, present = verdict_line(j)
-    if present: return v
+    if present and not (last and older(p.with_name("report.json"), u.get("resumed_at") or u.get("started"))): return v
     return last
 
 def herdr_agents(cfg):
@@ -112,6 +113,11 @@ def report_path(cfg, u):
     brings that folder here, never into another unit's."""
     remote = u.get("host") in cfg.hosts and not cfg.hosts[u["host"]].get("local")
     return Path(u["report"]) if u.get("report") and not remote else cfg.p("out", "out") / u["name"] / "REPORT.md"
+
+def older(f, t):
+    """File f was last written before epoch t: an earlier run's (no t, or no file: False)."""
+    try: return bool(t) and f.stat().st_mtime < t
+    except OSError: return False
 
 def report_json(cfg, u):
     """The unit's structured report, report.json next to its REPORT.md (verdict, files_changed, jobs with exit codes,

@@ -497,10 +497,12 @@ BACKLOG_WORDS = {"ready": "ready: janus fill launches it", "relaunch": "relaunch
                  "units-done": "all units done: close it or brief the rest"}
 
 def units_cell(p):
-    """The UNITS cell of a backlog item: its units done and open (the newest open one named), from item_progress."""
+    """The UNITS cell of a backlog item: its units done, blocked (BLOCKED or FAILED), unfinished (closed with no final verdict) and
+    open (the newest open one named), from item_progress."""
     if not p: return "-"
-    other = p["closed"] - len(p["done"])
-    return (f"{len(p['done'])} done" + (f", {other} ended otherwise" if other else "") + (f", {len(p['open'])} open: {p['open'][0]}" if p["open"] else ""))
+    b = len(p["blocked"]); left = p["closed"] - len(p["done"]) - b
+    return (f"{len(p['done'])} done" + (f", {b} blocked" if b else "") + (f", {left} unfinished" if left else "")
+            + (f", {len(p['open'])} open: {p['open'][0]}" if p["open"] else ""))
 
 def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs", by=None, lead=(), progress=None, holds=None):
     """covered, missing: the checklist source's items live open units cover (their --item or brief ITEM: line; a unit on a stranded
@@ -533,6 +535,7 @@ def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="brie
              f"Age:       {fmt_dur(now - t0) if t0 else '?'}", f"Meaning:   {mean}"]
         if us: d.append("Open now:  " + ", ".join(f"{n} ({h}" + (", host down)" if s else ")") for n, h, s in us))
         if p.get("done"): d.append(f"Done:      {', '.join(p['done'])}")
+        if p.get("blocked"): d.append(f"Blocked:   {', '.join(p['blocked'])}")
         last = f"{fmt_dur(now - p['last'])} ago" if p.get("last") else "-"
         words = "held, all its units done: lift the hold, or close it" if state == "held" and p.get("done") and not p.get("open") else BACKLOG_WORDS.get(state, state)
         rows.append(Row(f"i:{i.get('id')}", (title, words + (" STALE" if stale else ""), units_cell(p), host or "-", last),

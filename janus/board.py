@@ -56,9 +56,14 @@ def stale_board_findings(cfg):
     return F
 
 def cmd_answer(cfg, a):
-    """janus answer q<N> <text>: answer one board question (a direction to its agent); works from any directory and any tool."""
+    """janus answer q<N> <text>: answer one board question (a direction to its agent); works from any directory and any tool. The
+    unit that asked gets the answer (lifecycle.answer_unit)."""
+    from janus.actions.lifecycle import answer_unit
+    who = next((ag for q, ag, *_ in board_questions(cfg) or [] if q == a.id), None)
     rc, o, e = board(cfg, "answer", a.id, a.answer)
     if rc: raise Err(f"answer {a.id}: {(e or o).strip()[:160]}")
+    if who:
+        with cfg.command_writer(): answer_unit(cfg, who, a.id, a.answer)   # the board answer above takes no lock; the resume does
     return 0, [f"answered {a.id}"]
 
 def cmd_send(cfg, a):

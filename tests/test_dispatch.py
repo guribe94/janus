@@ -367,6 +367,14 @@ class Landing(LandingBase):
         self.assertIn("unpushed", str(e.exception))
 
 
+    def test_close_records_the_units_verdict_not_done(self):
+        """Catches: janus close recorded reason 'done' for a unit whose report said BLOCKED or PENDING, so the ledger read as if
+        every closed unit had finished."""
+        self.land(); rep = self.d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True, exist_ok=True); rep.write_text("VERDICT: BLOCKED (no VM host)\n")
+        with mock.patch.object(janus, "uncollected", lambda *a: None), mock.patch.object(janus, "X", lambda *a, **k: (0, "", "")):
+            self.close(dry=False)
+        self.assertIn(("close", "u1", "--reason", "VERDICT: BLOCKED (no VM host)"), self.w.writes)
+
 class FollowUp(LandingBase):
     """The reviewer's follow-up findings: each test fails on the first-pass code."""
     def held(self): return str(self.cfg.f("write.lock")) in sys.modules["janus.context"]._HELD

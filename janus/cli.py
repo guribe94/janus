@@ -21,9 +21,9 @@ from janus.monitor import cmd_monitor, interval_arg
 from janus.setup import cmd_doctor, cmd_init, cmd_install_host, cmd_queue, cmd_register, cmd_resume_orch, cmd_standby, cmd_switch
 from janus.watch import cmd_watch
 
-LOCKS_LATE = {"collect"}   # writers that take the lock themselves, once their remote reads are done
+LOCKS_LATE = {"collect", "answer"}   # writers that take the lock themselves, once their remote reads are done
 WRITERS = {"launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
-           "remember", "forget", "memory", "index", "register", "board-close", "report", "standby", "on", "off"}
+           "remember", "forget", "memory", "index", "register", "board-close", "report", "standby", "on", "off", "answer"}
 
 def cmd_resume(cfg, a):
     """janus resume: a parked unit when one is named, else the orchestration itself (janus/setup.cmd_resume_orch): continue it

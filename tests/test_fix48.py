@@ -213,3 +213,34 @@ class CapacityRuleFollowsReleases(unittest.TestCase):
         cfg.capc["psi_pause"] = 20; janus.tend_cap(cfg, hs, log.append)
         self.assertEqual(len(log), 2); self.assertIn("PSIP=20", f.read_text())
         janus.tend_cap(cfg, {"here": {"ok": False}}, log.append); self.assertEqual(len(log), 2)   # a host that does not answer: next pass
+
+
+class UnitsThatDoNotFinish(unittest.TestCase):
+    """2026-11-18: 86 closed units on a project ended without DONE. Each test names the janus cause it catches."""
+    def test_a_report_json_an_earlier_run_left_does_not_state_the_verdict(self):
+        """Catches (a80-page-signoff, a98-finish-midgard): a unit resumed and finished DONE read BLOCKED / READY-TO-LAND from the
+        report.json its run before the resume had written."""
+        d, cfg = project(); o = d / ".janus/out/u"; o.mkdir(parents=True); u = {"name": "u", "host": "here", "started": 0, "resumed_at": time.time() - 300}
+        (o / "report.json").write_text(json.dumps({"verdict": "BLOCKED"})); (o / "REPORT.md").write_text("VERDICT: DONE (landed)\n")
+        os.utime(o / "report.json", (time.time() - 600,) * 2)
+        self.assertEqual(janus.verdict(cfg, u), "VERDICT: DONE (landed)")
+        os.utime(o / "report.json", None)
+        self.assertEqual(janus.verdict(cfg, u), "VERDICT: BLOCKED")                       # this run's json still wins over the prose
+
+    def test_an_answer_resumes_the_stopped_unit_that_asked(self):
+        """Catches: janus answer only wrote the board; an agent whose turn had ended on its question never read it, and the unit was
+        closed unfinished (6 answered questions, none acted on)."""
+        d, cfg = project(); cfg.run.ro = False; resumed = []; state = {"a1": "idle"}
+        units = {n: {"name": n, "host": "here", "via": "herdr"} for n in ("a1", "a2")}
+        def get_unit(cfg, n):
+            if n not in units: raise janus.Err(f"no unit {n}")
+            return None, units[n]
+        with mock.patch.object(janus, "get_unit", get_unit), mock.patch.object(janus, "herdr_agents", lambda cfg: {n: {"agent_status": s} for n, s in state.items()}), \
+             mock.patch.object(janus, "cmd_resume", lambda cfg, a: resumed.append((a.unit, a.message))):
+            for who in ("a1", "a2", "orch"): janus.board(cfg, "post", who, "question", f"{who} asks")
+            janus.cmd_answer(cfg, argparse.Namespace(id="q1", answer="use 8080"))
+            self.assertEqual(resumed, [("a1", "The answer to your question q1: use 8080")])
+            state["a2"] = "working"; janus.cmd_answer(cfg, argparse.Namespace(id="q2", answer="x"))   # working: it reads the board itself
+            janus.cmd_answer(cfg, argparse.Namespace(id="q3", answer="y"))                          # not a unit: the board answer is all
+            state.clear(); janus.board(cfg, "post", "a1", "question", "again"); janus.cmd_answer(cfg, argparse.Namespace(id="q4", answer="z"))   # its pane is gone: a prompt reaches nobody
+        self.assertEqual(len(resumed), 1)

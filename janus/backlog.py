@@ -168,8 +168,9 @@ def stranded_cover(cfg, units, iss=None):
     return out
 
 def item_progress(cfg, units, iss=None):
-    """{item: {"open": [unit names], "done": [unit names], "closed": n, "last": epoch}} over every unit, open or closed, that
-    names the item (unit_items): the work each backlog item has had. done: closed with a final VERDICT: DONE. Names newest
+    """{item: {"open": [unit names], "done": [unit names], "blocked": [unit names], "closed": n, "last": epoch}} over every unit,
+    open or closed, that names the item (unit_items): the work each backlog item has had. done: closed with a final VERDICT: DONE;
+    blocked: closed with a final VERDICT: BLOCKED or FAILED (the rest of the closed ended with no final verdict). Names newest
     first; last: the latest start or close among them. Read by check (backlog:done) and the monitor's Backlog tab."""
     def at(x):
         try: return datetime.datetime.fromisoformat(str(x).replace("Z", "+00:00")).timestamp()
@@ -177,11 +178,12 @@ def item_progress(cfg, units, iss=None):
     out = {}
     for u in sorted(units, key=lambda u: -(u.get("started") or 0)):
         for k in unit_items(cfg, [u], iss):
-            p = out.setdefault(k, {"open": [], "done": [], "closed": 0, "last": 0})
+            p = out.setdefault(k, {"open": [], "done": [], "blocked": [], "closed": 0, "last": 0})
             if u.get("status") != "closed": p["open"].append(u["name"])
             else:
-                p["closed"] += 1
-                if str(verdict(cfg, u) or "").startswith("VERDICT: DONE"): p["done"].append(u["name"])
+                p["closed"] += 1; v = str(verdict(cfg, u) or "")
+                if v.startswith("VERDICT: DONE"): p["done"].append(u["name"])
+                elif v.startswith(("VERDICT: BLOCKED", "VERDICT: FAILED")): p["blocked"].append(u["name"])
             p["last"] = max(p["last"], u.get("started") or 0, at(u.get("closed_at")) if u.get("closed_at") else 0)
     return out
 

@@ -242,6 +242,18 @@ class ItemProgress(Base):
         self.assertEqual(b["Item two"].state, "held"); self.assertIn("waits for the owner", " ".join(b["Item two"].detail))
         self.assertTrue(b["Item two"].cells[1].startswith("held, all its units done"), b["Item two"].cells[1])   # finished work behind a hold
 
+    def test_units_that_ended_without_done_are_told_apart(self):
+        """Catches (owner 2026-11-18): 'ended otherwise' lumped a unit that stopped BLOCKED with one closed before it finished."""
+        w = self.w; (self.d / "S.md").write_text("| # | item | status | evidence |\n|---|---|---|---|\n| one | Item one | READY | - |\n")
+        lab = ["backlog", "backlog-ready"]
+        w.backlog = [{"id": "b-1", "title": "Item one", "labels": lab, "status": "open", "external_ref": "backlog:one"}]
+        w.ready = [{"id": "b-1", "title": "Item one", "labels": lab}]
+        w.closed = [{**unit(n, item="one"), "status": "closed", "closed_at": "2026-11-17T10:00:00Z"} for n in ("d", "b", "f", "p")]
+        for n, t in (("d", "VERDICT: DONE (landed)"), ("b", "VERDICT: BLOCKED (no host)"), ("f", "VERDICT: FAILED"), ("p", "VERDICT: PENDING")): w.report(n, t + "\n")
+        self.collect(); r = next(r for r in self.model().rows["Backlog"] if r.cells[0] == "Item one")
+        self.assertEqual(r.cells[2], "1 done, 2 blocked, 1 unfinished")
+        self.assertIn("Blocked:   f, b", r.detail)
+
 
 class Stranded(Base):
     """A host down past [capacity] down_after_min, or marked by the owner: the monitor says what janus does about it."""
