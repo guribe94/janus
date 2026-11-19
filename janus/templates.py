@@ -131,7 +131,7 @@ res_sum() {  # live reservations: RJ jobs holding RC cores and RM MB, RA agents 
 res=$p $c $m $t $k ${f##*/} $sc"
   done
   for j in $( { %(jobids)s; } 2>/dev/null); do
-    [ -e "$RD/$j.res" ] && continue
+    [ -e "$RD/$j.res" ] || [ -e "$RD/$j.rc" ] && continue   # .rc: the job ended; a daemon it started (sccache) can keep its scope alive
     RJ=$((RJ + 1)); RC=$((RC + CPJ)); RM=$((RM + CAPMB)); RL="$RL
 res=- $CPJ $CAPMB - untracked $j"
   done

@@ -9,7 +9,7 @@ from janus.board import board, board_rows
 from janus.cap import capv
 from janus.context import FIXTURE_MARK, Err, LockLost, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
 from janus.branch import contained, landed, landing_branch
-from janus.project import own_card
+from janus.project import label_owner, own_card, tmux_name
 from janus.transcripts import card_fields
 from janus.units import all_units, herdr_agents, orphan_tabs, ws_id
 
@@ -132,6 +132,7 @@ def tidy_out_bulk(cfg, units):
 TIDY_HOST = r'''root=%(root)s; rd=%(rd)s; kd=%(kd)d
 [ -n "$root" ] && [ -d "$root/worktrees" ] && for d in "$root"/worktrees/*/; do [ -d "$d" ] && n=${d%%/}; [ -d "$d" ] && echo "copy ${n##*/} $(du -sm "$d" 2>/dev/null | cut -f1)"; done
 [ -d "$rd" ] && echo "runfiles $(find "$rd" -maxdepth 1 -type f -mtime +$kd \( -name '*.log' -o -name '*.sh' -o -name '*.rc' -o -name '*.cmd' -o -name '*.out' -o -name '*.err' -o -name '*.done' \) 2>/dev/null | wc -l | tr -d ' ')"
+tmux ls -F '#S' 2>/dev/null | sed 's/^/tmux /'
 command -v podman >/dev/null 2>&1 && podman ps -a --filter name=^janus-run- --filter status=exited --format '{{.Names}}' 2>/dev/null | sed 's/^/container /'
 for c in %(caches)s; do [ -d "$c" ] || continue; for e in "$c"/*; do [ -e "$e" ] && echo "cache $(du -sm "$e" 2>/dev/null | cut -f1) $(stat -c %%Y "$e" 2>/dev/null || stat -f %%m "$e") $e"; done; done
 [ -n "$root" ] && [ -d "$root" ] && echo "rootmb $(du -sm "$root" 2>/dev/null | cut -f1)"; true'''
@@ -154,6 +155,10 @@ def tidy_host(cfg, n, h, units, au):
                 why = uncollected(cfg, {**u, "via": u.get("via") if u.get("via") not in ("failed", "starting") else "x"})
                 if why: continue
                 P.append(("remote-copy", f"{n}:{f[1]}", "its unit is closed and its copy holds nothing uncollected", int(fl(f[2]) if len(f) > 2 else 0)))
+        elif f[0] == "tmux" and len(f) > 1 and f[1].startswith("janus-"):   # a closed unit's session: close of an older janus left it, and its pid holds the agent's reservation
+            base, pid = label_owner(f[1]); u = au.get(base[6:])
+            if pid == tmux_name(cfg, "x").rpartition("@")[2] and base[6:] not in open_ and u and u.get("status") == "closed" and u.get("host") == n:
+                P.append(("tmux", f"{n}:{f[1]}", "its unit is closed", 0))
         elif f[0] == "runfiles" and len(f) > 1 and int(f[1] or 0): P.append(("run-files", n, f"{f[1]} job run file(s) older than {tset(cfg, 'keep_days')} days", 0))
         elif f[0] == "container" and len(f) > 1 and f[1].startswith("janus-run-"): P.append(("container", f"{n}:{f[1]}", "our own stopped container", 0))
         elif f[0] == "cache" and len(f) > 3: cache.append((int(fl(f[1])), int(fl(f[2])), f[3]))
@@ -239,8 +244,8 @@ def tidy_all(cfg, units, hs=None):
 # The kinds the watcher removes on its own with [tidy] auto = true: every kind tidy finds, each already chosen by its safe rule
 # (clean and landed; closed and nothing uncollected; our own stopped container; older than keep_days; over the disk budget).
 # Only some once, and the rest waited for the orchestrator, whose hooks refuse hand removal: found waste filled the disk.
-TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch", "artifact", "remote-copy", "run-files", "container", "cache", "test-root", "out-bulk", "pane", "tab", "card")
-TIDY_HOST_KINDS = ("remote-copy", "run-files", "container", "cache")
+TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch", "artifact", "remote-copy", "run-files", "container", "cache", "test-root", "out-bulk", "pane", "tab", "card", "tmux")
+TIDY_HOST_KINDS = ("remote-copy", "run-files", "container", "cache", "tmux")
 
 LOW_DISK_MIN = 5   # a host under [capacity] min_disk_gb is tidied this often (a pass scans every host: tens of seconds)
 
@@ -291,6 +296,7 @@ def tidy_do(cfg, kind, t):
     hn, _, x = t.partition(":"); h = cfg.hosts.get(hn if kind != "run-files" else t, {})
     if kind == "remote-copy":
         root = h["root"]; return hrun(h, f"cd {qp(root)} && rm -rf worktrees/{shlex.quote(x)} base/{shlex.quote(x)} briefs/{shlex.quote(x)}.md run/{shlex.quote(x)}.* ctx/{shlex.quote(x)}; true", timeout=300)[0], ""
+    if kind == "tmux": return hrun(h, f"tmux kill-session -t {shlex.quote('=' + x)}", timeout=60)[0], ""
     if kind == "run-files":
         return hrun(h, f"find {qp(h['_rd'])} -maxdepth 1 -type f -mtime +{int(tset(cfg, 'keep_days'))} \\( -name '*.log' -o -name '*.sh' -o -name '*.rc' -o -name '*.cmd' -o -name '*.out' -o -name '*.err' -o -name '*.done' \\) -exec rm -f {{}} +", timeout=300)[0], ""
     if kind == "container":

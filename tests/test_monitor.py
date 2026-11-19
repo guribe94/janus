@@ -60,7 +60,7 @@ class Base(unittest.TestCase):
     extra = FAR
     def setUp(self):
         self.d, self.cfg = project(self.extra); self.w = World(self.d); self.store = M.Store()
-        for p in self.w.patches(): p.start(); self.addCleanup(p.stop)
+        for p in self.w.patches() + [mock.patch.object(M, "BEADS_EVERY", 0)]: p.start(); self.addCleanup(p.stop)   # every collection reads beads (BeadsReads tests the limit)
         self.col = M.Collector(self.d, self.store, 5)
     def collect(self): self.col.collect_once()
     def model(self, offset=0):
@@ -629,6 +629,19 @@ class Cleanup(Base):
         env = {k: v for k, v in os.environ.items() if k not in ("JANUS_ROOT", "JANUS_UNIT", "JANUS_ROLE", "JANUS_REPORT")}
         r = subprocess.run([sys.executable, str(JANUS_PY), "monitor"], cwd=self.d, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
         self.assertEqual(r.returncode, 1); self.assertIn("interactive terminal", r.stderr); self.assertNotIn("Traceback", r.stderr)
+
+
+class BeadsReads(Base):
+    def test_beads_are_read_at_most_every_beads_every(self):
+        """Catches (2026-11-19): the open monitor read beads with five bd calls every 5 s; bd answers one call at a
+        time across processes, so a janus status waited 25 s for one bd list. Hosts still refresh every time; r reads beads too."""
+        bd = lambda: sum(1 for c in self.w.calls if c[0] == "bd"); far = lambda: sum(1 for c in self.w.calls if c[0] == "ssh")
+        self.w.units = [unit("run", task=1)]; self.w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})})
+        with mock.patch.object(M, "BEADS_EVERY", 30.0):
+            self.collect(); n, s = bd(), far(); self.assertGreater(n, 0)
+            self.collect(); self.assertEqual(bd(), n); self.assertGreater(far(), s)    # within BEADS_EVERY: no bd call, the hosts again
+            self.assertEqual(self.states(), {"run": "working"})                         # the units read before are still shown
+        self.col.request(); self.col.wake.clear(); self.collect(); self.assertGreater(bd(), n)
 
 
 class Cli(unittest.TestCase):

@@ -503,7 +503,7 @@ def tmux_submit(cfg, h, tm, text):
     """Submit text as one prompt to the agent in tmux session tm on host h, and confirm it was taken. The text is pasted from a
     tmux buffer: `send-keys -l` refuses a command over about 16 KB ("command too long"), and a resume carries the project memory,
     so every interactive resume was lost while janus logged it as sent. A prompt pasted while the agent works is queued until its
-    turn ends. Taken (read on its screen and scrollback, rigpc 2.1.328): the prompt's first line stands in the history once more
+    turn ends. Taken (read on its screen and scrollback, Claude Code 2.1.328): the prompt's first line stands in the history once more
     than before (`❯ <line>`, sent or queued; a short turn can be over within a second), or an agent idle before it now works.
     A draft already in the box (an earlier prompt never sent) is cleared first (C-u; Escape would interrupt a working agent),
     so the prompt never goes twice. A box that still holds the prompt gets one more Enter. Err when it is not taken."""

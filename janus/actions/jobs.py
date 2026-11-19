@@ -182,7 +182,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
                    "waitmax": int(lane_wait(cfg, a.lane) * 60)}   # item 21: give up after the lane's wait limit
     if h.get("local"):
-        body = f"{cdir}{ce[1] if ce else ''}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n {nice} bash -c {q(cmd)}\n"
+        body = f"{h.get('run_env', '')}\n{cdir}{ce[1] if ce else ''}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n {nice} bash -c {q(cmd)}\n"
     else:
         cap = int(h.get("job_gb", 2) * 1024)
         scope = f"systemd-run --user --scope -q {q('--unit=janus-' + jid)} -p MemoryMax={cap}M -p \"CPUQuota=$((CC * 100))%\" --"   # CC: the admitted cores

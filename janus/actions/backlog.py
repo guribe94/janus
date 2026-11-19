@@ -390,8 +390,8 @@ def checklist_set(cfg, item, status=None, evidence=None):
 def accept_item(cfg, item, status, unit, commit=None):
     """janus backlog set <item> status=DONE --unit <unit> [--commit <sha>] [--dry-run]: the owner's explicit acceptance of a whole
     item, never a side effect of a landing or a close. The unit must be linked to the item (its --item or brief ITEM: line) and its
-    landing publication recorded (janus land --push), or, for a unit whose agent pushed without janus land, --commit: a commit its
-    own report names. Either must be on the remote's landing branch now (fetched again: unknown is a refusal). Then, under the
+    landing publication recorded (janus land --push), or, for a unit whose agent pushed without janus land or verified the work already there, --commit:
+    a commit its own report names. Either must be on the remote's landing branch now (fetched again: unknown is a refusal). Then, under the
     writer lock, the checklist row: status DONE and the sha as evidence; then the item's beads issue is closed. Run again it
     finishes what a failure left (each step is idempotent) and changes nothing more."""
     dn = [x.upper() for x in backlog_cfg(cfg).get("done", ["DONE"])]
@@ -412,14 +412,11 @@ def accept_item(cfg, item, status, unit, commit=None):
         if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit) or commit.lower() not in report_text(cfg, u).lower():
             raise Err(f"--commit {commit}: not a commit {unit}'s report names ({report_path(cfg, u)}): {item} is not accepted")
         pub = {"commit": commit, "remote": "origin", "branch": landing_branch(cfg, published_repo(cfg, u))}
-        made = lambda: sh(["git", "-C", str(published_repo(cfg, u)), "show", "-s", "--format=%ct", commit + "^{commit}"])[1].strip()
     if not pub.get("commit"): raise Err(f"{unit} has no verified publication recorded (janus land {unit} --push records it; a commit its agent pushed itself: --commit <sha>): {item} is not accepted")
     repo = published_repo(cfg, u)
     with cfg.unlocked(): ok = verify_published(repo, pub)   # git fetch: never under the writer lock
     if ok is None: raise Err(f"the publication of {pub['commit'][:12]} on {pub.get('remote')}/{pub.get('branch')} cannot be verified now (fetch failed or unknown commit): refused, try again")
     if not ok: raise Err(f"{pub['commit'][:12]} is not on {pub.get('remote')}/{pub.get('branch')} now: {item} is not accepted")
-    if commit and int(made() or 0) < u.get("started", 0):   # the base it started from, which its report may name: not its work
-        raise Err(f"--commit {commit} was made before {unit} started: not its work; {item} is not accepted")
     sha = (sh(["git", "-C", str(repo), "rev-parse", "--verify", pub["commit"] + "^{commit}"])[1].strip() or pub["commit"])[:12]
     if cfg.run.dry:
         did = checklist_set(cfg, item, dn[0], sha)

@@ -201,7 +201,7 @@ def host_findings(cfg, hs, units):
             if not s.startswith("janus-") or s in mine: continue
             base, pid = label_owner(s)
             if pid is None: F.append((f"machine:tmux:{n}:{s}", f"tmux session {s} on {n} carries no project id: machine state, not this project's; janus does not act on it"))
-            elif pid == tmux_name(cfg, "x").rpartition("@")[2]: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: collect what it wrote, then stop it (janus stop, or relaunch its unit)"))
+            elif pid == tmux_name(cfg, "x").rpartition("@")[2]: F.append((f"orphan:tmux:{n}:{s}", f"orphan tmux session {s} on {n} has no open unit: janus tidy stops it when its unit is closed"))
     return F
 
 def pane_findings(cfg, units, ag):

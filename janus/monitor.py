@@ -25,6 +25,8 @@ except ImportError: curses = None   # janus itself must still import where the c
 
 TABS = ("Active", "Backlog", "Ended", "Board", "Overview")
 MIN_INTERVAL = 1.0      # seconds: every refresh is an ssh round trip per host
+BEADS = ("units", "closed", "backlog", "checklist")   # the sources read from beads, every BEADS_EVERY only
+BEADS_EVERY = 30.0      # seconds between beads reads: bd answers one call at a time across every process, so a read every refresh kept every janus command waiting
 FINISHED_KEEP = 40      # closed units shown (newest first)
 BOARD_TAIL = 400        # board log lines read
 LOG_BYTES = 256 * 1024  # of the log's tail
@@ -259,10 +261,10 @@ class Collector:
     Never two at a time. Hosts are probed in parallel, each a source of its own, so a slow or dead host delays only itself."""
     def __init__(self, root, store, interval, clock=time.time):
         self.root, self.store, self.interval, self.clock = Path(root), store, interval, clock
-        self.wake, self.stopping = threading.Event(), threading.Event(); self.thread = None
+        self.wake, self.stopping = threading.Event(), threading.Event(); self.thread = None; self.beads_due = 0.0
     def start(self):
         self.thread = threading.Thread(target=self.loop, name="janus-monitor-collect", daemon=True); self.thread.start()
-    def request(self): self.wake.set()
+    def request(self): self.beads_due = 0.0; self.wake.set()   # a refresh asked for reads beads too
     def stop(self):
         self.stopping.set(); self.wake.set()
         if self.thread: self.thread.join(1)
@@ -292,13 +294,15 @@ class Collector:
                 try: p = collect_host(cfg, n); done.put((n, p, None, self.clock()))
                 except Exception as e: done.put((n, None, err_text(e), self.clock()))
             for n in cfg.hosts: threading.Thread(target=host, args=(n,), daemon=True).start()
-            prev = st.view()[0]
-            units = self.step("units", collect_units, cfg)
-            closed = self.step("closed", collect_closed, cfg)
+            prev = st.view()[0]; last = lambda n: prev.get(n, Source()).data
+            beads = self.clock() >= self.beads_due
+            if beads: self.beads_due = self.clock() + BEADS_EVERY
+            units = self.step("units", collect_units, cfg) if beads else last("units")
+            closed = self.step("closed", collect_closed, cfg) if beads else last("closed")
             if units is not None: self.step("reports-open", collect_reports, cfg, units)
             if closed is not None: self.step("reports-closed", collect_reports, cfg, closed)
-            backlog = self.step("backlog", collect_backlog, cfg)
-            if units is not None: self.step("checklist", collect_checklist, cfg, units, backlog)
+            backlog = self.step("backlog", collect_backlog, cfg) if beads else last("backlog")
+            if units is not None and beads: self.step("checklist", collect_checklist, cfg, units, backlog)
             self.step("board", collect_board, cfg)
             self.step("facts", collect_facts, cfg)
             self.step("liveness", collect_liveness, cfg)
@@ -584,7 +588,7 @@ EMPTY = {"Active": "Nothing is running, queued or parked", "Backlog": "Nothing i
 
 def derive(view, now, interval):
     """The Model: every source read as what it means now, with its age and error beside it. Unknown stays '?' or 'unavailable'."""
-    limit = 3 * interval + 60.0; S = lambda n: view.get(n) or Source(); st = lambda n: source_state(S(n), now, limit); stale = lambda n: st(n) == "stale"
+    limit = 3 * interval + 60.0; S = lambda n: view.get(n) or Source(); st = lambda n: source_state(S(n), now, limit + (BEADS_EVERY if n in BEADS else 0)); stale = lambda n: st(n) == "stale"
     m = Model(); cfg = S("config"); hosts = (cfg.data or {}).get("hosts", [])
     if cfg.data: m.project = cfg.data["name"]; m.standby = cfg.data.get("standby"); m.rigor = cfg.data.get("rigor", "")
     ck = S("checklist").data or {}

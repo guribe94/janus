@@ -344,7 +344,8 @@ class Landing(LandingBase):
     def test_done_for_a_commit_the_units_agent_pushed_itself(self):
         """Catches (2026-11-18, BRIEF-UPKEEP, CHECKLIST-UPKEEP, A80): a unit whose agent pushed to main itself has no janus land
         record, so its item could not be accepted at all, though `merge-base --is-ancestor` proves it landed. --commit names
-        the commit; it must be one the unit's own report names and on the landing branch now."""
+        the commit; it must be one the unit's own report names and on the landing branch now. Catches too (2026-11-19):
+        a unit that verified work already on main named a commit from before it started, and that was refused."""
         self.w.issue("X1"); sha = git(self.wt, "rev-parse", "HEAD"); rep = self.d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True, exist_ok=True)
         rep.write_text("VERDICT: DONE\npushed\n")
         with self.assertRaises(janus.Err) as e: self.set_done(commit=sha[:9])
@@ -353,9 +354,7 @@ class Landing(LandingBase):
         with self.assertRaises(janus.Err) as e: self.set_done(commit=sha[:9])
         self.assertIn("is not on origin/main", str(e.exception))           # named, not on the landing branch yet
         git(self.wt, "push", "-q", "origin", "HEAD:main")                   # the agent's own push
-        self.u["started"] = int(time.time()) + 3600                          # a commit from before the unit started: its base, not its work
-        with self.assertRaises(janus.Err) as e: self.set_done(commit=sha[:9])
-        self.assertIn("before u started", str(e.exception)); self.u["started"] = int(time.time()) - 3600
+        self.u["started"] = int(time.time()) + 3600                          # made before the unit started: work it verified already on main
         self.set_done(commit=sha[:9])
         self.assertIn(f"| X1 | one | DONE | {sha[:12]} |", (self.d / "S.md").read_text())
         self.u["published"] = {"commit": sha, "remote": "origin", "branch": "main"}   # a recorded publication is the evidence then
@@ -394,7 +393,19 @@ class Landing(LandingBase):
         self.land(); rep = self.d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True, exist_ok=True); rep.write_text("VERDICT: BLOCKED (no VM host)\n")
         with mock.patch.object(janus, "uncollected", lambda *a: None), mock.patch.object(janus, "X", lambda *a, **k: (0, "", "")):
             self.close(dry=False)
-        self.assertIn(("close", "u1", "--reason", "VERDICT: BLOCKED (no VM host)"), self.w.writes)
+        self.assertIn(("close", "u1", "--force", "--reason", "VERDICT: BLOCKED (no VM host)"), self.w.writes)
+
+    def test_close_stops_a_tmux_units_session_and_closes_a_blocked_issue(self):
+        """Catches (2026-11-19): close removed a tmux unit's copy but left its session running, and the session's
+        pid kept the agent's reservation, so fill fitted nothing for hours. And bd refused to close a unit issue an audit had made
+        blocked, which stayed 'closing' for good: --force, an ordering edge never keeps an
+        ended unit open."""
+        self.land(); rep = self.d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True, exist_ok=True); rep.write_text("VERDICT: DONE\n")
+        self.u["via"] = "tmux"; ran = []
+        with mock.patch.object(janus, "uncollected", lambda *a: None), mock.patch.object(janus, "X", lambda cfg, h, c, **k: ran.append(c) or (0, "", "")):
+            self.close(dry=False)
+        self.assertIn("tmux kill-session -t =janus-u 2>/dev/null; true", ran)   # =: never a prefix match (janus-u-r2 lives on)
+        self.assertIn(("close", "u1", "--force", "--reason", "done"), self.w.writes)
 
 class FollowUp(LandingBase):
     """The reviewer's follow-up findings: each test fails on the first-pass code."""

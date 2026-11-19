@@ -544,6 +544,39 @@ class Capacity(unittest.TestCase):
         hc = janus.host_cap(self.cfg, "b", dict(p, cap_pause="memory PSI avg10 30 over 10"), units[:1])
         self.assertFalse(janus.build_room(self.cfg, "b", hc)[0])
 
+class Leftovers(unittest.TestCase):
+    def test_a_finished_jobs_scope_holds_no_capacity(self):
+        """Catches (2026-11-19): a finished job whose scope a daemon kept alive (sccache from run_env) counted as an
+        untracked job holding cores_per_job cores, and check said 'running without a janus reservation'."""
+        d, cfg = project(); t = Path(tempfile.mkdtemp(dir=d))
+        for j in ("done", "live"): (t / f"as/janus-{j}.scope").mkdir(parents=True)
+        (t / "rd").mkdir(); (t / "rd/done.rc").write_text("0\n")
+        lib = janus.cap_lib(cfg, "far", {"ssh": "nowhere", "root": "/x", "_rd": "/x/runs"})
+        p = subprocess.run(["bash"], input=f'{lib}\nAS={t}/as; RD={t}/rd; CAP_RO=1; res_sum; echo "RJ=$RJ"; echo "$RL"', text=True, capture_output=True)
+        self.assertIn("RJ=1", p.stdout, p.stderr); self.assertIn("untracked live", p.stdout); self.assertNotIn("untracked done", p.stdout)
+
+    def test_a_local_job_gets_its_hosts_run_env(self):
+        """Catches (2026-11-19): the Mac's run_env (RUSTC_WRAPPER=sccache) was left out of every local job; remote jobs had it."""
+        import argparse
+        d, cfg = project(); h = {**cfg.hosts["here"], "run_env": "export JANUS_TEST_ENV=1"}
+        r = argparse.Namespace(host="here", lane="jobs", unit=None, wt=str(d), subdir=None, usb=False, priority=0, no_wait=True,
+                               allow_unmerged=False, command=["--", "true"], broad=None)
+        js = janus.job_script(cfg, "here", h, r, "u", "true", "j-1")
+        self.assertIn("export JANUS_TEST_ENV=1\n", js.split("main() {", 1)[1])
+
+    def test_tidy_stops_the_tmux_session_of_a_closed_unit(self):
+        """Catches (2026-11-19): sessions of closed units held agent reservations, the finding said 'janus stop', which
+        refuses a closed unit, and the hook refuses a hand kill: no way out. Never an open unit's or another project's."""
+        d, cfg = project(); T = sys.modules["janus.actions.tidy"]; pid = janus.tmux_name(cfg, "x").rpartition("@")[2]; ran = []
+        out = f"tmux janus-gone@{pid}\ntmux janus-live@{pid}\ntmux janus-other@elsewhere\ntmux janus-far@{pid}\ntmux mine\n"
+        au = {n: {"name": n, "status": s, "host": hn} for n, s, hn in (("gone", "closed", "here"), ("live", "in_progress", "here"), ("other", "closed", "here"), ("far", "closed", "far"))}
+        with mock.patch.object(T, "hrun", lambda h, c, **k: ran.append(c) or (0, out, "")):
+            P = janus.tidy_host(cfg, "here", cfg.hosts["here"], [{"name": "live"}], au)
+            self.assertEqual([(k, t) for k, t, *_ in P if k == "tmux"], [("tmux", f"here:janus-gone@{pid}")])
+            self.assertEqual(janus.tidy_do(cfg, "tmux", f"here:janus-gone@{pid}")[0], 0)
+        self.assertEqual(ran[-1], f"tmux kill-session -t =janus-gone@{pid}")   # =: never a prefix match
+
+
 class AdmitBound(unittest.TestCase):
     def test_a_blocked_job_says_why_and_gives_up(self):
         """Catches (item 21): a job blocked in admission waited forever with no reason and no bound. It now says why (with

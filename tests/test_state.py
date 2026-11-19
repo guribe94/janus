@@ -223,7 +223,7 @@ class State(unittest.TestCase):
         + busy first (collect and the sync skip it), and the bd issue is closed after the cleanup."""
         out, recs, ledger, seen, calls, err = self._two_phase("close")
         self.assertEqual(err, [], err); self.assertIn("got it", out, "an ack was refused the lock while close cleaned the host")
-        self.assertEqual((seen["closing"], seen["busy"]["op"]), (True, "close")); self.assertIn(("close", "1", "--reason", "done"), calls); self.assertIn("settled", ledger)
+        self.assertEqual((seen["closing"], seen["busy"]["op"]), (True, "close")); self.assertIn(("close", "1", "--force", "--reason", "done"), calls); self.assertIn("settled", ledger)
         u = dict(seen); self.assertTrue(janus.no_remote_copy(u), "sync and collect would copy a copy that is being removed")
 
     def test_a_launch_or_close_that_died_is_named_interrupted(self):

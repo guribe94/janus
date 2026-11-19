@@ -465,6 +465,7 @@ def cmd_close(cfg, a):
         raise Err(f"refused: {u['name']}: {why3} (it changed while the close was starting): commit and push, or land it, then close again")
     with cfg.unlocked():
         close_tab(cfg, u)
+        if u.get("via") == "tmux" and not gone: X(cfg, h, f"tmux kill-session -t {shlex.quote('=' + unit_tmux(u))} 2>/dev/null; true")   # =: that name only, never a prefix match (a relaunch janus-<unit>-r2); its pid holds the agent's reservation
         if gone: say(f"{u['host']} is marked gone: its copy there is not removed, and its task log not saved (out/{u['name']}/ keeps what was synced)")
         elif not h.get("local"):
             root = h["root"]; n = u["name"]
@@ -480,7 +481,7 @@ def cmd_close(cfg, a):
     if cfg.run.dry: return
     u = next((x for x in bd.units() if x["id"] == u["id"]), u)   # as it is now: the run is settled and the issue closed on the current record
     if ended: settle_run(cfg, u, "closed")
-    bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--reason", a.reason or close_reason(cfg, u))
+    bd.comment(u["id"], f"{ts()} closed"); bd.run("close", u["id"], "--force", "--reason", a.reason or close_reason(cfg, u))   # --force: an ordering edge (blocks) never keeps an ended unit open
     say("closed")
 
 def job_result(cfg, hs, ref, agent_host):
