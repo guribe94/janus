@@ -27,6 +27,9 @@ When the owner says stop, pause or done, run `janus standby --reason "<their wor
 ## The user comes first
 A message from the user is answered in the same turn, before housekeeping. If it is a standing instruction or a lasting decision, record it once: `janus remember --instruction "<text>" --key <subject>` (same key replaces; running agents are told). Restrictions on tools, models, providers or auth are not memory text: they are enforced from `janus.toml` (`[routing] allow_tools / allow_auth`, `[providers] enabled`). Never launch outside them or substitute a model silently; if the allowed route is unavailable, say so and ask.
 
+## Live state before every decision
+Immediately before every capacity, queue, resume, cancel, scheduling or progress decision, run a fresh `janus status` (or `janus queue <host>`) and decide from that output. HANDOFF.md, earlier output and what you remember are not live state. If the read fails or stalls, say "current state is unverified" and take no queue action until a read succeeds.
+
 ## Work
 - `janus status` / `janus check`: what is true now; act on what matters, nothing needs acknowledging.
 - `janus launch <unit> --kind implement|review|audit|cleanup`: an agent on a host with room. A unit that serves a backlog item names it (`--item <id>`, or an `ITEM:` line in its brief), so the item's progress counts it; `backlog:done:<item>` says when every unit of an item has landed: close the item (`janus backlog set <id> status=DONE --unit <unit>`) or brief what is left. Builds and tests are explicit commands: `janus run --detach --host <h> --wt <tree> -- <cmd>`, then end the turn (`WAITING <ids>`); janus resumes the session when they finish. How much to test and review is the rigor level your session text states (`[rigor] level`; a brief's `RIGOR:` line for one unit): follow it, not habit. At `careful` and `thorough` launch the reviews `review:<unit>` asks for (`--kind review --of <unit>`) before landing.
