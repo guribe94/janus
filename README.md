@@ -41,10 +41,13 @@ Order matters: the watcher acts on every project listed in `~/.config/janus/proj
    ```
 4. **Start the orchestrator yourself** in `PROJECT` (a Claude Code, Codex or opencode session, in herdr or tmux if you use them) and have it
    run `janus register`. It prints `registered <session> (<kind>)` and warns if `[orchestrator] kind` differs from the tool you started.
-5. **Activate hooks and the watcher**: run the checkout's `install` with `PROJECT` as the current directory (or pass `--project PROJECT`).
-   A full install does the release, edits `~/.claude/settings.json` and `~/.codex/hooks.json` (backed up first; trust Codex's hooks once with `/hooks`),
-   installs the watcher (a launchd agent or systemd user timer, every 2 minutes), lists `PROJECT` in `~/.config/janus/projects`, installs missing
-   `bd` and `pueue` through Homebrew on macOS, and runs `janus install-host` for each remote host (`--no-hosts` skips that).
+5. **Install, then switch janus on in the project**: run the checkout's `install` with `PROJECT` as the current directory (or pass
+   `--project PROJECT`), then `janus on` in `PROJECT`. Janus is off everywhere until then. A full install does the release, installs the
+   watcher (a launchd agent or systemd user timer, every 2 minutes), installs missing `bd` and `pueue` through Homebrew on macOS, and runs
+   `janus install-host` for each remote host (`--no-hosts` skips that). `janus on` writes the project's own hooks and skill link
+   (`PROJECT/.claude/settings.local.json`, `PROJECT/.claude/skills/janus`), lists `PROJECT` in `~/.config/janus/projects` for the watcher,
+   and, while any project is on, the Codex hooks and skill (`~/.codex/hooks.json`, `~/.agents/skills/janus`; trust them once with `/hooks`):
+   Codex reads no per-project hooks in an agent's worktree. `janus off` removes exactly those; agents keep running.
    Running a full `./install` before step 4 is allowed, but then the watcher may start an orchestrator itself, in the `[orchestrator]` tool
    and `args`/settings you set under `[orchestrator]`, once it finds work and no live orchestrator.
 6. `janus doctor` again, then `janus status`.

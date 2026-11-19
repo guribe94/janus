@@ -14,6 +14,7 @@ from janus.reset import log_line
 from janus.ledger import ledger_read, read_secret, spend
 from janus.platform import pane_tool, watcher_loaded, watcher_service
 from janus.probe import discover, probe, pueue
+from janus.switch import set_project
 from janus.units import ws_id
 
 def cmd_register(cfg, a):
@@ -58,6 +59,19 @@ def support_tabs(cfg, want):
         r = herdr("tab", "create", "--workspace", ws, "--label", lab, "--cwd", str(cfg.root), "--no-focus")
         if r: herdr("pane", "run", r["root_pane"]["pane_id"], cmd); made.append(lab)
     return made
+
+def cmd_switch(cfg, a):
+    """janus on | janus off: janus in this project's sessions or not (switch.set_project): its own Claude Code hooks and skill,
+    its place on the watcher's list, and the global Codex hooks while any project is on. Off never stops an agent or removes
+    work; it says which units are still open, since nothing watches them until janus is on again."""
+    refuse_agent(a.cmd)
+    on = a.cmd == "on"; now = set_project(cfg.root, on, say, cfg.run.dry)
+    if not on:
+        try: left = [u["name"] for u in Beads(cfg).units()]
+        except Err: left = None
+        if left: say(f"{len(left)} unit(s) still open, now unwatched: {', '.join(left[:8])}{'...' if len(left) > 8 else ''} (janus on watches them again)")
+        elif left is None: say("open units unknown (beads did not answer): nothing watches any that are open")
+    say(f"janus is {'on' if on else 'off'} in {cfg.root}; on in {len(now)} project(s)")
 
 def cmd_standby(cfg, a):
     """janus standby [--stop-units] [--reason] | janus standby off. The owner said stop or done: the watcher then only syncs the

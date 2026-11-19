@@ -18,12 +18,12 @@ from janus.actions.swarm import cmd_forget, cmd_index, cmd_ledger, cmd_memory, c
 from janus.actions.tidy import cmd_tidy
 from janus.check import cmd_capacity, cmd_check, cmd_status
 from janus.monitor import cmd_monitor, interval_arg
-from janus.setup import cmd_doctor, cmd_init, cmd_install_host, cmd_queue, cmd_register, cmd_resume_orch, cmd_standby
+from janus.setup import cmd_doctor, cmd_init, cmd_install_host, cmd_queue, cmd_register, cmd_resume_orch, cmd_standby, cmd_switch
 from janus.watch import cmd_watch
 
 LOCKS_LATE = {"collect"}   # writers that take the lock themselves, once their remote reads are done
 WRITERS = {"launch", "park", "resume", "stop", "collect", "close", "fill", "tidy", "thrash", "cancel", "ledger", "backlog",
-           "remember", "forget", "memory", "index", "register", "board-close", "report", "standby"}
+           "remember", "forget", "memory", "index", "register", "board-close", "report", "standby", "on", "off"}
 
 def cmd_resume(cfg, a):
     """janus resume: a parked unit when one is named, else the orchestration itself (janus/setup.cmd_resume_orch): continue it
@@ -105,6 +105,7 @@ def main():
     add("send", cmd_send, A("agent", help="a unit, or orchestrator"), A("text"))
     add("board-close", cmd_board_close, A("agent", help="a board card that is not an open unit"), dry=True)
     add("register", cmd_register, A("session", nargs="?"), dry=True)
+    add("on", cmd_switch, dry=True); add("off", cmd_switch, dry=True)
     add("standby", cmd_standby, A("action", nargs="?", help="off: end standby (back to work)"), A("--reason", help="why (the owner said stop, done, or waits to answer)"),
         A("--stop-units", action="store_true", help="also stop every open unit now (janus stop, with its jobs): the owner asked for all work to stop"),
         A("--force", action="store_true", help="--stop-units: stop a unit even though its remote copy has uncollected work"), dry=True)

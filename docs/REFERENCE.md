@@ -158,9 +158,11 @@ update the handoff over the context threshold. A worker's Stop hook blocks once 
 `--stage-only` (build and check an immutable release, switch nothing), `--release-only` (release and links only: no hooks, no watcher),
 `--rollback` (back to the previous release), `--no-hosts`, `--hosts-only`, `--tests PATTERN` (also run only the matching test files against the copy).
 Both `--release-only` and a full `./install` switch `current` and refuse while a registered project is still on the old layout (migrate it first, with
-`python3 janus.py migrate` from the checkout or the staged release; see the README). A full `./install` also merges hooks into `~/.claude/settings.json`
-and `~/.codex/hooks.json` (backup first), activates the watcher (launchd agent or systemd user timer, every 2 minutes, over the projects listed in
-`~/.config/janus/projects`; the project found from the current directory or `--project` is added) and runs `janus install-host` per remote host.
+`python3 janus.py migrate` from the checkout or the staged release; see the README). A full `./install` also activates the watcher (launchd agent or systemd user timer, every 2 minutes, over the projects listed in
+`~/.config/janus/projects`) and runs `janus install-host` per remote host. Janus is on per project: `janus on` (in the project) writes its
+hooks into `<project>/.claude/settings.local.json`, links `<project>/.claude/skills/janus`, adds the project to `~/.config/janus/projects`, and
+while any project is on keeps the Codex hooks and skill global (`~/.codex/hooks.json`, `~/.agents/skills/janus`); `janus off` removes exactly
+those. Agents janus launches get the hooks for their own session (`claude --settings`). An install keeps every registered project on and removes
+the old global Claude Code hooks and skill link.
 Because the watcher can start an orchestrator, set up and `janus register` first, then run the full install (README, Fresh setup).
-Releases a running process or queued job names are never pruned. Skill links: `~/.claude/skills/janus` (Claude Code and opencode) and
-`~/.agents/skills/janus` (Codex).
+Releases a running process or queued job names are never pruned.

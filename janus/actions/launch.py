@@ -19,7 +19,13 @@ from janus.rigor import DEFAULT, R, agent_text, check_level, level_of
 from janus.probe import probe_all, pueue, room
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import transcript_of
+from janus.switch import hooks_json
 from janus.units import REPORT_SEED, TAB_SEP, reopened, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
+
+def agent_args(mc):
+    """The client arguments of an agent janus starts in a pane: the model's args, and for Claude janus's hooks for that session,
+    whether or not its project is on (switch: the agent's worktree is a project of its own)."""
+    return [*mc.get("args", []), *(["--settings", json.dumps(hooks_json())] if mc.get("kind") == "claude" else [])]
 
 def tool_argv(mc, prompt, session=None):
     """The coding client's command line for a launch, or for continuing `session`. Each form was read from the installed client's
@@ -701,7 +707,7 @@ def cmd_launch(cfg, a):
                     herdr("pane", "run", pane, "unset ANTHROPIC_API_KEY CLAUDE_CODE_MESSAGING_TOKEN HERDR_PANE_ID CLAUDE_CODE_SESSION_ID; "
                           + "; ".join(f"export {k}={shlex.quote(v)}" for k, v in envs.items()) + f"; echo env-'{name}'")
                     sh(["herdr", "pane", "wait-output", pane, "--match", f"env-{name}", "--timeout", "10000"], timeout=15)
-                    r = sh(["herdr", "agent", "start", name, "--kind", mc["kind"], "--pane", pane, "--timeout", "90000", "--", *mc.get("args", [])], timeout=100)
+                    r = sh(["herdr", "agent", "start", name, "--kind", mc["kind"], "--pane", pane, "--timeout", "90000", "--", *agent_args(mc)], timeout=100)
                     d = past_dialogs(*herdr_screen(name, pane), tries=6)
                     if r[0] and d: raise Err("herdr agent start failed: " + (r[2] or d)[:160])
                     if d: raise Err(f"{name}: {d}")

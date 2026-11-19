@@ -799,21 +799,16 @@ class Item27ParkedFinished(unittest.TestCase):
         self.assertEqual(F3, [])
 
     def test_hooks_drop_janus_own_user_prompt_entry_and_never_add_it_back(self):
-        """Catches: UserPromptSubmit left in EVENTS, so merge_hooks removed janus's own entry and added it again at once."""
-        src = Path(JANUS_PY).parent / "install"
-        if not src.is_file(): self.skipTest("install is not shipped in the release copy; ./check runs this against the tree")
-        home = Path(tempfile.mkdtemp(prefix="janus-home-")); ns = {"__name__": "install_under_test", "__file__": str(src)}
-        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(sys, "argv", ["install", "--dry-run"]), contextlib.redirect_stdout(io.StringIO()):
-            exec(compile(src.read_text().rsplit("\nmain()", 1)[0], str(src), "exec"), ns)
-        ns["DRY"] = False; J = ns["JANUS"]; f = home / "settings.json"
+        """Catches: UserPromptSubmit left in EVENTS, so setting the hooks removed janus's own entry and added it again at once."""
+        from janus import switch
+        f = Path(tempfile.mkdtemp(prefix="janus-home-")) / "settings.json"; J = switch.JANUS
         mine = {"hooks": [{"type": "command", "command": f"{J} hook UserPromptSubmit"}]}; other = {"hooks": [{"type": "command", "command": "other-tool prompt"}]}
         f.write_text(json.dumps({"hooks": {"UserPromptSubmit": [mine, other]}}))
-        with contextlib.redirect_stdout(io.StringIO()): ns["merge_hooks"](str(f))
+        switch.set_hooks(f, True, lambda m: None)
         h = json.loads(f.read_text())["hooks"]
         self.assertEqual(h["UserPromptSubmit"], [other])                                       # janus's own entry dropped, the other tool's kept, nothing re-added
         self.assertEqual(sorted(h), ["PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"])
-        before = f.read_text()
-        with contextlib.redirect_stdout(io.StringIO()): ns["merge_hooks"](str(f))
+        before = f.read_text(); switch.set_hooks(f, True, lambda m: None)
         self.assertEqual(f.read_text(), before)                                                # a second run changes nothing
 
 if __name__ == "__main__": unittest.main()
@@ -876,19 +871,14 @@ class LauncherLinks(unittest.TestCase):
         J.unlink(); run(); self.assertTrue(ns["generated_launcher"](J)); self.assertTrue(os.access(J, os.X_OK))
 
     def test_hooks_drop_janus_own_user_prompt_entry_and_never_add_it_back(self):
-        """Catches: UserPromptSubmit left in EVENTS, so merge_hooks removed janus's own entry and added it again at once."""
-        src = Path(JANUS_PY).parent / "install"
-        if not src.is_file(): self.skipTest("install is not shipped in the release copy; ./check runs this against the tree")
-        home = Path(tempfile.mkdtemp(prefix="janus-home-")); ns = {"__name__": "install_under_test", "__file__": str(src)}
-        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(sys, "argv", ["install", "--dry-run"]), contextlib.redirect_stdout(io.StringIO()):
-            exec(compile(src.read_text().rsplit("\nmain()", 1)[0], str(src), "exec"), ns)
-        ns["DRY"] = False; J = ns["JANUS"]; f = home / "settings.json"
+        """Catches: UserPromptSubmit left in EVENTS, so setting the hooks removed janus's own entry and added it again at once."""
+        from janus import switch
+        f = Path(tempfile.mkdtemp(prefix="janus-home-")) / "settings.json"; J = switch.JANUS
         mine = {"hooks": [{"type": "command", "command": f"{J} hook UserPromptSubmit"}]}; other = {"hooks": [{"type": "command", "command": "other-tool prompt"}]}
         f.write_text(json.dumps({"hooks": {"UserPromptSubmit": [mine, other]}}))
-        with contextlib.redirect_stdout(io.StringIO()): ns["merge_hooks"](str(f))
+        switch.set_hooks(f, True, lambda m: None)
         h = json.loads(f.read_text())["hooks"]
         self.assertEqual(h["UserPromptSubmit"], [other])                                       # janus's own entry dropped, the other tool's kept, nothing re-added
         self.assertEqual(sorted(h), ["PreToolUse", "SessionStart", "Stop", "UserPromptSubmit"])
-        before = f.read_text()
-        with contextlib.redirect_stdout(io.StringIO()): ns["merge_hooks"](str(f))
+        before = f.read_text(); switch.set_hooks(f, True, lambda m: None)
         self.assertEqual(f.read_text(), before)                                                # a second run changes nothing
