@@ -1,7 +1,7 @@
 """The backlog: checklist items, who does them (actors), their beads issues and the units that cover them; ready work.
 
 Queries only: janus backlog and janus fill (actions/backlog.py) change things."""
-import re
+import datetime, re
 from pathlib import Path
 from janus.beads import Beads
 from janus.context import Err, slug
@@ -165,6 +165,24 @@ def stranded_cover(cfg, units, iss=None):
     for u in sorted((u for u in units if id(u) not in ids), key=lambda u: (u.get("kind") == "review", -(u.get("started") or 0))):
         for k in unit_items(cfg, [u], iss):
             if k not in cov: out.setdefault(k, []).append(u)
+    return out
+
+def item_progress(cfg, units, iss=None):
+    """{item: {"open": [unit names], "done": [unit names], "closed": n, "last": epoch}} over every unit, open or closed, that
+    names the item (unit_items): the work each backlog item has had. done: closed with a final VERDICT: DONE. Names newest
+    first; last: the latest start or close among them. Read by check (backlog:done) and the monitor's Backlog tab."""
+    def at(x):
+        try: return datetime.datetime.fromisoformat(str(x).replace("Z", "+00:00")).timestamp()
+        except ValueError: return 0
+    out = {}
+    for u in sorted(units, key=lambda u: -(u.get("started") or 0)):
+        for k in unit_items(cfg, [u], iss):
+            p = out.setdefault(k, {"open": [], "done": [], "closed": 0, "last": 0})
+            if u.get("status") != "closed": p["open"].append(u["name"])
+            else:
+                p["closed"] += 1
+                if str(verdict(cfg, u) or "").startswith("VERDICT: DONE"): p["done"].append(u["name"])
+            p["last"] = max(p["last"], u.get("started") or 0, at(u.get("closed_at")) if u.get("closed_at") else 0)
     return out
 
 STRANDED = {   # status -> (what is true, what to do): stranded_status's words, shown by the host finding and the monitor

@@ -100,7 +100,7 @@ class States(Base):
         w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}}), "2": task(2, "Queued"), "9": job(9, "j9"), "8": job(8, "j8")}, pause="memory critical",
                                       extra=f"res=4242 1 512 {t0} cargo_test j9.res -\ncls=cargo_test 12 120 1\nwaitjob=j8\n")
         w.agents = [{"name": "idl", "agent_status": "idle", "pane_id": "p1"}]
-        self.collect(); m = self.model(); cell = {r.key: r.cells[1] for r in m.rows["Active"]}
+        self.collect(); m = self.model(); cell = {r.key: r.cells[2] for r in m.rows["Active"]}
         self.assertEqual(self.states("Active", m), {"run": "working", "que": "queued", "park": "parked", "hold": "parked", "idl": "idle"})
         self.assertEqual(cell["run"], "agent working")
         self.assertTrue(cell["que"].startswith("waiting for a free agent slot"), cell["que"])
@@ -122,7 +122,7 @@ class States(Base):
         self.w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}}), "2": task(2, {"Running": {}})})
         self.w.report("p", "VERDICT: PENDING\n- [x] a\n- [x] b\n- [ ] c\n"); self.w.report("q", "VERDICT: PENDING\n")
         self.collect(); m = self.model()
-        self.assertEqual({r.cells[0]: r.cells[5] for r in m.rows["Active"]}, {"p": "2/3 66%", "q": "-"})
+        self.assertEqual({r.cells[0]: r.cells[6] for r in m.rows["Active"]}, {"p": "2/3 66%", "q": "-"})
         m.done = (3, 4); scr = "\n".join("".join(t for t, _ in l) for l in M.render(m, M.UI(), 30, 160, time.time(), ""))
         self.assertIn("done 3/4", scr); self.assertIn("75%", scr); self.assertIn("PROGRESS", scr)
 
@@ -130,7 +130,7 @@ class States(Base):
         """Catches: a unit's first screen, drawn before its report was read, saying 'no verdict' (or finished) of a report nobody read."""
         self.w.units = [unit("x", task=3)]; self.w.probes["here"] = probe_text(tasks={"3": task(3, {"Done": {"result": "Success"}})}); self.w.report("x", "VERDICT: DONE\n"); self.collect()
         view = {k: v for k, v in self.store.view()[0].items() if k != "reports-open"}
-        self.assertEqual({r.cells[0]: r.cells[1] for r in M.derive(view, time.time(), 5).rows["Ended"]}, {"x": "ended:unverified"})
+        self.assertEqual({r.cells[0]: r.state for r in M.derive(view, time.time(), 5).rows["Ended"]}, {"x": "ended:unverified"})
         self.assertEqual(self.states("Ended"), {"x": "finished"})
 
     def test_tool_model_admission_capability_freshness_and_the_handoff_checkpoint(self):
@@ -145,7 +145,7 @@ class States(Base):
         self.assertTrue(r["far"][7].startswith("claude+ codex ("), r["far"][7])
         self.assertTrue(r["here"][7].startswith("unknown"), r["here"][7])               # never discovered: unknown, not none
         self.assertEqual(m.rows["Overview"][0].cells[0], "Checkpoint"); self.assertIn("~60%", m.rows["Overview"][0].cells[1]); self.assertIn("tests left", m.rows["Overview"][0].cells[1])
-        self.assertIn("/", next(x for x in m.rows["Active"] + m.rows["Ended"] if x.key == "a").cells[3])   # tool/model
+        self.assertIn("/", next(x for x in m.rows["Active"] + m.rows["Ended"] if x.key == "a").cells[4])   # tool/model
         (self.d / ".janus/hosts-facts.json").write_text("{not json"); self.collect(); m = self.model()
         self.assertIn("unreadable", {x.cells[0]: x.cells for x in m.machines}["far"][7]); self.assertIn("unreadable", m.rows["Overview"][-1].cells[1])
 
@@ -178,7 +178,7 @@ class States(Base):
         w.units = [unit("u", item="one"), unit("f", host="far", task=2)]; w.closed = [{**unit("old"), "status": "closed", "closed_at": "2026-11-12T10:00:00Z"}]
         w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})}); self.collect(); m = self.model()
         for tab in M.TABS:
-            cols = {"Board": M.BOARD_COLS, "Overview": M.OVERVIEW_COLS}.get(tab, M.WORK_COLS)
+            cols = M.TAB_COLS.get(tab, M.WORK_COLS)
             self.assertTrue(m.rows[tab], tab)
             for r in m.rows[tab]: self.assertEqual(len(r.cells), len(cols), (tab, r.key, r.cells))
             for width in (60, 240):
@@ -211,6 +211,31 @@ class States(Base):
                             out = M.render(M.filtered(m, ui.filt), ui, h, wd, time.time(), "status")
                         except Exception as e: self.fail(f"{name}, {M.TABS[tab]}, {mode}, {h}x{wd}: {e!r}")
                         self.assertLessEqual(len(out), h, (name, M.TABS[tab], mode, h, wd))   # paint clips the width
+
+
+class ItemProgress(Base):
+    extra = FAR + '\n[backlog]\nfile = "S.md"\nevidence_col = "evidence"\n'
+
+    def test_which_work_serves_which_item_and_when_an_item_is_finished(self):
+        """Catches (owner 2026-11-18): the Active tab never said which backlog item a unit served, the Backlog tab showed an item's
+        age instead of its units, and an item whose every unit had landed DONE stayed 'ready' with nothing saying it was done."""
+        w = self.w; (self.d / "S.md").write_text("| # | item | status | evidence |\n|---|---|---|---|\n| one | Item one | READY | - |\n| two | Item two | READY | - |\n")
+        lab = ["backlog", "backlog-ready"]
+        w.backlog = [{"id": "b-1", "title": "Item one", "labels": lab, "status": "open", "external_ref": "backlog:one"},
+                     {"id": "b-2", "title": "Item two", "labels": lab, "status": "open", "external_ref": "backlog:two"}]
+        w.ready = [{"id": "b-1", "title": "Item one", "labels": lab}, {"id": "b-2", "title": "Item two", "labels": lab}]
+        w.units = [unit("one-c", item="one", task=1), unit("loose", task=1)]
+        w.closed = [{**unit(n, item=it), "status": "closed", "closed_at": "2026-11-17T10:00:00Z"} for n, it in (("one-a", "one"), ("one-b", "one"), ("two-a", "two"))]
+        for n in ("one-a", "one-b", "two-a"): w.report(n, "VERDICT: DONE (landed)\n")
+        w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})}); self.collect(); m = self.model()
+        item = {r.key: r.cells[1] for r in m.rows["Active"]}
+        self.assertEqual((item["one-c"], item["loose"]), ("ONE", "-"))
+        b = {r.cells[0]: r for r in m.rows["Backlog"]}
+        self.assertEqual((b["Item one"].state, b["Item one"].cells[1], b["Item one"].cells[2]), ("open-unit", "in progress", "2 done, 1 open: one-c"))
+        self.assertEqual((b["Item two"].state, b["Item two"].cells[2]), ("units-done", "1 done"))
+        self.assertTrue(b["Item two"].cells[1].startswith("all units done"))
+        self.assertEqual(m.rows["Backlog"][0].cells[0], "Item two")                                  # what needs closing comes first
+        self.assertIn("loose", next(r for r in m.rows["Overview"] if r.key == "o:no-item").cells[1])
 
 
 class Stranded(Base):
@@ -263,8 +288,8 @@ class Stranded(Base):
         w.units = [unit("s1", host="far", task=7, item="one"), unit("s2", host="far", task=8, item="two"), unit("l2", task=1, item="two")]
         w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})}); w.fail.add("far"); self.down("far", 120); self.collect(); m = self.model()
         rows = {r.cells[0]: r for r in m.rows["Backlog"]}
-        self.assertEqual({k: (r.cells[1], r.cells[2]) for k, r in rows.items()}, {"Item one": ("relaunch", "far"), "Item two": ("open-unit", "here"), "Item three": ("owner", "-")})
-        self.assertIn("Units:     s1 (far, host down)", rows["Item one"].detail); self.assertEqual(m.rows["Backlog"][0].cells[0], "Item one")   # what fill launches next first
+        self.assertEqual({k: (r.state, r.cells[3]) for k, r in rows.items()}, {"Item one": ("relaunch", "far"), "Item two": ("open-unit", "here"), "Item three": ("owner", "-")})
+        self.assertIn("Open now:  s1 (far, host down)", rows["Item one"].detail); self.assertEqual(m.rows["Backlog"][0].cells[0], "Item one")   # what fill launches next first
         ui = M.UI(); ui.tab = 1; scr = "\n".join("".join(t for t, _ in l) for l in M.render(m, ui, 30, 200, time.time(), ""))
         self.assertIn("[Backlog (2 agent, 1 owner)]", scr)
 
@@ -314,7 +339,7 @@ class Recovery(Base):
         self.collect(); self.assertEqual(self.model().problems, 0)
         self.w.fail = {"bd", "far"}; self.w.units = []; self.collect()
         m = self.model(offset=40)
-        self.assertEqual(self.states("Active", m), {"a": "working STALE"}); self.assertTrue(m.rows["Active"][0].stale); self.assertIn("STALE", m.rows["Active"][0].cells[1])
+        self.assertEqual(self.states("Active", m), {"a": "working STALE"}); self.assertTrue(m.rows["Active"][0].stale); self.assertIn("STALE", m.rows["Active"][0].cells[2])
         self.assertTrue(any("units: STALE, last good" in b and "dolt server unreachable" in b for b in m.banners["Active"]), m.banners)
         far = next(r for r in m.machines if r.cells[0] == "far"); self.assertEqual(far.cells[1], "UNREACHABLE"); self.assertEqual(far.cells[5], "4.0G"); self.assertIn("last good", far.cells[8])
         self.assertEqual(next(r for r in m.machines if r.cells[0] == "here").cells[1], "ok")

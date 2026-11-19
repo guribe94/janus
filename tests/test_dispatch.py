@@ -70,6 +70,18 @@ class Selection(unittest.TestCase):
         self.hs = {"here": host_probe(name="here")}
     def brief(self, name, item, extra=""): (self.d / f".janus/briefs/{name}.md").write_text(f"# {name}\nITEM: {item}\n{extra}")
 
+    def test_an_item_whose_units_are_all_done_is_named_for_closing(self):
+        """Catches (owner 2026-11-18): items whose every unit had landed DONE stayed in the backlog as 'ready' for days; nothing told
+        the orchestrator to close them, and check asked for a brief instead."""
+        self.w.issue("X1"); self.w.issue("X2")
+        (self.d / ".janus/out/x1-a").mkdir(parents=True); (self.d / ".janus/out/x1-a/REPORT.md").write_text("VERDICT: DONE (landed abc)\n")
+        self.w.closed.append({"id": "u-x1a", "title": "unit:x1-a", "status": "closed", "notes": json.dumps({"v": 2, "name": "x1-a", "item": "X1", "host": "here", "started": 100})})
+        F = dict(janus.backlog_findings(self.cfg, self.hs, []))
+        self.assertIn("backlog:done:X1", F); self.assertIn("janus backlog set X1 status=DONE --unit x1-a", F["backlog:done:X1"])
+        self.assertNotIn("X1", F["idle-with-backlog:nobrief"]); self.assertIn("X2", F["idle-with-backlog:nobrief"])
+        self.brief("x1-b", "X1")   # a brief waits for what is left: fill launches it, nothing to close yet
+        self.assertNotIn("backlog:done:X1", dict(janus.backlog_findings(self.cfg, self.hs, [])))
+
     def test_missing_brief_is_named_not_silently_omitted(self):
         """Catches: a ready agent item without a usable brief vanishing from fill and check (nobody is told to write its brief)."""
         self.w.issue("X1"); self.w.issue("X2"); self.brief("x1-a", "x1")   # the brief's ITEM is the same id in another case
@@ -505,7 +517,7 @@ class Reports(unittest.TestCase):
         self.assertNotIn("local copy", d); self.assertNotIn("Synced:", d)   # a report outside out/<unit> is not what the output sync brought
         rows = M.backlog_rows({"items": [{"id": "b-X1", "title": "backlog: X1 one", "labels": ["backlog"], "external_ref": "backlog:X1"}], "ready": []},
                               [{"name": "u", "item": "x1"}], now, False)
-        self.assertEqual(rows[0].cells[1], "open-unit"); self.assertIn("not necessarily running", " ".join(rows[0].detail))
+        self.assertEqual(rows[0].state, "open-unit"); self.assertIn("not necessarily running", " ".join(rows[0].detail))
 
 
 DRAFT = "# X1 draft\nPRIORITY: 1\nHOLD: waiting on the owner's design\nbody kept\r\nmore\n" + "x\n" * 10 + "HOLD: past the head, not a hold\n"

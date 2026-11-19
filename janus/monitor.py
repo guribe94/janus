@@ -9,7 +9,7 @@ calls none of check, status, sync, handoff, writer lock, ack or wake code. Nothi
 effect is the probe's own scratch under /tmp on each host, which `janus capacity` already makes. Standard library only."""
 import contextlib, dataclasses, datetime, json, os, queue, re, signal, sys, threading, time
 from pathlib import Path
-from janus.backlog import LOG_LABELS, LOG_RX, STRANDED, checklist_line, checklist_totals, covered_items, eligible_items, item_actors, item_holds, norm_item, stranded_status, unit_items
+from janus.backlog import LOG_LABELS, LOG_RX, STRANDED, checklist_line, checklist_totals, covered_items, eligible_items, item_actors, item_holds, item_progress, norm_item, stranded_status, unit_items
 from janus.beads import unit_record
 from janus.actions.jobs import job_progress
 from janus.cap import CAP_DEFAULTS, capv
@@ -143,18 +143,25 @@ def collect_checklist(cfg, units, backlog):
     from janus.actions.backlog import brief_dir, brief_index, usable_brief
     iss = {i["external_ref"]: i for i in (backlog or {}).get("items", []) if str(i.get("external_ref") or "").startswith("backlog:")}   # bd --readonly's answer
     tot = checklist_totals(cfg, units, iss)
+    closed = [u for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u]
+    prog = item_progress(cfg, units + closed, iss)   # each item's units, open and closed: the Backlog's UNITS, STATE and LAST
+    items_of = {}
+    for k, v in prog.items():
+        for n in v["open"]: items_of.setdefault(n, []).append(k)
+    for u in closed: items_of.setdefault(u["name"], sorted(unit_items(cfg, [u], iss)))
     gone = stranded_hosts(cfg); by = {}   # item -> [(unit, host, stranded)]: who covers it, for the Backlog tab's HOST column and details
     for u in units:
         for k in unit_items(cfg, [u], iss): by.setdefault(k, []).append((clean(u["name"]), clean(u.get("host")) or "?", u.get("host") in gone))
     strand = stranded_status(cfg, units, iss)   # the rule fill acts on, for the Active tab's text and the Backlog's relaunch rows
     lead = sorted({k for u in units if strand.get(u["name"]) == "lead" for k in unit_items(cfg, [u], iss)})
-    if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(covered_items(cfg, units, iss)), "by": by, "strand": strand, "lead": lead}
+    more = {"by": by, "strand": strand, "lead": lead, "progress": prog, "items_of": items_of}
+    if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(covered_items(cfg, units, iss)), **more}
     missing = None   # unknown while the backlog cannot be read
     if backlog is not None:
         items = eligible_items(iss, {i.get("id") for i in backlog["ready"]}, tot["cov"], item_actors(cfg, iss), item_holds(cfg, iss))
-        ever = {u["name"] for u in units} | {u["name"] for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u}
+        ever = {u["name"] for u in units} | {u["name"] for u in closed}
         idx = brief_index(cfg); missing = [clean(it) for _, _, it, _ in sorted(items) if not usable_brief(cfg, it, idx, ever)]
-    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg), "done": tot["done"], "total": tot["total"], "by": by, "strand": strand, "lead": lead}
+    return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg), "done": tot["done"], "total": tot["total"], **more}
 
 def collect_liveness(cfg):
     """{"live": {host: [up|down|stranded|returning|gone, down since]}, "after": {host: seconds}}: janus's own judgement of each host
@@ -367,11 +374,13 @@ def source_note(label, s, now, limit):
     if k == "failed": return f"{label}: UNAVAILABLE, no data yet ({s.err})"
     return f"{label}: STALE, last good data {fmt_dur(now - s.ok_at)} old" + (f" ({s.err})" if s.err else " (no answer yet)")
 
-WORK_COLS = (("NAME", 24, 9, True), ("STATE", 54, 8, False), ("HOST", 10, 4, False), ("TOOL/MODEL", 20, 3, False), ("ELAPSED", 8, 6, False), ("PROGRESS", 9, 7, False))
+WORK_COLS = (("NAME", 24, 9, True), ("ITEM", 8, 5, False), ("STATE", 54, 8, False), ("HOST", 10, 4, False), ("TOOL/MODEL", 20, 3, False), ("ELAPSED", 8, 6, False), ("PROGRESS", 9, 7, False))
 OVERVIEW_COLS = (("ITEM", 14, 9, False), ("NOW", 60, 9, True))
+BACKLOG_COLS = (("ITEM", 24, 9, True), ("STATE", 34, 8, False), ("UNITS", 38, 7, False), ("HOST", 10, 4, False), ("LAST", 9, 6, False))
 BOARD_COLS = (("NEW", 3, 7, False), ("TIME", 16, 5, False), ("KIND", 9, 8, False), ("AGENT", 24, 6, False), ("MESSAGE", 40, 9, True))
 HOST_COLS = (("HOST", 12, 9, False), ("STATE", 15, 8, False), ("RUN/QUEUED", 10, 7, False), ("AGENTS", 11, 6, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False),
              ("ADMISSION", 22, 6, False), ("TOOLS (FACTS AGE)", 24, 3, False), ("NOTE", 30, 2, True))
+TAB_COLS = {"Board": BOARD_COLS, "Overview": OVERVIEW_COLS, "Backlog": BACKLOG_COLS}   # every other tab: WORK_COLS
 NOT_READ = {"err": "report not read yet"}   # a unit's report before its first read: unknown, never 'no verdict'
 PRIO = {"blocked": 0, "failed": 1, "working": 2, "idle": 3, "queued": 4, "parked": 5, "starting": 6, "closing": 6, "unknown": 7, "host-down": 7, "stranded": 9}
 
@@ -454,7 +463,7 @@ def progress_cell(pr, done=False):
     if done: return "done"
     return f"{pr[0]}/{pr[1]} {100 * pr[0] // pr[1]}%" if pr else "-"
 
-def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at=None, slow=False):
+def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at=None, slow=False, items=()):
     end = epoch(u.get("closed_at") or u.get("collected_at")) if tab == "Ended" else now
     t0 = epoch(u.get("started"))
     el = fmt_dur(end - t0) if end is not None and t0 is not None else "?"
@@ -476,12 +485,23 @@ def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at
     if (rep or {}).get("limit"): d.append(f"Stopped:   {rep['limit']}")
     if u.get("item"): d.append(f"Item:      {clean(u['item'])}")
     pc = progress_cell((rep or {}).get("progress"), state in ("finished", "closed:DONE"))
-    return Row(u["name"], (u["name"], state_words(state, note) + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el, pc),
+    if items: d.insert(1, f"Item:      {', '.join(i.upper() for i in items)}")
+    return Row(u["name"], (u["name"], ",".join(i.upper() for i in items) or "-", state_words(state, note) + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el, pc),
                "warn" if slow or stale and state_style(state) in ("ok", "dim") else state_style(state), [x for x in d if x], stale, state=state)
 
-BACKLOG_ORDER = {"ready": 0, "relaunch": 1, "no-brief": 2, "open-unit": 3, "waiting": 4, "held": 5, "owner": 6}
+BACKLOG_ORDER = {"units-done": -1, "ready": 0, "relaunch": 1, "no-brief": 2, "open-unit": 3, "waiting": 4, "held": 5, "owner": 6}
 
-def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs", by=None, lead=()):
+BACKLOG_WORDS = {"ready": "ready: janus fill launches it", "relaunch": "relaunch: its unit's host is gone", "no-brief": "ready, no brief: write one",
+                 "open-unit": "in progress", "waiting": "waiting on another item", "held": "held", "owner": "owner's",
+                 "units-done": "all units done: close it or brief the rest"}
+
+def units_cell(p):
+    """The UNITS cell of a backlog item: its units done and open (the newest open one named), from item_progress."""
+    if not p: return "-"
+    other = p["closed"] - len(p["done"])
+    return (f"{len(p['done'])} done" + (f", {other} ended otherwise" if other else "") + (f", {len(p['open'])} open: {p['open'][0]}" if p["open"] else ""))
+
+def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs", by=None, lead=(), progress=None):
     """covered, missing: the checklist source's items live open units cover (their --item or brief ITEM: line; a unit on a stranded
     host covers nothing) and ready items without a usable brief, as collected (render reads no file); briefs: the configured briefs
     folder a missing brief is written in; by: item -> [(unit, host, stranded)] of every open unit that names it."""
@@ -498,27 +518,32 @@ def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="brie
         actor = next((l[6:] for l in labels if l.startswith("actor:")), "agent"); hold = next((l[5:] for l in labels if l.startswith("hold:")), None)
         state = "open-unit" if k in covered else "held" if hold else "owner" if actor != "agent" else \
             ("relaunch" if k in strand else "no-brief" if k in nob else "ready") if i.get("id") in ready else "waiting"
+        p = (progress or {}).get(k) or {}
+        if state == "no-brief" and p.get("done") and not p.get("open"): state = "units-done"   # its work landed; nothing waits to launch
         us = by.get(k, []); t0 = epoch(i.get("created_at")); title = clean(i.get("title")).removeprefix("backlog: ") or ref or str(i.get("id"))   # every item's title starts so: the column is for the item
         host = ",".join(dict.fromkeys(h for _, h, s in us if s == (state == "relaunch"))) if state in ("open-unit", "relaunch") else "-"
         mean = {"open-unit": "an open unit on a host that answers covers it (open, not necessarily running)", "ready": "not blocked by beads: janus fill may launch it",
                 "relaunch": "only units on hosts that are down cover it: janus fill relaunches it on a host that answers, from their report and synced changes",
                 "no-brief": f"ready, but no usable brief: write {briefs}/<unit>.md with ITEM: {ref}", "owner": "someone else does it",
-                "waiting": "open, but beads does not list it ready (blocked or deferred)"}.get(state) or f"held on purpose: {hold}"
+                "waiting": "open, but beads does not list it ready (blocked or deferred)",
+                "units-done": f"every unit of it ended, {len(p.get('done', []))} landed DONE, none is open and no brief waits: close it (janus backlog set {ref} status=DONE --unit {(p.get('done') or ['<unit>'])[0]}) or brief what is left"}.get(state) or f"held on purpose: {hold}"
         d = [f"Item:      {title}", f"State:     {state}", f"Id:        {clean(i.get('id'))}", f"Ref:       {ref or '-'}", f"Actor:     {actor}", f"Labels:    {', '.join(labels) or '-'}",
              f"Age:       {fmt_dur(now - t0) if t0 else '?'}", f"Meaning:   {mean}"]
-        if us: d.append("Units:     " + ", ".join(f"{n} ({h}" + (", host down)" if s else ")") for n, h, s in us))
-        rows.append(Row(f"i:{i.get('id')}", (title, state + (" STALE" if stale else ""), host or "-", "-", fmt_dur(now - t0) if t0 else "?", "-"),
-                        "warn" if stale else {"ready": "ok", "held": "dim", "owner": "dim", "open-unit": "ok", "no-brief": "warn", "relaunch": "warn"}.get(state, ""),
-                        d + ["", clean(i.get("description"), 600)], stale))
+        if us: d.append("Open now:  " + ", ".join(f"{n} ({h}" + (", host down)" if s else ")") for n, h, s in us))
+        if p.get("done"): d.append(f"Done:      {', '.join(p['done'])}")
+        last = f"{fmt_dur(now - p['last'])} ago" if p.get("last") else "-"
+        rows.append(Row(f"i:{i.get('id')}", (title, BACKLOG_WORDS.get(state, state) + (" STALE" if stale else ""), units_cell(p), host or "-", last),
+                        "warn" if stale else {"ready": "ok", "held": "dim", "owner": "dim", "open-unit": "ok", "no-brief": "warn", "relaunch": "warn", "units-done": "warn"}.get(state, ""),
+                        d + ["", clean(i.get("description"), 600)], stale, state=state))
     ids = {i.get("id") for i in data.get("items", [])}
     for i in data.get("ready", []):   # ready work that is not a checklist item: it is queued work too
         labels = set(i.get("labels") or []); title = str(i.get("title", ""))
         if i.get("id") in ids or labels & ({"unit", "instruction", "backlog", "intent"} | LOG_LABELS) or any(str(l).startswith("actor:") and l != "actor:agent" for l in labels): continue
         if title.startswith(("unit:", "janus:", "instr:", "intent:")) or LOG_RX.match(title): continue
         t0 = epoch(i.get("created_at"))
-        rows.append(Row(f"i:{i.get('id')}", (clean(title) or str(i.get("id")), "ready" + (" STALE" if stale else ""), "-", "-", fmt_dur(now - t0) if t0 else "?", "-"), "warn" if stale else "ok",
-                        [f"Item:      {clean(title)}", "State:     ready", f"Id:        {clean(i.get('id'))}", "Meaning:   ready in beads; no unit works on it", "", clean(i.get("description"), 600)], stale))
-    return sorted(rows, key=lambda r: (BACKLOG_ORDER.get(state_word(r.cells[1]), 4), r.cells[0].lower()))   # what fill launches next first
+        rows.append(Row(f"i:{i.get('id')}", (clean(title) or str(i.get("id")), BACKLOG_WORDS["ready"] + (" STALE" if stale else ""), "-", "-", "-"), "warn" if stale else "ok",
+                        [f"Item:      {clean(title)}", "State:     ready", f"Id:        {clean(i.get('id'))}", "Meaning:   ready in beads; no unit works on it", "", clean(i.get("description"), 600)], stale, state="ready"))
+    return sorted(rows, key=lambda r: (BACKLOG_ORDER.get(r.state, 4), r.cells[0].lower()))   # what fill launches next first
 
 def memory_row(ms, stale):
     """One row for one [memory] change sent to each running unit (the log keeps a line per delivery): its key is the first
@@ -572,7 +597,7 @@ def derive(view, now, interval):
         if state == "starting" and t0 is not None and now - t0 > wait:   # a launch takes minutes, never this long: it was interrupted
             state, note = "starting STALLED", f"its launch began {fmt_dur(now - t0)} ago and never finished (interrupted?): janus check says why; close or relaunch it"
         rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or (host_stale(u) and state_word(state) != "stranded"), rep,
-                                  tools.get(u.get("model")), cards.get(u["name"]), S("reports-open").ok_at, slow))
+                                  tools.get(u.get("model")), cards.get(u["name"]), S("reports-open").ok_at, slow, (ck.get("items_of") or {}).get(u["name"], ())))
         if tab == "Active" and u.get("host"):
             c = live.setdefault(u["host"], [0, 0, 0])
             if state in ("working", "idle", "blocked"): c[0] += 1
@@ -582,13 +607,14 @@ def derive(view, now, interval):
     for u in closed or []:
         if u["name"] in names: continue   # reopened or relaunched: the open unit is the truth
         rep = (S("reports-closed").data or {}).get(u["name"], NOT_READ); tab, state, note, slow = classify(u, ps, None, rep, now=now)
-        rows["Ended"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports-closed"), rep, read_at=S("reports-closed").ok_at))
+        rows["Ended"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports-closed"), rep, read_at=S("reports-closed").ok_at,
+                                      items=(ck.get("items_of") or {}).get(u["name"], ())))
     rows["Active"].sort(key=lambda r: (PRIO.get(state_word(r.state), 8), r.cells[0].lower()))
     rows["Ended"].sort(key=lambda r: (r.state.startswith("closed"), r.cells[0].lower()))   # ended and waiting to be collected first
     if S("backlog").data is not None:
-        rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"), ck.get("lead", ()))
+        rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"), ck.get("lead", ()), ck.get("progress"))
         k = {}
-        for r in rows["Backlog"]: w = state_word(r.cells[1]); k[w if w in ("owner", "held") else "agent"] = k.get(w if w in ("owner", "held") else "agent", 0) + 1
+        for r in rows["Backlog"]: w = r.state; k[w if w in ("owner", "held") else "agent"] = k.get(w if w in ("owner", "held") else "agent", 0) + 1
         if rows["Backlog"]: m.labels["Backlog"] = ", ".join(f"{k[x]} {x}" for x in ("agent", "owner", "held") if k.get(x))   # owner and held items are not queued agent work
     if S("board").data is not None: rows["Board"] = message_rows(S("board").data, stale("board"))
     m.rows = rows
@@ -640,6 +666,8 @@ def overview_rows(m, rows, hand, now, view):
         line = (f"{mr.cells[1]}  {mr.cells[3]}  {mr.cells[8]}" if mr.cells[1].startswith(KNOWN_DOWN) else
                 f"{mr.cells[1]}  run/queued {mr.cells[2]}  admission {mr.cells[6]}  tools {mr.cells[7]}" + (f"  ({mr.cells[8]})" if mr.cells[8] else ""))
         R.append(Row("o:" + mr.key, (mr.cells[0], line), mr.style, [", ".join(map(str, mr.cells))]))
+    free = [r.cells[0] for r in rows["Active"] if r.cells[1] == "-"]   # work that serves no backlog item: its progress counts nowhere
+    if free: R.append(Row("o:no-item", ("No item", f"{len(free)} open unit(s) name no backlog item: {', '.join(free)}"), "dim", [", ".join(free)]))
     bad = [f"{n}: {x.err}" for n, x in sorted(view.items()) if x.err]
     R.append(Row("o:problems", ("Data", "; ".join(bad) if bad else "every source read"), "warn" if bad else "ok", bad or ["every source read"]))
     return R
@@ -840,7 +868,7 @@ def render(model, ui, h, w, now, status):
     tab_at = len(L); L.append([])   # the tab bar is filled in below, once the selection has been settled (it counts the unread)
     for b in banners: L.append([(("! " + b)[:w], "warn")])
     bh = h - len(L) - colhead - foot
-    cols = {"Board": BOARD_COLS, "Overview": OVERVIEW_COLS}.get(tab, WORK_COLS); rows = model.rows[tab]
+    cols = TAB_COLS.get(tab, WORK_COLS); rows = model.rows[tab]
     ui.sync(model, max(bh, 1))
     sel = ui.sel.get(tab); i = ui.idx.get(tab, 0); new = ui.new_count(model)
     tabs = []

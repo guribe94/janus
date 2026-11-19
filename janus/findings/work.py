@@ -1,6 +1,7 @@
 """Findings about work in flight: ready backlog that would fit, the project's own git state, the watcher's health."""
 from janus.actions.backlog import brief_dir, fill_candidates, fill_plan
-from janus.backlog import backlog_cfg, backlog_issues
+from janus.backlog import backlog_cfg, backlog_issues, item_progress, norm_item
+from janus.units import all_units
 from janus.context import Err, sh
 from janus.platform import watcher_loaded, watcher_service
 
@@ -28,6 +29,14 @@ def backlog_findings(cfg, hs, units):
     F = []; missing, blocked, held = [], [], []
     try: cands = fill_candidates(cfg, units, missing=missing, blocked=blocked, held=held)
     except Err: return F
+    # an item with no brief waiting, no open unit and at least one unit closed DONE: finished work the item still waits to be closed on
+    prog = item_progress(cfg, list(all_units(cfg).values()), iss)
+    done = [i for i in missing if (p := prog.get(norm_item(i))) and p["done"] and not p["open"]]
+    for i in done:
+        p = prog[norm_item(i)]
+        F.append((f"backlog:done:{i}", f"all {p['closed']} closed unit(s) of {i} ended and {len(p['done'])} landed DONE (newest {p['done'][0]}); no unit is open and no brief "
+                  f"waits for it: close it (janus backlog set {i} status=DONE --unit {p['done'][0]}) or brief what is left"))
+    missing = [i for i in missing if i not in done]
     cfg.run.briefless = missing; cfg.run.held = held   # held: named by status only, never a dispatch finding
     if missing: F.append(("idle-with-backlog:nobrief", f"{len(missing)} ready backlog item(s) have no usable brief: {', '.join(missing[:12])}{'...' if len(missing) > 12 else ''}; "
                           f"write {brief_dir(cfg)}/<unit>.md with an ITEM: <id> line (janus fill launches it), or janus backlog set <id> hold=<reason>"))
