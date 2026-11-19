@@ -139,9 +139,11 @@ if __name__ == "__main__": unittest.main()
 
 
 class StartupDialogs(unittest.TestCase):
-    """2026-11-18: two agents started on another host (tmux over ssh) sat at Claude's "Do you trust this folder" prompt since launch;
-    only herdr panes were checked for startup dialogs, and the tmux session existing read as running."""
-    TRUST = "Do you trust the files in this folder?\n> 1. Yes, proceed"
+    """2026-11-18: two agents started on another host (tmux over ssh) sat at Claude's trust prompt since launch; only herdr panes
+    were checked for startup dialogs, and the tmux session existing read as running. Then (same day) 3 of 4 launches on rigpc sat
+    there 35-51 min: the pattern was written for a screen nobody had captured. TRUST is Claude Code 2.1.328's, read on rigpc."""
+    TRUST = (" Accessing workspace:\n /home/vegtam/janus-repro-tmux\n Quick safety check: Is this a project you created or one you trust? (Like your\n"
+             " own code, a well-known open source project, or work from your team).\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel")
 
     def test_one_loop_gets_past_a_dialog_by_screen_alone_or_by_agent_status(self):
         """Catches: a screen read before the client drew its dialog taken as clear; a dialog that never goes away taken as started."""
@@ -149,7 +151,7 @@ class StartupDialogs(unittest.TestCase):
         with mock.patch("time.sleep", lambda s: None):
             screens = iter(["", self.TRUST, "Claude Code\n> ", "Claude Code\n> "])
             self.assertIsNone(janus.past_dialogs(lambda: next(screens), lambda *k: sent.append(k)))
-            self.assertEqual(sent, [("Enter",)])                                # answered once, then the screen settled
+            self.assertEqual(sent, [("Down", "Enter")])                         # "Yes", not the "No, exit" the cursor starts on; then settled
             self.assertIn("still shown", janus.past_dialogs(lambda: self.TRUST, lambda *k: None))
             self.assertIsNone(janus.past_dialogs(lambda: "{}", lambda *k: None, lambda: "working"))   # herdr: its status says started
             self.assertIn("agent blocked", janus.past_dialogs(lambda: "x", lambda *k: None, lambda: "blocked"))
@@ -164,8 +166,87 @@ class StartupDialogs(unittest.TestCase):
             return 0, "", ""
         with mock.patch.object(janus, "hrun", hrun), mock.patch("time.sleep", lambda s: None):
             self.assertEqual(janus.start_tmux(cfg, h, "janus-u@t", "cd /r && exec claude"), 4242)
-        self.assertTrue(any("send-keys -t janus-u@t Enter" in c for c in cmds), cmds)
+        self.assertTrue(any("send-keys -t janus-u@t Down Enter" in c for c in cmds), cmds)
+        self.assertTrue(any("tmux new -d -s janus-u@t -x 200 -y 50 " in c for c in cmds), cmds)   # tall enough for the trust dialog
         self.assertTrue(any("has-session" in c for c in cmds))
+
+
+class TmuxAgents(unittest.TestCase):
+    """2026-11-18: no resume janus typed into a tmux agent was ever submitted (none is in any agent's transcript on asgard or rigpc),
+    and the agents sat idle for hours reading "working". The screens below are Claude Code 2.1.328's, read on rigpc."""
+    RULE = "─" * 80
+    FOOT = "  ⏵⏵ auto mode on (shift+tab to cycle)"
+    IDLE = f"● ONE\n✻ Crunched for 1s\n{RULE}\n❯ \n{RULE}\n{FOOT}"
+    BUSY = f"✻ Harmonizing…\n{RULE}\n❯ \n{RULE}\n{FOOT} · esc to interrupt"
+    HELD = f"● done\n{RULE}\n❯ [Pasted text #1 +146 lines]\n{RULE}\n  paste again to expand"
+    SENT = f"❯ [janus] Your jobs finished\n  memory line\n● Done.\n✻ Cogitated for 1s\n{RULE}\n❯ \n{RULE}\n{FOOT}"
+    QUEUED = f"❯ [janus] Your jobs finished\n  ⎿  Queued · ctrl+x ctrl+s to send now\n✢ Discombobulating…\n{RULE}\n❯ Press up to edit queued messages\n{RULE}\n{FOOT} · esc to interrupt"
+    TEXT = "[janus] Your jobs finished  \n" + "memory line\n" * 2000
+
+    def submit(self, screens, text=TEXT):
+        d, cfg = project('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n'); h = cfg.hosts["far"]; sent = []; cmds = []; it = iter(screens)
+        def hrun(h, s, **k):
+            cmds.append(s); return (0, next(it), "") if "capture-pane" in s else (0, "", "")
+        with mock.patch.object(janus, "X", lambda cfg, h, s, **k: sent.append((s, k.get("inp"))) or (0, "", "")), \
+             mock.patch.object(janus, "hrun", hrun), mock.patch("time.sleep", lambda s: None):
+            try: return sent, cmds, janus.tmux_submit(cfg, h, "janus-u@t", text)
+            except janus.Err as e: return sent, cmds, e
+
+    def test_a_long_prompt_is_pasted_whole_and_confirmed(self):
+        """Catches: `send-keys -l <text>` refuses a command over about 16 KB ("command too long"), a resume carries the project
+        memory (47 KB), the `&&` skipped the Enter and the exit status was never read, so janus logged a resume nothing received."""
+        sent, cmds, r = self.submit([self.IDLE, self.BUSY])
+        self.assertIsNone(r); self.assertEqual(len(sent), 1)
+        self.assertIn("paste-buffer -p", sent[0][0]); self.assertNotIn("send-keys -t janus-u@t -l", sent[0][0])
+        self.assertGreater(len(sent[0][1]), 20000)                      # the text goes on stdin, never on a command line
+        self.assertIsNone(self.submit([self.IDLE, self.SENT])[2])       # a turn already over: the prompt stands in the history
+
+    def test_only_new_proof_counts(self):
+        """Catches: an empty box taken as delivered (a lost paste leaves it empty too); an earlier resume's line in the history
+        (resumes share their first line) taken as this one; "esc to interrupt" in the agent's output taken as its footer."""
+        self.assertIsInstance(self.submit([self.IDLE] * 11)[2], janus.Err)
+        self.assertIsInstance(self.submit([self.SENT] * 11)[2], janus.Err)
+        quoted = f"● the probe greps esc to interrupt\n{self.RULE}\n❯ \n{self.RULE}\n{self.FOOT}"
+        self.assertFalse(janus.busy(quoted)); self.assertTrue(janus.busy(self.BUSY))
+        held = f"● done\n{self.RULE}\n❯ go on\n{self.RULE}\n{self.FOOT}"   # a short draft shows in the box as `❯ <text>`
+        self.assertEqual(janus.sent_lines(held, "❯ go on"), 0)
+        self.assertEqual(janus.sent_lines(f"❯ go on\n{self.RULE}\n{self.FOOT}", "❯ go on"), 0)   # one rule: no box drawn, no proof
+
+    def test_a_prompt_is_never_sent_twice(self):
+        """Catches: a prompt left unsent read as delivered; a retry pasting onto an earlier unsent paste, sending the text twice."""
+        sent, cmds, r = self.submit([self.IDLE] + [self.HELD] * 5 + [self.BUSY])   # held: one more Enter, never a second paste
+        self.assertIsNone(r); self.assertEqual(len(sent), 1); self.assertEqual(sum(c.endswith("send-keys -t janus-u@t Enter") for c in cmds), 1)
+        sent, cmds, r = self.submit([self.HELD, self.BUSY])                         # an earlier unsent paste is cleared first
+        self.assertIsNone(r); self.assertTrue(cmds[1].endswith("send-keys -t janus-u@t C-u"), cmds)
+        sent, cmds, r = self.submit([self.BUSY, self.QUEUED])                       # working: the prompt queues, and the queue shows it
+        self.assertIsNone(r); self.assertFalse(any("C-u" in c or "Escape" in c for c in cmds), cmds)
+        self.assertIsInstance(self.submit([self.BUSY] * 11)[2], janus.Err)         # working before: busy proves nothing about this prompt
+
+    def test_a_tmux_agent_reads_working_only_while_its_screen_says_so(self):
+        """Catches: a tmux unit read "working" whenever its session existed, so an agent idle at its prompt for hours raised
+        nothing. An idle tmux agent is alive: its jobs are not orphans, and close and handover still ask for janus stop."""
+        out = "avail_mb=1\n--pueue\n{}\n--tmux\njanus-a@t busy\njanus-b@t\nother\n"
+        with mock.patch.object(janus, "hrun", lambda *a, **k: (0, out, "")):
+            p = janus.probe("far", {"ssh": "u@far", "_rd": "/r"})
+        self.assertEqual((p["tmux"], p["tmux_busy"]), (["janus-a@t", "janus-b@t", "other"], ["janus-a@t"]))
+        st = lambda t: janus.unit_state({"via": "tmux", "tmux": t, "host": "far"}, {"far": p}, {})
+        self.assertEqual([st("janus-a@t"), st("janus-b@t"), st("janus-c@t")], ["working", "idle", "gone"])
+        self.assertFalse(janus.agent_ended({"via": "tmux", "state": "idle"})); self.assertTrue(janus.agent_ended({"via": "tmux", "state": "gone"}))
+        self.assertTrue(janus.agent_live({"via": "tmux"}, "idle")); self.assertFalse(janus.agent_live({"via": "herdr"}, "idle"))
+
+    def test_the_probe_reads_busy_from_the_footer_of_a_real_screen(self):
+        """Catches: the probe loop never run (only parsed); the words in the agent's output read as its footer."""
+        with tempfile.TemporaryDirectory() as d:
+            sock = str(Path(d, "s")); tm = lambda *a: subprocess.run(["tmux", "-S", sock, *a], capture_output=True, text=True)
+            if subprocess.run(["sh", "-c", "command -v tmux"], capture_output=True).returncode: self.skipTest("no tmux")
+            for n, scr in (("w", self.BUSY), ("i", f"esc to interrupt\n{self.IDLE}")):
+                f = Path(d, n); f.write_text(scr + "\n"); tm("new", "-d", "-s", n, "-x", "120", "-y", "20", f"cat {f}; sleep 30")
+            time.sleep(0.5)
+            try:
+                loop = janus.PROBE.split('echo "--tmux"; ')[1].rsplit("; true", 1)[0].replace("tmux ", f"tmux -S {sock} ")
+                out = subprocess.run(["sh", "-c", loop], capture_output=True, text=True).stdout
+            finally: tm("kill-server")
+        self.assertEqual(sorted(out.split("\n")[:-1]), ["i", "w busy"], out)
 
 
 class ResumeReopensReport(unittest.TestCase):
@@ -180,9 +261,10 @@ class ResumeReopensReport(unittest.TestCase):
             janus.resume_unit(cfg, u, "your jobs finished")
         self.assertEqual(rep.read_text().splitlines()[:2], ["VERDICT: PENDING", "history"]); self.assertTrue(sent)
         cmds = []; rep.write_text("VERDICT: BLOCKED x\n")
-        remote = lambda h, s, **k: (0, "VERDICT: DONE (on the host)\nnotes\n", "") if s.startswith("cat ") else (0, "", "")
+        screens = iter([TmuxAgents.IDLE, TmuxAgents.BUSY])   # the agent takes the prompt
+        remote = lambda h, s, **k: (0, "VERDICT: DONE (on the host)\nnotes\n", "") if s.startswith("cat ") else (0, next(screens), "") if "capture-pane" in s else (0, "", "")
         with mock.patch.object(janus, "X", lambda cfg, h, s, **k: cmds.append((s, k.get("inp"))) or (0, "", "")), mock.patch.object(janus, "hrun", remote), \
-             mock.patch.object(janus, "route_ok", lambda *a: (True, "")):
+             mock.patch.object(janus, "route_ok", lambda *a: (True, "")), mock.patch("time.sleep", lambda s: None):
             janus.resume_unit(cfg, {"name": "u", "host": "far", "via": "tmux", "tmux": "t", "model": "m"}, "go on")
         self.assertIn("VERDICT: PENDING\nnotes\n", [i for c, i in cmds if "/r/out/u/REPORT.md" in c], cmds)   # written on the host, by the file it read there
         self.assertTrue(rep.read_text().startswith("VERDICT: PENDING"))

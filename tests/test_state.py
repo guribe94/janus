@@ -241,6 +241,8 @@ class State(unittest.TestCase):
         u = lambda age: {"name": "u", "id": "1", "host": "here", "via": "tmux", "tmux": "janus-u@t", "started": int(janus.now()) - age}
         keys = lambda x: [k for k, _ in janus.unit_findings(cfg, hs, [x], {})[0]]
         self.assertIn("unit:u:not-started", keys(u(cfg.silent + 60)))
+        self.assertNotIn("unit:u:finished", keys(u(cfg.silent + 60)))               # idle at its prompt: named once, as not started
+        hs["here"]["tmux_busy"] = ["janus-u@t"]; self.assertIn("unit:u:not-started", keys(u(cfg.silent + 60))); del hs["here"]["tmux_busy"]   # working
         self.assertNotIn("unit:u:not-started", keys(u(cfg.silent - 60)))           # still within the first silent window
         rep.write_text(janus.REPORT_SEED + "\n- [ ] read the brief\n"); self.assertNotIn("unit:u:not-started", keys(u(cfg.silent + 60)))
         rep.write_text(janus.REPORT_SEED + "\n"); self.assertNotIn("unit:u:not-started", keys({**u(cfg.silent + 60), "tmux": "other"}))   # not running

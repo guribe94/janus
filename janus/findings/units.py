@@ -76,7 +76,7 @@ def unit_findings(cfg, hs, units, ag):
         # parked (janus-fixes9 item 1): recorded, or its turn ended with a WAITING line; no verdict yet. A recorded park wins over
         # a verdict (item 11): a resumed-then-parked unit is parked, not finished.
         rec = (u.get("parked") or {}).get("jobs")
-        pk = rec or ([] if v else (waiting_line_jobs(cfg, u) if st in ENDED or u.get("via") == "tmux" else []))
+        pk = rec or ([] if v else (waiting_line_jobs(cfg, u) if st in ENDED else []))
         if pk:
             u["_park"] = pk; u["state"] = st = "parked"
             F += parked_findings(cfg, hs, u, pk)
@@ -86,7 +86,8 @@ def unit_findings(cfg, hs, units, ag):
                 F.append((f"waiting:{u['name']}", f"{u['name']} is alive while its job(s) {', '.join(jw[:4])} wait for admission: "
                           f"janus park {u['name']} (stops it; it resumes, same session, when its jobs finish)"))
         if st in ("working", "queued", "parked"): running += 1
-        if st == "working" and age > cfg.silent and report_untouched(cfg, u):   # alive but silent since launch: it never began its brief
+        silent = st in ("working", "idle") and age > cfg.silent and report_untouched(cfg, u)
+        if silent:   # alive but silent since launch: it never began its brief
             where = f"tmux attach -t {u.get('tmux')} on {u['host']}" if u.get("via") == "tmux" else f"its {u.get('via')} pane or task log"
             F.append((f"unit:{u['name']}:not-started", f"{u['name']} has written nothing to its report in {int(age // 60)} min since launch: its "
                       f"agent is likely stuck before its first turn (a startup prompt, a login, an error); look at its screen ({where}), "
@@ -97,7 +98,7 @@ def unit_findings(cfg, hs, units, ag):
         if st == "blocked":
             r = herdr("agent", "read", u["name"], "--source", "detection") or {}
             F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked: {json.dumps(r)[:160]}; answer it (board.sh direct) or relaunch with what it needs"))
-        elif st in ("done", "failed", "gone", "idle"):
+        elif st in ("done", "failed", "gone", "idle") and not silent:
             F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
         if v and v.startswith("VERDICT: DONE"):   # finished work that its rigor level wants reviewed before it lands (rigor.review_gap)
             gap = review_gap(cfg, u, units)

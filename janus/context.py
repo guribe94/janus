@@ -119,7 +119,7 @@ class Cfg:
 # Every process janus queues (pueue add) or starts on the Mac gets this allow-listed environment plus explicit JANUS_* values,
 # never the caller's: pueue stores a task's whole environment in its state file, so a caller's ANTHROPIC_API_KEY, messaging
 # token or HERDR_PANE_ID would be written to disk (audit H1, M2).
-ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SSH_AUTH_SOCK", "TZ", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME")
+ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SSH_AUTH_SOCK", "TZ", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "TMUX_TMPDIR")
 
 def clean_env(extra=None):
     e = {k: os.environ[k] for k in ENV_KEEP if k in os.environ}

@@ -431,7 +431,7 @@ def classify(u, ps, agents, rep, live=None, strand=None, now=None):
     try: st = "unknown" if via == "herdr" and agents is None else unit_state(u, ps, agents or {})
     except Exception: st = "unknown"
     ended = st in ("done", "failed", "gone")
-    pk = (u.get("parked") or {}).get("jobs") or ([] if v else ((rep or {}).get("waiting") or []) if ended or st == "idle" or via == "tmux" else [])
+    pk = (u.get("parked") or {}).get("jobs") or ([] if v else ((rep or {}).get("waiting") or []) if ended or st == "idle" else [])
     if pk:
         w = [job_words(ps, str(j), time.time() if now is None else now) for j in pk[:4]]
         return "Active", "parked", "waiting for job " + "; job ".join(f"{j}: {t}" for j, (t, _) in zip(pk, w)), any(o for _, o in w)

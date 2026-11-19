@@ -22,7 +22,8 @@ def unit_state(u, ps, agents):
         return a.get("agent_status", "unknown") if a else "gone"
     p = ps.get(u.get("host"), {})
     if not p.get("ok"): return "unknown"
-    if via == "tmux": return "working" if unit_tmux(u) in p.get("tmux", []) else "gone"
+    if via == "tmux":   # from its screen (the probe): working while it shows the agent busy, idle at its prompt
+        t = unit_tmux(u); return ("working" if t in p.get("tmux_busy", []) else "idle") if t in p.get("tmux", []) else "gone"
     if via == "pueue":
         t = ((p.get("pueue") or {}).get("tasks") or {}).get(str(u.get("task")))
         if not t: return "gone"
@@ -260,9 +261,14 @@ def all_units(cfg):
         cfg.run.all_units = out
     return cfg.run.all_units
 
+def agent_live(u, st):
+    """Whether u's agent may still run in state st: working, queued, blocked, unknown (its host cannot say), or idle in tmux (its
+    session stays until janus stop ends it; closing a herdr agent's tab ends it)."""
+    return st in ("working", "queued", "blocked", "unknown") or (st == "idle" and u.get("via") == "tmux")
+
 def agent_ended(u):
-    """The unit's agent is gone: an API run ended, a tmux session or herdr agent is gone (an idle herdr agent is alive)."""
-    return u.get("state") == "gone" if u.get("via") == "herdr" else u.get("state") in ENDED
+    """The unit's agent is gone: an API run ended, a tmux session or herdr agent is gone (an idle one is alive)."""
+    return u.get("state") == "gone" if u.get("via") in ("herdr", "tmux") else u.get("state") in ENDED
 
 def unit_any(cfg, name):
     """An open unit, else the latest record of a closed one."""
@@ -270,7 +276,7 @@ def unit_any(cfg, name):
     except Err: u = None
     return u or all_units(cfg).get(name)
 
-__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "REPORT_SEED", "reopened", "report_untouched", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_ended", "unit_any"]
+__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "REPORT_SEED", "reopened", "report_untouched", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_live", "agent_ended", "unit_any"]
 
 
 def no_remote_copy(u):

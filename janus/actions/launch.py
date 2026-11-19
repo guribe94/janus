@@ -20,7 +20,7 @@ from janus.probe import probe_all, pueue, room
 from janus.templates import CLEAN_PUEUE
 from janus.transcripts import transcript_of
 from janus.switch import hooks_json
-from janus.units import REPORT_SEED, TAB_SEP, reopened, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
+from janus.units import REPORT_SEED, TAB_SEP, agent_live, reopened, busy_mark, herdr_agents, main_checkout, report_path, unit_state, ws_id
 
 def agent_args(mc):
     """The client arguments of an agent janus starts in a pane: the model's args, and for Claude janus's hooks for that session,
@@ -431,6 +431,7 @@ def write_seed(src, dst):
     os.utime(dst, (mt, mt))
 
 DIALOGS = [   # startup dialogs janus gets past (fixes5 item 10): (text in the pane, keys to send)
+    (r"Yes, I trust this folder", ["Down", "Enter"]),   # Claude Code 2.1 ("Quick safety check"): the cursor starts on "No, exit"
     (r"trust the (files|contents) (in|of) this (folder|directory)|Do you trust", ["Enter"]),
     (r"Update available|new version of Codex|Skip until next version", ["Down", "Enter"]),
     (r"Press Enter to continue", ["Enter"])]
@@ -463,7 +464,8 @@ def start_tmux(cfg, h, tm, inner):
     """Start an agent in tmux session tm on host h, get it past its startup dialogs and confirm the session is alive: its pane pid.
     Err when the session cannot start, ends at once (a broken command line) or still shows a dialog."""
     pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '; q = shlex.quote(tm)
-    rc, o, er = X(cfg, h, pre + f"tmux new -d -s {q} {shlex.quote(inner)} && tmux display -p -t {q} '#{{pane_pid}}'")
+    # 200x50, not tmux's 80x24: Claude Code's trust dialog refuses a short window ("first make the window taller")
+    rc, o, er = X(cfg, h, pre + f"tmux new -d -s {q} -x 200 -y 50 {shlex.quote(inner)} && tmux display -p -t {q} '#{{pane_pid}}'")
     if rc: raise Err("tmux start failed: " + er.strip()[:100])
     pid = int(o.strip() or 0)
     if cfg.run.dry: return pid
@@ -473,6 +475,57 @@ def start_tmux(cfg, h, tm, inner):
     if hrun(h, pre + f"tmux has-session -t {q}")[0] or not pid: raise Err(f"the agent's tmux session {tm} ended at once; nothing is running")
     if d: raise Err(f"{tm}: {d}")
     return pid
+
+BUSY = "esc to interrupt"   # Claude Code's footer while a turn runs or a prompt waits in its queue (2.1.328); the probe reads it too
+RULE = lambda l: bool(l.strip()) and set(l.strip()) == {"─"}   # a full-width rule: Claude Code draws its input box between two
+
+def input_box(screen):
+    """The text in Claude Code's input box (between the last two rules of the screen), "" when it is empty, None when the screen
+    shows no box."""
+    L = screen.splitlines(); rules = [i for i, l in enumerate(L) if RULE(l)]
+    if len(rules) < 2: return None
+    t = " ".join(L[rules[-2] + 1:rules[-1]]).strip().lstrip("❯").strip()
+    return "" if t.startswith('Try "') else t   # its placeholder in an empty box
+
+def busy(screen):
+    """The agent works (or holds a queued prompt): its footer, below the input box, says so. Only the footer: the agent's own
+    output may quote the words."""
+    L = screen.splitlines(); rules = [i for i, l in enumerate(L) if RULE(l)]
+    return BUSY in "\n".join(L[rules[-1] + 1:] if rules else L[-3:]).lower()
+
+def sent_lines(screen, first):
+    """How many prompts starting with first stand in the history above the input box (`❯ <line>`; the box itself shows a draft
+    the same way)."""
+    L = screen.splitlines(); rules = [i for i, l in enumerate(L) if RULE(l)]
+    return sum(l.strip().startswith(first) for l in L[:rules[-2]]) if len(rules) > 1 else 0   # no box drawn: no proof
+
+def tmux_submit(cfg, h, tm, text):
+    """Submit text as one prompt to the agent in tmux session tm on host h, and confirm it was taken. The text is pasted from a
+    tmux buffer: `send-keys -l` refuses a command over about 16 KB ("command too long"), and a resume carries the project memory,
+    so every interactive resume was lost while janus logged it as sent. A prompt pasted while the agent works is queued until its
+    turn ends. Taken (read on its screen and scrollback, rigpc 2.1.328): the prompt's first line stands in the history once more
+    than before (`❯ <line>`, sent or queued; a short turn can be over within a second), or an agent idle before it now works.
+    A draft already in the box (an earlier prompt never sent) is cleared first (C-u; Escape would interrupt a working agent),
+    so the prompt never goes twice. A box that still holds the prompt gets one more Enter. Err when it is not taken."""
+    pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '; q = shlex.quote(tm); b = shlex.quote(f"janus-{tm}")
+    read = lambda: hrun(h, pre + f"tmux capture-pane -p -S -500 -t {q}")   # with scrollback: the line may scroll off the screen
+    first = "❯ " + text.strip().splitlines()[0].strip()[:60]
+    if not cfg.run.dry:
+        rc, scr, er = read()
+        if rc: raise Err(f"{tm}: its screen cannot be read: {er.strip()[:120]}")
+        n0, b0 = sent_lines(scr, first), busy(scr)
+        if input_box(scr) and not (b0 and "queued messages" in input_box(scr)): hrun(h, pre + f"tmux send-keys -t {q} C-u")
+    rc, o, er = X(cfg, h, pre + f"tmux load-buffer -b {b} - && tmux paste-buffer -p -d -b {b} -t {q} && tmux send-keys -t {q} Enter", inp=text)
+    if rc: raise Err(f"{tm}: the prompt was not delivered: {(er or o).strip()[:120]}")
+    if cfg.run.dry: return
+    box = None
+    for i in range(10):
+        time.sleep(1); rc, scr, er = read()
+        if rc: raise Err(f"{tm}: its screen cannot be read after the prompt: {er.strip()[:120]}")
+        if sent_lines(scr, first) > n0 or (busy(scr) and not b0): return
+        box = input_box(scr)
+        if i == 4 and box: hrun(h, pre + f"tmux send-keys -t {q} Enter")
+    raise Err(f"{tm}: the prompt was not taken; its input box holds: {(box or '(nothing)')[:120]}")
 
 def unit_tab(cfg, u, mname, hn, h):
     """One labelled tab per running unit (<unit> · <model> · <host>) that follows its pueue log (fixes5 item 3)."""
@@ -566,7 +619,7 @@ def cmd_launch(cfg, a):
         if why: raise Err(f"refused: --resume-of {handover}: {why}")
         hst = (hand or {}).get("state") or (unit_state(hand, hs, ag) if hand else "unknown")
         what = f"still {hst}" if hst != "unknown" else "in an unknown state (its host could not say whether it runs)"
-        if hst in ("working", "queued", "blocked", "unknown"):
+        if agent_live(hand or {}, hst):
             raise Err(f"{handover}: cannot hand over its tree: its agent is {what}; stop it first (janus stop {handover}), then hand its tree over")
     if main_checkout(cwd) and not a.allow_main: raise Err(f"refused: {cwd} is a main checkout with linked worktrees; use a worktree (or --allow-main)")
     outd = cfg.p("out", "out") / name   # made only once every refusal is behind (brief_plan below): a refused launch leaves nothing

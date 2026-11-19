@@ -57,7 +57,8 @@ def probe(name, h, ro=True, cfg=None):
     if rc == 255 and not h.get("local"): rc, o, e = sh([*SSH, "-o", "ControlPath=none", h["ssh"], script], timeout=25)
     if rc: return {"name": name, "ok": False, "err": (e or o).strip().splitlines()[-1][:80] if (e or o).strip() else f"rc {rc}"}
     head, _, rest = o.partition("--pueue\n"); pj, _, tm = rest.partition("--tmux\n")
-    p = {"name": name, "ok": True, "tmux": tm.split(), **{k: [] for k in LIST_KEYS}}
+    tl = [l.split() for l in tm.splitlines() if l.strip()]
+    p = {"name": name, "ok": True, "tmux": [l[0] for l in tl], "tmux_busy": [l[0] for l in tl if l[1:] == ["busy"]], **{k: [] for k in LIST_KEYS}}
     for l in head.splitlines():
         k, _, v = l.partition("=")
         if k in LIST_KEYS: p[k].append(v)

@@ -285,9 +285,9 @@ class LandingBase(unittest.TestCase):
         for p in (mock.patch.object(janus, "own_tree", lambda *a: True), mock.patch.object(janus, "unapplied_patch", lambda *a: None)): p.start(); self.addCleanup(p.stop)
     def land(self): return out(janus.cmd_land, self.cfg, type("A", (), {"unit": "u", "push": True, "host": None})())
     def remote_count(self): return int(git(self.origin, "rev-list", "--count", "main"))
-    def set_done(self, dry=False):
+    def set_done(self, dry=False, commit=None):
         self.cfg.run.dry = dry
-        try: return out(janus.cmd_backlog, self.cfg, type("A", (), {"action": "set", "args": ["X1", "status=DONE"], "unit": "u"})())
+        try: return out(janus.cmd_backlog, self.cfg, type("A", (), {"action": "set", "args": ["X1", "status=DONE"], "unit": "u", "commit": commit})())
         finally: self.cfg.run.dry = False
 
     def close(self, dry=True):
@@ -340,6 +340,27 @@ class Landing(LandingBase):
         self.assertEqual((self.d / "S.md").read_text(), before); self.assertEqual(len([x for x in self.w.writes if x[0] == "close"]), 1)
         self.u["published"] = {**self.u["published"], "commit": "f" * 40}   # a record whose commit is not on the remote: refused
         with self.assertRaises(janus.Err): self.set_done()
+
+    def test_done_for_a_commit_the_units_agent_pushed_itself(self):
+        """Catches (2026-11-18, BRIEF-UPKEEP, CHECKLIST-UPKEEP, A80): a unit whose agent pushed to main itself has no janus land
+        record, so its item could not be accepted at all, though `merge-base --is-ancestor` proves it landed. --commit names
+        the commit; it must be one the unit's own report names and on the landing branch now."""
+        self.w.issue("X1"); sha = git(self.wt, "rev-parse", "HEAD"); rep = self.d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True, exist_ok=True)
+        rep.write_text("VERDICT: DONE\npushed\n")
+        with self.assertRaises(janus.Err) as e: self.set_done(commit=sha[:9])
+        self.assertIn("report names", str(e.exception))                     # a commit its report does not name: not its evidence
+        rep.write_text(f"VERDICT: DONE (pushed {sha[:9]} to main)\n")
+        with self.assertRaises(janus.Err) as e: self.set_done(commit=sha[:9])
+        self.assertIn("is not on origin/main", str(e.exception))           # named, not on the landing branch yet
+        git(self.wt, "push", "-q", "origin", "HEAD:main")                   # the agent's own push
+        self.u["started"] = int(time.time()) + 3600                          # a commit from before the unit started: its base, not its work
+        with self.assertRaises(janus.Err) as e: self.set_done(commit=sha[:9])
+        self.assertIn("before u started", str(e.exception)); self.u["started"] = int(time.time()) - 3600
+        self.set_done(commit=sha[:9])
+        self.assertIn(f"| X1 | one | DONE | {sha[:12]} |", (self.d / "S.md").read_text())
+        self.u["published"] = {"commit": sha, "remote": "origin", "branch": "main"}   # a recorded publication is the evidence then
+        with self.assertRaises(janus.Err) as e: self.set_done(commit=sha[:9])
+        self.assertIn("only for a unit pushed without janus land", str(e.exception))
 
     def test_ambiguous_or_unsupported_layouts_refuse(self):
         (self.d / "S.md").write_text(CHECK + "| X1 | again | READY | - |\n")

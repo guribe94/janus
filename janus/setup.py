@@ -4,7 +4,7 @@ import argparse, concurrent.futures as cf, json, os, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import facts_line, remote_wt
 from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
-from janus.actions.launch import new_tab, wait_shell
+from janus.actions.launch import new_tab, tmux_submit, wait_shell
 from janus.board import board_dir, board_script
 from janus.context import (CLAIM_WINDOW, CONF, old_layout, Err, JANUS_MARK, JANUS_SELF, SSH, atomic_write, clean_env, herdr, hrun, now, pending_age, qp,
     record_session_proc, refuse_agent, say, session_alive, sh, slug, standby, wake_clear)
@@ -208,12 +208,13 @@ def start_orchestrator(cfg, kind):
         say(f"started a {kind} orchestrator in a new herdr tab (pane {pane}); its first hook event claims the registration")
     else:
         sess = "janus-orchestrator"
-        rc, o, e = sh(["tmux", "new", "-d", "-s", sess, "-c", str(cfg.root), shlex.join([kind, *args])], timeout=30)
+        # 200x50: Claude Code's trust dialog refuses a short window (launch.start_tmux)
+        rc, o, e = sh(["tmux", "new", "-d", "-s", sess, "-x", "200", "-y", "50", "-c", str(cfg.root), shlex.join([kind, *args])], timeout=30)
         if rc: raise Err("tmux new failed: " + (e or o).strip()[:120])
         atomic_write(cfg.f("pane"), "")   # no herdr pane: the watcher judges this session by its process and transcript
         time.sleep(2)
         if sh(["tmux", "has-session", "-t", sess])[0]: raise Err(f"the {kind} session ended at once; nothing is running")
-        sh(["tmux", "send-keys", "-t", sess, "-l", prompt]); sh(["tmux", "send-keys", "-t", sess, "Enter"])
+        tmux_submit(cfg, {"local": True}, sess, prompt)
         say(f"started a {kind} orchestrator in tmux session {sess}; its first hook event claims the registration")
 
 def register_here(cfg):

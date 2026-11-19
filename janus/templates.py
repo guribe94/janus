@@ -25,7 +25,8 @@ RD=%(rd)s; CAP_RO=%(ro)s
 %(cap)s
 cap_report
 echo "--pueue"; %(pueue)s status --json 2>/dev/null
-echo "--tmux"; tmux ls -F '#S' 2>/dev/null; true'''
+# each tmux session, and "busy" when the footer of its screen (its last two lines) shows the agent working (launch.busy)
+echo "--tmux"; for s in $(tmux ls -F '#S' 2>/dev/null); do b=; tmux capture-pane -p -t "$s" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 2 | grep -qi 'esc to interrupt' && b=' busy'; echo "$s$b"; done; true'''
 
 DIRECT_PROBE = r'''if [ -d /proc/1 ]; then
  for f in /proc/[0-9]*/environ; do u=$(tr '\0' '\n' < $f 2>/dev/null | sed -n 's/^JANUS_UNIT=//p'); [ -n "$u" ] && echo "${f#/proc/} $u"; done 2>/dev/null | sed 's#/environ##' > /tmp/.janus-units.$$

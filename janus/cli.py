@@ -63,7 +63,8 @@ def main():
     add("ledger", cmd_ledger, A("action", choices=["check", "repair", "reconcile", "recost"]), A("--provider"), dry=True)
     add("doctor", cmd_doctor, A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", cmd_backlog, A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...> | hold=<reason> | status=DONE"),
-        A("--unit", help="set <item> status=DONE: the unit whose verified published landing is the item's evidence"), dry=True)
+        A("--unit", help="set <item> status=DONE: the unit whose verified published landing is the item's evidence"),
+        A("--commit", help="set <item> status=DONE: a commit the unit's agent pushed itself (no janus land): named in its report, on the landing branch"), dry=True)
     add("install-host", cmd_install_host, A("host", help="a host of janus.toml: folders, pueued as a user service, a janus copy, the heartbeat watchdog"), dry=True)
     add("queue", cmd_queue, A("host", nargs="?"), A("--log", metavar="[HOST:]ID", help="print one task's output: <host>:<id> (ids collide between hosts); the job's run log when pueue has none"))
     add("stop", cmd_stop, A("unit"), A("--force", action="store_true", help="stop although its remote copy has uncollected work"), dry=True)

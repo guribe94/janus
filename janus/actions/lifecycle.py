@@ -4,7 +4,7 @@ import argparse, ast, contextlib, os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import (collect_job, job_of, job_state, patch_scope, patch_scope_desc, patch_scope_sh, recorded_jid, runs_dir, save_task_log,
     task_rc, task_status, unit_jobs)
-from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken, put_script, tool_argv
+from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken, put_script, start_tmux, tmux_submit, tool_argv
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
 from janus.branch import published_contains
@@ -17,7 +17,7 @@ from janus.project import project_id, tag, unit_tmux
 from janus.probe import host_liveness, probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
-from janus.units import (ENDED, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, reopened, report_path, unit_runs, unit_spent, unit_state,
+from janus.units import (ENDED, agent_live, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, reopened, report_path, unit_runs, unit_spent, unit_state,
     verdict, waiting_line_jobs)
 
 # Agents never pay to wait. An agent submits its builds and tests detached (`janus run --detach`, or its lane runner's
@@ -89,7 +89,8 @@ def cmd_stop(cfg, a):
     if left: raise Err(f"{u['name']}: {left} process(es) still alive after TERM and KILL")
     for _ in range(10):
         with cfg.unlocked(): ps = probe(u["host"], h)
-        if ps["ok"] and unit_state(u, {u["host"]: ps}, herdr_agents(cfg)) in ("gone", "done", "failed", "idle", "unknown"): break
+        st = unit_state(u, {u["host"]: ps}, herdr_agents(cfg)) if ps["ok"] else None
+        if st and (st == "unknown" or not agent_live(u, st)): break   # an idle tmux agent's session still stands: not stopped
         time.sleep(1)
     else: raise Err(f"{u['name']} is still alive after stop")
     if close_tab(cfg, u): bd.save(u)   # every kind: a stopped herdr agent leaves only an empty shell in its tab (issue 267)
@@ -384,7 +385,7 @@ def agent_running(cfg, u):
     """Why u's agent may still run (asked of its host now), else None: still working, queued or blocked, or its host cannot say."""
     with cfg.unlocked(): ps = probe(u["host"], cfg.hosts[u["host"]])
     st = unit_state(u, {u["host"]: ps}, herdr_agents(cfg))
-    if st in ("working", "queued", "blocked", "unknown"):
+    if agent_live(u, st):
         return f"{u['name']}: its agent is " + (f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)") + f"; stop it first (janus stop {u['name']})"
     return None
 
@@ -443,7 +444,7 @@ def cmd_close(cfg, a):
         st = unit_state(u, probe_all(cfg), herdr_agents(cfg)) if handover and not cfg.run.dry else None
     if why: raise Err(f"refused: {u['name']}: {why}")
     if handover and not cfg.run.dry:   # never close a predecessor whose agent is still running (finding 3; finding 5: unknown too)
-        if st in ("working", "queued", "blocked", "unknown"):
+        if agent_live(u, st):
             what = f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)"
             raise Err(f"{u['name']}: cannot hand over its tree: its agent is {what}; stop it first (janus stop {u['name']}), then hand its tree over")
     if not cfg.run.dry:   # the record as it is now; marked closing before the remote cleanup, which runs without the lock
@@ -571,11 +572,12 @@ def resume_unit(cfg, u, msg, budget=None):
             sid = session_of(cfg, u) if mc.get("kind") == "claude" else None
             if not sid: raise Err(f"{name}: its tmux session ended and its {mc.get('kind')} session id cannot be read here: resume it by hand in {u.get('rcwd')}")
             env_ = " ".join(f"{k}={shlex.quote(v)}" for k, v in {"JANUS_ROLE": "agent", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root)}.items())
-            inner = f"cd {qp(u['rcwd'])} && exec env {env_} {shlex.join(tool_argv(mc, text, sid))}"
-            rc, o, er = hrun(h, pre + f"tmux new -d -s {tm} {shlex.quote(inner)}")
-            if rc: raise Err(f"{name}: tmux start failed: {er.strip()[:100]}")
+            # started without the prompt (its last argument): tmux refuses a command line that carries the project memory
+            inner = f"cd {qp(u['rcwd'])} && exec env {env_} {shlex.join(tool_argv(mc, text, sid)[:-1])}"
+            try: u["pid"] = start_tmux(cfg, h, unit_tmux(u), inner); tmux_submit(cfg, h, unit_tmux(u), text)
+            except Err as e: raise Err(f"{name}: {e}")
             return f"{name}: its session ended; started {mc['kind']} again on session {sid[:8]} in tmux {unit_tmux(u)} on {u['host']}"
-        X(cfg, h, f"tmux send-keys -t {tm} -l {shlex.quote(text)} && tmux send-keys -t {tm} Enter")
+        tmux_submit(cfg, h, unit_tmux(u), text)
         return f"{name}: " + (f"resumed in tmux {unit_tmux(u)} on {u['host']}" if not cfg.run.dry else f"would resume in tmux {unit_tmux(u)} on {u['host']} (dry run)")
     if via != "pueue" or mc.get("kind") != "api": raise Err(f"{name}: a unit run via {via} cannot be resumed")
     pv = cfg.prov[mc["provider"]]; od = cfg.p("out", "out") / name
@@ -787,7 +789,7 @@ def refresh_remote(cfg, u, bd, log, fetched=None):
     if fin: u["saved"] = saved_marker(u); settle_remote(cfg, u)   # its run is closed when it ends, not at collect
     bd.save(u)
     u["verdict"] = v = verdict(cfg, u)
-    if not v and not u.get("_park") and (fin or u.get("via") == "tmux"):
+    if not v and not u.get("_park") and fin:
         pk = waiting_line_jobs(cfg, u)
         if pk: u["_park"] = pk; u["state"] = "parked"
 
