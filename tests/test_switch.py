@@ -41,6 +41,15 @@ class Switch(unittest.TestCase):
         switch.set_project(self.proj, True, self.say); switch.set_project(other, True, self.say); switch.set_project(self.proj, False, self.say)
         self.assertIn("janus hook", switch.CODEX_HOOKS.read_text()); self.assertEqual(switch.on_projects(), [str(other.resolve())])
 
+    def test_a_git_projects_local_janus_files_stay_out_of_git(self):
+        """Catches: janus on leaving .claude/settings.local.json and the skill link as untracked files git offers to commit."""
+        import subprocess
+        subprocess.run(["git", "init", "-q", str(self.proj)], check=True)
+        switch.set_project(self.proj, True, self.say); switch.set_project(self.proj, True, self.say)
+        st = subprocess.run(["git", "-C", str(self.proj), "status", "--porcelain", "--untracked-files=all"], capture_output=True, text=True).stdout
+        self.assertEqual(st, ""); ex = (self.proj / ".git/info/exclude").read_text()
+        self.assertEqual(ex.count(".claude/settings.local.json"), 1)                     # on twice: listed once
+
     def test_a_folder_where_the_skill_link_goes_is_never_removed(self):
         """Catches: janus off deleting a real skills folder someone put at that path."""
         d = self.proj / ".claude/skills/janus"; d.mkdir(parents=True); (d / "SKILL.md").write_text("mine\n")

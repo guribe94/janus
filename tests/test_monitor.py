@@ -240,6 +240,7 @@ class ItemProgress(Base):
         (self.d / ".janus/briefs/drafts").mkdir(parents=True, exist_ok=True); (self.d / ".janus/briefs/drafts/two.md").write_text("HOLD: waits for the owner\n")
         self.collect(); b = {r.cells[0]: r for r in self.model().rows["Backlog"]}
         self.assertEqual(b["Item two"].state, "held"); self.assertIn("waits for the owner", " ".join(b["Item two"].detail))
+        self.assertTrue(b["Item two"].cells[1].startswith("held, all its units done"), b["Item two"].cells[1])   # finished work behind a hold
 
 
 class Stranded(Base):

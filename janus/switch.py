@@ -11,6 +11,7 @@ JANUS = HOME / ".local/bin/janus"; CUR = HOME / ".local/share/janus/current"; PR
 EVENTS = {"SessionStart": None, "PreToolUse": "Bash|Edit|Write|MultiEdit|NotebookEdit|apply_patch", "Stop": None}
 OLD_EVENTS = ("UserPromptSubmit",)   # janus's entries of events it no longer uses: removed, never added
 CLAUDE_GLOBAL = HOME / ".claude/settings.json"; CODEX_HOOKS = HOME / ".codex/hooks.json"
+LOCAL_FILES = ("/.claude/settings.local.json", "/.claude/skills/janus")   # what janus on writes in a project
 CLAUDE_SKILL = HOME / ".claude/skills/janus"; CODEX_SKILLS = (HOME / ".agents/skills/janus", HOME / ".codex/skills/janus")
 
 def hooks_json():
@@ -64,11 +65,21 @@ def set_project(root, on, say=print, dry=False):
     skill while any project is on. Off removes exactly those; agents and their work are untouched."""
     root = Path(root).resolve(); have = on_projects(); now = [p for p in have if p != str(root)] + ([str(root)] if on else [])
     set_hooks(root / ".claude/settings.local.json", on, say, dry); set_link(root / ".claude/skills/janus", on, say, dry)
+    if on: git_exclude(root, say, dry)
     if now != have:
         say(f"{'add' if on else 'remove'} {root} {'to' if on else 'from'} {PROJECTS}")
         if not dry: PROJECTS.parent.mkdir(parents=True, exist_ok=True); PROJECTS.write_text("".join(p + "\n" for p in now))
     codex(bool(now), say, dry)
     return now
+
+def git_exclude(root, say=print, dry=False):
+    """In a git project, keep janus's local files out of git: .git/info/exclude (the clone's own, never committed) lists them."""
+    ex = root / ".git/info/exclude"
+    if not (root / ".git").is_dir(): return
+    have = ex.read_text().splitlines() if ex.exists() else []; add = [x for x in LOCAL_FILES if x not in have]
+    if not add: return
+    say(f"exclude from git: {', '.join(add)} ({ex})")
+    if not dry: ex.parent.mkdir(parents=True, exist_ok=True); ex.write_text("".join(l + "\n" for l in [*have, *add]))
 
 def codex(on, say=print, dry=False):
     """Codex's janus hooks and skill: global while any project is on (it reads no per-project hooks in an agent's worktree)."""

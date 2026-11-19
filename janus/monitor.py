@@ -534,7 +534,8 @@ def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="brie
         if us: d.append("Open now:  " + ", ".join(f"{n} ({h}" + (", host down)" if s else ")") for n, h, s in us))
         if p.get("done"): d.append(f"Done:      {', '.join(p['done'])}")
         last = f"{fmt_dur(now - p['last'])} ago" if p.get("last") else "-"
-        rows.append(Row(f"i:{i.get('id')}", (title, BACKLOG_WORDS.get(state, state) + (" STALE" if stale else ""), units_cell(p), host or "-", last),
+        words = "held, all its units done: lift the hold, or close it" if state == "held" and p.get("done") and not p.get("open") else BACKLOG_WORDS.get(state, state)
+        rows.append(Row(f"i:{i.get('id')}", (title, words + (" STALE" if stale else ""), units_cell(p), host or "-", last),
                         "warn" if stale else {"ready": "ok", "held": "dim", "owner": "dim", "open-unit": "ok", "no-brief": "warn", "relaunch": "warn", "units-done": "warn"}.get(state, ""),
                         d + ["", clean(i.get("description"), 600)], stale, state=state))
     ids = {i.get("id") for i in data.get("items", [])}
