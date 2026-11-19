@@ -236,6 +236,10 @@ class ItemProgress(Base):
         self.assertTrue(b["Item two"].cells[1].startswith("all units done"))
         self.assertEqual(m.rows["Backlog"][0].cells[0], "Item two")                                  # what needs closing comes first
         self.assertIn("loose", next(r for r in m.rows["Overview"] if r.key == "o:no-item").cells[1])
+        # a HOLD: line in the item's draft holds it for fill; the Backlog tab said "ready: janus fill launches it" (owner 2026-11-18)
+        (self.d / ".janus/briefs/drafts").mkdir(parents=True, exist_ok=True); (self.d / ".janus/briefs/drafts/two.md").write_text("HOLD: waits for the owner\n")
+        self.collect(); b = {r.cells[0]: r for r in self.model().rows["Backlog"]}
+        self.assertEqual(b["Item two"].state, "held"); self.assertIn("waits for the owner", " ".join(b["Item two"].detail))
 
 
 class Stranded(Base):

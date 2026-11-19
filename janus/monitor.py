@@ -154,7 +154,8 @@ def collect_checklist(cfg, units, backlog):
         for k in unit_items(cfg, [u], iss): by.setdefault(k, []).append((clean(u["name"]), clean(u.get("host")) or "?", u.get("host") in gone))
     strand = stranded_status(cfg, units, iss)   # the rule fill acts on, for the Active tab's text and the Backlog's relaunch rows
     lead = sorted({k for u in units if strand.get(u["name"]) == "lead" for k in unit_items(cfg, [u], iss)})
-    more = {"by": by, "strand": strand, "lead": lead, "progress": prog, "items_of": items_of}
+    holds = item_holds(cfg, iss)   # fill's holds: the beads label and a draft's HOLD: line
+    more = {"by": by, "strand": strand, "lead": lead, "progress": prog, "items_of": items_of, "holds": holds}
     if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(covered_items(cfg, units, iss)), **more}
     missing = None   # unknown while the backlog cannot be read
     if backlog is not None:
@@ -501,7 +502,7 @@ def units_cell(p):
     other = p["closed"] - len(p["done"])
     return (f"{len(p['done'])} done" + (f", {other} ended otherwise" if other else "") + (f", {len(p['open'])} open: {p['open'][0]}" if p["open"] else ""))
 
-def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs", by=None, lead=(), progress=None):
+def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="briefs", by=None, lead=(), progress=None, holds=None):
     """covered, missing: the checklist source's items live open units cover (their --item or brief ITEM: line; a unit on a stranded
     host covers nothing) and ready items without a usable brief, as collected (render reads no file); briefs: the configured briefs
     folder a missing brief is written in; by: item -> [(unit, host, stranded)] of every open unit that names it."""
@@ -515,7 +516,8 @@ def backlog_rows(data, units, now, stale, covered=(), missing=None, briefs="brie
         labels = [clean(l) for l in i.get("labels") or []]
         if skip & set(labels) or labels and set(labels) & LOG_LABELS: continue
         ref = str(i.get("external_ref") or "")[8:]; k = norm_item(ref)
-        actor = next((l[6:] for l in labels if l.startswith("actor:")), "agent"); hold = next((l[5:] for l in labels if l.startswith("hold:")), None)
+        actor = next((l[6:] for l in labels if l.startswith("actor:")), "agent")
+        hold = next((l[5:] for l in labels if l.startswith("hold:")), None) or (holds or {}).get(k)   # as fill holds it (backlog.item_holds)
         state = "open-unit" if k in covered else "held" if hold else "owner" if actor != "agent" else \
             ("relaunch" if k in strand else "no-brief" if k in nob else "ready") if i.get("id") in ready else "waiting"
         p = (progress or {}).get(k) or {}
@@ -612,7 +614,7 @@ def derive(view, now, interval):
     rows["Active"].sort(key=lambda r: (PRIO.get(state_word(r.state), 8), r.cells[0].lower()))
     rows["Ended"].sort(key=lambda r: (r.state.startswith("closed"), r.cells[0].lower()))   # ended and waiting to be collected first
     if S("backlog").data is not None:
-        rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"), ck.get("lead", ()), ck.get("progress"))
+        rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"), ck.get("lead", ()), ck.get("progress"), ck.get("holds"))
         k = {}
         for r in rows["Backlog"]: w = r.state; k[w if w in ("owner", "held") else "agent"] = k.get(w if w in ("owner", "held") else "agent", 0) + 1
         if rows["Backlog"]: m.labels["Backlog"] = ", ".join(f"{k[x]} {x}" for x in ("agent", "owner", "held") if k.get(x))   # owner and held items are not queued agent work
