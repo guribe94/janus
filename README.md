@@ -64,7 +64,9 @@ janus land UNIT [--push]         # merge and optionally push, never forced
 Commands, routing, capacity, locks and findings: [docs/REFERENCE.md](docs/REFERENCE.md).
 
 **Monitor** (read-only; needs an interactive terminal): tabs Active, Backlog, Ended, Board, Overview. Keys: `Tab`/`←`/`→` or `1`-`5` switch tabs,
-`↑`/`↓` or `j`/`k` and `PgUp`/`PgDn`/`g`/`G` move, `Enter` opens details (`Esc` closes), `/` filters, `r` refreshes, `?` help, `q` quits.
+`↑`/`↓` or `j`/`k` and `PgUp`/`PgDn`/`g`/`G` move, `Enter` opens details (`Esc` closes), `/` filters, `w` cycles the window (24h, 7d, all), `r` refreshes, `?` help, `q` quits.
+The header's `done` fraction moves only when the owner accepts an item; beside it the flow line counts the window's movement (launched, finished, landed, accepted).
+The Ended tab shows each unit's STAGE (finished: waiting to be collected; closed; landed; accepted) and WHEN, newest first, within the window; a finished unit is never hidden by it.
 A host that does not answer is shown as unreachable or stale with the age of its last good reading, never as empty.
 
 **Progress**: the Overview's checkpoint (`~N%`) is the latest line of `HANDOFF.md` that mentions checkpoint, progress, done, complete or finished with a percentage.

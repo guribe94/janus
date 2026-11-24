@@ -28,7 +28,7 @@ class World:
     """What bd and the hosts answer, and a record of every command run."""
     def __init__(self, d):
         self.d, self.calls, self.fail, self.block = d, [], set(), None
-        self.units, self.closed, self.ready, self.backlog = [], [], [], []
+        self.units, self.closed, self.ready, self.backlog, self.closed_items = [], [], [], [], []   # closed_items: closed backlog issues (accepted items)
         self.probes = {"here": probe_text(), "far": probe_text(avail=4096, load="0.20", rj=0)}
         self.agents = None
     def sh(self, cmd, cwd=None, inp=None, timeout=25, env=None, clean=False):
@@ -36,7 +36,7 @@ class World:
         if cmd[0] == "bd":
             if "bd" in self.fail: return 1, "", "bd: dolt server unreachable (token=hunter2hunter2)"
             a = cmd[2:]; kind = a[0]
-            out = (self.closed if "closed" in a else self.units if "unit" in a else self.backlog if "backlog" in a else None) if kind == "list" else self.ready if kind == "ready" else None
+            out = (self.closed_items if "backlog" in a and "closed" in a else self.closed if "closed" in a else self.units if "unit" in a else self.backlog if "backlog" in a else None) if kind == "list" else self.ready if kind == "ready" else None
             return (0, json.dumps(out), "") if out is not None else (1, "", f"unexpected bd {a}")
         host = "here" if cmd[:2] == ["sh", "-c"] else "far" if cmd[0] == "ssh" else None
         if host:
@@ -253,6 +253,64 @@ class ItemProgress(Base):
         self.collect(); r = next(r for r in self.model().rows["Backlog"] if r.cells[0] == "Item one")
         self.assertEqual(r.cells[2], "1 done, 2 blocked, 1 unfinished")
         self.assertIn("Blocked:   f, b", r.detail)
+
+
+class Flow(Base):
+    """The flow of work (owner 2026-11-24): the header's done fraction only moves on acceptance, so finishing, closing and landing
+    read as nothing happening. Each ended unit says the stage it reached and when; the header counts the last day's movement."""
+    extra = FAR + '\n[backlog]\nfile = "S.md"\nevidence_col = "evidence"\n'
+    def world(self):
+        w = self.w; now = time.time(); iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        (self.d / "S.md").write_text("| # | item | status | evidence |\n|---|---|---|---|\n| one | Item one | DONE | abc |\n| two | Item two | READY | - |\n")
+        lab = ["backlog", "backlog-ready"]
+        w.backlog = [{"id": "b-2", "title": "Item two", "labels": lab, "status": "open", "external_ref": "backlog:two"}]
+        w.closed_items = [{"id": "b-1", "title": "Item one", "labels": lab, "status": "closed", "external_ref": "backlog:one", "closed_at": iso(now - 1800)}]
+        w.units = [unit("fin", task=4, item="two"), unit("run", task=1)]
+        w.probes["here"] = probe_text(tasks={"4": task(4, {"Done": {"result": "Success"}}), "1": task(1, {"Running": {}})})
+        w.report("fin", "VERDICT: DONE\n")
+        w.closed = [{**unit("c-old", started=now - 10 * 86400), "status": "closed", "closed_at": iso(now - 9 * 86400)},
+                    {**unit("c-land", started=now - 7200, published={"commit": "abcdef0123456", "remote": "origin", "branch": "main", "at": int(now - 3600)}), "status": "closed", "closed_at": iso(now - 7000)},
+                    {**unit("c-acc", item="one", started=now - 2 * 86400, published={"commit": "0123456abcdef", "remote": "origin", "branch": "main", "at": int(now - 86400 - 60)}), "status": "closed", "closed_at": iso(now - 86400 - 30)}]
+        for n in ("c-old", "c-land", "c-acc"): w.report(n, "VERDICT: DONE\n")
+        self.collect(); return self.model()
+
+    def test_each_ended_unit_says_its_stage_and_when_newest_first_after_those_waiting(self):
+        """Catches: finished, closed, landed and accepted units listed alike and alphabetically, so what moved today is invisible."""
+        m = self.world(); rows = m.rows["Ended"]
+        self.assertEqual([r.cells[0] for r in rows], ["fin", "c-acc", "c-land", "c-old"])   # waiting for the owner first, then newest first
+        self.assertEqual({r.cells[0]: r.stage for r in rows}, {"fin": "finished", "c-acc": "accepted", "c-land": "landed", "c-old": "closed"})
+        self.assertEqual([r.cells[7] for r in rows], ["finished", "accepted", "landed", "closed"])
+        self.assertTrue(abs(next(r for r in rows if r.key == "c-acc").when - (time.time() - 1800)) < 5)   # the item's acceptance, not the unit's close
+        self.assertTrue(abs(next(r for r in rows if r.key == "c-land").when - (time.time() - 3600)) < 5)
+        self.assertEqual(next(r for r in rows if r.key == "c-land").cells[8], "1h00m ago")
+        d = " ".join(next(r for r in rows if r.key == "c-land").detail)
+        self.assertIn("Stage:     landed", d); self.assertIn("Landed:    abcdef012 on origin/main", d)
+        ui = M.UI(); ui.tab = 2; scr = "\n".join("".join(t for t, _ in l) for l in M.render(m, ui, 30, 200, time.time(), ""))
+        self.assertIn("STAGE", scr); self.assertIn("WHEN", scr)
+
+    def test_the_header_counts_the_last_days_movement_and_w_widens_the_window(self):
+        """Catches: a header whose only number is acceptance; a window the Ended tab applies that the header's counts ignore."""
+        m = self.world()
+        self.assertEqual(m.flow[86400], {"launched": 3, "finished": 2, "landed": 1, "accepted": 1})   # fin, run and c-land launched; fin and c-land finished; c-acc landed a day and a minute ago
+        self.assertEqual(m.flow[7 * 86400], {"launched": 4, "finished": 3, "landed": 2, "accepted": 1})
+        self.assertEqual(m.flow[None], {"launched": 5, "finished": 4, "landed": 2, "accepted": 1})
+        ui = M.UI(); draw = lambda: "\n".join("".join(t for t, _ in l) for l in M.render(M.windowed(m, ui.window, time.time()), ui, 30, 220, time.time(), ""))
+        self.assertIn("24h: launched 3, finished 2, landed 1, accepted 1", draw())
+        ui.key(m, ord("w"), 20); self.assertIn("7d: launched 4, finished 3, landed 2, accepted 1", draw())
+        ui.key(m, ord("w"), 20); self.assertIn("all: launched 5, finished 4, landed 2, accepted 1", draw())
+        ui.key(m, ord("w"), 20); self.assertIn("24h: launched 3", draw())
+        self.assertIn("24h: launched 3, finished 2, landed 1, accepted 1", next(r for r in m.rows["Overview"] if r.key == "o:work").cells[1])
+        self.assertTrue(any("w       " in l for l in M.HELP))
+
+    def test_the_window_hides_old_ended_rows_but_never_one_waiting_for_the_owner(self):
+        """Catches: a finished unit hidden by the window (nothing would say it waits); a count label that hides that rows are hidden."""
+        m = self.world(); now = time.time()
+        d = M.windowed(m, 86400, now); self.assertEqual([r.cells[0] for r in d.rows["Ended"]], ["fin", "c-acc", "c-land"]); self.assertEqual(d.labels["Ended"], "3 of 4, 24h")
+        d = M.windowed(m, 7 * 86400, now); self.assertEqual(len(d.rows["Ended"]), 3); self.assertEqual(d.labels["Ended"], "3 of 4, 7d")
+        d = M.windowed(m, None, now); self.assertEqual(len(d.rows["Ended"]), 4); self.assertNotIn("Ended", d.labels)
+        m.rows["Ended"] = [r for r in m.rows["Ended"] if r.key == "c-old"]; d = M.windowed(m, 86400, now)
+        self.assertEqual(d.rows["Ended"], []); self.assertEqual(d.empty["Ended"], "nothing ended in the last 24h (w: widen the window)")
+        self.assertEqual(M.windowed(m, 86400, now).rows["Active"], m.rows["Active"])   # other tabs stay whole
 
 
 class Stranded(Base):

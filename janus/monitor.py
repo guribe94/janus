@@ -117,7 +117,7 @@ def collect_closed(cfg):
     us = [u for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u]
     best = {}
     for u in sorted(us, key=lambda u: epoch(u.get("closed_at")) or 0, reverse=True): best.setdefault(u["name"], u)   # a name relaunched: its latest closing
-    return list(best.values())[:FINISHED_KEEP]
+    return list(best.values())   # every closed unit, newest first: the flow counts them all; the Ended rows take the first FINISHED_KEEP
 
 def collect_backlog(cfg):
     keep = lambda i: {k: i.get(k) for k in ("id", "title", "labels", "status", "external_ref", "created_at", "description", "priority")}
@@ -157,7 +157,9 @@ def collect_checklist(cfg, units, backlog):
     strand = stranded_status(cfg, units, iss)   # the rule fill acts on, for the Active tab's text and the Backlog's relaunch rows
     lead = sorted({k for u in units if strand.get(u["name"]) == "lead" for k in unit_items(cfg, [u], iss)})
     holds = item_holds(cfg, iss)   # fill's holds: the beads label and a draft's HOLD: line
-    more = {"by": by, "strand": strand, "lead": lead, "progress": prog, "items_of": items_of, "holds": holds}
+    try: acc = accepted_items(cfg)
+    except Err: acc = None   # the rest of the checklist stands; accepted shows as unknown
+    more = {"by": by, "strand": strand, "lead": lead, "progress": prog, "items_of": items_of, "holds": holds, "accepted_at": acc}
     if tot is None: return {"line": checklist_line(None), "missing": [], "cov": sorted(covered_items(cfg, units, iss)), **more}
     missing = None   # unknown while the backlog cannot be read
     if backlog is not None:
@@ -165,6 +167,15 @@ def collect_checklist(cfg, units, backlog):
         ever = {u["name"] for u in units} | {u["name"] for u in closed}
         idx = brief_index(cfg); missing = [clean(it) for _, _, it, _ in sorted(items) if not usable_brief(cfg, it, idx, ever)]
     return {"line": clean(checklist_line(tot, missing), 600), "missing": missing, "cov": sorted(tot["cov"]), "briefs": brief_dir(cfg), "done": tot["done"], "total": tot["total"], **more}
+
+def accepted_items(cfg):
+    """{item (norm_item form): when the owner accepted it}: the closed backlog issues' closed_at (janus backlog set status=DONE closes
+    the item's issue once the checklist says DONE). The one time acceptance is recorded; the checklist row itself carries none."""
+    out = {}
+    for i in bd_json(cfg, "list", "--label", "backlog", "--status", "closed", "-n", "0"):
+        ref = str(i.get("external_ref") or ""); k = norm_item(ref[8:] if ref.startswith("backlog:") else i.get("id"))
+        if k and epoch(i.get("closed_at")) is not None: out[k] = max(out.get(k, 0), epoch(i.get("closed_at")))
+    return out
 
 def collect_liveness(cfg):
     """{"live": {host: [up|down|stranded|returning|gone, down since]}, "after": {host: seconds}}: janus's own judgement of each host
@@ -300,7 +311,7 @@ class Collector:
             units = self.step("units", collect_units, cfg) if beads else last("units")
             closed = self.step("closed", collect_closed, cfg) if beads else last("closed")
             if units is not None: self.step("reports-open", collect_reports, cfg, units)
-            if closed is not None: self.step("reports-closed", collect_reports, cfg, closed)
+            if closed is not None: self.step("reports-closed", collect_reports, cfg, closed[:FINISHED_KEEP])
             backlog = self.step("backlog", collect_backlog, cfg) if beads else last("backlog")
             if units is not None and beads: self.step("checklist", collect_checklist, cfg, units, backlog)
             self.step("board", collect_board, cfg)
@@ -351,6 +362,8 @@ class Row:
     stale: bool = False
     keys: tuple = ()        # the board messages one row stands for, when more than its key (a grouped [memory] change)
     state: str = ""         # a unit row's state code (classify), which sorting and counting read; the STATE cell says it in words
+    stage: str = ""         # an ended unit's stage (unit_stage): finished, closed, landed, accepted
+    when: float | None = None   # when it reached that stage (epoch); the Ended tab's order and window
 
 @dataclasses.dataclass
 class Model:
@@ -366,6 +379,7 @@ class Model:
     rigor: str = ""               # the project's rigor level ([rigor] level), or what is wrong with it
     down: int = 0                 # hosts janus has given up on for now (stranded, gone) or that the owner said will return
     labels: dict = dataclasses.field(default_factory=dict)      # tab -> what its count is made of, shown instead of the bare number
+    flow: dict = dataclasses.field(default_factory=dict)        # window seconds (None: all) -> {launched, finished, landed, accepted} in it (flow_counts)
 
 def source_state(s, now, limit):
     """none (not asked yet) | failed (never succeeded) | ok | stale (failed since its last success, or older than limit)."""
@@ -385,7 +399,9 @@ BACKLOG_COLS = (("ITEM", 24, 9, True), ("STATE", 34, 8, False), ("UNITS", 38, 7,
 BOARD_COLS = (("NEW", 3, 7, False), ("TIME", 16, 5, False), ("KIND", 9, 8, False), ("AGENT", 24, 6, False), ("MESSAGE", 40, 9, True))
 HOST_COLS = (("HOST", 12, 9, False), ("STATE", 15, 8, False), ("RUN/QUEUED", 10, 7, False), ("AGENTS", 11, 6, False), ("LOAD", 6, 4, False), ("RAM FREE", 8, 5, False),
              ("ADMISSION", 22, 6, False), ("TOOLS (FACTS AGE)", 24, 3, False), ("NOTE", 30, 2, True))
-TAB_COLS = {"Board": BOARD_COLS, "Overview": OVERVIEW_COLS, "Backlog": BACKLOG_COLS}   # every other tab: WORK_COLS
+ENDED_COLS = WORK_COLS + (("STAGE", 8, 8, False), ("WHEN", 9, 8, False))
+TAB_COLS = {"Board": BOARD_COLS, "Overview": OVERVIEW_COLS, "Backlog": BACKLOG_COLS, "Ended": ENDED_COLS}   # every other tab: WORK_COLS
+WINDOWS = ((86400, "24h"), (7 * 86400, "7d"), (None, "all"))   # the Ended tab's window and the header's flow counts; w cycles them
 NOT_READ = {"err": "report not read yet"}   # a unit's report before its first read: unknown, never 'no verdict'
 PRIO = {"blocked": 0, "failed": 1, "working": 2, "idle": 3, "queued": 4, "parked": 5, "starting": 6, "closing": 6, "unknown": 7, "host-down": 7, "stranded": 9}
 
@@ -468,7 +484,20 @@ def progress_cell(pr, done=False):
     if done: return "done"
     return f"{pr[0]}/{pr[1]} {100 * pr[0] // pr[1]}%" if pr else "-"
 
-def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at=None, slow=False, items=()):
+def unit_stage(u, tab, rep, accepted=None, items=()):
+    """(stage, when) of a unit on the Ended tab: accepted (one of its items was accepted: that time), landed (a verified publication
+    on its record: its time), closed (closed_at), finished (still open, its agent done: its report's time); ('', None) elsewhere.
+    Acceptance outranks landing: janus backlog set --commit accepts work landed outside janus land. Nothing here is inferred from
+    a process ending."""
+    if tab != "Ended": return "", None
+    if u.get("status") != "closed": return "finished", (rep or {}).get("mtime")
+    acc = [accepted[k] for k in items if k in (accepted or {})]
+    if acc: return "accepted", max(acc)
+    pub = u.get("published") or {}
+    if pub.get("commit"): return "landed", epoch(pub.get("at")) or epoch(u.get("closed_at"))
+    return "closed", epoch(u.get("closed_at"))
+
+def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at=None, slow=False, items=(), accepted=None):
     end = epoch(u.get("closed_at") or u.get("collected_at")) if tab == "Ended" else now
     t0 = epoch(u.get("started"))
     el = fmt_dur(end - t0) if end is not None and t0 is not None else "?"
@@ -491,8 +520,13 @@ def unit_row(u, tab, state, note, now, stale, rep, tool=None, card=None, read_at
     if u.get("item"): d.append(f"Item:      {clean(u['item'])}")
     pc = progress_cell((rep or {}).get("progress"), state in ("finished", "closed:DONE"))
     if items: d.insert(1, f"Item:      {', '.join(i.upper() for i in items)}")
-    return Row(u["name"], (u["name"], ",".join(i.upper() for i in items) or "-", state_words(state, note) + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el, pc),
-               "warn" if slow or stale and state_style(state) in ("ok", "dim") else state_style(state), [x for x in d if x], stale, state=state)
+    stage, when = unit_stage(u, tab, rep, accepted, items); pub = u.get("published") or {}
+    cells = (u["name"], ",".join(i.upper() for i in items) or "-", state_words(state, note) + (" STALE" if stale else ""), clean(u.get("host")) or "?", tool_model(tool or (card or {}).get("tool"), u.get("model")), el, pc)
+    if tab == "Ended":
+        cells += (stage, f"{fmt_dur(now - when)} ago" if when is not None else "?")
+        d.insert(2, f"Stage:     {stage}" + (f"  ({time.strftime('%Y-%m-%d %H:%M', time.localtime(when))})" if when is not None else "  (when is not recorded)"))
+        if pub.get("commit"): d.insert(3, f"Landed:    {clean(pub['commit'])[:9]} on {clean(pub.get('remote')) or '?'}/{clean(pub.get('branch')) or '?'}" + (f"  ({time.strftime('%Y-%m-%d %H:%M', time.localtime(epoch(pub['at'])))})" if epoch(pub.get("at")) is not None else ""))
+    return Row(u["name"], cells, "warn" if slow or stale and state_style(state) in ("ok", "dim") else state_style(state), [x for x in d if x], stale, state=state, stage=stage, when=when)
 
 BACKLOG_ORDER = {"units-done": -1, "ready": 0, "relaunch": 1, "no-brief": 2, "open-unit": 3, "waiting": 4, "held": 5, "owner": 6}
 
@@ -583,6 +617,21 @@ def message_rows(data, stale):
             rows.append(Row(f"Q{qid}", ("", q["asked"], "QUESTION*", q["agent"], f"[{qid}] {q['text']}"), "warn", [f"Time:      {q['asked']}", "Kind:      QUESTION  (open)", f"From:      {q['agent']}", "", q["text"]], stale))
     return rows
 
+def flow_counts(units, closed, ended, accepted, now, window):
+    """{launched, finished, landed, accepted} within window seconds of now (None: ever): units started; units whose agent finished
+    (open units on the Ended tab, by their report's time) plus units closed (closed_at: they had finished); publications
+    (published.at); items accepted (accepted_items). Counts, not a funnel: a unit finished today and landed today is in both."""
+    In = lambda t: t is not None and (window is None or now - t <= window)
+    return {"launched": sum(1 for u in list(units) + list(closed) if In(epoch(u.get("started")))),
+            "finished": sum(1 for r in ended if r.stage == "finished" and In(r.when)) + sum(1 for u in closed if In(epoch(u.get("closed_at")))),
+            "landed": sum(1 for u in closed if (u.get("published") or {}).get("commit") and In(epoch((u.get("published") or {}).get("at")))),
+            "accepted": sum(1 for t in accepted.values() if In(t)) if accepted is not None else "?"}
+
+def flow_text(flow, window):
+    """One line of the flow in a window: '24h: launched 3, finished 2, landed 1, accepted 1'; '' before units and closed units are read."""
+    f = flow.get(window); lab = dict(WINDOWS).get(window, "?")
+    return f"{lab}: " + ", ".join(f"{k} {f[k]}" for k in ("launched", "finished", "landed", "accepted")) if f else ""
+
 PRIMARY = {"Active": ("units",), "Backlog": ("backlog",), "Ended": ("units", "closed"), "Board": ("board",), "Overview": ("handoff",)}   # what a tab's count needs
 EMPTY = {"Active": "Nothing is running, queued or parked", "Backlog": "Nothing is waiting to be launched", "Ended": "Nothing has ended or closed", "Board": "The board has no posts", "Overview": "Nothing to show yet"}
 
@@ -596,6 +645,7 @@ def derive(view, now, interval):
     general = [f"{n}: {S(n).err}" for n in ("config", "collection") if S(n).err]
     ps = {n: S(f"host:{n}").data for n in hosts if S(f"host:{n}").data}
     units, closed, ag = S("units").data, S("closed").data, S("herdr").data
+    accepted = ck.get("accepted_at")
     tools = (cfg.data or {}).get("tools", {}); cards = (S("board").data or {}).get("cards", {})
     lv = (S("liveness").data or {}).get("live", {}); after = (S("liveness").data or {}).get("after", {})
     rows = {t: [] for t in TABS}; live = {}   # live: host -> [agents known to be alive, agents whose state is unknown, units stranded there]
@@ -607,20 +657,21 @@ def derive(view, now, interval):
         if state == "starting" and t0 is not None and now - t0 > wait:   # a launch takes minutes, never this long: it was interrupted
             state, note = "starting STALLED", f"its launch began {fmt_dur(now - t0)} ago and never finished (interrupted?): janus check says why; close or relaunch it"
         rows[tab].append(unit_row(u, tab, state, note, now, stale("units") or stale("reports-open") or (host_stale(u) and state_word(state) != "stranded"), rep,
-                                  tools.get(u.get("model")), cards.get(u["name"]), S("reports-open").ok_at, slow, (ck.get("items_of") or {}).get(u["name"], ())))
+                                  tools.get(u.get("model")), cards.get(u["name"]), S("reports-open").ok_at, slow, (ck.get("items_of") or {}).get(u["name"], ()), accepted))
         if tab == "Active" and u.get("host"):
             c = live.setdefault(u["host"], [0, 0, 0])
             if state in ("working", "idle", "blocked"): c[0] += 1
             elif state == "unknown" or state.startswith("host-down"): c[1] += 1
             elif state_word(state) == "stranded": c[2] += 1
     names = {u["name"] for u in units or []}
-    for u in closed or []:
+    for u in (closed or [])[:FINISHED_KEEP]:
         if u["name"] in names: continue   # reopened or relaunched: the open unit is the truth
         rep = (S("reports-closed").data or {}).get(u["name"], NOT_READ); tab, state, note, slow = classify(u, ps, None, rep, now=now)
         rows["Ended"].append(unit_row(u, tab, state, note, now, stale("closed") or stale("reports-closed"), rep, read_at=S("reports-closed").ok_at,
-                                      items=(ck.get("items_of") or {}).get(u["name"], ())))
+                                      items=(ck.get("items_of") or {}).get(u["name"], ()), accepted=accepted))
     rows["Active"].sort(key=lambda r: (PRIO.get(state_word(r.state), 8), r.cells[0].lower()))
-    rows["Ended"].sort(key=lambda r: (r.state.startswith("closed"), r.cells[0].lower()))   # ended and waiting to be collected first
+    rows["Ended"].sort(key=lambda r: (r.stage != "finished", -(r.when or 0), r.cells[0].lower()))   # waiting to be collected first, then newest first
+    if units is not None and closed is not None: m.flow = {win: flow_counts(units, closed, rows["Ended"], accepted, now, win) for win, _ in WINDOWS}
     if S("backlog").data is not None:
         rows["Backlog"] = backlog_rows(S("backlog").data, units, now, stale("backlog"), ck.get("cov", ()), ck.get("missing"), ck.get("briefs", "briefs"), ck.get("by"), ck.get("lead", ()), ck.get("progress"), ck.get("holds"))
         k = {}
@@ -669,7 +720,8 @@ def overview_rows(m, rows, hand, now, view):
     for r in rows["Active"]: k = state_word(r.state); by[k] = by.get(k, 0) + 1
     known = m.counts.get("Active") is not None
     work = (", ".join(f"{v} {k}" for k, v in sorted(by.items(), key=lambda kv: PRIO.get(kv[0], 8))) or "nothing active") if known else "unknown"
-    R.append(Row("o:work", ("Work", f"{work}; {m.counts.get('Ended') if m.counts.get('Ended') is not None else '?'} ended or closed"), "", [work]))
+    fl = flow_text(m.flow, WINDOWS[0][0])
+    R.append(Row("o:work", ("Work", f"{work}; {m.counts.get('Ended') if m.counts.get('Ended') is not None else '?'} ended or closed" + (f"; {fl}" if fl else "")), "", [work] + ([fl] if fl else [])))
     ck = view.get("checklist"); line = (ck.data or {}).get("line") if ck else None
     R.append(Row("o:checklist", ("Checklist", line or ("unknown: " + (ck.err or "not read yet") if ck else "unknown: not read yet")), "" if line else "dim", [line or "unknown"]))
     for mr in m.machines:
@@ -762,6 +814,7 @@ class UI:
     filt: str = ""                                            # rows must hold this text (case-insensitive); / edits it
     typing: bool = False
     help: bool = False
+    window: int | None = WINDOWS[0][0]                        # seconds the Ended tab and the header's flow look back (None: all); w cycles WINDOWS
 
     def observe(self, model):
         """Board baseline: what is there when the board first loads is not new; later posts are, until they are selected."""
@@ -801,6 +854,7 @@ class UI:
         if k == ord("/"): self.typing = True; self.detail = False; return None
         if k in (ord("q"), ord("Q")): return "quit"
         if k in (ord("r"), ord("R")): self.flash = "refresh requested"; return "refresh"
+        if k == ord("w"): ws = [x for x, _ in WINDOWS]; self.window = ws[(ws.index(self.window) + 1) % len(ws)]; return None
         if k in (9, K.KEY_RIGHT, K.KEY_BTAB, K.KEY_LEFT) or k in map(ord, "12345"):
             self.tab = (self.tab + (-1 if k in (K.KEY_BTAB, K.KEY_LEFT) else 1)) % len(TABS) if k not in map(ord, "12345") else k - ord("1")
             self.detail = False; return None
@@ -819,6 +873,7 @@ class UI:
 HELP = ["janus monitor: read-only (it writes nothing and runs nothing that does)", "",
         "Tab / Left / Right / 1-5   switch tabs: Active, Backlog, Ended, Board, Overview", "Up / Down / j / k / PgUp / PgDn / g / G   select and scroll",
         "Enter   details of the selected row (Esc or Enter: back)", "/       filter the rows of every tab by text (Enter keeps it, Esc clears it)",
+        "w       window: how far back the Ended tab and the header's flow counts look (24h, 7d, all); a unit waiting to be collected is always listed",
         "r       refresh now", "q       quit", "", "Unknown stays '?': a host that does not answer is UNREACHABLE or STALE with the age of its last good data;",
         "a process that ended is not 'finished' until its report says VERDICT: DONE.", "",
         "Hosts: DOWN <time> has not answered for longer than [capacity] down_after_min (default 30 min): its units are 'stranded'",
@@ -837,6 +892,16 @@ def filtered(model, text):
     t = text.lower(); m = dataclasses.replace(model, rows={k: [r for r in v if t in " ".join(map(str, r.cells)).lower() or t in " ".join(r.detail).lower()] for k, v in model.rows.items()})
     for k, v in m.rows.items():
         if not v and model.rows[k]: m.empty = {**m.empty, k: f"No row matches the filter {text!r} (/ then Esc clears it)"}
+    return m
+
+def windowed(model, window, now):
+    """The model with the Ended rows reduced to those that reached their stage within window seconds (None: all); a finished unit,
+    still waiting to be collected, is never hidden. The tab's count says how many of how many; the empty text says how to widen."""
+    if window is None: return model
+    rows = [r for r in model.rows["Ended"] if r.stage == "finished" or r.when is None or now - r.when <= window]
+    m = dataclasses.replace(model, rows={**model.rows, "Ended": rows}); lab = dict(WINDOWS)[window]
+    if model.rows["Ended"]: m.labels = {**m.labels, "Ended": f"{len(rows)} of {len(model.rows['Ended'])}, {lab}"}
+    if not rows and model.rows["Ended"]: m.empty = {**m.empty, "Ended": f"nothing ended in the last {lab} (w: widen the window)"}
     return m
 
 def wrap(lines, w):
@@ -860,6 +925,7 @@ def render(model, ui, h, w, now, status):
     if model.rigor: top.append((f"  rigor {model.rigor}", "warn" if model.rigor.startswith("?") else "dim"))
     if model.done:
         d, n = model.done; top.append((f"  done {d}/{n} {bar(d / n)} {100 * d // n}%", "ok"))
+    if flow_text(model.flow, ui.window): top.append((f"  {flow_text(model.flow, ui.window)}", "info"))
     L.append(top + [(f"  {status}"[:max(0, w - sum(len(t) for t, _ in top))], "dim")])
     banners = model.banners.get(tab, [])[:2]
     foot = 1; tabbar = 1; colhead = 1
@@ -908,7 +974,7 @@ def render(model, ui, h, w, now, status):
     L = L[:h - 1]
     while len(L) < h - 1: L.append([])
     pos = f" {i + 1}/{len(rows)}" if rows else ""
-    foot = f"/{ui.filt}_" if ui.typing else (f"filter: {ui.filt}  " if ui.filt else "") + (ui.flash or "Tab tabs  Up/Down select  Enter details  / filter  ? help  r refresh  q quit")
+    foot = f"/{ui.filt}_" if ui.typing else (f"filter: {ui.filt}  " if ui.filt else "") + (ui.flash or "Tab tabs  Up/Down select  Enter details  / filter  w window  ? help  r refresh  q quit")
     L.append([(foot[:max(0, w - len(pos) - 1)], "dim"), (pos, "dim")])
     return [[(t[:w], s) for t, s in line] for line in L][:h]
 
@@ -960,7 +1026,7 @@ def run_ui(scr, collector, store, interval, attrs=None, clock=time.time):
         if ui.flash and flash_at is not None and view[3] != flash_at: ui.flash = ""   # the refresh began: the header says so
         stamp = (view[3], int(clock()), scr.getmaxyx(), ui.flash, ui.filt)
         if stamp != last or dirty:
-            now = clock(); model = derive(view[0], now, interval); ui.observe(model); model = filtered(model, ui.filt)
+            now = clock(); model = derive(view[0], now, interval); ui.observe(model); model = windowed(filtered(model, ui.filt), ui.window, now)
             h, w = scr.getmaxyx(); paint(scr, render(model, ui, h, w, now, status_line(view, model, now, interval)), attrs)
             last, dirty = stamp, False
         try: k = scr.getch()
