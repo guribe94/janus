@@ -65,7 +65,8 @@ def status_text(cfg, hs, units, F):
     L.append("Units:")
     for u in units:
         L.append(f"- {u['name']} | {u.get('host')} | {u.get('model')} | {u.get('state', '?')}" + (f" on {' '.join(u['_park'][:4])}" if u.get("_park") else "")
-                 + f" | {int((now() - u.get('started', now())) / 60)}m | {u.get('verdict') or 'no verdict'}")
+                 + f" | {int((now() - u.get('started', now())) / 60)}m | {u.get('verdict') or 'no verdict'}"
+                 + (f" | {u['commits_since']} commit(s) since launch" if u.get("commits_since") and not u.get("verdict") else ""))
     if not units: L.append("- none")
     try: rd = ready_work(cfg); L.append("Queue: " + (", ".join(i.get("title", "")[:40] for i in rd[:8]) or "empty"))
     except Err as e: L.append(f"Queue: unavailable ({e})")

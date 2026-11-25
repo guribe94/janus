@@ -2,9 +2,10 @@
 transcript; the watcher's tend_parked (resume a parked unit when its jobs finished)."""
 import argparse, ast, contextlib, os, re, shlex, sys, time
 from pathlib import Path
-from janus.actions.jobs import (collect_job, job_of, job_state, patch_scope, patch_scope_desc, patch_scope_sh, recorded_jid, runs_dir, save_task_log,
+from janus.actions.jobs import (agent_res, collect_job, job_of, job_state, patch_scope, patch_scope_desc, patch_scope_sh, recorded_jid, runs_dir, save_task_log,
     task_rc, task_status, unit_jobs)
-from janus.actions.launch import api_remote, close_tab, confirm_started, cwd_taken, put_script, start_tmux, tmux_submit, tool_argv
+from janus.actions.launch import (agent_scope, api_remote, close_tab, confirm_started, cwd_taken, per_turn, put_script, remote_env, start_tmux, start_turn, tmux_submit, tool_argv,
+    turn_command, turn_running)
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
 from janus.branch import published_contains
@@ -14,6 +15,7 @@ from janus.context import (DIFF_X, Err, JANUS_MARK, LockLost, JANUS_SELF, SSH, X
 from janus.memory import memory_text
 from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, route_ok, run_cost, settle_run
 from janus.project import project_id, tag, unit_tmux
+from janus.rigor import level_of
 from janus.probe import host_liveness, probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
@@ -567,7 +569,19 @@ def resume_unit(cfg, u, msg, budget=None):
     if ag is not None and name not in {a.get("name") for a in ag.get("agents", [])}:   # stopped, or its pane closed: a prompt reaches nobody
         from janus.actions.backlog import relaunch_cmd
         raise Err(f"{name}: its herdr agent is gone: nothing prompted; relaunch it: {relaunch_cmd(cfg, u)}")
-    if not cfg.run.dry: reopen_report(cfg, u); u.pop("saved", None)   # saved: this turn's end is brought here again (a tmux unit's marker never changes)
+    turns = via == "tmux" and (u.get("turns") or per_turn(mc))
+    if turns and not cfg.run.dry and turn_running(cfg, h, unit_tmux(u)):   # a new turn would kill the one running (respawn-pane -k)
+        raise Err(f"{name}: its turn is still running in tmux {unit_tmux(u)} on {u['host']}: the message goes when that turn ends (or janus stop {name})")
+    if not cfg.run.dry: reopen_report(cfg, u); u.pop("saved", None)   # saved: this turn's end is brought here again
+    if turns:   # a per-turn client (opencode run): a new turn on the same session, the message on its command line, nothing pasted
+        sid = u.get("session")
+        if not sid: raise Err(f"{name}: no session id recorded (launched by an older janus): relaunch it with janus launch --resume-of {name}")
+        msgf = f"{h['root']}/run/{name}.msg"
+        try: u["pid"] = start_turn(cfg, h, unit_tmux(u), turn_command(cfg, h, mc, u["rcwd"], remote_env(cfg, h, name, level_of(cfg, u)), sid, msgf), text, msgf)
+        except Err as e: raise Err(f"{name}: {e}")
+        u["turns"] = True
+        if not cfg.run.dry: agent_res(cfg, u["host"], h, name, u["pid"])   # the new turn's process holds the agent's reservation
+        return f"{name}: " + (f"a new turn on session {sid} in tmux {unit_tmux(u)} on {u['host']}" if not cfg.run.dry else f"would start a new turn on session {sid} (dry run)")
     if via == "herdr":
         if not cfg.run.dry and herdr("agent", "prompt", name, text) is None: raise Err(f"{name}: herdr did not take the prompt (its agent waits at a dialog or prompt, or is gone): janus check names what it is blocked on")
         return f"{name}: " + ("prompted in its herdr pane" if not cfg.run.dry else "would prompt in its herdr pane")
@@ -576,9 +590,9 @@ def resume_unit(cfg, u, msg, budget=None):
         if not cfg.run.dry and hrun(h, pre + f"tmux has-session -t {tm}")[0]:   # its session ended: start the client again on its own session, or say it cannot
             sid = session_of(cfg, u) if mc.get("kind") == "claude" else None
             if not sid: raise Err(f"{name}: its tmux session ended and its {mc.get('kind')} session id cannot be read here: resume it by hand in {u.get('rcwd')}")
-            env_ = " ".join(f"{k}={shlex.quote(v)}" for k, v in {"JANUS_ROLE": "agent", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root)}.items())
+            env_ = " ".join(f"{k}={shlex.quote(v)}" for k, v in remote_env(cfg, h, name, level_of(cfg, u)).items())   # JANUS_REPORT too: the Stop hook reads it
             # started without the prompt (its last argument): tmux refuses a command line that carries the project memory
-            inner = f"cd {qp(u['rcwd'])} && exec env {env_} {shlex.join(tool_argv(mc, text, sid)[:-1])}"
+            inner = f"cd {qp(u['rcwd'])} && exec env {env_} {agent_scope(cfg, h, mc)}{shlex.join(tool_argv(mc, text, sid)[:-1])}"
             try: u["pid"] = start_tmux(cfg, h, unit_tmux(u), inner); tmux_submit(cfg, h, unit_tmux(u), text)
             except Err as e: raise Err(f"{name}: {e}")
             return f"{name}: its session ended; started {mc['kind']} again on session {sid[:8]} in tmux {unit_tmux(u)} on {u['host']}"
@@ -762,20 +776,29 @@ def settle_remote(cfg, u):
     if reported: keep_run_json(cfg, od, u["run"]); ledger_done(cfg, pv, u["run"], u["name"], cost, "ended")
 
 def saved_marker(u):
-    """What `saved` records when a remote unit's output was brought here: its pueue task, else 'tmux' (a tmux unit has no task,
-    finding 5, so `saved == task` is never None == None)."""
-    return u.get("task") if u.get("task") is not None else "tmux"
+    """What `saved` records when a remote unit's output was brought here: its pueue task, else the end of its tmux turn (a per-turn
+    client's pane records when its process ended: each turn's end is a new marker, so each is brought here), else 'tmux' (a tmux
+    unit has no task, finding 5, so `saved == task` is never None == None)."""
+    if u.get("task") is not None: return u["task"]
+    return f"tmux:{u['_turn_end']}" if u.get("_turn_end") else "tmux"
 
 def refresh_due(cfg, u):
-    """True when refresh_remote brings a remote unit's output here now: its agent ended and it is unsaved, or its last backup is
-    older than [collect] backup_min."""
-    if cfg.hosts[u["host"]].get("local") or no_remote_copy(u): return False
+    """True when refresh_remote brings a remote unit's output here now: its agent ended and it is unsaved, its report was written
+    on its host after it was last brought here (the probe's mtime: a copy that lagged 11 lines, 2026-11-24), or its last backup is
+    older than [collect] backup_min. A record without a known host (a launch still writing it) is never due."""
+    h = cfg.hosts.get(u.get("host"))
+    if h is None or no_remote_copy(u) or h.get("local"): return False
     if u.get("state") == "unknown": return False   # its host did not answer this pass's probe: an ssh per unit per pass only fails and floods watch.log
+    if u.get("_report_mtime", 0) > u.get("saved_at", 0): return True
     return (u.get("state") in ENDED and u.get("saved") != saved_marker(u)) or now() - u.get("saved_at", 0) > cfg.c.get("collect", {}).get("backup_min", 30) * 60
 
 def fetch_unit(cfg, u):
     """One unit's remote read phase, writing no state: (backup patch rc, its stderr, whether the output folder was saved)."""
     prc, _, perr = remote_patch(cfg, cfg.hosts[u["host"]], u["name"], "backup.patch") or (0, "", "")   # the agent's changes so far, as a patch (out/<unit>/backup.patch)
+    base = (u.get("repo") or {}).get("base")
+    if base and u.get("rcwd") and u.get("state") in ENDED and not cfg.run.dry:   # an agent that committed and ended with its report PENDING
+        rc, o, _ = hrun(cfg.hosts[u["host"]], f"git -C {qp(u['rcwd'])} rev-list --count {shlex.quote(base)}..HEAD", timeout=30)
+        if rc == 0 and o.strip().isdigit(): u["_commits"] = int(o.strip())
     return prc, perr, bool(save_output(cfg, u))
 
 def refresh_remote(cfg, u, bd, log, fetched=None):
@@ -791,6 +814,7 @@ def refresh_remote(cfg, u, bd, log, fetched=None):
     if prc: log(f"{u['name']}: no backup patch could be made on {u['host']} (exit {prc}; the earlier one is kept): {(perr or '').strip()[-300:]}")
     if not ok: log(f"{u['name']}: saving its output from {u['host']} failed ({u.get('_sync_error')})"); return
     u["saved_at"] = int(now())
+    if "_commits" in u: u["commits_since"] = u["_commits"]   # its commits since launch on its host (status, unit:<n>:ended-pending)
     if fin: u["saved"] = saved_marker(u); settle_remote(cfg, u)   # its run is closed when it ends, not at collect
     bd.save(u)
     u["verdict"] = v = verdict(cfg, u)

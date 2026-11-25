@@ -362,7 +362,7 @@ def ctx(ev, text): out({"hookSpecificOutput": {"hookEventName": ev, "additionalC
 def block(reason): out({"decision": "block", "reason": reason})
 
 AGENT_VERDICT = re.compile(r"^[\s*>-]*VERDICT:\s*(DONE|BLOCKED|FAILED)\b")
-AGENT_WAIT = re.compile(r"^[\s*>-]*WAITING\b\**:?\s*\S")   # the PARK_RULE line (units.WAIT_RX, one shape)
+AGENT_WAIT = re.compile(r"^[\s*>-]*[Ww](?i:aiting)\b\**:?\s*\S")   # the PARK_RULE line (units.WAIT_RX, one shape)
 
 def agent_hook(ev, d):
     """The Stop hook of a unit agent. It allows a stop that is (a) finished — a VERDICT line and the real exit codes, line 1 no

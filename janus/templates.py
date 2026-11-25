@@ -20,13 +20,17 @@ else
  echo "psi=$(awk '/^some/{sub("avg10=","",$2);print $2}' /proc/pressure/memory 2>/dev/null)"; echo "os=linux"
 fi
 d=%(root)s; [ -d "$d" ] || d=/; echo "disk_gb=$(df -Pk "$d" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')"
+# each unit report's mtime: a report written after janus last brought it here is brought again (a turn the probe could not see end)
+[ "$d" = / ] || for f in "$d"/out/*/REPORT.md; do [ -f "$f" ] && echo "report=$(basename "$(dirname "$f")") $(stat -c %%Y "$f" 2>/dev/null || stat -f %%m "$f")"; done
 %(extra)s
 RD=%(rd)s; CAP_RO=%(ro)s
 %(cap)s
 cap_report
 echo "--pueue"; %(pueue)s status --json 2>/dev/null
-# each tmux session, and "busy" when the footer of its screen (its last two lines) shows the agent working (launch.busy)
-echo "--tmux"; for s in $(tmux ls -F '#S' 2>/dev/null); do b=; tmux capture-pane -p -t "$s" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 2 | grep -qi 'esc to interrupt' && b=' busy'; echo "$s$b"; done; true'''
+# each tmux session: "dead <time>" when its pane's process ended (remain-on-exit: a per-turn client's turn is over), else "busy"
+# when the footer of its screen (its last two lines) shows the agent working (launch.busy)
+echo "--tmux"; for s in $(tmux ls -F '#S' 2>/dev/null); do b=; d=$(tmux display -p -t "=$s:" '#{pane_dead} #{pane_dead_time}' 2>/dev/null)
+ case "$d" in 1*) b=" dead ${d#1 }";; *) tmux capture-pane -p -t "=$s:" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 2 | grep -qi 'esc to interrupt' && b=' busy';; esac; echo "$s$b"; done; true'''
 
 DIRECT_PROBE = r'''if [ -d /proc/1 ]; then
  for f in /proc/[0-9]*/environ; do u=$(tr '\0' '\n' < $f 2>/dev/null | sed -n 's/^JANUS_UNIT=//p'); [ -n "$u" ] && echo "${f#/proc/} $u"; done 2>/dev/null | sed 's#/environ##' > /tmp/.janus-units.$$

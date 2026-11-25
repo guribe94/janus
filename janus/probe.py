@@ -43,7 +43,7 @@ def pueue(h, wrap=""):
     c = h.get("pueue_config"); pre = "" if h.get("local") else f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH" '
     return pre + wrap + "pueue" + (f" -c {shlex.quote(c)}" if c else "")
 
-LIST_KEYS = ("res", "cls", "sched", "direct", "waitjob", "apiproc", "apiinfo", "live")   # apiproc/apiinfo: API processes janus did not start, and whose they are   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
+LIST_KEYS = ("res", "cls", "sched", "direct", "waitjob", "apiproc", "apiinfo", "live", "report")   # apiproc/apiinfo: API processes janus did not start, and whose they are   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
 
 def probe(name, h, ro=True, cfg=None):
     """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,
@@ -58,11 +58,13 @@ def probe(name, h, ro=True, cfg=None):
     if rc: return {"name": name, "ok": False, "err": (e or o).strip().splitlines()[-1][:80] if (e or o).strip() else f"rc {rc}"}
     head, _, rest = o.partition("--pueue\n"); pj, _, tm = rest.partition("--tmux\n")
     tl = [l.split() for l in tm.splitlines() if l.strip()]
-    p = {"name": name, "ok": True, "tmux": [l[0] for l in tl], "tmux_busy": [l[0] for l in tl if l[1:] == ["busy"]], **{k: [] for k in LIST_KEYS}}
+    p = {"name": name, "ok": True, "tmux": [l[0] for l in tl], "tmux_busy": [l[0] for l in tl if l[1:] == ["busy"]],
+         "tmux_dead": {l[0]: (l[2] if len(l) > 2 else "") for l in tl if l[1:2] == ["dead"]}, **{k: [] for k in LIST_KEYS}}
     for l in head.splitlines():
         k, _, v = l.partition("=")
         if k in LIST_KEYS: p[k].append(v)
         else: p[k] = v
+    p["reports"] = dict(x.split(" ", 1) for x in p.pop("report") if " " in x)   # unit -> its remote report's mtime
     try: p["pueue"] = json.loads(pj) if pj.strip() else None
     except Exception: p["pueue"] = None
     return p

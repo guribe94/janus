@@ -140,7 +140,7 @@ def api_remote(cfg, h, name, mc, rbrief, rcwd, budget, prompt, env, session=None
     pv = cfg.prov[mc["provider"]]; var, key = read_secret(pv)
     q = shlex.quote; R = h["root"]; root = qp(R); kf = f"{R}/run/{name}.key"; fifo = qp(kf); od = qp(f"{R}/out/{name}"); sp = f"{R}/run/{name}.sh"
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", var): raise Err(f"provider key variable {var!r} is not a variable name")
-    mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {q(f'MemoryMax={mm}')} -- " if mm else ""
+    sd = agent_scope(cfg, h, mc)
     ex = "".join(f"export {k}={q(v)}\n" for k, v in env.items())
     rd = qp(h["_rd"]); amb = int(cap_nums(cfg, h)["agmb"])
     # the agent's reservation (runs/agent-<unit>.res, its pid: exec keeps it) and a sampler that records the agent class's peak
@@ -527,6 +527,69 @@ def tmux_submit(cfg, h, tm, text):
         if i == 4 and box: hrun(h, pre + f"tmux send-keys -t {q} Enter")
     raise Err(f"{tm}: the prompt was not taken; its input box holds: {(box or '(nothing)')[:120]}")
 
+def per_turn(mc):
+    """A client janus runs once per turn in tmux (opencode run: it exits when its turn ends). Its message goes on its command line,
+    never pasted (a pasted brief sat unsent: '[Pasted ~1 lines]'), its state is whether its process lives, never its screen
+    (opencode has no 'esc to interrupt' footer, so a working agent read idle), and a resume is a new turn on the same session."""
+    return mc.get("kind") == "opencode"
+
+def turn_session(name):
+    """The session id janus gives a per-turn client, so a resume can continue it: opencode 2.4 takes an id of its caller's choosing
+    when it starts with 'ses' (read on rigpc 2026-11-25: `--session janus-x` refused, `--session ses_janus_x` created, then continued)."""
+    return "ses_janus_" + re.sub(r"[^A-Za-z0-9]", "_", name) + "_" + str(int(time.time()))
+
+def agent_scope(cfg, h, mc):
+    """The systemd scope an agent starts in on a host with memory_max ([models.<m>] memory_max first): OOMPolicy=continue, so the
+    kernel killing a build the agent ran itself (rustc + ld over a 3 GB scope, rigpc 2026-11-24) fails that build, not the agent with
+    its uncommitted work (systemd's default stops the whole scope)."""
+    mm = mc.get("memory_max") or h.get("memory_max")
+    return f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -p OOMPolicy=continue -- " if mm else ""
+
+def remote_env(cfg, h, name, level=None):
+    """The environment of an agent janus starts on a remote host (launch, and a resume that starts its client again: JANUS_REPORT
+    there too, or the Stop hook never checks the report of a restarted session)."""
+    return {"JANUS_ROLE": "agent", "JANUS_REPORT": f"{h['root']}/out/{name}/REPORT.md", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg),
+            "JANUS_ROOT": str(cfg.root), **({"JANUS_RIGOR": level} if level else {})}
+
+def turn_command(cfg, h, mc, rcwd, env, session, msgf):
+    """The pane command of one turn: the message is read from msgf by the shell that runs it, so the tmux command line stays short
+    whatever the message (a resume carries the project memory)."""
+    e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+    return f"cd {qp(rcwd)} && exec env {e} {agent_scope(cfg, h, mc)}{shlex.join(tool_argv(mc, '', session)[:-1])} \"$(cat {qp(msgf)})\""
+
+def tmux_target(tm, window=True):
+    """An exact tmux target for session tm, always single-quoted: shlex leaves '=name' bare, and a zsh login shell (a Mac host over
+    ssh) expands a word starting with '=' as a command path. window: '=name:' (its window and pane; a bare '=name' is neither)."""
+    return "'" + (f"={tm}:" if window else f"={tm}").replace("'", "'\\''") + "'"
+
+def start_turn(cfg, h, tm, inner, text, msgf):
+    """Run one turn of a per-turn client in tmux session tm on host h: the message is written to msgf, the session is made if it
+    is not there, kept after its process ends (remain-on-exit: the pane, its last screen and the session stay, so the turn's end is
+    seen as such, not as a lost agent), and its pane runs inner. Its pane pid; Err when it cannot start or exits at once with an error."""
+    pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '; q = tmux_target(tm)
+    if not cfg.run.dry:
+        rc, o, e = put_script(cfg, h, msgf, text, "600")
+        if rc: raise Err(f"the message for {tm} was not written: {(e or o).strip()[:120]}")
+    rc, o, er = X(cfg, h, pre + f"{{ tmux has-session -t {tmux_target(tm, False)} 2>/dev/null || tmux new -d -s {shlex.quote(tm)} -x 200 -y 50; }} && tmux set-option -w -t {q} remain-on-exit on"
+                  f" && tmux respawn-pane -k -t {q} {shlex.quote(inner)} && tmux display -p -t {q} '#{{pane_pid}}'")
+    if rc: raise Err("tmux start failed: " + (er or o).strip()[:100])
+    pid = int((o.strip().splitlines() or ["0"])[-1] or 0)
+    if cfg.run.dry: return pid
+    time.sleep(2)
+    rc, o, _ = hrun(h, pre + f"tmux display -p -t {q} '#{{pane_dead}} #{{pane_dead_status}}'")
+    dead, _, st = o.strip().partition(" ")
+    if rc or not pid: raise Err(f"the agent's tmux session {tm} ended at once; nothing is running")
+    if dead == "1" and st not in ("", "0"):
+        scr = hrun(h, pre + f"tmux capture-pane -p -t {q}")[1].strip()
+        raise Err(f"{tm}: the client exited at once (status {st}): {scr[-200:]}")
+    return pid
+
+def turn_running(cfg, h, tm):
+    """A per-turn client's turn is still running in tmux session tm (its pane's process lives)."""
+    pre = f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; '
+    rc, o, _ = hrun(h, pre + f"tmux display -p -t {tmux_target(tm)} '#{{pane_dead}}'")
+    return rc == 0 and o.strip() == "0"
+
 def unit_tab(cfg, u, mname, hn, h):
     """One labelled tab per running unit (<unit> · <model> · <host>) that follows its pueue log (fixes5 item 3)."""
     if u.get("via") != "pueue" or cfg.run.dry: return
@@ -776,11 +839,14 @@ def cmd_launch(cfg, a):
                     agent_res(cfg, hn, h, name, u.get("pid"))
                 else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
             else:
-                e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-                mm = h.get("memory_max"); sd = f"systemd-run --user --scope -q -p {shlex.quote(f'MemoryMax={mm}')} -- " if mm else ""   # fixes5 item 7
-                inner = f"cd {qp(rcwd)} && exec env {e} {sd}{shlex.join(tool_argv(mc, prompt))}"
                 tm = tmux_name(cfg, name)
-                u.update(via="tmux", tmux=tm, pid=start_tmux(cfg, h, tm, inner))   # launched: alive and past its startup dialogs
+                if per_turn(mc):   # one process per turn: the brief goes on its command line, the session id is janus's own
+                    sid = turn_session(name); msgf = f"{h['root']}/run/{name}.msg"
+                    u.update(via="tmux", tmux=tm, turns=True, session=sid, pid=start_turn(cfg, h, tm, turn_command(cfg, h, mc, rcwd, env, sid, msgf), prompt, msgf))
+                else:
+                    e = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+                    inner = f"cd {qp(rcwd)} && exec env {e} {agent_scope(cfg, h, mc)}{shlex.join(tool_argv(mc, prompt))}"   # fixes5 item 7
+                    u.update(via="tmux", tmux=tm, pid=start_tmux(cfg, h, tm, inner))   # launched: alive and past its startup dialogs
                 if not cfg.run.dry: u["start_state"] = "running"
                 if not cfg.run.dry: agent_res(cfg, hn, h, name, u["pid"])
                 if not cfg.run.dry:

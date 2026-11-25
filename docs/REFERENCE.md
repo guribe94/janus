@@ -100,6 +100,14 @@ the new session runs `janus register` (it reads `OPENCODE_SESSION_ID`), and Open
 size trigger and no end-to-end live run was made. Otherwise it says why and restores the old registration. Other tools are unsupported.
 Launch and resume command lines (`launch.tool_argv`) are the ones each client's `--help` shows: claude `--model/--resume`, codex `resume`/`-m`,
 opencode `run --model/--session`.
+An opencode agent in tmux runs **one process per turn** (`launch.per_turn`): janus gives it a session id of its own (`ses_janus_<unit>_<time>`,
+recorded as the unit's `session`), writes each message to `<root>/run/<unit>.msg` and runs `opencode run --session <id> "$(cat <msg>)"` in the
+unit's tmux pane, which is kept after the process ends (`remain-on-exit`). Its state is its process: working while it lives, idle when its pane is
+dead (the probe's `dead <time>`), gone when the session is. Nothing is pasted and no screen is read. A resume (janus resume, the watcher) is a new
+turn on the same session; it is refused while a turn still runs. Each turn's end is brought here (its end time is the saved marker).
+An agent started on a host with `memory_max` runs in a systemd scope with that `MemoryMax` (`[models.M] memory_max` overrides the host's) and
+`OOMPolicy=continue`: when the kernel kills a build the agent ran itself, that build fails and the agent lives. Builds belong in `janus run`, whose
+job gets its own admitted scope.
 The Stop hook defers the reset while the owner wrote in the last 15 min and never resets in standby; after a reset the new session is handed the old one's last message to repeat if it was for the owner. A hook from the registered orchestrator pane registers its session, whatever its id (an older session resumed there).
 
 ## Locks

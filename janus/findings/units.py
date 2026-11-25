@@ -99,8 +99,12 @@ def unit_findings(cfg, hs, units, ag):
             scr = [l.strip() for l in (herdr_text("agent", "read", u["name"], "--source", "visible", "--lines", "40") or "").splitlines() if l.strip(" ─│╭╮╰╯")]
             F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked on: {' / '.join(scr[-6:])[-300:] or 'its screen could not be read'}; "
                       "a question: answer it (board.sh direct); a prompt only a person may answer (never sent keys): the owner answers it, or janus stop and relaunch (Claude Code's own removal safety check times out by itself)"))
-        elif st in ("done", "failed", "gone", "idle") and not silent:
-            F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v or 'no verdict'}); collect/close or relaunch"))
+        elif st in ("done", "failed", "gone", "idle") and not silent and v:
+            F.append((f"unit:{u['name']}:finished", f"{u['name']} finished ({st}; {v}); collect/close or relaunch"))
+        elif st in ("done", "failed", "gone", "idle") and not silent:   # its turn ended with the report still PENDING: not finished
+            c = u.get("commits_since"); cm = f"; {c} commit(s) on its host since launch" if c else ""
+            F.append((f"unit:{u['name']}:ended-pending", f"{u['name']}'s turn ended without a verdict ({st}; report PENDING{cm}): "
+                      f"resume it (janus resume {u['name']} --message ...), or collect it and read its tree before relaunching"))
         if v and v.startswith("VERDICT: DONE"):   # finished work that its rigor level wants reviewed before it lands (rigor.review_gap)
             gap = review_gap(cfg, u, units)
             if gap: F.append((f"review:{u['name']}", f"{u['name']}: {gap}; janus land refuses it until then"))

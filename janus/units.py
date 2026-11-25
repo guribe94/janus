@@ -22,8 +22,13 @@ def unit_state(u, ps, agents):
         return a.get("agent_status", "unknown") if a else "gone"
     p = ps.get(u.get("host"), {})
     if not p.get("ok"): return "unknown"
+    if u.get("name") in p.get("reports", {}): u["_report_mtime"] = int(p["reports"][u["name"]] or 0)   # refresh_due: written since last brought here
     if via == "tmux":   # from its screen (the probe): working while it shows the agent busy, idle at its prompt
-        t = unit_tmux(u); return ("working" if t in p.get("tmux_busy", []) else "idle") if t in p.get("tmux", []) else "gone"
+        t = unit_tmux(u)
+        if t not in p.get("tmux", []): return "gone"
+        if t in p.get("tmux_dead", {}):   # its process ended, the pane kept (remain-on-exit): a per-turn client's turn is over
+            u["_turn_end"] = p["tmux_dead"][t] or "dead"; return "idle"
+        return "working" if u.get("turns") or t in p.get("tmux_busy", []) else "idle"   # a per-turn client works while its process lives
     if via == "pueue":
         t = ((p.get("pueue") or {}).get("tasks") or {}).get(str(u.get("task")))
         if not t: return "gone"
@@ -182,7 +187,7 @@ def force_close_refusal(cfg, u, units):
 
 ENDED = ("done", "failed", "gone", "idle")
 
-WAIT_RX = re.compile(r"^[\s*>-]*WAITING\b\**:?\s*(.*)$", re.M)
+WAIT_RX = re.compile(r"^[\s*>-]*(?P<w>[Ww](?i:aiting))\b\**:?\s*(.*)$", re.M)   # WAITING, Waiting, waiting: agents write all three (item 8)
 
 JOBREF = re.compile(r"(?<![\w/.-])([A-Za-z0-9][\w.-]*):(\d+)\b")
 
@@ -200,9 +205,9 @@ def park_jobs(cfg, text):
     (None, []) when there is no such park line."""
     out = (None, [])
     for m in WAIT_RX.finditer(text):
-        jobs = [f"{h}:{t}" for h, t in JOBREF.findall(m.group(1)) if h in cfg.hosts]
+        jobs = [f"{h}:{t}" for h, t in JOBREF.findall(m.group(2)) if h in cfg.hosts]
         # WAIT_RX's `\s*` spans the line break: ids caught from the line AFTER the park word are the start of a list
-        gap = text[text.index("WAITING", m.start()) + 7:m.start(1)]; own = bool(jobs) and not any(c in gap for c in LINE_BREAKS)
+        gap = text[m.end("w"):m.start(2)]; own = bool(jobs) and not any(c in gap for c in LINE_BREAKS)
         for line in ([] if own else text[m.end():].splitlines()):
             st = line.strip()
             if not st: continue
