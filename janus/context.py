@@ -40,6 +40,7 @@ class Run:
     dry: bool = False
     ro: bool = False
     all_units: dict | None = None
+    all_units_err: str | None = None   # why all_units read nothing (a bd failure), so a caller can say so instead of trusting {}
     rates: dict | None = None
     briefless: list | None = None   # the ready backlog items check found without a usable brief (status names them)
     held: list | None = None   # the backlog items check found left out only by a hold: (item, reason, sources, brief) (status names them)

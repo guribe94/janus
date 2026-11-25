@@ -409,4 +409,57 @@ class OrphansAndTheHook(unittest.TestCase):
         self.assertIsNotNone(self.why(str(Path.home() / ".claude/projects/-other-project/memory/note.md"), tool="Write"))
 
 
+class Tidy(unittest.TestCase):
+    """Items 24, 26, 27."""
+
+    def test_a_bulky_folder_of_many_small_files_goes_whole(self):
+        """Catches item 24: a cargo target dir, an extracted tarball and repository snapshots (3.7 GB, each file under 50 MB) in closed
+        units' output were invisible to tidy, while the hook refuses rm -r."""
+        d, cfg = project(); od = d / ".janus/out"; old = time.time() - 30 * 86400
+        def files(base, n):
+            for i in range(n):
+                q = base / f"deps/f{i}.rlib"; q.parent.mkdir(parents=True, exist_ok=True)
+                with open(q, "wb") as h: h.truncate(1 << 20)
+                os.utime(q, (old, old))
+        files(od / "gone/target", 60); files(od / "gone/notes", 2); files(od / "live/target", 60); files(od / "keep/snap", 60)
+        (od / "keep/snap/REPORT.md").write_text("x"); os.utime(od / "keep/snap/REPORT.md", (old, old))
+        with mock.patch.object(janus, "all_units", lambda c: {"gone": {"status": "closed"}, "live": {"status": "closed"}, "keep": {"status": "closed"}}):
+            P = janus.tidy_out_bulk(cfg, [{"name": "live"}])
+        self.assertEqual([t for _, t, _, _ in P], [str(od / "gone/target")]); self.assertEqual(P[0][3], 60)
+
+    def test_a_tree_squash_landed_then_changed_on_main_is_landed(self):
+        """Catches item 26: rigpc-hw-session was kept 'unlanded' though its files were byte-identical to its squash commit: the
+        comparison ran against main's tip, where a later commit had changed one of them."""
+        d, cfg = project('\n[paths]\nworktrees = "wt"\n[landing]\nbranch = "main"\n')
+        g = lambda c, *a: subprocess.run(["git", "-C", str(c), *a], capture_output=True, text=True, check=True).stdout.strip()
+        r = d / "repo"; r.mkdir(); g(r, "init", "-q", "-b", "main"); (r / "f").write_text("a\n"); g(r, "add", "f"); g(r, "commit", "-qm", "base")
+        wt = d / "wt/rigpc-hw-session"; wt.parent.mkdir(); g(r, "worktree", "add", "-q", "-b", "wk/rigpc-hw-session", str(wt))
+        (wt / "f").write_text("b\n"); g(wt, "commit", "-qam", "work")
+        (r / "f").write_text("b\n"); g(r, "commit", "-qam", "rigpc-hw-session: land (squash)")      # the squash landing
+        (r / "f").write_text("c\n"); g(r, "commit", "-qam", "later change to the same file")
+        with mock.patch.object(janus, "all_units", lambda c: {}), mock.patch.object(janus, "herdr_agents", lambda c: {}), mock.patch.object(janus, "orphan_tabs", lambda *a: []):
+            P = janus.tidy_plan(cfg, [], rows={})
+        self.assertIn(("worktree", str(wt)), [(k, t) for k, t, _ in P])
+        (wt / "f").write_text("d\n"); g(wt, "commit", "-qam", "more work after the landing")         # not landed: kept
+        with mock.patch.object(janus, "all_units", lambda c: {}), mock.patch.object(janus, "herdr_agents", lambda c: {}), mock.patch.object(janus, "orphan_tabs", lambda *a: []):
+            self.assertNotIn(str(wt), [t for _, t, _ in janus.tidy_plan(cfg, [], rows={})])
+
+    def test_a_beads_timeout_still_runs_the_rules_that_need_no_unit(self):
+        """Catches item 27: 'bd list: bd: timeout' under load made janus tidy exit doing nothing."""
+        d, cfg = project(); cfg.run.dry = True
+        B = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: (_ for _ in ()).throw(janus.Err("bd list: bd: timeout"))})
+        host = "runfiles 3\nstalewait /x/runs/j.wait\ntmux janus-u@" + janus.tmux_name(cfg, "x").rpartition("@")[2] + "\n"
+        with mock.patch.object(janus, "Beads", B), mock.patch.object(janus, "hrun", lambda h, c, **k: (0, host, "")), \
+             mock.patch.object(janus, "refuse_agent", lambda w: None), contextlib.redirect_stdout(io.StringIO()) as o:
+            janus.cmd_tidy(cfg, argparse.Namespace(action=None, target=None, why=None, dry_run=True, run=None))
+        t = o.getvalue()
+        self.assertIn("beads could not be read", t); self.assertIn("would remove run-files here", t)
+        self.assertNotIn("tmux", t.split("the rest runs", 1)[1])                                   # sessions need the open units: never judged blind
+        cmds = []
+        with mock.patch.object(janus, "sh", lambda cmd, **k: cmds.append(k.get("timeout")) or ((124, "", "bd: timeout") if len(cmds) == 1 else (0, "[]", ""))), \
+             mock.patch("time.sleep", lambda s: None):
+            self.assertEqual(janus.Beads(cfg).run("list"), [])
+        self.assertEqual(cmds, [None, 90])                                                           # a read is asked once more, longer
+
+
 if __name__ == "__main__": unittest.main()

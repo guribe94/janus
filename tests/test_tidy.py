@@ -106,7 +106,8 @@ class OutBulk(unittest.TestCase):
         f(od / "live/a.bundle", 60); f(od / "openrec/a.bundle", 60)
         janus.all_units = lambda c: {"gone": {"status": "closed"}, "live": {"status": "closed"}, "openrec": {"status": "in_progress"}}
         P = janus.tidy_out_bulk(cfg, [{"name": "live"}])
-        self.assertEqual(sorted(t for _, t, _, _ in P), sorted([str(big), str(od / "gone/integration/repo")]))
+        # rig29 item 24: a folder of the closed unit's output that is bulky as a whole and old goes whole (its bundle and its clone)
+        self.assertEqual(sorted(t for _, t, _, _ in P), [str(od / "gone/integration")])
         for _, t, _, _ in P: self.assertEqual(janus.tidy_do(cfg, "out-bulk", t)[0], 0)
         self.assertFalse(big.exists()); self.assertFalse((od / "gone/integration/repo").exists())
         self.assertTrue((od / "gone/REPORT.md").exists()); self.assertTrue((od / "gone/backup.patch").exists()); self.assertTrue(fresh.exists())

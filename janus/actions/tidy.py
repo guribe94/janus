@@ -39,6 +39,7 @@ def tidy_plan(cfg, units, ag=None, rows=None, kept=None):
         lt = landed(cfg, {"cwd": str(d)})
         ups = upstream_of(d, landing_branch(cfg, d)) if lt is not True else None
         if ups and (sh(["git", "-C", str(d), "merge-base", "--is-ancestor", "HEAD", ups])[0] == 0 or contained(d, ups)): lt = True
+        if lt is not True and landed_at(cfg, d, br, [landing_branch(cfg, d)] + ([ups] if ups else [])): lt = True
         if lt is not True:
             mb = sh(["git", "-C", str(d), "merge-base", "HEAD", landing_branch(cfg, d)])[1].strip()
             n = len(sh(["git", "-C", str(d), "diff", "--name-only", mb, "HEAD"])[1].split()) if mb else 0
@@ -110,6 +111,28 @@ def tidy_artifacts(cfg, units):
 OUT_BULK_MB = 50   # a file in a closed unit's output at least this big is bulk (bundles, snapshots), never its report
 OUT_KEEP = {"REPORT.md", "report.json", "backup.patch", "changes.patch"}   # what a closed unit's output is kept for
 
+def dir_stats(path):
+    """(bytes, newest mtime, holds an OUT_KEEP file) of the files under path, links not followed."""
+    size, newest, keep = 0, 0, False
+    for root, dirs, files in os.walk(path):
+        for f in files:
+            try: st = os.lstat(os.path.join(root, f))
+            except OSError: continue
+            size += st.st_size; newest = max(newest, st.st_mtime); keep = keep or f in OUT_KEEP
+    return size, newest, keep
+
+def landed_at(cfg, d, br, onto):
+    """True when tree d's changes are the content of the commit that landed it: its unit's recorded publication, else the newest
+    '<name>: land ' commit (janus land's subject) on a landing ref, that commit an ancestor of one of onto. A later change on the landing
+    branch to one of its files kept a squash-landed tree 'unlanded' for good (rigpc-hw-session: byte-identical to its squash commit)."""
+    u = all_units(cfg).get(d.name) or {}
+    cands = [(u.get("published") or {}).get("commit")] + [sh(["git", "-C", str(d), "log", "-1", "--format=%H", f"--grep=^{re.escape(n)}: land ", r])[1].strip()
+                                                         for n in dict.fromkeys(x for x in (d.name, br) if x) for r in onto]
+    for c in dict.fromkeys(x for x in cands if x):
+        if not any(sh(["git", "-C", str(d), "merge-base", "--is-ancestor", c, r])[0] == 0 for r in onto): continue
+        if contained(d, c) is True: return True
+    return False
+
 def tidy_out_bulk(cfg, units):
     """[(kind, target, why, mb)]: bulky files (OUT_BULK_MB and more) and repository clones in the output folder (out/<unit>) of a
     CLOSED unit, unchanged for [tidy] keep_days; never OUT_KEEP files, never an open unit's output."""
@@ -117,8 +140,14 @@ def tidy_out_bulk(cfg, units):
     cut = now() - tset(cfg, "keep_days") * 86400
     for d in sorted(od.iterdir()) if od.is_dir() else []:
         if not d.is_dir() or d.is_symlink() or d.name in names or au.get(d.name, {}).get("status") != "closed": continue
+        whole = set()   # a folder of many files, each under OUT_BULK_MB (a cargo target dir, an extracted tarball, a repository snapshot):
+        for sub in sorted(x for x in d.iterdir() if x.is_dir() and not x.is_symlink()):   # 3.7 GB of them were invisible to tidy (2026-11-25)
+            size, newest, keep = dir_stats(sub)
+            if keep or newest >= cut or size < OUT_BULK_MB << 20: continue
+            whole.add(sub.name); P.append(("out-bulk", str(sub), f"{size >> 20} MB folder in closed unit {d.name}'s output, unchanged {tset(cfg, 'keep_days')} days", size >> 20))
         for root, dirs, files in os.walk(d):
             r = Path(root)
+            if r == d: dirs[:] = [x for x in dirs if x not in whole]
             if ".git" in dirs:
                 dirs.remove(".git")
                 if r != d and (r / ".git").stat().st_mtime < cut:   # a nested clone (the output folder itself is never removed)
@@ -160,17 +189,17 @@ def tidy_host(cfg, n, h, units, au):
     rc, o, e = hrun(h, TIDY_HOST % {"bin": h.get("bin", ""), "root": qp(root) if root else "''", "rd": qp(h["_rd"]), "kd": int(tset(cfg, "keep_days")),
                                     "caches": " ".join(qp(c) for c in caches) or "''"}, timeout=180)
     if rc: return []
-    P, open_ = [], {u["name"] for u in units}; cache, total = [], 0
+    P, open_ = [], {u["name"] for u in units or []}; cache, total = [], 0   # units None: beads unreadable, nothing that needs them is judged
     for l in o.splitlines():
         f = l.split(None, 3)
         if not f: continue
-        if f[0] == "copy" and len(f) >= 2 and f[1] not in open_:
+        if f[0] == "copy" and len(f) >= 2 and units is not None and f[1] not in open_:
             u = au.get(f[1])
             if u and u.get("status") == "closed" and u.get("host") == n:
                 why = uncollected(cfg, {**u, "via": u.get("via") if u.get("via") not in ("failed", "starting") else "x"})
                 if why: continue
                 P.append(("remote-copy", f"{n}:{f[1]}", "its unit is closed and its copy holds nothing uncollected", int(fl(f[2]) if len(f) > 2 else 0)))
-        elif f[0] == "tmux" and len(f) > 1 and f[1].startswith("janus-"):   # this project's session that no open unit records: its pid holds the agent's reservation (fill fitted nothing for days)
+        elif f[0] == "tmux" and len(f) > 1 and f[1].startswith("janus-") and units is not None:   # this project's session that no open unit records: its pid holds the agent's reservation (fill fitted nothing for days)
             why = orphan_session(cfg, f[1], units, au)
             if why: P.append(("tmux", f"{n}:{f[1]}", why, 0))
         elif f[0] == "stalewait" and len(f) > 1: P.append(("stale-wait", f"{n}:{l.split(None, 1)[1]}", "a job's wait file whose process is gone (it read as a job waiting)", 0))
@@ -380,9 +409,16 @@ def cmd_tidy(cfg, a):
         else: say(f"released {a.target}" if unhold_item(cfg, a.target) else f"no hold on {a.target}")
         return
     if not cfg.run.dry: refuse_agent("janus tidy")   # --dry-run only reads
-    free0 = disk_free_gb(cfg.root)
-    units = Beads(cfg).units(); kept = []; au = all_units(cfg)
-    P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units) + tidy_job_records(cfg)
+    free0 = disk_free_gb(cfg.root); kept = []
+    try: units = Beads(cfg).units()
+    except Err as e:   # beads unreadable (bd: timeout under load made tidy exit doing nothing): only the rules that need no unit run
+        units = None
+        say(f"note: beads could not be read ({e}): skipped the rules that need the open and closed units (worktrees, artifacts, closed units' output, "
+            "remote copies, tmux sessions, panes, cards); the rest runs")
+    au = all_units(cfg) if units is not None else {}
+    if units is not None and cfg.run.all_units_err: say(f"note: closed units could not be read ({cfg.run.all_units_err}): their output and copies are not judged this time")
+    P = tidy_branches(cfg, units or []) + tidy_roots(cfg) + tidy_job_records(cfg)
+    if units is not None: P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + P + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units)
     for n, h in cfg.hosts.items(): P += tidy_host(cfg, n, h, units, au)
     P = apply_holds(cfg, P)
     for d, why in kept: say(f"kept worktree {d}: {why}")

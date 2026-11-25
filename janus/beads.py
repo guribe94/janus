@@ -4,7 +4,7 @@ A unit's record is the JSON in its issue's notes. It carries its version (v); un
 brings an older version up to UNIT_V, so a renamed or added field is one migration step here, never a .get() guess at
 every reader (section 7, seam 6)."""
 from janus.context import sh, Err
-import json
+import json, time
 
 UNIT_V = 2
 
@@ -25,10 +25,15 @@ def unit_record(i):
     return migrate_unit(m) if isinstance(m, dict) and m else {}
 
 
+READS = ("list", "show", "ready", "count", "history")   # bd calls that change nothing: one more try after a timeout
+
 class Beads:
     def __init__(self, cfg): self.cfg = cfg
     def run(self, *a):
         rc, o, e = sh(["bd", *a, "--json"], cwd=self.cfg.beads)
+        # bd answers one call at a time across processes: under load (mac load 61 on 10 cores) a read waited out its 25 s and tidy did
+        # nothing; a read is asked once more, longer (a write is never repeated: it may have run)
+        if rc == 124 and a and a[0] in READS: time.sleep(2); rc, o, e = sh(["bd", *a, "--json"], cwd=self.cfg.beads, timeout=90)
         if rc: raise Err(f"bd {a[0]}: {(e or o).strip()[:120]}")
         try: return json.loads(o) if o.strip() else []
         except Exception: raise Err(f"bd {a[0]}: bad json")

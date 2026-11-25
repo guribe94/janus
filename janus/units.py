@@ -257,7 +257,7 @@ def all_units(cfg):
         try:
             r = Beads(cfg).run("list", "--label", "unit", "--all", "-n", "0")
             r = r.get("issues", r) if isinstance(r, dict) else r
-        except Err: r = []
+        except Err as e: r = []; cfg.run.all_units_err = str(e)   # read as none: callers that remove things say so (tidy)
         out = {}
         for i in sorted(r, key=lambda i: i.get("created_at", "")):
             t = i.get("title", "")
