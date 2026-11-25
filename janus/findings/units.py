@@ -108,7 +108,7 @@ def unit_findings(cfg, hs, units, ag):
         if v and v.startswith("VERDICT: DONE"):   # finished work that its rigor level wants reviewed before it lands (rigor.review_gap)
             gap = review_gap(cfg, u, units)
             if gap: F.append((f"review:{u['name']}", f"{u['name']}: {gap}; janus land refuses it until then"))
-        if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled", True):
+        if not cfg.prov.get(cfg.models.get(u.get("model"), {}).get("provider"), {}).get("enabled"):   # a missing enabled is disabled, as route_ok reads it
             F.append((f"provider:{u['name']}", f"{u['name']} uses disabled provider of {u.get('model')}: stop it, or relaunch it on an enabled model"))
     return F, running
 

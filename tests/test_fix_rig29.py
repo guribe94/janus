@@ -146,4 +146,62 @@ class EndedWithoutAVerdict(unittest.TestCase):
         self.assertIn("2 commit(s) on its host since launch", dict(F)["unit:u:ended-pending"])
 
 
+class LaunchAndRouting(unittest.TestCase):
+    """Items 9, 10, 14."""
+    CONF = ('\n[providers.off]\nenabled = false\n'   # project() has [providers.api] and [models.m]
+            '[models.m2]\nprovider = "api"\nkind = "api"\napi_id = "y"\n'
+            '[models.dis]\nprovider = "off"\nkind = "claude"\n[routing]\nnormal = ["dis", "m"]\nreview = ["m"]\n')
+
+    def test_a_briefs_model_line_is_used_or_refused_never_replaced(self):
+        """Catches item 9: `MODEL: ernie` in a brief was never read, so launch without --model started the routed default."""
+        d, cfg = project(self.CONF); b = d / ".janus/briefs/u1.md"
+        b.write_text("ITEM: X1\nMODEL: m2\nbody\n"); self.assertEqual(janus.brief_model(cfg, b), "m2")
+        b.write_text("ITEM: X1\nbody\n"); self.assertIsNone(janus.brief_model(cfg, b))
+        b.write_text("MODEL: nope\n")
+        with self.assertRaises(janus.Err) as e: janus.brief_model(cfg, b)
+        self.assertIn("[models.nope]", str(e.exception))
+        b.write_text("MODEL: dis\n")
+        with self.assertRaises(janus.Err) as e: janus.brief_model(cfg, b)
+        self.assertIn("disabled", str(e.exception))
+        b.write_text("ITEM: X1\nMODEL: m2\nbody\n"); cfg.run.dry = True
+        a = argparse.Namespace(unit="u1", kind="implement", tier="normal", host="here", model=None, brief=str(b), cwd=None, budget=None, test_host=None,
+                               allow_main=True, of=None, report=None, resume_of=None, item=None, probes={"here": {"name": "here", "ok": True, "avail_mb": "64000", "disk_gb": "100", "load": "0"}})
+        with mock.patch.object(janus, "Beads", type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [], "run": lambda s, *a: [], "create": lambda s, *a: "x", "save": lambda s, u: None})), \
+             mock.patch.object(janus, "herdr", lambda *a, **k: None), contextlib.redirect_stdout(io.StringIO()):
+            try: janus.cmd_launch(cfg, a)
+            except janus.Err: pass
+        self.assertEqual(a.model, "m2")
+
+    def test_a_review_never_takes_an_open_units_name(self):
+        """Catches item 9: a --kind review under an open unit's name passed the duplicate check (two rows for one unit)."""
+        d, cfg = project(self.CONF); b = d / ".janus/briefs/u1.md"; b.write_text("ITEM: X1\nbody\n")
+        a = argparse.Namespace(unit="u1", kind="review", tier="normal", host=None, model="m", brief=str(b), cwd=None, budget=None, test_host=None,
+                               allow_main=True, of=None, report=None, resume_of=None, item=None)
+        with mock.patch.object(janus, "Beads", type("B", (), {"__init__": lambda s, c: None, "units": lambda s: [{"name": "u1", "id": "i", "host": "here"}], "run": lambda s, *a: []})):
+            with self.assertRaises(janus.Err) as e: janus.cmd_launch(cfg, a)
+        self.assertIn("already launched", str(e.exception)); self.assertIn("--kind review --of u1", str(e.exception))
+
+    def test_a_routing_list_that_cannot_launch_is_named(self):
+        """Catches item 10: [routing] normal led with a disabled provider and no fallback: fill stopped with 'no model available'
+        while nothing in check or doctor said the config disabled its own route."""
+        d, cfg = project(self.CONF)
+        self.assertEqual(janus.route_unusable(cfg), [("normal", "dis", "provider off disabled")])
+        F = dict(janus.orchestrator_findings(cfg)); self.assertIn("routing:normal", F); self.assertIn("put an enabled model first", F["routing:normal"])
+        self.assertEqual(janus.family("routing:normal"), "routing")
+        cfg.route["fallback"] = True; self.assertEqual(janus.route_unusable(cfg), [])
+
+    def test_a_binary_built_for_another_os_is_not_copied(self):
+        """Catches item 14: a Mac-built .firmware-tools/bin/elf2uf2-rs synced into a rigpc worktree."""
+        d, cfg = project('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n')
+        with tempfile.TemporaryDirectory() as t:
+            for rel, head in ((".firmware-tools/bin/elf2uf2-rs", b"\xcf\xfa\xed\xfe...."), ("tools/linux-tool", b"\x7fELF...."), ("run.sh", b"#!/bin/sh\n"), ("data.bin", b"\xcf\xfa\xed\xfe")):
+                f = Path(t, rel); f.parent.mkdir(parents=True, exist_ok=True); f.write_bytes(head); f.chmod(0o755 if rel != "data.bin" else 0o644)
+            cfg.jput("hosts-facts.json", {"far": {"os": "linux"}})
+            self.assertEqual(janus.foreign_excludes(cfg, "far", cfg.hosts["far"], t), ["--exclude", "/.firmware-tools/bin/elf2uf2-rs"])
+            cfg.jput("hosts-facts.json", {"far": {"os": "mac"}})
+            self.assertEqual(janus.foreign_excludes(cfg, "far", cfg.hosts["far"], t), ["--exclude", "/tools/linux-tool"])
+            cfg.jput("hosts-facts.json", {})
+            self.assertEqual(janus.foreign_excludes(cfg, "far", cfg.hosts["far"], t), [])   # unknown: nothing left out
+
+
 if __name__ == "__main__": unittest.main()

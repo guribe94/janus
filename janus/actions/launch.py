@@ -2,7 +2,7 @@
 (API run as a pueue task, herdr pane, remote tmux), and briefs whose paths must reach a remote agent."""
 import argparse, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
-from janus.actions.jobs import agent_res, ensure_lanes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
+from janus.actions.jobs import agent_res, ensure_lanes, foreign_excludes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
 from janus.backlog import backlog_issues, holding_units, item_eligible, norm_item, unit_items
 from janus.beads import Beads, UNIT_V
 from janus.board import board, board_dir, board_shipped
@@ -54,6 +54,21 @@ def pick_model(cfg, tier, kind, host=None, note=None):
             return m
         why.append(f"{m}: {w}")
     raise Err("no model available for " + tier + "/" + kind + " (" + ("; ".join(why) or "none configured") + ")" + ("" if cfg.route.get("fallback") is True or len(lst) < 2 else "; no fallback to the later entries unless [routing] fallback = true"))
+
+def brief_model(cfg, brief):
+    """The model a brief's MODEL: line names (in its first 12 lines, as fill reads its other header lines), checked as --model is:
+    None when it names none. An unknown or disallowed model is refused, never replaced by a routed one (a brief's MODEL: ernie
+    started fable-sub, 2026-11-24)."""
+    try:
+        with open(brief, errors="replace") as fh: head = "".join(next(fh, "") for _ in range(12))
+    except OSError: return None
+    m = re.search(r"^MODEL:\s*(\S+)", head, re.M)
+    if not m: return None
+    n = m.group(1).rstrip(".,;")
+    if n not in cfg.models: raise Err(f"MODEL: {n} in {Path(brief).name} is not a model in janus.toml ([models.{n}])")
+    ok, w = model_ok(cfg, n)
+    if not ok: raise Err(f"MODEL: {n} in {Path(brief).name}: {w}")
+    return n
 
 def agent_prompt(cfg, unit, brief, hn, report=None, budget=None, level=None):
     """The first prompt of a unit. It names the report path the unit must keep (row 26: a resumed unit continues its original
@@ -645,10 +660,11 @@ def cmd_launch(cfg, a):
     name = a.unit
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name): raise Err("unit must match [a-z][a-z0-9_-]{0,31}")
     bd = Beads(cfg); units = bd.units(); prev = next((u for u in units if u["name"] == name), None)
-    if prev and a.kind != "review": raise Err(already_launched(cfg, prev))
+    if prev: raise Err(already_launched(cfg, prev) + (f"; a review takes a name of its own: janus launch <name> --kind review --of {name}" if a.kind == "review" else ""))   # a review under an open unit's name made a second row for it (2026-11-24)
     brief = Path(a.brief) if a.brief else cfg.p("briefs", "briefs") / f"{name}.md"
     if not brief.is_file(): raise Err(f"brief {brief} not found")
     of = next((u for u in units if u["name"] == (a.of or name)), None)
+    if not a.model: a.model = brief_model(cfg, brief)   # the brief's MODEL: line, checked like --model below
     if a.model:   # an explicit model passes the same enabled and budget checks as a routed one (M1)
         if a.model not in cfg.models: raise Err(f"unknown model {a.model}")
         ok, w = model_ok(cfg, a.model)
@@ -661,7 +677,7 @@ def cmd_launch(cfg, a):
     if not hs:
         with cfg.unlocked(): hs = probe_all(cfg)   # the hosts' answers: not under the writer lock; the units are read again after it (another launch may have taken the name or the room)
         units = bd.units(); prev = next((u for u in units if u["name"] == name), None); of = next((u for u in units if u["name"] == (a.of or name)), None)
-        if prev and a.kind != "review": raise Err(already_launched(cfg, prev))
+        if prev: raise Err(already_launched(cfg, prev))
     if getattr(a, "auto", False) and a.item:   # fill: the item may have been launched meanwhile (a manual launch while the hosts answered)
         try: iss = backlog_issues(cfg)
         except Err as e: raise Err(f"refused: beads cannot be read to recheck item {a.item} ({e}): not launched")
@@ -675,7 +691,8 @@ def cmd_launch(cfg, a):
     h = cfg.hosts[hn]; local = h.get("local", False)
     if getattr(a, "new_worktree", None) and a.cwd:   # finding 12: --new-worktree makes its own tree
         raise Err("--cwd with --new-worktree: --new-worktree makes its own worktree (drop --cwd)")
-    if not (a.cwd or getattr(a, "new_worktree", None) or getattr(a, "allow_main", False) or a.of or a.kind == "review"):   # the repository fill uses (REPO:, [fill] repo): the same tree on every host; never for a review, which reads the tree it reviews
+    if a.kind == "review" and a.of and of and of.get("cwd") and not (a.cwd or getattr(a, "new_worktree", None)): a.cwd = of["cwd"]   # a review reads the open unit's tree it reviews
+    if not (a.cwd or getattr(a, "new_worktree", None) or getattr(a, "allow_main", False)):   # the repository fill uses (REPO:, [fill] repo): the same tree on every host, a review of landed work too (one ran in the project root, 2026-11-24)
         from janus.actions.backlog import fill_repo
         a.new_worktree = fill_repo(cfg, name, brief)
     cwd, no_tree = launch_cwd(cfg, a, name)
@@ -747,7 +764,9 @@ def cmd_launch(cfg, a):
     level = level_of(cfg, u)
     if cfg.run.dry: say(f"+ bd create unit:{name}; bd update --status in_progress")
     else:
-        u["id"] = bd.create(f"unit:{name}", "unit", f"{a.kind} on {hn} with {mname}"); u["name"] = name
+        # the record is the description from the start (unit_record reads it until the notes are written): a status reading the
+        # issue between create and save got a record without its host (KeyError 'host', 2026-11-24)
+        u["id"] = bd.create(f"unit:{name}", "unit", json.dumps({k: v for k, v in u.items() if not k.startswith("_")})); u["name"] = name
         bd.run("update", u["id"], "--status", "in_progress"); bd.save(u)
         old = next((x for x in units if x["name"] == getattr(a, "relaunch_of", None)), None)
         if old: bd.save({**old, "relaunched": name})   # the stranded original names its relaunch: check and the monitor pair them when its host returns
@@ -768,7 +787,7 @@ def cmd_launch(cfg, a):
                 rc_, o_, _ = X(cfg, h, "mkdir -p " + " ".join(qp(x) for x in (rcwd, f"{root}/briefs", f"{root}/out/{name}", f"{root}/run", f"{root}/base"))
                                + f" && cd {qp(rcwd)} && pwd -P")
                 if rc_ == 0 and o_.strip().startswith("/"): u["rcwd_abs"] = o_.strip().splitlines()[-1]   # the transcript folder's name (#4)
-                cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
+                cmd = ["rsync", "-a", "--delete", "-e", " ".join(SSH), *EXCL, *foreign_excludes(cfg, hn, h, str(cwd)), f"{cwd}/", f"{h['ssh']}:{rcwd}/"]
                 if cfg.run.dry: say("+ " + shlex.join(cmd))
                 else:
                     rc, o, e = sh(cmd, timeout=900)
@@ -839,7 +858,7 @@ def cmd_launch(cfg, a):
                     agent_res(cfg, hn, h, name, u.get("pid"))
                 else: say(f"+ herdr tab create / agent start {name} --kind {mc['kind']} / agent prompt")
             else:
-                tm = tmux_name(cfg, name)
+                tm = tmux_name(cfg, name); u["_tm"] = tm   # a failed start stops this session (it kept running beside a relaunch: two rows)
                 if per_turn(mc):   # one process per turn: the brief goes on its command line, the session id is janus's own
                     sid = turn_session(name); msgf = f"{h['root']}/run/{name}.msg"
                     u.update(via="tmux", tmux=tm, turns=True, session=sid, pid=start_turn(cfg, h, tm, turn_command(cfg, h, mc, rcwd, env, sid, msgf), prompt, msgf))
@@ -859,6 +878,7 @@ def cmd_launch(cfg, a):
             u = settle_launch(bd, u, snap); u["via"] = "failed"; u.pop("busy", None); bd.save(u); bd.comment(u["id"], f"{ts()} launch failed: {ex}")
             bd.run("close", u["id"], "--reason", "launch failed")
             if u.get("tab"): herdr("tab", "close", u["tab"])
+            if u.get("_tm"): hrun(h, f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; tmux kill-session -t {tmux_target(u["_tm"], False)} 2>/dev/null; true')
         raise
     except Exception:   # a crash: the record stays starting + busy (check names it interrupted); a budget never queued is released
         if not cfg.run.dry: release_unqueued(cfg, mc, u)

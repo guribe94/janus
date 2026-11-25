@@ -37,6 +37,7 @@ FAMILIES = {
     "parked": Family("a parked unit's job can never finish, or its resume failed", urgent=True),
     "pressure": Family("a host's admission is paused by back-pressure", urgent=True),
     "provider": Family("a unit runs on a disabled provider"),
+    "routing": Family("a [routing] list starts with a model that cannot launch (provider disabled, tool or auth not allowed) and no fallback is allowed"),
     "question": Family("an open board question (janus answer q<N> <text>)", urgent=True),
     "scheduler": Family("job-running work outside a host's janus lanes", urgent=True),
     "spend": Family("a provider's committed spend is at its cap or over 80/90 % of it, or an API process janus did not start", urgent=True),

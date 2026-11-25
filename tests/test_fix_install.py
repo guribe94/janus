@@ -715,7 +715,8 @@ class Item12NewWorktree(unittest.TestCase):
                 try: janus.cmd_launch(cfg, self._ns("u1", kind="review", model="c", brief=str(b), allow_main=False))
                 except janus.Err: pass
         finally: janus.Beads, janus.herdr = saved
-        self.assertNotIn("worktree add", out.getvalue())                    # a review reads the tree it reviews: never a fresh copy of main
+        # rig29 item 9: a review of no open unit (landed work) gets the configured repository's tree, not the project root
+        self.assertIn(f"git -C {R.resolve()} worktree add -b u1", out.getvalue())
 
 
 class Item13ForceClose(unittest.TestCase):

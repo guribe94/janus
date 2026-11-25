@@ -3,6 +3,7 @@ from janus.actions.backlog import brief_dir, fill_candidates, fill_plan
 from janus.backlog import backlog_cfg, backlog_issues, item_progress, norm_item
 from janus.units import all_units
 from janus.context import Err, sh
+from janus.ledger import route_unusable
 from janus.platform import watcher_loaded, watcher_service
 
 def git_findings(cfg):
@@ -64,6 +65,9 @@ def orchestrator_findings(cfg):
     if w.get("passes", 0) >= ORCH_WAIT:
         F.append(("orchestrator:unregistered", f"no orchestrator seen for {w['passes']} watcher passes ({w.get('why')}); the watcher starts no other while it "
                   "may be starting: look at its pane, then run janus register in it, or close the pane (herdr pane close) so the watcher starts a new one"))
+    for k, m, why in route_unusable(cfg):
+        F.append((f"routing:{k}", f"[routing] {k} starts with {m}, which cannot launch ({why}), and no fallback is allowed: fill and launch without "
+                  f"--model or MODEL: launch nothing for {k}; put an enabled model first in [routing] {k}, or set fallback = true"))
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but janus.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))

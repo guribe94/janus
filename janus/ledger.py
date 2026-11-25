@@ -259,6 +259,18 @@ def route_ok(cfg, m):
     if r.get("allow_auth") is not None and auth not in r["allow_auth"]: return False, f"auth {auth} (provider {c['provider']}) is not in [routing] allow_auth"
     return True, ""
 
+def route_unusable(cfg):
+    """[(list, model, why)] for each [routing] model list whose first entry route_ok refuses while no fallback is allowed: fill and
+    launch then stop with 'no model available' (or a fill planned on that list launches nothing), a route the config disabled itself
+    (item 10: a project whose orchestrator moved to codex kept [routing] on a disabled Claude provider). Policy keys are not lists."""
+    if cfg.route.get("fallback") is True: return []
+    out = []
+    for k, lst in cfg.route.items():
+        if k in ("allow_tools", "allow_auth", "fallback") or not isinstance(lst, list) or not lst: continue
+        ok, why = route_ok(cfg, lst[0])
+        if not ok: out.append((k, lst[0], why))
+    return out
+
 def model_ok(cfg, m):
     """route_ok, and the provider's ledger and budget for a new run."""
     ok, why = route_ok(cfg, m)
@@ -274,4 +286,4 @@ def model_ok(cfg, m):
 
 RECONCILED = "done unknown"   # a reconciled run: its agent is gone with no done row; its budget is counted as the upper bound
 
-__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_json", "run_time", "session_before", "run_cost", "keep_run_json", "settle_run", "recost_plan", "reconciled_plan", "left_cost", "row_time", "recost", "read_secret", "model_tool", "route_ok", "model_ok", "RECONCILED"]
+__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_json", "run_time", "session_before", "run_cost", "keep_run_json", "settle_run", "recost_plan", "reconciled_plan", "left_cost", "row_time", "recost", "read_secret", "model_tool", "route_ok", "route_unusable", "model_ok", "RECONCILED"]

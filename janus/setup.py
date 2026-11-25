@@ -11,7 +11,7 @@ from janus.context import (CLAIM_WINDOW, CONF, old_layout, Err, JANUS_MARK, JANU
 from janus.beads import Beads
 from janus.hooks import session_start_text
 from janus.reset import log_line
-from janus.ledger import ledger_read, read_secret, spend
+from janus.ledger import ledger_read, read_secret, route_unusable, spend
 from janus.platform import pane_tool, watcher_loaded, watcher_service
 from janus.probe import discover, probe, pueue
 from janus.switch import set_project
@@ -340,6 +340,7 @@ def doctor(cfg, a):
     for tier, lst in route_lists(cfg).items():
         for m in lst:
             if m not in cfg.models: r(False, f"routing {tier}: unknown model {m}", "fix [routing]")
+    for tier, m, why in route_unusable(cfg): r(None, f"routing {tier}: its first model {m} cannot launch ({why}) and fallback is off", f"put an enabled model first in [routing] {tier}, or set fallback = true")
     if cfg.f("migration/PENDING.md").is_file(): r(None, "migration is not final: the bd database and its unit records still name the old root", f"review {cfg.f('migration/PENDING.md')}")
     for w in model_host_warnings(cfg): r(None, w, "drop [models.<m>] hosts to allow every host, or add the missing ones")
     for k, d in (("briefs", "briefs"), ("out", "out")):

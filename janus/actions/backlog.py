@@ -1,7 +1,7 @@
 """janus backlog (import, list, set actor) and janus fill (launch ready backlog units up to capacity)."""
 import argparse, os, re, shlex, stat
 from pathlib import Path
-from janus.actions.launch import brief_plan, choose, cmd_launch, pick_model, place
+from janus.actions.launch import brief_model, brief_plan, choose, cmd_launch, pick_model, place
 from janus.backlog import backlog_cfg, backlog_issues, ready_work, backlog_items, backlog_ready_ids, covered_items, draft_holds, eligible_items, held_text, hold_drafts, item_actors, item_holds, norm_item, stranded_cover, unit_items
 from janus.beads import Beads
 from janus.branch import landing_branch, verify_published
@@ -55,7 +55,7 @@ def cmd_backlog(cfg, a):
     if not cfg.run.dry: cfg.touch("backlog_imported")
     say(f"backlog: {len(items)} checklist items; " + ", ".join(f"{v} {k}" for k, v in n.items()))
 
-BRIEF_KEYS = re.compile(r"^(ITEM|KIND|TIER|TEST-HOST|PRIORITY|BUDGET):\s*(\S+)", re.M)
+BRIEF_KEYS = re.compile(r"^(ITEM|KIND|TIER|TEST-HOST|PRIORITY|BUDGET|MODEL):\s*(\S+)", re.M)
 
 def brief_index(cfg):
     """[(path, unit name, {ITEM, KIND, TIER, TEST-HOST, PRIORITY}, head text)] of every brief, newest first."""
@@ -197,7 +197,7 @@ def fill_plan(cfg, hs, units, limit=None, launch=False, cands=None, missing=None
         return plan, [f"no ready backlog item has an unlaunched brief (a brief is for an item when {bd}/<unit>.md has an ITEM: <id> line)" + miss] + wait + ([hel] if hel else [])
     for pr, order, item, f, name, kind, tier in cands:
         a = argparse.Namespace(unit=name, host=None, test_host=None, kind=kind, tier=tier)
-        try: m = pick_model(cfg, tier, kind)   # unattended: the first route entry or a stated refusal, a fallback only where [routing] fallback = true
+        try: m = brief_model(cfg, Path(f)) or pick_model(cfg, tier, kind)   # the brief's MODEL: line, else the first route entry or a stated refusal (a fallback only where [routing] fallback = true)
         except Err as e: stops.append(f"{name}: {e}"); continue
         mc = cfg.models[m]; budget, bwhy = budget_for(cfg, mc, kind, tier) if mc.get("kind") == "api" else (None, "")
         bl = dict(BRIEF_KEYS.findall("".join(open(f, errors="replace").readlines()[:12]))).get("BUDGET")   # the brief's own BUDGET: $12 line wins over the learned budget

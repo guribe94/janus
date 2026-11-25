@@ -212,6 +212,32 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
 # queued by an agent whose HOME is not the account's found no image (exit 125). A podman job uses the account's own home.
 ACCOUNT_HOME = 'H=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); [ -n "$H" ] && export HOME="$H"\n'
 
+NATIVE = {"mac": (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"), "linux": (b"\x7fELF",)}   # Mach-O 64/32, universal; ELF
+
+def host_os(cfg, hn, h):
+    """'mac' or 'linux' for host hn: here from this machine, else from its discovered facts (janus hosts); None when unknown."""
+    if h.get("local"): return "mac" if sys.platform == "darwin" else "linux"
+    return (cfg.jget("hosts-facts.json").get(hn) or {}).get("os")
+
+def foreign_excludes(cfg, hn, h, src, skip=(".git", "target", ".venv", "node_modules")):
+    """rsync --exclude pairs for each executable file under src built for another OS than host hn's (a Mac-built
+    .firmware-tools/bin/elf2uf2-rs copied into a rigpc worktree, 2026-11-20). A worktree's ignored toolchains are per host: the
+    host keeps its own (an excluded file is also safe from --delete). Paths are anchored at the tree's top; unknown OS: none."""
+    want = host_os(cfg, hn, h); here = "mac" if sys.platform == "darwin" else "linux"
+    if not want: return []
+    bad = tuple(m for o, ms in NATIVE.items() if o != want for m in ms)
+    out = []
+    for dp, dn, fn in os.walk(src):
+        dn[:] = [d for d in dn if d not in skip and not os.path.islink(os.path.join(dp, d))]
+        for f in fn:
+            q = os.path.join(dp, f)
+            try:
+                if os.path.islink(q) or not os.access(q, os.X_OK): continue
+                with open(q, "rb") as fh: head = fh.read(4)
+            except OSError: continue
+            if head.startswith(bad): out += ["--exclude", "/" + os.path.relpath(q, src)]
+    return out
+
 def sync_wt(cfg, hn, h, src, name):
     """Sync a worktree to the host: --checksum and no -t (a changed file gets the transfer time as its mtime, so cargo never
     reuses an artifact built from older content), without the host's sync_exclude list (default .git, target, .venv,
@@ -224,7 +250,7 @@ def sync_wt(cfg, hn, h, src, name):
         rc, o, e = hrun(h, f"[ -d {qp(dst)} ] || cp -a --reflink=always {qp(ctr(h)['clone_base'])} {qp(dst)}", timeout=300)
         if rc: raise Err(f"reflink clone on {hn} failed: {(e or o).strip()[-120:]}")
     rdst = dst.replace("$HOME/", "")   # rsync resolves a relative path under the remote home
-    cmd = ["rsync", "-rlpgoD", "--checksum", "--delete", "-e", " ".join(SSH), *ex, f"{src}/", f"{h['ssh']}:{rdst}/"]
+    cmd = ["rsync", "-rlpgoD", "--checksum", "--delete", "-e", " ".join(SSH), *ex, *foreign_excludes(cfg, hn, h, src), f"{src}/", f"{h['ssh']}:{rdst}/"]
     # Row 233: one sync of a worktree to a host at a time (a gate's steps placed on one host each sync the same tree; parallel
     # rsync --delete runs removed each other's temp files, exit 23). A later one waits, then finds the tree there and sends little.
     import fcntl
