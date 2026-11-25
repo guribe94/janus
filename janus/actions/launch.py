@@ -452,6 +452,10 @@ DIALOGS = [   # startup dialogs janus gets past (fixes5 item 10): (text in the p
     (r"Update available|new version of Codex|Skip until next version", ["Down", "Enter"]),
     (r"Press Enter to continue", ["Enter"])]
 
+BLOCKERS = [   # startup screens janus never answers (trust is the owner's): the start fails at once, naming them
+    (r"\d+\s+hooks?\s+needs?\s+review", "Codex asks to review its hooks (a hook file was rewritten: their event:index moved): the owner trusts them once with /hooks in an interactive codex"),
+]
+
 def past_dialogs(read, send, status=None, tries=10):
     """Get a coding client past its startup dialogs (DIALOGS): None once its screen shows none, else why not. read(): the screen
     text (None: nothing to read, the caller's own check decides); send(*keys); status(): the agent's status where the pane tool
@@ -461,6 +465,8 @@ def past_dialogs(read, send, status=None, tries=10):
     for _ in range(tries):
         txt = read()
         if txt is None: return None
+        stop = next((w for rx, w in BLOCKERS if re.search(rx, txt, re.I)), None)
+        if stop: return stop
         hit = next((k for rx, k in DIALOGS if re.search(rx, txt, re.I)), None)
         if hit: send(*hit); last = None; time.sleep(2); continue
         if status is not None:

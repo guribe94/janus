@@ -29,8 +29,12 @@ def set_hooks(path, on, say=print, dry=False):
     except ValueError: say(f"{path}: not JSON, left as it is"); return False
     old = json.dumps(data, sort_keys=True); hooks = data.setdefault("hooks", {})
     for ev in (*EVENTS, *OLD_EVENTS):
-        keep = [e for e in hooks.get(ev, []) if not is_janus(e)]
-        if on and ev in EVENTS: keep += hooks_json()["hooks"][ev]
+        cur = hooks.get(ev, []); want = hooks_json()["hooks"][ev] if on and ev in EVENTS else []
+        at = next((i for i, e in enumerate(cur) if is_janus(e)), None)
+        # janus's entry stays where it is (Codex keys a hook's trust by event:index: moving it to the end re-asked review of
+        # every hook after another tool wrote the file, and each codex agent stopped at 'N hooks need review'); a new one goes last
+        keep = [e for e in cur if not is_janus(e)]
+        if want: keep[at if at is not None else len(keep):at if at is not None else len(keep)] = want
         if keep: hooks[ev] = keep
         else: hooks.pop(ev, None)
     if not hooks: data.pop("hooks")

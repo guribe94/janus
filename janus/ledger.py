@@ -259,6 +259,13 @@ def route_ok(cfg, m):
     if r.get("allow_auth") is not None and auth not in r["allow_auth"]: return False, f"auth {auth} (provider {c['provider']}) is not in [routing] allow_auth"
     return True, ""
 
+def implausible(cfg, n, runs):
+    """The finished runs of provider n that cost over twice their budget plus $1 (a spend reading that cannot be right), less the
+    ones the owner reviewed and accepted (janus ledger accept: an append-only ledger keeps a real overspend for good, so the urgent
+    finding fired on every status while janus ledger check said 'valid'). check and status use this one rule."""
+    ok = cfg.jget("ledger-accepted.json").get(n, {})
+    return [k for k, r in runs.items() if r["done"] and r["budget"] and r["cost"] > 2 * r["budget"] + 1 and k not in ok]
+
 def route_unusable(cfg):
     """[(list, model, why)] for each [routing] model list whose first entry route_ok refuses while no fallback is allowed: fill and
     launch then stop with 'no model available' (or a fill planned on that list launches nothing), a route the config disabled itself
@@ -286,4 +293,4 @@ def model_ok(cfg, m):
 
 RECONCILED = "done unknown"   # a reconciled run: its agent is gone with no done row; its budget is counted as the upper bound
 
-__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_json", "run_time", "session_before", "run_cost", "keep_run_json", "settle_run", "recost_plan", "reconciled_plan", "left_cost", "row_time", "recost", "read_secret", "model_tool", "route_ok", "route_unusable", "model_ok", "RECONCILED"]
+__all__ = ["OVERSHOOT_PCT", "reserved", "budget_of", "ledger_path", "ledger_parse", "ledger_read", "spend", "committed", "ledger_append", "tstamp", "reserve_budget", "ledger_done", "run_json", "run_time", "session_before", "run_cost", "keep_run_json", "settle_run", "recost_plan", "reconciled_plan", "left_cost", "row_time", "recost", "read_secret", "model_tool", "route_ok", "route_unusable", "implausible", "model_ok", "RECONCILED"]

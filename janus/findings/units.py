@@ -4,7 +4,7 @@ import time
 from janus.actions.jobs import job_state, unit_jobs
 from janus.board import board_questions, board_rows
 from janus.context import now
-from janus.ledger import ledger_read, recost_plan, spend
+from janus.ledger import implausible, ledger_read, recost_plan, spend
 from janus.platform import herdr, herdr_text
 from janus.probe import live_units
 from janus.project import project_id
@@ -130,10 +130,10 @@ def ledger_findings(cfg, units):
         if "ledger" in pv:
             bad = ledger_read(cfg, pv)[1]
             if bad: F.append((f"ledger:{n}", f"{n} ledger {pv['ledger']} is malformed ({len(bad)} problem(s): {bad[0][:90]}); every launch is refused: janus ledger check, janus ledger repair"))
-            runs = ledger_read(cfg, pv)[0]; odd = [k for k, r in runs.items() if r["done"] and r["budget"] and r["cost"] > 2 * r["budget"] + 1]
+            runs = ledger_read(cfg, pv)[0]; odd = implausible(cfg, n, runs)   # the rule janus ledger check lists too
             if odd or ("cap_usd" in pv and spend(runs) > 1.5 * pv["cap_usd"]):   # issue 39: a spend reading that cannot be right
                 F.append((f"ledger:{n}:implausible", f"{n} spend reading implausible: ${spend(runs):.2f} committed" + (f" vs cap ${pv['cap_usd']}" if "cap_usd" in pv else "")
-                          + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": janus ledger check"))
+                          + (f"; runs costing over twice their budget: {', '.join(odd[:3])}" if odd else "") + ": janus ledger check names them; a reviewed overspend: janus ledger accept <run> --why <text>"))
             rc = recost_plan(cfg, pv) if not bad else []   # rows that charge a resumed run its session's whole total again
             if rc: F.append((f"ledger:{n}:recost", f"{len(rc)} {n} done row(s) charge a resumed run its session's whole total again (${sum(c - own for _, _, c, own in rc):.2f} "
                              f"counted twice: {', '.join(x[0] for x in rc[:3])}): janus ledger recost --dry-run, then janus ledger recost"))

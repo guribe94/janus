@@ -8,7 +8,7 @@ from janus.board import board, board_dir
 from janus.budgets import OUTCOMES, run_outcomes
 from janus.context import Err, Locked, NUM, atomic_write, memory_path, refuse_agent, say, slug, ts
 from janus.findings.units import unreconciled
-from janus.ledger import RECONCILED, ledger_done, ledger_path, ledger_read, committed, left_cost, recost, recost_plan, reconciled_plan, spend
+from janus.ledger import RECONCILED, implausible, ledger_done, ledger_path, ledger_read, committed, left_cost, recost, recost_plan, reconciled_plan, spend
 from janus.memory import MEM_SECTIONS, mem_line, memory_history, memory_read, memory_write
 from janus.probe import probe_all
 from janus.transcripts import read_transcript
@@ -22,6 +22,16 @@ def cmd_ledger(cfg, a):
     pvs = [(n, pv) for n, pv in cfg.prov.items() if "ledger" in pv and (not a.provider or n == a.provider)]
     if not pvs: raise Err("no provider has a ledger in janus.toml")
     worst = 0
+    if a.action == "accept":   # a reviewed overspend: out of the implausible finding, kept in the ledger as it is
+        if not cfg.run.dry: refuse_agent("janus ledger accept")
+        run, why = getattr(a, "run", None), (getattr(a, "why", None) or "").strip()
+        if not run or not why: raise Err("janus ledger accept <run> --why <text>: the run the owner reviewed and why its cost stands")
+        hit = [(n, pv) for n, pv in pvs if run in ledger_read(cfg, pv)[0]]
+        if not hit: raise Err(f"no run {run} in any ledger")
+        n = hit[0][0]; r = ledger_read(cfg, hit[0][1])[0][run]
+        if cfg.run.dry: say(f"+ accept {run} ({n}): ${r['cost'] or 0:.2f} of budget ${r['budget'] or 0:g}: {why}"); return 0
+        acc = cfg.jget("ledger-accepted.json"); acc.setdefault(n, {})[run] = {"why": why, "at": int(time.time()), "cost": r["cost"], "budget": r["budget"]}
+        cfg.jput("ledger-accepted.json", acc); say(f"{n}: {run} accepted (${r['cost'] or 0:.2f} of budget ${r['budget'] or 0:g}): {why}"); return 0
     if a.action == "recost":   # rows that charge a resumed run its session's whole total: each run pays its own part (once)
         if not cfg.run.dry: refuse_agent("janus ledger recost")
         for n, pv in pvs:
@@ -61,6 +71,9 @@ def cmd_ledger(cfg, a):
             say(f"{n}: {p}: {sum(len(r['running']) + len(r['done']) for r in runs.values())} rows, {len(runs)} runs, "
                 f"${spend(runs):.2f} committed" + (f" of ${pv['cap_usd']}" if "cap_usd" in pv else "") + (f"; MALFORMED, {len(bad)} problem(s):" if bad else "; valid"))
             for x in bad[:20] + notes[:10]: say("  " + x)
+            for k in implausible(cfg, n, runs):   # what status names ledger:<provider>:implausible for: never a silent 'valid'
+                say(f"  implausible: {k} cost ${runs[k]['cost']:.2f}, over twice its budget ${runs[k]['budget']:g} (a double count: janus ledger recost --dry-run; "
+                    f"a real overspend you reviewed: janus ledger accept {k} --why <text>)")
             if len(bad) > 20: say(f"  ... {len(bad) - 20} more")
             worst = max(worst, 1 if bad else 0); continue
         if cfg.run.dry: say(f"+ back up {p}, keep the first running and done row per run id, write-then-rename"); continue

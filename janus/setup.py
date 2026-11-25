@@ -235,6 +235,16 @@ def codex_hooks_check(cfg):
     miss = [ev for ev in CODEX_HOOK_EVENTS if not any("janus hook " + ev in h.get("command", "") for e in hk.get(ev, []) for h in e.get("hooks", []))]
     if miss: say(f"Codex: janus hooks are missing ({', '.join(miss)}): run ./install, then trust them once with /hooks")
     else: say("Codex: janus hooks installed; trust them once with /hooks (Codex keeps its own trust store, which janus does not read)")
+    # Codex keys trust by event:index: positions that moved since the last check (another tool rewrote the file, e.g. a herdr
+    # integration install or a plugin resync) mean every codex agent will stop at 'N hooks need review'
+    at = {ev: next((i for i, e in enumerate(hk.get(ev, [])) if any("janus hook " in h.get("command", "") for h in e.get("hooks", []))), None) for ev in CODEX_HOOK_EVENTS}
+    sf = Path.home() / ".local/share/janus/codex-hook-index.json"
+    try: was = json.loads(sf.read_text())
+    except (OSError, ValueError): was = None
+    moved = [f"{ev} {was.get(ev)}->{i}" for ev, i in at.items() if was is not None and was.get(ev) != i]
+    if moved: say(f"Codex: janus hook positions moved since the last check ({', '.join(moved)}): Codex will ask to review its hooks again; trust them once with /hooks")
+    try: sf.parent.mkdir(parents=True, exist_ok=True); sf.write_text(json.dumps(at))
+    except OSError: pass
 
 def cmd_resume_orch(cfg, a):
     """janus resume [--runtime claude|codex] [--here]: continue the orchestration in a new session with nothing lost. The state

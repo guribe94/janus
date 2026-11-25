@@ -462,4 +462,47 @@ class Tidy(unittest.TestCase):
         self.assertEqual(cmds, [None, 90])                                                           # a read is asked once more, longer
 
 
+class LedgerAndCodexHooks(unittest.TestCase):
+    """Items 28, 29."""
+
+    def test_check_names_the_implausible_run_and_an_accepted_one_leaves_the_finding(self):
+        """Catches item 28: [ledger:claude_api:implausible] on every status for one run over twice its budget, while janus ledger
+        check said 'valid' (two rules), and no way to record a reviewed overspend in an append-only ledger."""
+        d, cfg = project(); pv = cfg.prov["api"]; mc = cfg.models["m"]
+        janus.ledger_done(cfg, pv, janus.reserve_budget(cfg, mc, "flir", 2, "flir.r4.1"), "flir", 6.5, 0)
+        with mock.patch.object(janus, "all_units", lambda c: {}):
+            self.assertIn("ledger:api:implausible", dict(janus.ledger_findings(cfg, [])))
+        A = lambda act, **k: argparse.Namespace(**{"action": act, "provider": None, "run": None, "why": None, **k})
+        with contextlib.redirect_stdout(io.StringIO()) as o: janus.cmd_ledger(cfg, A("check"))
+        self.assertIn("implausible: flir.r4.1 cost $6.50, over twice its budget $2", o.getvalue())
+        with self.assertRaises(janus.Err): janus.cmd_ledger(cfg, A("accept", run="flir.r4.1"))          # a why is needed
+        with contextlib.redirect_stdout(io.StringIO()): janus.cmd_ledger(cfg, A("accept", run="flir.r4.1", why="owner reviewed: long firmware run"))
+        with mock.patch.object(janus, "all_units", lambda c: {}):
+            self.assertNotIn("ledger:api:implausible", dict(janus.ledger_findings(cfg, [])))
+        with contextlib.redirect_stdout(io.StringIO()) as o: janus.cmd_ledger(cfg, A("check"))
+        self.assertNotIn("implausible", o.getvalue())
+
+    def test_janus_hooks_keep_their_place_in_codex_hooks_json(self):
+        """Catches item 29: set_hooks moved janus's entries to the end of each event list, so after another tool wrote the file
+        every install reordered it; Codex keys trust by event:index and every codex agent stopped at 'N hooks need review'."""
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t, "hooks.json"); herdr = {"hooks": [{"type": "command", "command": "herdr hook PreToolUse"}]}
+            jan = janus.hooks_json()["hooks"]
+            f.write_text(json.dumps({"hooks": {ev: [jan[ev][0], herdr] for ev in jan}}, indent=2) + "\n"); before = f.read_bytes()
+            self.assertFalse(janus.set_hooks(f, True, say=lambda *a: None)); self.assertEqual(f.read_bytes(), before)
+            stale = {ev: [{"hooks": [{"type": "command", "command": "/old/janus hook " + ev, "timeout": 60}]}, herdr] for ev in jan}
+            f.write_text(json.dumps({"hooks": stale}))
+            self.assertTrue(janus.set_hooks(f, True, say=lambda *a: None))
+            got = json.loads(f.read_text())["hooks"]
+            for ev in jan: self.assertEqual(got[ev], [jan[ev][0], herdr], ev)                           # replaced where it stood
+            f.write_text(json.dumps({"hooks": {"Stop": [herdr]}})); janus.set_hooks(f, True, say=lambda *a: None)
+            self.assertEqual(json.loads(f.read_text())["hooks"]["Stop"][0], herdr)                       # a new entry goes last
+
+    def test_codex_asking_to_review_hooks_fails_the_start_and_is_never_answered(self):
+        sent = []
+        with mock.patch("time.sleep", lambda s: None):
+            why = janus.past_dialogs(lambda: "OpenAI Codex\n 2 hooks need review\n Review now / Later", lambda *k: sent.append(k))
+        self.assertIn("/hooks", why); self.assertEqual(sent, [])
+
+
 if __name__ == "__main__": unittest.main()
