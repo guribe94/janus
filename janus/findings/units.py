@@ -94,7 +94,9 @@ def unit_findings(cfg, hs, units, ag):
                       "answer it, or stop and relaunch it"))
         b = busy_dead(u)
         if b: F.append((f"unit:{u['name']}:interrupted", f"{u['name']}: its {b['op']} (pid {b.get('pid')}) stopped before it finished, so the unit is marked {'starting' if b['op'] == 'launch' else 'closing'}: "
-                        + ("janus cancel / close it and launch again (its host copy and budget run are named in the record)" if b["op"] == "launch" else f"run janus close {u['name']} again (it skips the checks that already passed)")))
+                        + ("janus cancel / close it and launch again (its host copy and budget run are named in the record)" if b["op"] == "launch" else
+                           f"run janus close {u['name']} again to finish it (its verdict and git checks run again)" if u.get("removing") else
+                           f"janus close {u['name']} --abort reopens it (nothing was removed yet: resume, collect or land it), or janus close {u['name']} again (its verdict and git checks run again)")))
         if st == "blocked":
             scr = [l.strip() for l in (herdr_text("agent", "read", u["name"], "--source", "visible", "--lines", "40") or "").splitlines() if l.strip(" ─│╭╮╰╯")]
             F.append((f"unit:{u['name']}:blocked", f"{u['name']} blocked on: {' / '.join(scr[-6:])[-300:] or 'its screen could not be read'}; "

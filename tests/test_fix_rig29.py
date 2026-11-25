@@ -265,4 +265,86 @@ class Jobs(unittest.TestCase):
             with self.assertRaises(janus.Err): janus.cancel_job(cfg, "here:999")
 
 
+from test_dispatch import LandingBase, out
+
+
+class CollectCloseLandBacklog(LandingBase):
+    """Items 15-20."""
+
+    def test_the_report_is_brought_here_when_the_bulk_copy_times_out(self):
+        """Catches item 15: a 17-byte placeholder REPORT.md stayed here while the host held the full report (the one rsync of a
+        bulky out/<unit>/ timed out)."""
+        cfg = self.cfg; cfg.hosts["far"] = {"ssh": "u@far", "root": "/r"}; calls = []
+        def sh(cmd, **k):
+            calls.append(cmd); return (0, "", "") if any(str(x).endswith("REPORT.md") for x in cmd) else (124, "", "timeout")
+        with mock.patch.object(janus, "sh", sh):
+            u = {"name": "u", "host": "far", "via": "tmux"}
+            self.assertFalse(janus.save_output(cfg, u))
+        self.assertIn("u@far:/r/out/u/REPORT.md", calls[0]); self.assertIn("u@far:/r/out/u/report.json", calls[0])
+        self.assertIn("timed out after 600 s", u["_sync_error"]); self.assertIn("its REPORT.md was brought here", u["_sync_error"])
+
+    def test_force_close_of_a_root_unit_is_allowed_and_a_beads_failure_says_so(self):
+        """Item 16: 'project root is shared' came from a release before 0a1fb74; today a unit in the project root may be force-closed,
+        and a hook that cannot read beads says that, not the owner's rule."""
+        root = {"id": "r1", "name": "a87", "cwd": str(self.cfg.root)}
+        self.assertIsNone(janus.force_close_refusal(self.cfg, root, [root]))
+        B = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: (_ for _ in ()).throw(janus.Err("bd list: bd: timeout"))})
+        with mock.patch.object(janus, "Beads", B):
+            why = janus.force_close_why(self.cfg, ["close", "a87", "--force"])
+        self.assertIn("beads could not be read", why); self.assertNotIn("shared", why)
+
+    def test_an_owner_accepted_item_needs_only_a_published_commit(self):
+        """Catches item 17: A80, accepted by the owner, could not be set DONE: its last unit had no land record, janus land had no
+        worktree, and --commit needed a sha the unit's report named."""
+        self.w.issue("X1"); sha = git(self.wt, "rev-parse", "HEAD"); git(self.wt, "push", "-q", "origin", "HEAD:main")
+        rep = self.d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True, exist_ok=True); rep.write_text("VERDICT: DONE\n")
+        A = lambda **k: type("A", (), {"action": "set", "args": ["X1", "status=DONE"], "unit": "u", "commit": None, "owner_accepted": None, **k})()
+        with self.assertRaises(janus.Err) as e: out(janus.cmd_backlog, self.cfg, A(commit=sha[:9]))
+        self.assertIn("--owner-accepted", str(e.exception))
+        with self.assertRaises(janus.Err) as e: out(janus.cmd_backlog, self.cfg, A(owner_accepted="owner 11-24"))
+        self.assertIn("needs --commit", str(e.exception))
+        out(janus.cmd_backlog, self.cfg, A(commit=sha[:9], owner_accepted="owner accepted A80 on 2026-11-24"))
+        self.assertIn(f"| X1 | one | DONE | {sha[:12]} |", (self.d / "S.md").read_text())
+        self.assertIn("owner accepted: owner accepted A80", [x for x in self.w.writes if x[0] == "close"][0][3])
+        with self.assertRaises(janus.Err) as e: out(janus.cmd_backlog, self.cfg, A(commit="f" * 12, owner_accepted="x"))   # still verified on the landing branch
+        self.assertRegex(str(e.exception), "not on origin/main|cannot be verified")
+
+    def test_acceptance_is_the_orchestrators_and_a_bulk_import_is_said_first(self):
+        """Catches item 18: ten checklist rows closed as DONE in beads (close reason 'checklist: DONE (unit <x>, <sha>)', the acceptance's
+        own) by units whose agents ran janus backlog set; and an import that closes many items at once did so silently."""
+        self.w.issue("X1")
+        with mock.patch.dict(os.environ, {"JANUS_ROLE": "agent"}):
+            with self.assertRaises(janus.Err) as e: out(janus.cmd_backlog, self.cfg, type("A", (), {"action": "set", "args": ["X1", "status=DONE"], "unit": "u", "commit": None})())
+        self.assertIn("orchestrator's", str(e.exception))
+        self.w.issue("X2"); (self.d / "S.md").write_text((self.d / "S.md").read_text().replace("| X1 | one | READY |", "| X1 | one | DONE |").replace("| X2 | two | READY |", "| X2 | two | DONE |"))
+        with self.assertRaises(janus.Err) as e: out(janus.cmd_backlog, self.cfg, type("A", (), {"action": "import", "args": [], "yes": False})())
+        self.assertIn("2 open items done: X1, X2", str(e.exception)); self.assertEqual([x for x in self.w.writes if x[0] == "close"], [])
+        out(janus.cmd_backlog, self.cfg, type("A", (), {"action": "import", "args": [], "yes": True})())
+        self.assertEqual(sorted(x[1] for x in self.w.writes if x[0] == "close"), ["b-X1", "b-X2"])
+
+    def test_one_item_without_a_row_does_not_skip_the_others(self):
+        """Catches item 19: the writeback stopped at the first item without a row (cp12, cc-02), so every item after it got no evidence."""
+        rep = self.d / ".janus/out/u/REPORT.md"; rep.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(janus, "unit_items", lambda cfg, us, *a: {"cc-02", "x1"}):
+            rc, txt = self.land()
+        self.assertEqual(rc, 0, txt); tip = self.u["published"]["commit"]
+        self.assertIn(f"| X1 | one | READY | {tip[:12]} |", (self.d / "S.md").read_text())
+        self.assertEqual(self.u["published"]["writeback"], "done"); self.assertIn("no row of cc-02", txt)
+
+    def test_an_interrupted_close_can_be_undone_until_its_cleanup_began(self):
+        """Catches item 20: a unit stuck 'closing' (its close died) with a PENDING verdict and unlanded changes: resume and collect
+        refused it, a second close refused the same checks, and nothing cleared the mark."""
+        dead = {"op": "close", "pid": 999999999, "at": 1}
+        self.u.update(closing=True, busy=dead)
+        _, txt = out(janus.cmd_close, self.cfg, type("A", (), {"unit": "u", "force": False, "reason": None, "abort": True})())
+        self.assertIn("undone", txt)
+        self.u.update(closing=True, busy=dead, removing=True)
+        with self.assertRaises(janus.Err) as e: out(janus.cmd_close, self.cfg, type("A", (), {"unit": "u", "force": False, "reason": None, "abort": True})())
+        self.assertIn("close u again", str(e.exception))
+
+
+def git(c, *a):
+    return subprocess.run(["git", "-C", str(c), *a], capture_output=True, text=True, check=True).stdout.strip()
+
+
 if __name__ == "__main__": unittest.main()

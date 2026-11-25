@@ -279,7 +279,7 @@ def collect_scoped(cfg, a, sub):
     if ":" in a.unit: raise Err(f"--subdir is for a remote unit, not a job ({a.unit})")
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; n = u["name"]
     if h.get("local"): raise Err(f"--subdir: {n} is a local unit: its tree is here, nothing to recover")
-    if u.get("closing"): raise Err(f"{n} is being closed: its copy on {u['host']} is being removed (janus close {n} finishes it)")
+    if u.get("closing"): raise Err(f"{n} is being closed: its copy on {u['host']} is being removed (janus close {n} finishes it; an interrupted close that removed nothing: janus close {n} --abort)")
     od = cfg.p("out", "out") / n; p = (od / SCOPED_PATCH).resolve()
     prc, _, perr = remote_patch(cfg, h, n, SCOPED_PATCH, sub)
     if prc: raise Err(f"collect {n} --subdir {sub}: NO PATCH could be made on {u['host']} (exit {prc}): {(perr or '').strip()[-1500:] or 'no message'}"
@@ -321,7 +321,7 @@ def cmd_collect(cfg, a):
         with cfg.command_writer(): return collect_job(cfg, a.unit)
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]
     if h.get("local"): say("local unit: nothing to collect"); return
-    if no_remote_copy(u) and u.get("closing"): raise Err(f"{u['name']} is being closed: its copy on {u['host']} is being removed (janus close {u['name']} finishes it)")
+    if no_remote_copy(u) and u.get("closing"): raise Err(f"{u['name']} is being closed: its copy on {u['host']} is being removed (janus close {u['name']} finishes it; an interrupted close that removed nothing: janus close {u['name']} --abort)")
     root = h["root"]; n = u["name"]; od = cfg.p("out", "out") / n
     # The agent's changes come back as a patch against the tree it was sent (base/<unit>), never as an rsync over the Mac
     # checkout, which may have moved on or be shared (H9). Apply it with git apply --3way in the unit's worktree (the patch
@@ -407,8 +407,22 @@ def close_reason(cfg, u):
     v = verdict(cfg, u)
     return "done" if str(v).startswith("VERDICT: DONE") else (v or "no final verdict")[:200]
 
+def close_abort(cfg, bd, u):
+    """janus close <unit> --abort: a close that died after it marked the unit closing and before its cleanup began is undone, so the
+    unit can be resumed, collected or landed (sweep-review-cc11-temporal-panel sat closing with a PENDING verdict and unlanded changes:
+    resume and collect refused it, and a second close refused the same checks). Refused while that close runs, or once its cleanup began."""
+    n = u["name"]
+    if not u.get("closing"): raise Err(f"{n} is not being closed: nothing to abort")
+    if u.get("busy") and not busy_dead(u): raise Err(f"{n}: its close is running (pid {u['busy'].get('pid')}): wait for it")
+    if u.get("removing"): raise Err(f"{n}: its close began removing its copy and tab: run janus close {n} again to finish it")
+    if cfg.run.dry: say(f"+ {n}: clear its closing mark"); return
+    with cfg.writer():
+        u = next((x for x in bd.units() if x["id"] == u["id"]), u); u.pop("closing", None); u.pop("busy", None); bd.save(u)
+    say(f"{n}: the interrupted close is undone; it is open again (resume, collect, land or close it)")
+
 def cmd_close(cfg, a):
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; units = bd.units()
+    if getattr(a, "abort", False): return close_abort(cfg, bd, u)
     handover = bool(getattr(a, "handover", False)); dup = getattr(a, "duplicate_of", None)
     redo = bool(u.get("closing")) and bool(busy_dead(u))   # a close that was interrupted: its checks passed then, the remote cleanup is repeated
     if u.get("busy") and not busy_dead(u): raise Err(f"{u['name']}: a {u['busy']['op']} of it is running (pid {u['busy'].get('pid')}); wait for it")
@@ -444,7 +458,7 @@ def cmd_close(cfg, a):
     with cfg.unlocked():   # the fingerprint and the probe ask the unit's host: an ack must not wait for them
         why = None if skip_guard or cfg.run.dry or redo else uncollected(cfg, u)
         st = unit_state(u, probe_all(cfg), herdr_agents(cfg)) if handover and not cfg.run.dry else None
-    if why: raise Err(f"refused: {u['name']}: {why}")
+    if why: raise Err(f"refused: {u['name']}: " + (why.replace(", or --force", " (--force keeps this guard for a unit without a tree of its own: its host copy is the only copy of its work)") if a.force else why))
     if handover and not cfg.run.dry:   # never close a predecessor whose agent is still running (finding 3; finding 5: unknown too)
         if agent_live(u, st):
             what = f"still {st}" if st != "unknown" else "in an unknown state (its host could not say whether it runs)"
@@ -465,6 +479,7 @@ def cmd_close(cfg, a):
     if why3:
         if not cfg.run.dry: u = next((x for x in bd.units() if x["id"] == u["id"]), u); u.pop("closing", None); u.pop("busy", None); bd.save(u)
         raise Err(f"refused: {u['name']}: {why3} (it changed while the close was starting): commit and push, or land it, then close again")
+    if not cfg.run.dry: u["removing"] = True; bd.save(u)   # from here a close is finished, never aborted (close_abort)
     with cfg.unlocked():
         close_tab(cfg, u)
         if u.get("via") == "tmux" and not gone: X(cfg, h, f"tmux kill-session -t {shlex.quote('=' + unit_tmux(u))} 2>/dev/null; true")   # =: that name only, never a prefix match (a relaunch janus-<unit>-r2); its pid holds the agent's reservation
@@ -682,7 +697,8 @@ def resume_outside_lock(cfg, bd, u, make_msg, budget=None):
     retaken after it; the mark is cleared when the resume ended (done or failed). Where the lock cannot be retaken (LockLost) the resume
     ran but its record was not written: the mark stays and check names the unit interrupted."""
     if cfg.run.dry: return resume_unit(cfg, u, make_msg(), budget=budget)
-    if u.get("busy"): raise Err(f"{u['name']}: a {u['busy'].get('op')} of it " + ("is running" if not busy_dead(u) else "was interrupted") + f" (pid {u['busy'].get('pid')}): no second resume beside it; janus check names it")
+    if u.get("busy"): raise Err(f"{u['name']}: a {u['busy'].get('op')} of it " + ("is running" if not busy_dead(u) else "was interrupted") + f" (pid {u['busy'].get('pid')}): no second resume beside it; "
+                                + (f"undo an interrupted close with janus close {u['name']} --abort" if busy_dead(u) and u.get("closing") else "janus check names it"))
     u["busy"] = busy_mark("resume"); bd.save(u)
     try:
         with cfg.unlocked(): line = resume_unit(cfg, u, make_msg(), budget=budget)
@@ -761,8 +777,14 @@ def save_output(cfg, u):
     cmd = ["rsync", "-a", "--exclude", "*.key", "-e", " ".join(SSH), f"{h['ssh']}:{h['root']}/out/{n}/", str(od) + "/"]
     if cfg.run.dry: say("+ " + shlex.join(cmd)); return True
     od.mkdir(parents=True, exist_ok=True)
+    # the report first, on its own: a bulky output folder that timed out left the 17-byte seed here while the host held the report
+    src = f"{h['ssh']}:{h['root']}/out/{n}/"
+    rr = sh(["rsync", "-a", "--ignore-missing-args", "-e", " ".join(SSH), src + "REPORT.md", src + "report.json", str(od) + "/"], timeout=120)
     rc, o, e = sh(cmd, timeout=600)
-    if rc: u["_sync_error"] = f"exit {rc}: {(e or o).strip()[-160:]}"; return False
+    if rc:
+        u["_sync_error"] = (f"timed out after 600 s copying out/{n}/ (its bulky files: janus tidy)" if rc == 124 else f"exit {rc}: {(e or o).strip()[-160:]}") \
+            + ("; its REPORT.md was brought here" if rr[0] == 0 else f"; its REPORT.md was not brought here either (exit {rr[0]})")
+        return False
     if u.get("via") == "pueue" and u.get("task") is not None: save_task_log(cfg, h, u, u["task"])
     return True
 

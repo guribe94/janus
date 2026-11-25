@@ -6,15 +6,16 @@ from janus.backlog import backlog_cfg, backlog_issues, ready_work, backlog_items
 from janus.beads import Beads
 from janus.branch import landing_branch, verify_published
 from janus.budgets import budget_for, finish_reserve
-from janus.context import Err, atomic_write, say, sh, slug, ts
+from janus.context import Err, atomic_write, refuse_agent, say, sh, slug, ts
 from janus.ledger import committed, reserved
 from janus.probe import host_liveness, probe_all, stranded_hosts
 from janus.units import all_units, herdr_agents, report_path, report_text, unit_any, unit_state
 
 def cmd_backlog(cfg, a):
+    if a.action in ("set", "import") and not cfg.run.dry: refuse_agent(f"janus backlog {a.action}")   # an item's acceptance and the import are the orchestrator's (agent units accepted items, 2026-11-19)
     if a.action == "set":   # janus backlog set <id> actor=<x>
         if not a.args or len(a.args) != 2 or not a.args[1].startswith(("actor=", "hold=", "status=")): raise Err("usage: janus backlog set <item id> actor=<agent|owner|hardware|...> | hold=<reason> (hold=off: no longer held) | status=DONE --unit <unit>")
-        if a.args[1].startswith("status="): return accept_item(cfg, a.args[0], a.args[1][7:], getattr(a, "unit", None), getattr(a, "commit", None))
+        if a.args[1].startswith("status="): return accept_item(cfg, a.args[0], a.args[1][7:], getattr(a, "unit", None), getattr(a, "commit", None), getattr(a, "owner_accepted", None))
         iss = backlog_issues(cfg); x = issue_of(iss, a.args[0])
         if not x: raise Err(f"no backlog item {a.args[0]} in beads (janus backlog import first)")
         if a.args[1].startswith("hold="):   # rows 29/99: an item parked on purpose is not idle backlog until the hold is taken off
@@ -37,6 +38,10 @@ def cmd_backlog(cfg, a):
                    if k in hold and not d else ""))
         return
     bd = Beads(cfg); ex = backlog_issues(cfg); n = {"created": 0, "updated": 0, "closed": 0, "reopened": 0, "same": 0}
+    shut = [i for i, t, st, d, rd in items if d and (ex.get(f"backlog:{i}") or {}).get("status") not in (None, "closed")]
+    if len(shut) > 1 and not getattr(a, "yes", False) and not cfg.run.dry:   # an import that closes many items at once is said, not done
+        raise Err(f"the checklist now marks {len(shut)} open items done: {', '.join(shut[:20])}{'...' if len(shut) > 20 else ''}; "
+                  "check each was accepted (janus backlog set <item> status=DONE --unit <unit> records an acceptance), then janus backlog import --yes")
     for i, t, st, d, rd in items:
         ref = f"backlog:{i}"; labels = ["backlog", "status:" + (slug(st) or "none")] + (["backlog-ready"] if rd else [])
         x = ex.get(ref); title = f"backlog: {i} {t}"[:150]
@@ -402,7 +407,7 @@ def checklist_set(cfg, item, status=None, evidence=None):
     if did and not cfg.run.dry: lines[n] = l; atomic_write(p, "\n".join(lines))
     return did
 
-def accept_item(cfg, item, status, unit, commit=None):
+def accept_item(cfg, item, status, unit, commit=None, owner=None):
     """janus backlog set <item> status=DONE --unit <unit> [--commit <sha>] [--dry-run]: the owner's explicit acceptance of a whole
     item, never a side effect of a landing or a close. The unit must be linked to the item (its --item or brief ITEM: line) and its
     landing publication recorded (janus land --push), or, for a unit whose agent pushed without janus land or verified the work already there, --commit:
@@ -425,10 +430,13 @@ def accept_item(cfg, item, status, unit, commit=None):
         raise Err(f"{unit} is not linked to item {item} (its --item or its brief's ITEM: line names {', '.join(sorted(unit_items(cfg, [u], iss))) or 'nothing known'}): refused; "
                   f"units linked to {item}: {', '.join(ln) or 'none'}")
     pub = u.get("published") or {}
+    if (owner or "").strip() and not commit: raise Err("--owner-accepted needs --commit <sha>: the published commit the owner accepted the item on")
     if commit:
         if pub.get("commit"): raise Err(f"{unit}'s publication is recorded ({pub['commit'][:12]}): --commit is only for a unit pushed without janus land")
-        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit) or commit.lower() not in report_text(cfg, u).lower():
-            raise Err(f"--commit {commit}: not a commit {unit}'s report names ({report_path(cfg, u)}): {item} is not accepted")
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit): raise Err(f"--commit {commit}: not a commit id")
+        if commit.lower() not in report_text(cfg, u).lower() and not (owner or "").strip():   # --owner-accepted: the owner's word (A80: its last unit had no land record and land no worktree)
+            raise Err(f"--commit {commit}: not a commit {unit}'s report names ({report_path(cfg, u)}): {item} is not accepted "
+                      f"(an item the owner accepted on that published commit: add --owner-accepted '<why>')")
         pub = {"commit": commit, "remote": "origin", "branch": landing_branch(cfg, published_repo(cfg, u))}
     if not pub.get("commit"): raise Err(f"{unit} has no verified publication recorded (janus land {unit} --push records it; a commit its agent pushed itself: --commit <sha>): {item} is not accepted")
     repo = published_repo(cfg, u)
@@ -442,7 +450,7 @@ def accept_item(cfg, item, status, unit, commit=None):
     with cfg.writer(): did = checklist_set(cfg, item, dn[0], sha)   # short: one read and one rename of the file (the lock itself, an agent's call too)
     say(f"{item}: " + ("; ".join(did) if did else f"the checklist already says {dn[0]} with {sha}"))
     if x.get("status") == "closed": say(f"{item}: beads issue {x['id']} already closed"); return 0
-    try: Beads(cfg).run("close", x["id"], "--reason", f"checklist: {dn[0]} (unit {unit}, {sha})")
+    try: Beads(cfg).run("close", x["id"], "--reason", f"checklist: {dn[0]} (unit {unit}, {sha})" + (f"; owner accepted: {owner.strip()[:120]}" if (owner or "").strip() else ""))
     except Err as e: raise Err(f"{item}: the checklist is updated ({dn[0]}, evidence {sha}), but the beads sync is incomplete: issue {x['id']} was not closed ({e}). "
                                f"Run the same command again: it changes nothing more in the checklist and closes the issue")
     say(f"{item}: beads issue {x['id']} closed"); return 0

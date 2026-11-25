@@ -192,12 +192,15 @@ def land_writeback(cfg, u, pub):
     if cfg.run.dry: say(f"+ checklist {', '.join(items) or '(no item)'}: evidence {sha}"); return
     if not items: res = "done"; say(f"note: {u['name']} names no backlog item (--item or ITEM:): no checklist evidence to write")
     else:
-        try:
-            with cfg.writer(): did = [checklist_set(cfg, i, evidence=sha) for i in items]   # short: a read and a rename of the file
-            res = "done"; say(f"checklist: {', '.join(items)}: " + ("evidence " + sha if any(did) else f"evidence {sha} already there") + "; status unchanged")
-        except (Err, OSError) as e:
-            res = f"incomplete: {e}"[:300]
-            say(f"WARNING: checklist writeback incomplete for {', '.join(items)} ({e}): the landing is published; janus land {u['name']} again retries the writeback (nothing is landed again)")
+        did, bad, norow = [], [], []   # each item on its own: one item without a row skipped every item after it (cp12, cc-02, 2026-11-24)
+        for i in items:
+            try:
+                with cfg.writer(): did.append((i, checklist_set(cfg, i, evidence=sha)))   # short: a read and a rename of the file
+            except (Err, OSError) as e: (norow if str(e).startswith("no row of ") else bad).append((i, str(e)))
+        if did: say(f"checklist: {', '.join(i for i, _ in did)}: " + ("evidence " + sha if any(d for _, d in did) else f"evidence {sha} already there") + "; status unchanged")
+        for i, e in norow: say(f"note: checklist: {e}: no evidence written for {i} (a named skip, not a failure)")
+        res = "done" if not bad else ("incomplete: " + "; ".join(f"{i}: {e}" for i, e in bad))[:300]
+        if bad: say(f"WARNING: checklist writeback incomplete for {', '.join(i for i, _ in bad)} ({'; '.join(e for _, e in bad)[:200]}): the landing is published; janus land {u['name']} again retries the writeback (nothing is landed again)")
     try: save_unit(cfg, u, published={**pub, "writeback": res})
     except Err as e: say(f"WARNING: the writeback state of {u['name']} was not recorded ({e})")
 

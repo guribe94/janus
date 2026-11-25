@@ -218,7 +218,9 @@ def judge_words(cfg, w, cwd, ok_dirs, remote, depth):
         a2 = [x for x in args if not x.startswith("-")][:2]
         if tuple(a2) in HERDR_NO: return f"herdr {' '.join(a2)} by hand: janus launch/stop/close manage panes"
     if b == "board.sh" and args[:1] == ["close"]: return "board.sh close by hand: janus close does it"
-    if b == "janus" and args[:1] == ["close"] and "--force" in args and not force_close_ok(cfg, args): return "janus close --force (owner: never on shared repos; allowed on a unit's own non-shared worktree)"
+    if b == "janus" and args[:1] == ["close"] and "--force" in args:
+        why = force_close_why(cfg, args)
+        if why: return f"janus close --force ({why})"
     if b == "janus" and args[:1] == ["api-run"]: return "janus api-run by hand: janus launch queues it (budget, ledger, lanes)"
     if b == "launchctl" and args[:1] and args[0] in ("bootout", "remove", "unload", "kill", "disable"): return f"launchctl {args[0]}"
     if b == "systemctl" and any(x in ("stop", "restart", "kill", "disable", "mask", "reboot", "poweroff") for x in args): return "systemctl stop/restart"
@@ -243,12 +245,23 @@ def force_close_ok(cfg, args):
     if "--reason" in args:
         i = args.index("--reason")
         if i + 1 < len(args) and args[i + 1] in names: names.remove(args[i + 1])
-    if not names: return False
+    return force_close_why(cfg, args) is None
+
+def force_close_why(cfg, args):
+    """Why the hook refuses `janus close <unit> --force`, else None: the unit is named, open, and units.force_close_refusal allows
+    it. A beads read that fails says so (it read as the owner's rule, 'never on shared repos', for a unit that rule allows)."""
+    names = [x for x in args[1:] if not x.startswith("-")]
+    if "--reason" in args:
+        i = args.index("--reason")
+        if i + 1 < len(args) and args[i + 1] in names: names.remove(args[i + 1])
+    if not names: return "no unit named"
     name = names[0]
-    try:
-        units = Beads(cfg).units(); u = next((x for x in units if x["name"] == name), None)
-        return bool(u and u.get("cwd")) and force_close_refusal(cfg, u, units) is None
-    except Exception: return False
+    try: units = Beads(cfg).units()
+    except Exception as e: return f"beads could not be read to check {name} ({str(e)[:80]}): try again"
+    u = next((x for x in units if x["name"] == name), None)
+    if not (u and u.get("cwd")): return f"no open unit {name}"
+    why = force_close_refusal(cfg, u, units)
+    return f"owner: never on a main checkout with linked worktrees: {why}" if why else None
 
 JANUS_READ = {"check", "status", "queue", "transcript", "memory", "report", "capacity", "busy", "doctor", "hosts", "thrash"}
 

@@ -64,7 +64,9 @@ def main():
     add("doctor", cmd_doctor, A("--no-hosts", action="store_true", help="skip the ssh checks"))
     add("backlog", cmd_backlog, A("action", choices=["import", "list", "set"]), A("args", nargs="*", help="set: <item id> actor=<agent|owner|hardware|...> | hold=<reason> | status=DONE"),
         A("--unit", help="set <item> status=DONE: the unit whose verified published landing is the item's evidence"),
-        A("--commit", help="set <item> status=DONE: a commit the unit's agent pushed itself (no janus land) or verified already there: named in its report, on the landing branch"), dry=True)
+        A("--commit", help="set <item> status=DONE: a commit the unit's agent pushed itself (no janus land) or verified already there: named in its report, on the landing branch"),
+        A("--owner-accepted", metavar="WHY", help="set <item> status=DONE --commit <sha>: the owner accepted the item on that published commit, which the unit's report need not name (recorded with WHY)"),
+        A("--yes", action="store_true", help="import: close every item the checklist now marks done (more than one is listed and refused without it)"), dry=True)
     add("install-host", cmd_install_host, A("host", help="a host of janus.toml: folders, pueued as a user service, a janus copy, the heartbeat watchdog"), dry=True)
     add("queue", cmd_queue, A("host", nargs="?"), A("--log", metavar="[HOST:]ID", help="print one task's output: <host>:<id> (ids collide between hosts); the job's run log when pueue has none"))
     add("stop", cmd_stop, A("unit"), A("--force", action="store_true", help="stop although its remote copy has uncollected work"), dry=True)
@@ -90,7 +92,8 @@ def main():
     add("land", cmd_land, A("unit"), A("--host", help="land on this host (default: the unit's own host when its tree is there, else here)"), A("--push", action="store_true", help="also push the landing commit, never forced (default: [landing] push)"),
         A("--force-review", action="store_true", help="land although the unit lacks the reviews its rigor level requires"), dry=True)
     add("close", cmd_close, A("unit"), A("--force", action="store_true"), A("--reason"),
-        A("--duplicate-of", metavar="UNIT", help="close a stopped relaunch that duplicated this open unit: no verdict needed, never --force"), dry=True)
+        A("--duplicate-of", metavar="UNIT", help="close a stopped relaunch that duplicated this open unit: no verdict needed, never --force"),
+        A("--abort", action="store_true", help="undo a close that was interrupted before its cleanup began: the unit is open again (resume, collect, land or close it)"), dry=True)
     add("commit-state", cmd_commit_state, A("-m", "--message", default="janus: state"), dry=True)
     m = add("remember", cmd_remember, A("text"), A("--source", help="where it can be checked: a path, a commit sha or a job (a fact needs one)"),
             A("--key", help="its subject: a newer entry on the same subject replaces the older one"), dry=True)
