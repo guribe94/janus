@@ -38,7 +38,7 @@ def ready_work(cfg):
     actor:<owner|hardware|...>): only what an agent could be launched on (skill-fix52)."""
     skip = {"unit", "instruction", "backlog", "intent"}   # backlog items have their own finding (idle with backlog)
     out = []
-    for i in run_once(cfg, "ready", lambda: Beads(cfg).run("ready")):
+    for i in run_once(cfg, "ready", lambda: Beads(cfg).run("ready", "-n", "0")):   # bd ready shows 100 by default: the rest were never named
         labels = set(i.get("labels") or []); title = str(i.get("title", ""))
         if skip & labels or labels & LOG_LABELS or any(l.startswith("actor:") and l != "actor:agent" for l in labels): continue
         if title.startswith(("unit:", "janus:", "instr:", "intent:")) or LOG_RX.match(title): continue

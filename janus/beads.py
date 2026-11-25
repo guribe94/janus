@@ -38,7 +38,7 @@ class Beads:
         try: return json.loads(o) if o.strip() else []
         except Exception: raise Err(f"bd {a[0]}: bad json")
     def issues(self, label, status="open"):
-        r = self.run("list", "--label", label, "--status", status)
+        r = self.run("list", "--label", label, "--status", status, "-n", "0")   # bd lists 50 by default: units past the 50th were not open to janus (their sessions read as orphans)
         return r.get("issues", r) if isinstance(r, dict) else r
     def units(self):
         """Open units: launch marks each in_progress (so `bd ready` never lists a running unit); older ones are still open."""

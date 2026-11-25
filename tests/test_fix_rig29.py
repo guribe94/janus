@@ -511,4 +511,15 @@ class LedgerAndCodexHooks(unittest.TestCase):
         self.assertIn("/hooks", why); self.assertEqual(sent, [])
 
 
+class BeadsReadsAreNeverCut(unittest.TestCase):
+    def test_open_units_and_ready_work_are_read_without_bds_default_limit(self):
+        """Catches (found cleaning up after rig29): bd list shows 50 and bd ready 100 unless told -n 0, so a project with more open
+        units than that had units janus could not see (their tmux sessions then read as orphans to tidy) and ready work it never named
+        (status counted 46 of 51 sweep beads)."""
+        d, cfg = project(); calls = []
+        with mock.patch.object(janus, "sh", lambda cmd, **k: calls.append(cmd) or (0, "[]", "")):
+            janus.Beads(cfg).units(); cfg.run.reads = None; janus.ready_work(cfg)
+        for c in calls: self.assertEqual(c[c.index("-n") + 1], "0", c)
+
+
 if __name__ == "__main__": unittest.main()
