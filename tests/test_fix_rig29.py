@@ -425,7 +425,13 @@ class Tidy(unittest.TestCase):
         (od / "keep/snap/REPORT.md").write_text("x"); os.utime(od / "keep/snap/REPORT.md", (old, old))
         with mock.patch.object(janus, "all_units", lambda c: {"gone": {"status": "closed"}, "live": {"status": "closed"}, "keep": {"status": "closed"}}):
             P = janus.tidy_out_bulk(cfg, [{"name": "live"}])
-        self.assertEqual([t for _, t, _, _ in P], [str(od / "gone/target")]); self.assertEqual(P[0][3], 60)
+        self.assertEqual(sorted(t for _, t, _, _ in P), [str(od / "gone/target"), str(od / "keep/snap/deps")])   # snap's REPORT.md stays, its bulk goes
+        self.assertTrue((od / "keep/snap/REPORT.md").exists())
+        # a folder with small results of its own (a run's logs, a checksum list) is opened up: its bulky subfolders go, its files stay
+        files(od / "gone/e2e/run-dir", 60); (od / "gone/e2e/01-validate.out").write_text("ok\n"); os.utime(od / "gone/e2e/01-validate.out", (old, old))
+        with mock.patch.object(janus, "all_units", lambda c: {"gone": {"status": "closed"}, "live": {"status": "closed"}, "keep": {"status": "closed"}}):
+            P = janus.tidy_out_bulk(cfg, [{"name": "live"}])
+        self.assertEqual(sorted(t for _, t, _, _ in P), [str(od / "gone/e2e/run-dir"), str(od / "gone/target"), str(od / "keep/snap/deps")])
 
     def test_a_tree_squash_landed_then_changed_on_main_is_landed(self):
         """Catches item 26: rigpc-hw-session was kept 'unlanded' though its files were byte-identical to its squash commit: the

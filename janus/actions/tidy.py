@@ -133,6 +133,21 @@ def landed_at(cfg, d, br, onto):
         if contained(d, c) is True: return True
     return False
 
+EVIDENCE_MB = 1   # a file this small, beside bulky folders, is a result someone may cite (a log, a checksum list): never removed with them
+
+def bulk_dirs(top, cut):
+    """The folders under top (a closed unit's output) that go whole: bulky (OUT_BULK_MB) and unchanged since cut, holding no kept
+    file and no small file of their own (a run's .out/.err logs, a checksum list: results); a folder that holds such files is
+    opened up instead, so its subfolders are judged one by one and its own files stay."""
+    out = []
+    for sub in sorted(x for x in top.iterdir() if x.is_dir() and not x.is_symlink()):
+        size, newest, keep = dir_stats(sub)
+        if newest >= cut or size < OUT_BULK_MB << 20: continue
+        own = [f for f in sub.iterdir() if f.is_file() and not f.is_symlink()]
+        if keep or any(f.stat().st_size < EVIDENCE_MB << 20 for f in own): out += bulk_dirs(sub, cut)
+        else: out.append(sub)
+    return out
+
 def tidy_out_bulk(cfg, units):
     """[(kind, target, why, mb)]: bulky files (OUT_BULK_MB and more) and repository clones in the output folder (out/<unit>) of a
     CLOSED unit, unchanged for [tidy] keep_days; never OUT_KEEP files, never an open unit's output."""
@@ -141,13 +156,12 @@ def tidy_out_bulk(cfg, units):
     for d in sorted(od.iterdir()) if od.is_dir() else []:
         if not d.is_dir() or d.is_symlink() or d.name in names or au.get(d.name, {}).get("status") != "closed": continue
         whole = set()   # a folder of many files, each under OUT_BULK_MB (a cargo target dir, an extracted tarball, a repository snapshot):
-        for sub in sorted(x for x in d.iterdir() if x.is_dir() and not x.is_symlink()):   # 3.7 GB of them were invisible to tidy (2026-11-25)
-            size, newest, keep = dir_stats(sub)
-            if keep or newest >= cut or size < OUT_BULK_MB << 20: continue
-            whole.add(sub.name); P.append(("out-bulk", str(sub), f"{size >> 20} MB folder in closed unit {d.name}'s output, unchanged {tset(cfg, 'keep_days')} days", size >> 20))
+        for sub in bulk_dirs(d, cut):   # 3.7 GB of them were invisible to tidy (2026-11-25)
+            whole.add(sub); size = dir_stats(sub)[0]
+            P.append(("out-bulk", str(sub), f"{size >> 20} MB folder in closed unit {d.name}'s output, unchanged {tset(cfg, 'keep_days')} days", size >> 20))
         for root, dirs, files in os.walk(d):
             r = Path(root)
-            if r == d: dirs[:] = [x for x in dirs if x not in whole]
+            dirs[:] = [x for x in dirs if r / x not in whole]
             if ".git" in dirs:
                 dirs.remove(".git")
                 if r != d and (r / ".git").stat().st_mtime < cut:   # a nested clone (the output folder itself is never removed)
