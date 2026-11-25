@@ -9,7 +9,7 @@ from janus.hooks import cmd_hook
 from janus.memory import MEM_SECTIONS
 from janus.migrate import migrate
 from janus.setup import doctor, init_project
-from janus.actions.backlog import cmd_backlog, cmd_fill
+from janus.actions.backlog import cmd_backlog, cmd_bead, cmd_fill
 from janus.actions.jobs import cmd_busy, cmd_cancel, cmd_hosts, cmd_run, cmd_thrash
 from janus.actions.landing import cmd_commit_state, cmd_land
 from janus.actions.launch import cmd_api_run, cmd_launch
@@ -69,7 +69,9 @@ def main():
         A("--yes", action="store_true", help="import: close every item the checklist now marks done (more than one is listed and refused without it)"), dry=True)
     add("install-host", cmd_install_host, A("host", help="a host of janus.toml: folders, pueued as a user service, a janus copy, the heartbeat watchdog"), dry=True)
     add("queue", cmd_queue, A("host", nargs="?"), A("--log", metavar="[HOST:]ID", help="print one task's output: <host>:<id> (ids collide between hosts); the job's run log when pueue has none"))
-    add("stop", cmd_stop, A("unit"), A("--force", action="store_true", help="stop although its remote copy has uncollected work"), dry=True)
+    add("stop", cmd_stop, A("unit", help="the unit; with --orphan, <host>:<tmux session>"), A("--force", action="store_true", help="stop although its remote copy has uncollected work"),
+        A("--orphan", action="store_true", help="stop one tmux session of this project that no open unit records (unit is <host>:<session>)"), dry=True)
+    add("bead", cmd_bead, A("action", choices=["close"]), A("ids", nargs="+"), A("--reason", required=True, help="why it is closed (kept on the issue)"), dry=True)
     add("collect", cmd_collect, A("unit", help="a unit, or <host>:<task id> for a janus run job"),
         A("--subdir", metavar="PATH", help="a remote unit only: patch just this relative subtree of its copy into out/<unit>/changes-scoped.patch "
                                          "(paths stay relative to the copy); partial: the unit is not recorded collected"), dry=True)

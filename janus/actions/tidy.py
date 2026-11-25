@@ -10,7 +10,8 @@ from janus.cap import capv
 from janus.context import FIXTURE_MARK, Err, LockLost, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
 from janus.branch import contained, landed, landing_branch
 from janus.probe import pueue
-from janus.project import label_owner, own_card, tmux_name
+from janus.project import label_owner, own_card, tmux_name, unit_tmux
+from janus.actions.launch import tmux_target
 from janus.transcripts import card_fields
 from janus.units import all_units, herdr_agents, orphan_tabs, ws_id
 
@@ -130,7 +131,7 @@ def tidy_out_bulk(cfg, units):
                 P.append(("out-bulk", str(q), f"{st.st_size >> 20} MB in closed unit {d.name}'s output, unchanged {tset(cfg, 'keep_days')} days", st.st_size >> 20))
     return P
 
-TIDY_HOST = r'''root=%(root)s; rd=%(rd)s; kd=%(kd)d
+TIDY_HOST = r'''PATH="$HOME/.local/bin:%(bin)s:$PATH"; root=%(root)s; rd=%(rd)s; kd=%(kd)d
 [ -n "$root" ] && [ -d "$root/worktrees" ] && for d in "$root"/worktrees/*/; do [ -d "$d" ] && n=${d%%/}; [ -d "$d" ] && echo "copy ${n##*/} $(du -sm "$d" 2>/dev/null | cut -f1)"; done
 [ -d "$rd" ] && echo "runfiles $(find "$rd" -maxdepth 1 -type f -mtime +$kd \( -name '*.log' -o -name '*.sh' -o -name '*.rc' -o -name '*.cmd' -o -name '*.out' -o -name '*.err' -o -name '*.done' \) 2>/dev/null | wc -l | tr -d ' ')"
 # a wait file whose pid is not its job any more (killed, reboot, pid reused): it read as a job waiting ([old-rule:mac]) and as one ahead
@@ -140,12 +141,23 @@ command -v podman >/dev/null 2>&1 && podman ps -a --filter name=^janus-run- --fi
 for c in %(caches)s; do [ -d "$c" ] || continue; for e in "$c"/*; do [ -e "$e" ] && echo "cache $(du -sm "$e" 2>/dev/null | cut -f1) $(stat -c %%Y "$e" 2>/dev/null || stat -f %%m "$e") $e"; done; done
 [ -n "$root" ] && [ -d "$root" ] && echo "rootmb $(du -sm "$root" 2>/dev/null | cut -f1)"; true'''
 
+def orphan_session(cfg, s, units, au):
+    """Why tmux session s is this project's orphan (check's orphan:tmux rule), else None: named janus-<unit>@<this project's id>,
+    and no open unit records it (by its tmux name, or by its name: a unit still starting has no tmux name yet). Its unit may be
+    closed, never recorded (a launch that failed after the session started), or a record another command left; a session with no
+    project id is machine state and never this project's."""
+    base, pid = label_owner(s)
+    if pid != tmux_name(cfg, "x").rpartition("@")[2] or not base.startswith("janus-"): return None
+    if s in {unit_tmux(u) for u in units} or base[6:] in {u["name"] for u in units}: return None
+    u = au.get(base[6:])
+    return "its unit is closed" if u and u.get("status") == "closed" else "no open unit records it"
+
 def tidy_host(cfg, n, h, units, au):
     """[(kind, target, why, mb)] on host n (one shell call): synced copies of closed units, old run files, our stopped containers,
     cache entries over the disk budget; plus ("disk", n, why, over_mb) when over budget."""
     caches = [c for c in h.get("cache_dirs", [])]
     root = h.get("root", "") if not h.get("local") else ""
-    rc, o, e = hrun(h, TIDY_HOST % {"root": qp(root) if root else "''", "rd": qp(h["_rd"]), "kd": int(tset(cfg, "keep_days")),
+    rc, o, e = hrun(h, TIDY_HOST % {"bin": h.get("bin", ""), "root": qp(root) if root else "''", "rd": qp(h["_rd"]), "kd": int(tset(cfg, "keep_days")),
                                     "caches": " ".join(qp(c) for c in caches) or "''"}, timeout=180)
     if rc: return []
     P, open_ = [], {u["name"] for u in units}; cache, total = [], 0
@@ -158,10 +170,9 @@ def tidy_host(cfg, n, h, units, au):
                 why = uncollected(cfg, {**u, "via": u.get("via") if u.get("via") not in ("failed", "starting") else "x"})
                 if why: continue
                 P.append(("remote-copy", f"{n}:{f[1]}", "its unit is closed and its copy holds nothing uncollected", int(fl(f[2]) if len(f) > 2 else 0)))
-        elif f[0] == "tmux" and len(f) > 1 and f[1].startswith("janus-"):   # a closed unit's session: close of an older janus left it, and its pid holds the agent's reservation
-            base, pid = label_owner(f[1]); u = au.get(base[6:])
-            if pid == tmux_name(cfg, "x").rpartition("@")[2] and base[6:] not in open_ and u and u.get("status") == "closed" and u.get("host") == n:
-                P.append(("tmux", f"{n}:{f[1]}", "its unit is closed", 0))
+        elif f[0] == "tmux" and len(f) > 1 and f[1].startswith("janus-"):   # this project's session that no open unit records: its pid holds the agent's reservation (fill fitted nothing for days)
+            why = orphan_session(cfg, f[1], units, au)
+            if why: P.append(("tmux", f"{n}:{f[1]}", why, 0))
         elif f[0] == "stalewait" and len(f) > 1: P.append(("stale-wait", f"{n}:{l.split(None, 1)[1]}", "a job's wait file whose process is gone (it read as a job waiting)", 0))
         elif f[0] == "runfiles" and len(f) > 1 and int(f[1] or 0): P.append(("run-files", n, f"{f[1]} job run file(s) older than {tset(cfg, 'keep_days')} days", 0))
         elif f[0] == "container" and len(f) > 1 and f[1].startswith("janus-run-"): P.append(("container", f"{n}:{f[1]}", "our own stopped container", 0))
@@ -324,7 +335,7 @@ def tidy_do(cfg, kind, t):
     hn, _, x = t.partition(":"); h = cfg.hosts.get(hn if kind != "run-files" else t, {})
     if kind == "remote-copy":
         root = h["root"]; return hrun(h, f"cd {qp(root)} && rm -rf worktrees/{shlex.quote(x)} base/{shlex.quote(x)} briefs/{shlex.quote(x)}.md run/{shlex.quote(x)}.* ctx/{shlex.quote(x)}; true", timeout=300)[0], ""
-    if kind == "tmux": return hrun(h, f"tmux kill-session -t {shlex.quote('=' + x)}", timeout=60)[0], ""
+    if kind == "tmux": return hrun(h, f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; tmux kill-session -t {tmux_target(x, False)}', timeout=60)[0], ""
     if kind == "stale-wait":
         if not (x.endswith((".wait", ".gwait")) and os.path.dirname(x) == h.get("_rd", "").rstrip("/")): return 1, "not a wait file in the host's runs dir"
         return hrun(h, f"rm -f {qp(x)}", timeout=60)[0], ""

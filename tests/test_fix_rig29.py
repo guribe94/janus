@@ -1,7 +1,7 @@
 """rig29: 29 defects the collection-rig orchestrator reported against release 20261124-113728 (opencode agents over tmux on rigpc,
 launch and routing, jobs, collect/close/land, the guard hook, tidy, the ledger). One test per failure, each naming what it catches.
 Standard library only; no network, no spend. Run by ./check (it discovers tests/test_*.py)."""
-import argparse, contextlib, io, json, os, subprocess, sys, tempfile, time, unittest
+import argparse, contextlib, io, json, os, re, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -345,6 +345,68 @@ class CollectCloseLandBacklog(LandingBase):
 
 def git(c, *a):
     return subprocess.run(["git", "-C", str(c), *a], capture_output=True, text=True, check=True).stdout.strip()
+
+
+class OrphansAndTheHook(unittest.TestCase):
+    """Items 21, 22, 23."""
+
+    def test_a_session_no_open_unit_records_is_an_orphan_tidy_and_stop_can_end(self):
+        """Catches item 21: tidy stopped only sessions of closed units recorded on that host; one with no record (a failed launch)
+        or a record elsewhere held its reservation for days, janus stop said 'no open unit' and the hook refuses tmux kill."""
+        cfg = self.cfg; pid = janus.tmux_name(cfg, "x").rpartition("@")[2]
+        units = [{"name": "live", "tmux": f"janus-live@{pid}"}, {"name": "starting"}]
+        o = lambda s: janus.orphan_session(cfg, s, units, {"old": {"status": "closed"}})
+        self.assertEqual(o(f"janus-cc20-s2-board@{pid}"), "no open unit records it")
+        self.assertEqual(o(f"janus-old@{pid}"), "its unit is closed")
+        for keep in (f"janus-live@{pid}", f"janus-starting@{pid}", "janus-x@otherproject", "janus-nopid", "mine"): self.assertIsNone(o(keep), keep)
+        ran = []
+        B = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: units})
+        with mock.patch.object(janus, "Beads", B), mock.patch.object(janus, "all_units", lambda cfg: {}), \
+             mock.patch.object(janus, "hrun", lambda h, c, **k: ran.append(c) or (0, "", "")), contextlib.redirect_stdout(io.StringIO()):
+            janus.cmd_stop(cfg, argparse.Namespace(unit=f"here:janus-cc20-s2-board@{pid}", force=False, orphan=True))
+            with self.assertRaises(janus.Err): janus.cmd_stop(cfg, argparse.Namespace(unit=f"here:janus-live@{pid}", force=False, orphan=True))
+        self.assertEqual(ran, [f'PATH="$HOME/.local/bin::$PATH"; tmux kill-session -t \'=janus-cc20-s2-board@{pid}\''])
+
+    def setUp(self): self.d, self.cfg = project()
+
+    def why(self, c, tool="Bash"):
+        ti = {"command": c} if tool == "Bash" else {"file_path": c, "content": "x"}
+        return janus.pretool_why(self.cfg, {"tool_name": tool, "tool_input": ti, "cwd": str(self.cfg.root)})
+
+    def test_bd_with_global_flags_is_judged_by_its_subcommand(self):
+        """Catches item 22: `bd -C .janus close <ids>` was refused as 'bd .janus by hand' (the -C value read as the subcommand)."""
+        self.assertIsNone(self.why("bd -C .janus close x --reason stale"))
+        self.assertIsNone(self.why("bd --db /x/beads.db list"))
+        self.assertIn("bd delete", self.why("bd -C .janus delete x"))
+        self.assertIn("janus bead close", janus.deny_alt(self.why("bd -C .janus delete x")))
+
+    def test_bead_close_takes_only_beads_that_are_neither_units_nor_items(self):
+        cfg = self.cfg; w = []
+        rec = {"s1": {"id": "s1", "title": "sweep-backlog-b32", "labels": []}, "u1": {"id": "u1", "title": "unit:x", "labels": ["unit"]},
+               "b1": {"id": "b1", "title": "backlog: A80", "labels": ["backlog"], "external_ref": "backlog:A80"}}
+        B = type("B", (), {"__init__": lambda s, c: None, "run": lambda s, *a: w.append(a) or ([rec[a[1]]] if a[0] == "show" else {})})
+        with mock.patch.object(janus, "Beads", B), contextlib.redirect_stdout(io.StringIO()):
+            janus.cmd_bead(cfg, argparse.Namespace(action="close", ids=["s1"], reason="stale sweep"))
+            self.assertIn(("close", "s1", "--reason", "stale sweep"), w)
+            for i, hint in (("u1", "janus close x"), ("b1", "janus backlog set")):
+                with self.assertRaises(janus.Err) as e: janus.cmd_bead(cfg, argparse.Namespace(action="close", ids=[i], reason="r"))
+                self.assertIn(hint, str(e.exception))
+
+    def test_in_place_edits_are_judged_by_their_files_as_edit_is(self):
+        """Catches item 23: sed -i / perl -i were refused whatever they edited, though Edit may change the same brief."""
+        self.assertIsNone(self.why("sed -i '' 's/a/b/' .janus/briefs/x.md"))
+        self.assertIsNone(self.why("perl -0pi -e 's/a/b/' .janus/briefs/x.md"))
+        self.assertIsNone(self.why("sed -i.bak -e 's/a/b/' .janus/janus.toml"))
+        self.assertEqual(self.why("sed -i 's/a/b/' src/x.py"), "in-place edit")
+        self.assertEqual(self.why("sed -i '' 's/a/b/' .janus/briefs/x.md src/x.py"), "in-place edit")   # every file must be allowed
+        self.assertEqual(self.why("perl -pi -e 's/a/b/' /etc/hosts"), "in-place edit")
+
+    def test_the_orchestrators_own_claude_memory_is_writable_and_nothing_else_there(self):
+        """Catches item 23: Write to ~/.claude/projects/<project>/memory/ was refused while a shell redirect there was allowed."""
+        mem = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9-]", "-", str(self.cfg.root.resolve())) / "memory" / "note.md"
+        self.assertIsNone(self.why(str(mem), tool="Write"))
+        self.assertIsNotNone(self.why(str(Path.home() / ".claude/settings.json"), tool="Write"))
+        self.assertIsNotNone(self.why(str(Path.home() / ".claude/projects/-other-project/memory/note.md"), tool="Write"))
 
 
 if __name__ == "__main__": unittest.main()

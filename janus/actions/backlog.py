@@ -11,6 +11,23 @@ from janus.ledger import committed, reserved
 from janus.probe import host_liveness, probe_all, stranded_hosts
 from janus.units import all_units, herdr_agents, report_path, report_text, unit_any, unit_state
 
+def cmd_bead(cfg, a):
+    """janus bead close <id>... --reason <why>: close beads that are neither units nor backlog items (stale sweep-* beads stayed in
+    status and fill for good: the hook refuses bd writes by hand and no janus command closed them). A unit is closed by janus close,
+    a backlog item by its acceptance (janus backlog set ... status=DONE); both are refused here."""
+    if not cfg.run.dry: refuse_agent("janus bead close")
+    bd = Beads(cfg); done = []
+    for i in a.ids:
+        r = bd.run("show", i); r = (r[0] if isinstance(r, list) and r else r) or {}
+        if not r.get("id"): raise Err(f"no bead {i}")
+        lab = r.get("labels") or []; t = str(r.get("title", ""))
+        if "unit" in lab or t.startswith("unit:"): raise Err(f"{i} is a unit ({t[:40]}): janus close {t[5:] if t.startswith('unit:') else '<unit>'}")
+        if "backlog" in lab or str(r.get("external_ref", "")).startswith("backlog:"): raise Err(f"{i} is a backlog item ({t[:40]}): janus backlog set <item> status=DONE --unit <unit>")
+        if r.get("status") == "closed": say(f"{i}: already closed"); continue
+        if cfg.run.dry: say(f"+ bd close {i} --reason {a.reason!r}"); continue
+        bd.run("close", i, "--reason", a.reason); done.append(i)
+    if done: say(f"closed {len(done)} bead(s): {', '.join(done)}")
+
 def cmd_backlog(cfg, a):
     if a.action in ("set", "import") and not cfg.run.dry: refuse_agent(f"janus backlog {a.action}")   # an item's acceptance and the import are the orchestrator's (agent units accepted items, 2026-11-19)
     if a.action == "set":   # janus backlog set <id> actor=<x>

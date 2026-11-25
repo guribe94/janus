@@ -431,7 +431,7 @@ class Landing(LandingBase):
         self.u["via"] = "tmux"; ran = []
         with mock.patch.object(janus, "uncollected", lambda *a: None), mock.patch.object(janus, "X", lambda cfg, h, c, **k: ran.append(c) or (0, "", "")):
             self.close(dry=False)
-        self.assertIn("tmux kill-session -t =janus-u 2>/dev/null; true", ran)   # =: never a prefix match (janus-u-r2 lives on)
+        self.assertIn("PATH=\"$HOME/.local/bin::$PATH\"; tmux kill-session -t '=janus-u' 2>/dev/null; true", ran)   # =: never a prefix match (janus-u-r2 lives on)
         self.assertIn(("close", "u1", "--force", "--reason", "done"), self.w.writes)
 
 class FollowUp(LandingBase):

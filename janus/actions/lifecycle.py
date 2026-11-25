@@ -4,7 +4,7 @@ import argparse, ast, contextlib, os, re, shlex, sys, time
 from pathlib import Path
 from janus.actions.jobs import (agent_res, collect_job, job_of, job_state, patch_scope, patch_scope_desc, patch_scope_sh, recorded_jid, runs_dir, save_task_log,
     task_rc, task_status, unit_jobs)
-from janus.actions.launch import (agent_scope, api_remote, close_tab, confirm_started, cwd_taken, per_turn, put_script, remote_env, start_tmux, start_turn, tmux_submit, tool_argv,
+from janus.actions.launch import (agent_scope, api_remote, close_tab, confirm_started, cwd_taken, per_turn, put_script, remote_env, start_tmux, start_turn, tmux_submit, tmux_target, tool_argv,
     turn_command, turn_running)
 from janus.beads import Beads
 from janus.board import board, board_dir, board_script
@@ -19,7 +19,7 @@ from janus.rigor import level_of
 from janus.probe import host_liveness, probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
-from janus.units import (ENDED, agent_live, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, reopened, report_path, unit_runs, unit_spent, unit_state,
+from janus.units import (ENDED, agent_live, all_units, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, reopened, report_path, unit_runs, unit_spent, unit_state,
     verdict, waiting_line_jobs)
 
 # Agents never pay to wait. An agent submits its builds and tests detached (`janus run --detach`, or its lane runner's
@@ -76,7 +76,21 @@ def task_pid_roots(h, u):
                        "END {for (x in m) if (p[x] in d) print x}'")
     return " ".join(o.split())
 
+def stop_orphan(cfg, ref):
+    """janus stop --orphan HOST:SESSION: stop one tmux session of this project that no open unit records (janus stop <unit> said
+    'no open unit' and the hook refuses tmux kill by hand: orphans held reservations and blocked fill for days)."""
+    from janus.actions.tidy import orphan_session
+    hn, _, s = ref.partition(":")
+    if hn not in cfg.hosts or not s: raise Err("expected --orphan <host>:<tmux session>")
+    h = cfg.hosts[hn]; units = Beads(cfg).units(); why = orphan_session(cfg, s, units, all_units(cfg))
+    if not why: raise Err(f"refused: {s} is not this project's orphan session (an open unit records it, or it carries no project id): janus stop <unit> stops a unit")
+    if cfg.run.dry: say(f"+ tmux kill-session -t ={s} on {hn} ({why})"); return
+    rc, o, e = hrun(h, f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; tmux kill-session -t {tmux_target(s, False)}', timeout=60)
+    if rc: raise Err(f"{hn}: tmux kill-session {s} failed: {(e or o).strip()[:120]}")
+    say(f"stopped orphan tmux session {s} on {hn} ({why})")
+
 def cmd_stop(cfg, a):
+    if getattr(a, "orphan", False): return stop_orphan(cfg, a.unit)
     bd, u = get_unit(cfg, a.unit); h = cfg.hosts[u["host"]]; via = u.get("via"); p = pueue(h)
     why = None if a.force or cfg.run.dry else uncollected(cfg, u)
     if why: raise Err(f"refused: {u['name']}: {why}")
@@ -84,7 +98,7 @@ def cmd_stop(cfg, a):
     roots = task_pid_roots(h, u) if not cfg.run.dry else ""
     if cfg.run.dry: say(f"+ pueue kill / tmux kill-session; TERM then KILL every process group of {u['name']} (roots {roots or '-'}, env JANUS_UNIT)"); return
     if via == "pueue": hrun(h, f"{p} kill {int(u['task'])}")
-    elif via == "tmux": hrun(h, f"tmux kill-session -t {shlex.quote(unit_tmux(u))}")
+    elif via == "tmux": hrun(h, f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; tmux kill-session -t {tmux_target(unit_tmux(u), False)}')   # that name only, on the PATH the probe uses
     # its lane jobs (label unit:<name>) belong to it too
     hrun(h, f"{p} status --json | python3 -c \"import json,sys; [print(i) for i, t in json.load(sys.stdin)['tasks'].items() if t.get('label') == '{tag(cfg, 'unit:' + u['name'])}' and ('Running' in str(t['status']) or 'Queued' in str(t['status']))]\" | xargs -r {p} kill 2>/dev/null; true")
     left = kill_unit(h, u["name"], roots)
@@ -482,7 +496,7 @@ def cmd_close(cfg, a):
     if not cfg.run.dry: u["removing"] = True; bd.save(u)   # from here a close is finished, never aborted (close_abort)
     with cfg.unlocked():
         close_tab(cfg, u)
-        if u.get("via") == "tmux" and not gone: X(cfg, h, f"tmux kill-session -t {shlex.quote('=' + unit_tmux(u))} 2>/dev/null; true")   # =: that name only, never a prefix match (a relaunch janus-<unit>-r2); its pid holds the agent's reservation
+        if u.get("via") == "tmux" and not gone: X(cfg, h, f'PATH="$HOME/.local/bin:{h.get("bin", "")}:$PATH"; tmux kill-session -t {tmux_target(unit_tmux(u), False)} 2>/dev/null; true')   # =: that name only, never a prefix match (a relaunch janus-<unit>-r2); its pid holds the agent's reservation
         if gone: say(f"{u['host']} is marked gone: its copy there is not removed, and its task log not saved (out/{u['name']}/ keeps what was synced)")
         elif not h.get("local"):
             root = h["root"]; n = u["name"]

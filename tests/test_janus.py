@@ -572,9 +572,10 @@ class Leftovers(unittest.TestCase):
         au = {n: {"name": n, "status": s, "host": hn} for n, s, hn in (("gone", "closed", "here"), ("live", "in_progress", "here"), ("other", "closed", "here"), ("far", "closed", "far"))}
         with mock.patch.object(T, "hrun", lambda h, c, **k: ran.append(c) or (0, out, "")):
             P = janus.tidy_host(cfg, "here", cfg.hosts["here"], [{"name": "live"}], au)
-            self.assertEqual([(k, t) for k, t, *_ in P if k == "tmux"], [("tmux", f"here:janus-gone@{pid}")])
+            # rig29 item 21: a closed unit's session found on another host than its record is this project's orphan too
+            self.assertEqual([(k, t) for k, t, *_ in P if k == "tmux"], [("tmux", f"here:janus-gone@{pid}"), ("tmux", f"here:janus-far@{pid}")])
             self.assertEqual(janus.tidy_do(cfg, "tmux", f"here:janus-gone@{pid}")[0], 0)
-        self.assertEqual(ran[-1], f"tmux kill-session -t =janus-gone@{pid}")   # =: never a prefix match
+        self.assertEqual(ran[-1], f'PATH="$HOME/.local/bin::$PATH"; tmux kill-session -t \'=janus-gone@{pid}\'')   # =: never a prefix match
 
 
 class AdmitBound(unittest.TestCase):

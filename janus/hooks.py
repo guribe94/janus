@@ -158,6 +158,27 @@ def write_ok(cfg, cwd, tgt, ok_dirs):
     if not any(p == g or g in p.parents for g in guarded): return True
     return any(p == o or o in p.parents for o in ok_dirs)
 
+def inplace_files(b, args):
+    """The files a sed -i / perl -i call edits: its operands after the script (the first operand, unless -e/-f give it) and the
+    options with a value; an empty argument (BSD sed's `-i ''` suffix) is no file."""
+    val = {"sed": ("-e", "-f", "-l", "--expression", "--file", "--line-length"), "perl": ("-e", "-E", "-M", "-m", "-I", "-x")}[b]
+    given = any(x in val[:2] or x.startswith(("--expression=", "--file=")) for x in args)
+    out, i, script = [], 0, given
+    while i < len(args):
+        x = args[i]
+        if x == "--": out += [y for y in args[i + 1:] if y]; break
+        if x in val: i += 2; continue
+        if x.startswith("-") or not x: i += 1; continue
+        if not script: script = True; i += 1; continue
+        out.append(x); i += 1
+    return out
+
+def edit_ok(cwd, f, ok_dirs):
+    """f (relative to cwd) is inside a path the orchestrator may edit (edit_ok_dirs), as the Edit tool's own rule reads it."""
+    if f.startswith("$"): return False
+    p = Path(os.path.expanduser(f)); p = (p if p.is_absolute() else Path(cwd) / p).resolve()
+    return any(p == o or o in p.parents for o in ok_dirs)
+
 def judge_words(cfg, w, cwd, ok_dirs, remote, depth):
     w = strip_wrappers(w)
     if not w: return None
@@ -178,8 +199,9 @@ def judge_words(cfg, w, cwd, ok_dirs, remote, depth):
     if b in ("mkfs",) or b.startswith("mkfs."): return "mkfs"
     if b == "rm" and any(x in ("-r", "-R", "--recursive") or (re.fullmatch(r"-[A-Za-z]+", x) and re.search(r"[rR]", x)) for x in args if x != "--"):
         return "rm -r by hand"
-    if b == "sed" and any(x.startswith("--in-place") or re.fullmatch(r"-[A-Za-z]*i\S*", x) for x in args): return "in-place edit"
-    if b == "perl" and any(re.fullmatch(r"-\w*i\S*", x) for x in args): return "in-place edit"
+    if (b == "sed" and any(x.startswith("--in-place") or re.fullmatch(r"-[A-Za-z]*i\S*", x) for x in args)) or (b == "perl" and any(re.fullmatch(r"-\w*i\S*", x) for x in args)):
+        fs = inplace_files(b, args)   # judged as the Edit tool is: every file inside a path the orchestrator may edit (a brief, .janus)
+        if remote or not fs or not all(edit_ok(cwd, f, ok_dirs) for f in fs): return "in-place edit"
     if INTERP.match(b):
         code = " ".join(args[i + 1] for i, x in enumerate(args[:-1]) if x in ("-c", "-e", "-E"))
         if INTERP_BAD.search(code): return f"destructive {b} one-liner"
@@ -211,8 +233,10 @@ def judge_words(cfg, w, cwd, ok_dirs, remote, depth):
         sub = args[i] if i < len(args) else "status"
         if sub not in PUEUE_OK or (sub == "group" and len(args) > i + 1 and not args[i + 1].startswith("-")):
             return f"pueue {sub} by hand: use janus run/stop/close (pueue limits are janus's)"
-    if b == "bd":
-        sub = next((x for x in args if not x.startswith("-")), "")
+    if b == "bd":   # a global flag's value is no subcommand: `bd -C .janus close X` read as 'bd .janus by hand'
+        i = 0
+        while i < len(args) and args[i].startswith("-"): i += 2 if args[i] in ("-C", "--directory", "--db", "--database", "--actor", "--dolt-auto-commit", "--mem-profile") else 1
+        sub = args[i] if i < len(args) else ""
         if sub and sub not in BD_OK: return f"bd {sub} by hand"
     if b == "herdr":
         a2 = [x for x in args if not x.startswith("-")][:2]
@@ -269,10 +293,12 @@ JANUS_READ = {"check", "status", "queue", "transcript", "memory", "report", "cap
 DENY_ALT = (
     (r"\bpueue\b", "janus cancel <host>:<task> (see them with janus queue)"),
     (r"herdr ", "janus launch/stop/close (they manage panes)"),
-    (r"kill by hand|tmux kill|launchctl |systemctl stop|docker |podman ", "janus stop <unit>"),
+    (r"tmux kill", "janus stop <unit> (a tmux session no open unit records: janus stop --orphan <host>:<session>, or janus tidy)"),
+    (r"kill by hand|launchctl |systemctl stop|docker |podman ", "janus stop <unit>"),
     (r"\bgit\b|rm -r|find -delete|find -exec|rsync --delete|sparse-checkout|truncat|^dd\b", "janus tidy --dry-run, then janus tidy"),
     (r"editing files by hand|in-place edit|writing .* by hand|destructive ", "brief an agent (janus launch)"),
     (r"janus api-run", "janus launch"),
+    (r"\bbd ", "janus bead close <id> --reason <why> (a non-backlog bead), janus backlog set (an item), janus close (a unit)"),
     (r"board\.sh close", "janus board-close <agent> (an open unit: janus close <unit>)"),
     (r"janus close --force", "janus close <unit> (--force closes without a verdict once its agent is stopped and its copy collected; never a main checkout)"),
 )
@@ -332,8 +358,10 @@ def judge(cfg, c, cwd, ok_dirs, remote=False, depth=0):
 
 def edit_ok_dirs(cfg):
     """Paths the orchestrator may write: .janus (config, memory, handoff, briefs), its own plan files (~/.claude/plans: plan mode
-    writes there) and the project's status checklist (paths.checklist)."""
-    ok = [cfg.state, cfg.p("briefs", "briefs"), Path.home() / ".claude/plans"]
+    writes there), its own Claude Code memory folder for this project (~/.claude/projects/<escaped root>/memory) and the project's
+    status checklist (paths.checklist)."""
+    ok = [cfg.state, cfg.p("briefs", "briefs"), Path.home() / ".claude/plans",
+          Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9-]", "-", str(cfg.root.resolve())) / "memory"]   # its own Claude Code memory (this project's folder only)
     if cfg.paths.get("checklist"): ok.append(cfg.p("checklist"))
     return [p.resolve() for p in ok]
 
