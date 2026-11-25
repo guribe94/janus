@@ -15,11 +15,13 @@ class ProbeCountsWaitingJobs(unittest.TestCase):
     def test_a_job_waiting_for_admission_is_counted(self):
         """Catches row 231: the probe's `cut -d' ' -f1` lost its quotes inside a Python string, the pid read failed, and wait_jobs
         was 0 with jobs waiting (blocked:, waiting:<unit>, placement and capacity never saw them)."""
+        job = subprocess.Popen(["sh", "-c", "sleep 30; :", "job7.sh"])   # a waiting job's pid runs its script (bash <jid>.sh): rig29 item 25
         with tempfile.TemporaryDirectory() as d:
-            Path(d, "7.wait").write_text(f"{os.getpid()} 1700000000\n"); Path(d, "8.wait").write_text("999999999 1700000000\n")   # 8: its job is gone
-            out = subprocess.run(["sh", "-c", janus.probe_extra({"_rd": d, "local": True})], capture_output=True, text=True).stdout
+            Path(d, "job7.wait").write_text(f"{job.pid} 1700000000\n"); Path(d, "job8.wait").write_text("999999999 1700000000\n")   # 8: its job is gone
+            try: out = subprocess.run(["sh", "-c", janus.probe_extra({"_rd": d, "local": True})], capture_output=True, text=True).stdout
+            finally: job.kill(); job.wait()
         self.assertIn("wait_jobs=1\n", out, "the live .wait file is not counted")
-        self.assertIn("waitjob=7\n", out)
+        self.assertIn("waitjob=job7\n", out)
 
 
 class PodmanJobUsesTheAccountHome(unittest.TestCase):

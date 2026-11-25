@@ -72,7 +72,7 @@ def main():
         A("--subdir", metavar="PATH", help="a remote unit only: patch just this relative subtree of its copy into out/<unit>/changes-scoped.patch "
                                          "(paths stay relative to the copy); partial: the unit is not recorded collected"), dry=True)
     add("run", cmd_run, A("--host", help="run there (pinned)"), A("--needs", action="append", help="requirements instead of a host: os, arch, features, devices, mem (linux,x86_64,device=usb,mem=4G); placed when a host that meets them has room"),
-        A("--place-wait", action="store_true", help=argparse.SUPPRESS), A("--broad", metavar="REASON", help="a whole-suite run: why it must be whole (it runs at low priority)"), A("--lane", choices=[x for x in LANES if x != "place"], default="jobs"), A("--unit"), A("--wt", required=True),
+        A("--place-wait", action="store_true", help=argparse.SUPPRESS), A("--broad", metavar="REASON", help="a whole-suite run: why it must be whole (it runs at low priority)"), A("--lane", choices=[x for x in LANES if x != "place"], default="jobs"), A("--unit"), A("--wt", required=True, help="the worktree here, or HOST:PATH for a tree already on that host (a remote unit's copy: never synced)"),
         A("--subdir", help="run from this subdirectory of the worktree"), A("--usb", action="store_true", help="a job that needs the host's USB devices (container.usb_args, usb_lock)"),
         A("--priority", type=int, default=0), A("--detach", "--no-wait", dest="no_wait", action="store_true", help="queue, print <host>:<task>, return (agents: then write WAITING <ids> and end the turn)"),
         A("--allow-unmerged", action="store_true", help="run on a tree with a merge in progress or conflict markers"),

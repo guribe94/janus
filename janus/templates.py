@@ -103,7 +103,7 @@ ahead() {  # $1 this job's wait file ("pid expected-s since MB cores"): NB jobs 
   for f in "$RD"/$pat; do
     [ "$f" = "$1" ] || [ ! -e "$f" ] && continue
     p= e= t= m= c=; { read -r p e t m c < "$f"; } 2>/dev/null
-    [ -n "$c" ] && kill -0 "$p" 2>/dev/null || continue
+    b=${f##*/}; [ -n "$c" ] && kill -0 "$p" 2>/dev/null && ps -p "$p" -o command= 2>/dev/null | grep -qF -- "${b%%.*}" || continue   # its pid is that job (a stale file's reused pid held cores)
     awk -v a="$e" -v ta="$t" -v b="$me_e" -v tb="$me_t" -v n="$nowt" -v w="$AGEW" 'BEGIN {sa = a - w * (n - ta); sb = b - w * (n - tb); exit !(sa < sb || (sa == sb && ta < tb))}' || continue
     NB=$((NB + 1)); BCC=$((BCC + c)); BMB=$((BMB + m))
   done

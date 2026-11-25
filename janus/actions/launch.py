@@ -275,7 +275,7 @@ def lane_runner(cfg, hn, h, name, rcwd, level=DEFAULT):
     crd = in_container(h, runs_dir(cfg, h))   # the runs dir as the job sees it
     mk = lambda **k: job_script(cfg, hn, h, argparse.Namespace(**{**vars(a), **k}), name, f"bash {qp(crd + '/__JID__.cmd')}", "__JID__", wd=rcwd, clsrc='"$(cat "$R.cmd")"')
     conf = {"host": hn, "unit": name, "wt": rcwd, "label": tag(cfg, "unit:" + name), "rd": h["_rd"], "pueue": pueue(h), "ensure": ensure_lanes(h, cfg),
-            "script": mk(), "script_broad": mk(broad="lane --broad"), "patterns": cfg.capc.get("broad_patterns", lane.BROAD_PATTERNS), "broad_min": capv(cfg, h, "broad_min"), "broad_policy": R[level]["broad"], "rigor": level}
+            "script": mk(), "script_broad": mk(broad="lane --broad"), "script_usb": mk(usb=True), "script_usb_broad": mk(usb=True, broad="lane --broad"), "patterns": cfg.capc.get("broad_patterns", lane.BROAD_PATTERNS), "broad_min": capv(cfg, h, "broad_min"), "broad_policy": R[level]["broad"], "rigor": level}
     return (f"#!/bin/sh\nexec python3 {qp(h['root'] + '/bin/lane.py')} {qp(h['root'] + f'/run/{name}.lane.json')} \"$@\"\n", json.dumps(conf))
 
 PARK_RULE = ("**Builds and tests (janus):** submit with `{submit}`; it prints the job id (`<host>:<task>`) at once. Then write "
@@ -329,7 +329,8 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
            "(janus collects a patch of your changes).\n")
     return (head + f"**Where you run (janus):** you are on host `{hn}`, in `{rcwd}` (a copy of the worktree; `janus collect` "
             f"brings back a patch of your changes, your REPORT and logs). {git}Run every build and test through this host's pueue lane: "
-            f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there. "
+            f"`{lane} --detach '<command>'` (for example `{lane} --detach 'cargo test -p <crate>'`); it waits for admission and runs there "
+            f"(add `--usb` for a command that uses the host's USB devices: such jobs run one at a time). "
             f"Do not run builds, tests or other heavy commands directly.\n" + PARK_RULE.format(submit=f"{lane} --detach '<command>'", report=rep)
             + report_block(report, level) + swarm_header(cfg, hn, h, name, rcwd, False, brief_text, pred))
 

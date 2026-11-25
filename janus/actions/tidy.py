@@ -1,6 +1,6 @@
 """janus tidy: bookkeeping without hand operations (landed branches, old run files, stopped containers, closed units'
 remote copies, old test roots, cache entries over a host's disk budget)."""
-import os, re, shlex, tempfile
+import json, os, re, shlex, tempfile
 from pathlib import Path
 from janus.actions.landing import follow_upstream
 from janus.actions.lifecycle import uncollected
@@ -9,6 +9,7 @@ from janus.board import board, board_rows
 from janus.cap import capv
 from janus.context import FIXTURE_MARK, Err, LockLost, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
 from janus.branch import contained, landed, landing_branch
+from janus.probe import pueue
 from janus.project import label_owner, own_card, tmux_name
 from janus.transcripts import card_fields
 from janus.units import all_units, herdr_agents, orphan_tabs, ws_id
@@ -132,6 +133,8 @@ def tidy_out_bulk(cfg, units):
 TIDY_HOST = r'''root=%(root)s; rd=%(rd)s; kd=%(kd)d
 [ -n "$root" ] && [ -d "$root/worktrees" ] && for d in "$root"/worktrees/*/; do [ -d "$d" ] && n=${d%%/}; [ -d "$d" ] && echo "copy ${n##*/} $(du -sm "$d" 2>/dev/null | cut -f1)"; done
 [ -d "$rd" ] && echo "runfiles $(find "$rd" -maxdepth 1 -type f -mtime +$kd \( -name '*.log' -o -name '*.sh' -o -name '*.rc' -o -name '*.cmd' -o -name '*.out' -o -name '*.err' -o -name '*.done' \) 2>/dev/null | wc -l | tr -d ' ')"
+# a wait file whose pid is not its job any more (killed, reboot, pid reused): it read as a job waiting ([old-rule:mac]) and as one ahead
+[ -d "$rd" ] && for f in "$rd"/*.wait "$rd"/*.gwait; do [ -e "$f" ] || continue; p=; read -r p _ < "$f" 2>/dev/null; b=${f##*/}; b=${b%%.*}; kill -0 "$p" 2>/dev/null && ps -p "$p" -o command= 2>/dev/null | grep -qF -- "$b" && continue; echo "stalewait $f"; done
 tmux ls -F '#S' 2>/dev/null | sed 's/^/tmux /'
 command -v podman >/dev/null 2>&1 && podman ps -a --filter name=^janus-run- --filter status=exited --format '{{.Names}}' 2>/dev/null | sed 's/^/container /'
 for c in %(caches)s; do [ -d "$c" ] || continue; for e in "$c"/*; do [ -e "$e" ] && echo "cache $(du -sm "$e" 2>/dev/null | cut -f1) $(stat -c %%Y "$e" 2>/dev/null || stat -f %%m "$e") $e"; done; done
@@ -159,6 +162,7 @@ def tidy_host(cfg, n, h, units, au):
             base, pid = label_owner(f[1]); u = au.get(base[6:])
             if pid == tmux_name(cfg, "x").rpartition("@")[2] and base[6:] not in open_ and u and u.get("status") == "closed" and u.get("host") == n:
                 P.append(("tmux", f"{n}:{f[1]}", "its unit is closed", 0))
+        elif f[0] == "stalewait" and len(f) > 1: P.append(("stale-wait", f"{n}:{l.split(None, 1)[1]}", "a job's wait file whose process is gone (it read as a job waiting)", 0))
         elif f[0] == "runfiles" and len(f) > 1 and int(f[1] or 0): P.append(("run-files", n, f"{f[1]} job run file(s) older than {tset(cfg, 'keep_days')} days", 0))
         elif f[0] == "container" and len(f) > 1 and f[1].startswith("janus-run-"): P.append(("container", f"{n}:{f[1]}", "our own stopped container", 0))
         elif f[0] == "cache" and len(f) > 3: cache.append((int(fl(f[1])), int(fl(f[2])), f[3]))
@@ -169,6 +173,29 @@ def tidy_host(cfg, n, h, units, au):
         for mb, mt, path in sorted(cache, key=lambda c: c[1]):   # oldest first, until under budget
             if over <= 0: break
             P.append(("cache", f"{n}:{path}", f"cache entry, {mb} MB, last changed {ts(mt)}: over the disk budget", mb)); over -= mb
+    return P
+
+def job_records(cfg):
+    """{jid: '<host>:<task>'} of the jobs janus recorded here (runs/busy, for janus busy)."""
+    out = {}; bd_ = cfg.f("runs") / "busy"
+    for f in sorted(bd_.glob("*")) if bd_.is_dir() else []:
+        try: out[f.name] = f.read_text().split("\t", 1)[0].strip()
+        except OSError: pass
+    return out
+
+def tidy_job_records(cfg):
+    """[("job-record", jid, why, 0)]: a job record (runs/busy/<jid>, runs/jobs/<jid>.json) whose pueue task its host no longer has,
+    read from that host's own pueue (a host that does not answer keeps its records). A 2026-11-15 job's records outlived its task
+    and its worktree, and nothing removed them."""
+    recs = job_records(cfg); P = []
+    for hn in sorted({r.split(":")[0] for r in recs.values()}):
+        h = cfg.hosts.get(hn)
+        if h is None: continue
+        rc, o, e = hrun(h, f"{pueue(h)} status --json", timeout=30)
+        if rc: continue
+        try: tasks = (json.loads(o) or {}).get("tasks") or {}
+        except ValueError: continue
+        P += [("job-record", j, f"its task {r} is gone from {hn}'s pueue", 0) for j, r in recs.items() if r.split(":")[0] == hn and r.partition(":")[2] not in tasks]
     return P
 
 def tidy_repos(cfg):
@@ -235,7 +262,7 @@ def tidy_all(cfg, units, hs=None):
         if err: say(f"note: {r}: {landing_branch(cfg, Path(r))} is {lag} behind its upstream and did not fast-forward: {err}")
         elif lag: say(f"{r}: {landing_branch(cfg, Path(r))} {'is' if cfg.run.dry or cfg.run.ro else 'was'} {lag} commit(s) behind its upstream" + ("" if cfg.run.dry or cfg.run.ro else ": fast-forwarded"))
     au = all_units(cfg); P = ([(k, t, w, 0) for k, t, w in tidy_plan(cfg, units)] + tidy_branches(cfg, units)
-                              + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units))
+                              + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units) + tidy_job_records(cfg))
     for n, h in cfg.hosts.items():
         if hs is not None and not (hs.get(n) or {}).get("ok"): continue
         P += tidy_host(cfg, n, h, units, au)
@@ -244,8 +271,9 @@ def tidy_all(cfg, units, hs=None):
 # The kinds the watcher removes on its own with [tidy] auto = true: every kind tidy finds, each already chosen by its safe rule
 # (clean and landed; closed and nothing uncollected; our own stopped container; older than keep_days; over the disk budget).
 # Only some once, and the rest waited for the orchestrator, whose hooks refuse hand removal: found waste filled the disk.
-TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch", "artifact", "remote-copy", "run-files", "container", "cache", "test-root", "out-bulk", "pane", "tab", "card", "tmux")
-TIDY_HOST_KINDS = ("remote-copy", "run-files", "container", "cache", "tmux")
+TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch", "artifact", "remote-copy", "run-files", "container", "cache", "test-root", "out-bulk", "pane", "tab", "card", "tmux",
+                   "stale-wait", "job-record")
+TIDY_HOST_KINDS = ("remote-copy", "run-files", "container", "cache", "tmux", "stale-wait")
 
 LOW_DISK_MIN = 5   # a host under [capacity] min_disk_gb is tidied this often (a pass scans every host: tens of seconds)
 
@@ -297,6 +325,9 @@ def tidy_do(cfg, kind, t):
     if kind == "remote-copy":
         root = h["root"]; return hrun(h, f"cd {qp(root)} && rm -rf worktrees/{shlex.quote(x)} base/{shlex.quote(x)} briefs/{shlex.quote(x)}.md run/{shlex.quote(x)}.* ctx/{shlex.quote(x)}; true", timeout=300)[0], ""
     if kind == "tmux": return hrun(h, f"tmux kill-session -t {shlex.quote('=' + x)}", timeout=60)[0], ""
+    if kind == "stale-wait":
+        if not (x.endswith((".wait", ".gwait")) and os.path.dirname(x) == h.get("_rd", "").rstrip("/")): return 1, "not a wait file in the host's runs dir"
+        return hrun(h, f"rm -f {qp(x)}", timeout=60)[0], ""
     if kind == "run-files":
         return hrun(h, f"find {qp(h['_rd'])} -maxdepth 1 -type f -mtime +{int(tset(cfg, 'keep_days'))} \\( -name '*.log' -o -name '*.sh' -o -name '*.rc' -o -name '*.cmd' -o -name '*.out' -o -name '*.err' -o -name '*.done' \\) -exec rm -f {{}} +", timeout=300)[0], ""
     if kind == "container":
@@ -311,6 +342,10 @@ def tidy_do(cfg, kind, t):
         if q.is_dir():
             import shutil; shutil.rmtree(t, ignore_errors=True); return 0, ""
         q.unlink(missing_ok=True); return 0, ""
+    if kind == "job-record":
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", t): return 1, "not a job id"
+        for f in (cfg.f("runs") / "busy" / t, cfg.f("runs") / "jobs" / f"{t}.json"): f.unlink(missing_ok=True)
+        return 0, ""
     if kind == "artifact":
         wd = cfg.p("worktrees", "worktrees").resolve(); q = Path(t)
         if not (q.is_dir() and q.resolve().is_relative_to(wd)): return 1, "not a worktree artifact"
@@ -336,7 +371,7 @@ def cmd_tidy(cfg, a):
     if not cfg.run.dry: refuse_agent("janus tidy")   # --dry-run only reads
     free0 = disk_free_gb(cfg.root)
     units = Beads(cfg).units(); kept = []; au = all_units(cfg)
-    P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units)
+    P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + tidy_branches(cfg, units) + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units) + tidy_job_records(cfg)
     for n, h in cfg.hosts.items(): P += tidy_host(cfg, n, h, units, au)
     P = apply_holds(cfg, P)
     for d, why in kept: say(f"kept worktree {d}: {why}")

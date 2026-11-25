@@ -117,7 +117,7 @@ class CpuScheduling(unittest.TestCase):
         self.assertEqual(self.sh("cap_secs suite"), "100"); self.assertEqual(self.sh("cap_secs none"), "")
     def test_short_job_goes_first_and_a_waiting_job_ages(self):
         """Catches: a long job taking the last cores while a short one waits (FIFO by poll order), and a long job starved forever."""
-        sleeper = subprocess.Popen(["sleep", "60"]); me = self.rd / "long.wait"; t = int(time.time())
+        sleeper = subprocess.Popen(["sh", "-c", "sleep 60; :", "short.sh"]); me = self.rd / "long.wait"; t = int(time.time())   # its command names the job, as bash <jid>.sh does
         try:
             (self.rd / "short.wait").write_text(f"{sleeper.pid} 60 {t} 500 2\n")
             me.write_text(f"{os.getpid()} 3600 {t} 500 2\n")

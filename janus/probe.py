@@ -17,8 +17,12 @@ def probe_extra(h):
     rd = h["_rd"]
     # a .wait/.gwait file holds '<pid> <since>'; its job waits while that pid lives (row 231: the pid is read by the shell's own read)
     # old_rule: waiting jobs whose script sources neither runs/cap.sh nor runs/admit.sh (queued before the measured rule; audit H5)
-    w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && read p _ < "$f" && kill -0 "$p" 2>/dev/null || continue; '
-         f'b=${{f##*/}}; echo "waitjob=${{b%.*}}"; case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null || {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
+    # a pid alone is not the job: a stale file whose pid the system reused (a killed job, a reboot) read as a job waiting under the
+    # old rule once tidy took its .sh ([old-rule:mac] for a job gone since 2026-11-15): the pid's command line must name the job, and a
+    # job without its script is stale, not old-rule
+    w = (f'g=0; j=0; o=0; ol=; for f in {qp(rd)}/*.gwait {qp(rd)}/*.wait; do [ -e "$f" ] && read p _ < "$f" || continue; b=${{f##*/}}; b=${{b%.*}}; '
+         f'kill -0 "$p" 2>/dev/null && ps -p "$p" -o command= 2>/dev/null | grep -qF -- "$b" || continue; '
+         f'echo "waitjob=$b"; case $f in *.gwait) g=$((g+1));; *) j=$((j+1));; esac; s=${{f%.*}}.sh; [ -e "$s" ] && ! grep -qE "cap.sh|admit.sh" "$s" 2>/dev/null && {{ o=$((o+1)); ol="$ol ${{s##*/}}"; }}; done; '
          f'echo "wait_gates=$g"; echo "wait_jobs=$j"; echo "old_rule=$o"; echo "old_rule_jobs=$ol"; '
          # row 214: seconds since each running job last showed progress (its own mark, written by the job script or the gate wrapper)
          f'nowt=$(date +%s); for f in {qp(rd)}/*.live; do [ -e "$f" ] || continue; b=${{f##*/}}; echo "live=${{b%.live}} $((nowt - $(cat "$f" 2>/dev/null || echo $nowt)))"; done')

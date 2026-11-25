@@ -105,16 +105,17 @@ def broad_decision(why, pol, level, broad):
     return None, f"a whole-suite run ({why}) needs --broad <reason>: it then runs at low priority (after shorter jobs); or narrow it (one package, a test filter)"
 
 def main(argv):
-    """The remote unit's `lane [--detach] [--broad REASON] <command>`: guard, record, queue in this host's jobs lane through the
+    """The remote unit's `lane [--detach] [--usb] [--broad REASON] <command>`: guard, record, queue in this host's jobs lane through the
     same functions `janus run` uses; wait for the exit code unless --detach. argv[0]: the unit's lane.json (written at launch:
     host, unit, label, runs dir, pueue, group setup, the job script with __JID__, its broad twin, guard settings)."""
     with open(argv[0]) as f: c = json.load(f)
-    a = argv[1:]; det, broad = False, None
-    while a and a[0] in ("--detach", "--broad"):
+    a = argv[1:]; det, broad, usb = False, None, False
+    while a and a[0] in ("--detach", "--broad", "--usb"):
         if a[0] == "--detach": det = True; a = a[1:]
+        elif a[0] == "--usb": usb = True; a = a[1:]   # the host's USB devices: one such job at a time (its usb lock)
         elif len(a) > 1: broad = a[1]; a = a[2:]
         else: print("lane: --broad needs a reason", file=sys.stderr); return 2
-    if not a: print("usage: lane [--detach] [--broad REASON] <command>", file=sys.stderr); return 2
+    if not a: print("usage: lane [--detach] [--usb] [--broad REASON] <command>", file=sys.stderr); return 2
     cmd = a[0] if len(a) == 1 else shlex.join(a); rd = os.path.expandvars(c["rd"]); unit = c["unit"]
     pol = c.get("broad_policy", "reason")   # the unit's rigor level (rigor.R broad)
     why = None
@@ -131,7 +132,7 @@ def main(argv):
     n = 1
     while os.path.exists(f"{rd}/{jid}.cmd"): n += 1; jid = f"{unit}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}-{n}"   # two lanes in one second never share files
     with open(f"{rd}/{jid}.cmd", "w") as f: f.write(cmd + "\n")
-    script = c["script_broad" if broad else "script"].replace("__JID__", jid)
+    script = c[("script_usb" if usb else "script") + ("_broad" if broad else "")].replace("__JID__", jid)
     clean = 'env -i HOME="$HOME" USER="$USER" ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} LANG="${LANG:-C.UTF-8}" '
     rc, tid = queue_job(local_run, c["pueue"], c["ensure"], rd, jid, script, "jobs", c["label"], low=bool(broad), clean=clean)
     if rc: print(f"lane: {tid}", file=sys.stderr); return 125

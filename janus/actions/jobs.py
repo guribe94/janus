@@ -179,7 +179,10 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
     broad = bool(getattr(a, "broad", None)); nice = 19 if broad else 10   # a broad run (--broad) runs at the lowest CPU priority
     setup = guarded_setup(h); log = h.get("job_log", "/dev/null")
     ce = cache_env(cfg, hn, h); cdir = f'JC={ce[0]}; mkdir -p "$JC"\n' if ce else ""   # [caches]: before job_setup, so it uses them too
-    adm = ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
+    # --usb: one job using the host's USB devices at a time, on every runner (only a podman host locked: rigpc's Pico jobs ran together)
+    ul = h.get("usb_lock") or (ctr(h).get("usb_lock") if h.get("runner") == "podman" else None)
+    usb = (f"exec 8>{qp(ul)}; flock 8\n" if ul else 'exec 8>"$RD/usb.lock"; flock 8\n') if getattr(a, "usb", False) else ""
+    adm = usb + ADMIT % {"lane": q(a.lane), "clsrc": clsrc or q(cmd), "jid": q(jid), "maxrss": q(MAXRSS_PY), "broad": "1" if broad else "''",
                    "waitmax": int(lane_wait(cfg, a.lane) * 60)}   # item 21: give up after the lane's wait limit
     if h.get("local"):
         body = f"{h.get('run_env', '')}\n{cdir}{ce[1] if ce else ''}cd {q(str(Path(wd or a.wt).resolve()))} && cd {q(sub)} || exit $?\n{adm}run_sampled nice -n {nice} bash -c {q(cmd)}\n"
@@ -195,7 +198,7 @@ def job_script(cfg, hn, h, a, name, cmd, jid, wd=None, clsrc=None):
             args = " ".join(q(sub_(x)) for x in c.get("args", []))
             body = (ACCOUNT_HOME + cdir + f"[ -d {qp(hw_)} ] || {{ echo {q(f'janus: no worktree {hw_} on {hn}')}; exit 2; }}\n"
                     + "".join(f"mkdir -p {q(sub_(d))}\n" for d in c.get("host_dirs", []))
-                    + (f"exec 8>{qp(c['usb_lock'])}; flock 8\n" if a.usb and c.get("usb_lock") else "") + adm +
+                    + adm +
                     f"printf '%s janus-run start [%s] %s %s\\n' \"$(date '+%F %T')\" {q(name)} {q(jid)} {q(cmd)} >> {qp(log)}\n"
                     f"run_sampled {scope} nice -n {max(nice, 15)} ionice -c 3 podman run --rm --init --name {q('janus-run-' + jid)} {hw}"
                     f"--memory={cap}m --memory-swap={cap}m --cpus=$CC -v {qp(c['mount'])}:{q(c['mount_at'])} " + (f'-v "$JC":{CACHE_AT} ' if ce else "") + f"-w {qp(cw)} {args} "
@@ -223,7 +226,7 @@ def foreign_excludes(cfg, hn, h, src, skip=(".git", "target", ".venv", "node_mod
     """rsync --exclude pairs for each executable file under src built for another OS than host hn's (a Mac-built
     .firmware-tools/bin/elf2uf2-rs copied into a rigpc worktree, 2026-11-20). A worktree's ignored toolchains are per host: the
     host keeps its own (an excluded file is also safe from --delete). Paths are anchored at the tree's top; unknown OS: none."""
-    want = host_os(cfg, hn, h); here = "mac" if sys.platform == "darwin" else "linux"
+    want = host_os(cfg, hn, h)
     if not want: return []
     bad = tuple(m for o, ms in NATIVE.items() if o != want for m in ms)
     out = []
@@ -425,21 +428,38 @@ def queue_placement(cfg, a, src, cmd, jid, label):
     subprocess.run(["sh", "-c", f"{pueue(h)} wait -q {int(tid)}; {pueue(h)} log {int(tid)} --full"])
     return task_rc(task_status(h, tid))
 
+def remote_tree(cfg, a, needs, unit):
+    """--wt HOST:PATH (a path on that host, not here): the path, with a.host set to it; None for a local --wt. From the Mac a
+    rigpc unit's copy could not be named (the path had to exist here, and was then synced over the host's own tree). Refused: a
+    local host, a different --host, --needs, and another open unit's copy (its agent works there)."""
+    m = re.fullmatch(r"([A-Za-z0-9][\w.-]*):((?:/|\$HOME/|~/).+)", a.wt or "")
+    if not m or m.group(1) not in cfg.hosts: return None
+    hn, p = m.groups(); h = cfg.hosts[hn]
+    if h.get("local"): raise Err(f"--wt {a.wt}: {hn} is this machine: give the path alone")
+    if a.host and a.host != hn: raise Err(f"--wt {a.wt} is on {hn}, not --host {a.host}")
+    if needs: raise Err(f"--wt {a.wt} runs where the tree is: drop --needs")
+    try: units = Beads(cfg).units()
+    except Err as e: raise Err(f"refused: beads cannot be read to check whose tree {a.wt} is ({e})")
+    other = [u["name"] for u in units if u.get("host") == hn and u.get("rcwd") == p and u["name"] != unit]
+    if other: raise Err(f"refused: {a.wt} is the copy open unit {other[0]} works in (run as that unit: --unit {other[0]})")
+    a.host = hn; return p
+
 def cmd_run(cfg, a):
     needs = parse_needs(getattr(a, "needs", None))
+    unit = a.unit or os.environ.get("JANUS_UNIT")
+    rwt = remote_tree(cfg, a, needs, unit)   # --wt HOST:PATH: a tree that is already on that host (a remote unit's copy), never synced
     if not a.host and not needs: raise Err("give --host <host> (the job stays there) or --needs <requirements> (placed where they are met and there is room)")
     if a.host and a.host not in cfg.hosts: raise Err(f"unknown host {a.host}")
     cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
     if not cmd: raise Err("no command")
     cmd = cmd[0] if len(cmd) == 1 else shlex.join(cmd)   # one argument is shell text; several are quoted words
-    src = str(Path(a.wt).resolve()); name = Path(src).name
-    if not Path(src).is_dir(): raise Err(f"worktree {src} not found")
-    unit = a.unit or os.environ.get("JANUS_UNIT")
-    why = tree_guard(src)
+    src = rwt or str(Path(a.wt).resolve()); name = Path(src).name
+    if not rwt and not Path(src).is_dir(): raise Err(f"worktree {src} not found")
+    why = None if rwt else tree_guard(src)
     if why and not a.allow_unmerged: raise Err(f"refused: {src} {why} (--allow-unmerged to run anyway)")
     jid = f"{re.sub(r'[^A-Za-z0-9_-]', '_', name)[:40]}-{time.strftime('%m%d-%H%M%S')}-{os.getpid()}"
     keys = {}   # --inputs: the result cache (janus/cache.py); a key that already passed on a host this job may run on is not run again
-    if getattr(a, "inputs", None) and not cfg.run.dry:
+    if getattr(a, "inputs", None) and not cfg.run.dry and not rwt:
         hh = input_hashes(Path(src), a.inputs); facts = host_facts(cfg, refresh="stale")
         if hh is None: print(f"janus: --inputs ignored: {src} is not a git checkout (nothing is cached)", file=sys.stderr)
         for n in ([a.host] if a.host else [n for n in cfg.hosts if host_meets(cfg, n, facts.get(n), needs)[0]]) if hh is not None else []:
@@ -470,14 +490,16 @@ def cmd_run(cfg, a):
         broad, no = lane.broad_decision(why, pol, lv, broad); a.broad = broad
         if no: raise Err(f"refused: {no}")
     if broad: print(f"janus: broad run ({broad}): low priority", file=sys.stderr)
-    if cfg.run.dry: say(job_script(cfg, hn, h, a, name, cmd, jid)); return
-    if not h.get("local"): sync_wt(cfg, hn, h, src, name)
+    if cfg.run.dry: say(job_script(cfg, hn, h, a, name, cmd, jid, wd=rwt)); return
+    if rwt:
+        if hrun(h, f"test -d {qp(rwt)}")[0]: raise Err(f"no tree {rwt} on {hn}")
+    elif not h.get("local"): sync_wt(cfg, hn, h, src, name)
     rd = runs_dir(cfg, h)
     if h.get("local"): Path(rd).mkdir(parents=True, exist_ok=True)
     rc, o, e = write_cap(cfg, hn, h)   # the rule the job reads at its start
     if rc: raise Err(f"writing the job to {hn} failed: {(e or o).strip()[-120:]}")
     run = lambda c, inp=None: hrun(h, c, inp=inp)
-    rc, tid = lane.queue_job(run, pueue(h), ensure_lanes(h, cfg), rd, jid, job_script(cfg, hn, h, a, name, cmd, jid), a.lane, label, a.priority, bool(broad))
+    rc, tid = lane.queue_job(run, pueue(h), ensure_lanes(h, cfg), rd, jid, job_script(cfg, hn, h, a, name, cmd, jid, wd=rwt), a.lane, label, a.priority, bool(broad))
     if rc: raise Err(f"queueing on {hn} failed: {tid}")
     record_job(cfg, f"{hn}:{tid}", jid, src, {"lane": a.lane, "unit": unit, "wt": src, "cmd": cmd, "subdir": a.subdir, "usb": bool(a.usb),
                                               "priority": a.priority, "needs": getattr(a, "needs", None), "pinned": not needs, "broad": broad,
@@ -598,13 +620,27 @@ def patch_scope_state(h, act=""):
     w = (o.split() or [""])[-1]
     return (w, "") if not rc and re.fullmatch(r"none|foreign|nosystemd|unknown|owned-[a-z-]+", w) else ("unknown", (e or o).strip()[-160:] or f"no answer (exit {rc})")
 
+def cancel_leftovers(cfg, ref, h):
+    """A cancel of a task its host no longer has: the records janus keeps for it (runs/busy/<jid>, runs/jobs/<jid>.json here, and
+    <jid>.wait/.gwait/.res in the host's runs dir) are removed, since they still read as a job (busy trees, [old-rule:<host>] when
+    admission paused: 'no task 689 on mac' left them for good). Err when there is nothing either."""
+    hn, _, tid = ref.partition(":")
+    jids = [f.name for f in sorted((cfg.f("runs") / "busy").glob("*")) if f.is_file() and f.read_text().split("\t", 1)[0].strip() == ref] if (cfg.f("runs") / "busy").is_dir() else []
+    if not jids: raise Err(f"no task {tid} on {hn}, and janus keeps no record of it")
+    if cfg.run.dry: return [f"+ remove the records of {ref} (gone from {hn}'s pueue): {', '.join(jids)}"]
+    rd = runs_dir(cfg, h)
+    for j in jids:
+        for f in (cfg.f("runs") / "busy" / j, cfg.f("runs") / "jobs" / f"{j}.json"): f.unlink(missing_ok=True)
+        hrun(h, "rm -f " + " ".join(qp(f"{rd}/{j}{x}") for x in (".wait", ".gwait", ".res")), timeout=60)
+    return [f"no task {tid} on {hn} (it is gone): removed what janus kept for it ({', '.join(jids)}: busy record, job record, wait and reservation files)"]
+
 def cancel_job(cfg, ref, force=False):
     """Cancel job <host>:<task>: its files are saved here first (runs/<jid>.*; refused when that fails, unless force: nothing is
     removed before it is collected), then pueue kill and remove, then its container or scope is stopped by name."""
     hn, _, tid = ref.partition(":")
     if hn not in cfg.hosts or not tid.isdigit(): raise Err("expected <host>:<task id>")
     h = cfg.hosts[hn]; t = task_status(h, tid)
-    if t is None: raise Err(f"no task {tid} on {hn}")
+    if t is None: return cancel_leftovers(cfg, ref, h)   # the task is gone: what janus kept for it still read as a job (busy, waiting)
     if own_label(cfg, t) is None:   # cross-project safety: never another project's job, nor one with no project id (machine state)
         raise Err(f"refused: {hn}:{tid} ({t.get('label')}) is " + ("machine state (no project id)" if untagged(t) else "another project's job")
                   + f": janus acts only on its own; if it must go, pueue kill {tid} on {hn} by hand")

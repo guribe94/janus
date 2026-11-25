@@ -204,4 +204,65 @@ class LaunchAndRouting(unittest.TestCase):
             self.assertEqual(janus.foreign_excludes(cfg, "far", cfg.hosts["far"], t), [])   # unknown: nothing left out
 
 
+class Jobs(unittest.TestCase):
+    """Items 12, 13, 25."""
+    def ns(self, **k): return argparse.Namespace(**{"lane": "jobs", "subdir": None, "usb": False, "wt": "/w/t", "broad": None, **k})
+
+    def test_usb_jobs_take_the_lock_on_every_runner(self):
+        """Catches item 13: --usb took usb_lock only on a podman host; rigpc (no container) ran its Pico jobs together."""
+        d, cfg = project('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n')
+        plain = {"ssh": "u@far", "root": "/r", "_rd": "/r/runs"}
+        for h in (plain, {**plain, "usb_lock": "/tmp/pico.lock"}, {"local": True, "_rd": str(d / "rd")}):
+            js = janus.job_script(cfg, "far", h, self.ns(usb=True), "t", "make flash", "t-1")
+            self.assertIn("flock 8", js, h); self.assertLess(js.index("flock 8"), js.index("cap.sh"), "the lock is taken after admission")
+            self.assertNotIn("flock 8", janus.job_script(cfg, "far", h, self.ns(), "t", "make", "t-1"))
+        self.assertIn('exec 8>"$RD/usb.lock"', janus.job_script(cfg, "far", plain, self.ns(usb=True), "t", "x", "t-1"))
+        self.assertIn("exec 8>/tmp/pico.lock", janus.job_script(cfg, "far", {**plain, "usb_lock": "/tmp/pico.lock"}, self.ns(usb=True), "t", "x", "t-1"))
+        with mock.patch.object(janus, "cap_nums", lambda *a: {"agmb": 1024, "cores": 4, "cpj": 1}):
+            _, conf = janus.lane_runner(cfg, "far", {**plain, "_rd": "/r/runs"}, "u", "/r/worktrees/u")
+        c = json.loads(conf); self.assertIn("flock 8", c["script_usb"]); self.assertNotIn("flock 8", c["script"]); self.assertIn("script_usb_broad", c)
+
+    def test_a_remote_units_tree_is_addressed_by_host_and_path(self):
+        """Catches item 12: `janus run --wt` from the Mac could not name a rigpc path (it had to exist here, and was synced over)."""
+        d, cfg = project('\n[hosts.far]\nssh = "u@far"\nroot = "/r"\n')
+        units = [{"name": "other", "host": "far", "rcwd": "/r/worktrees/other"}, {"name": "u", "host": "far", "rcwd": "/r/worktrees/u"}]
+        B = type("B", (), {"__init__": lambda s, c: None, "units": lambda s: units})
+        with mock.patch.object(janus, "Beads", B):
+            a = self.ns(wt="far:/r/worktrees/u", host=None); self.assertEqual(janus.remote_tree(cfg, a, [], "u"), "/r/worktrees/u"); self.assertEqual(a.host, "far")
+            self.assertIsNone(janus.remote_tree(cfg, self.ns(wt="/local/tree", host=None), [], None))
+            with self.assertRaises(janus.Err) as e: janus.remote_tree(cfg, self.ns(wt="far:/r/worktrees/other", host=None), [], "u")
+            self.assertIn("--unit other", str(e.exception))
+            with self.assertRaises(janus.Err): janus.remote_tree(cfg, self.ns(wt="far:/r/x", host="here"), [], None)
+        js = janus.job_script(cfg, "far", {"ssh": "u@far", "root": "/r", "_rd": "/r/runs"}, self.ns(wt="far:/r/worktrees/u"), "u", "make", "u-1", wd="/r/worktrees/u")
+        self.assertIn("cd /r/worktrees/u &&", js)
+
+    def test_a_stale_wait_file_is_neither_waiting_nor_old_rule_and_tidy_takes_it(self):
+        """Catches item 25: a 2026-11-15 job's .wait outlived its task; its pid was reused, so it read as a job waiting under the old
+        rule ([old-rule:mac]) once tidy took its .sh, tidy never removed it, and cancel said only 'no task 689 on mac'."""
+        other = subprocess.Popen(["sh", "-c", "sleep 30; :", "unrelated"])
+        try:
+            with tempfile.TemporaryDirectory() as rd:
+                Path(rd, "cargo_clean-1115.wait").write_text(f"{other.pid} 60 1700000000 500 1\n")   # a live pid that is not the job
+                out = subprocess.run(["sh", "-c", janus.probe_extra({"_rd": rd, "local": True})], capture_output=True, text=True).stdout
+                self.assertIn("wait_jobs=0\n", out); self.assertIn("old_rule=0\n", out)
+                d, cfg = project(); h = {**cfg.hosts["here"], "_rd": rd}
+                with mock.patch.object(janus, "all_units", lambda cfg: {}):
+                    P = janus.tidy_host(cfg, "here", h, [], {})
+                self.assertIn(("stale-wait", f"here:{rd}/cargo_clean-1115.wait"), [(k, t) for k, t, _, _ in P])
+        finally: other.kill(); other.wait()
+
+    def test_records_of_a_gone_task_are_tidied_and_cancel_clears_them(self):
+        d, cfg = project(); b = cfg.f("runs") / "busy"; b.mkdir(parents=True); j = cfg.f("runs") / "jobs"; j.mkdir()
+        for jid, ref in (("old-1115", "here:689"), ("live-1125", "here:7")):
+            (b / jid).write_text(f"{ref}\t/w/t\n"); (j / f"{jid}.json").write_text("{}")
+        with mock.patch.object(janus, "hrun", lambda h, s, **k: (0, json.dumps({"tasks": {"7": {}}}), "")):
+            self.assertEqual([t for k, t, _, _ in janus.tidy_job_records(cfg)], ["old-1115"])
+        cmds = []
+        with mock.patch.object(janus, "task_status", lambda h, t: None), mock.patch.object(janus, "hrun", lambda h, s, **k: cmds.append(s) or (0, "", "")):
+            out = janus.cancel_job(cfg, "here:689")
+            self.assertIn("removed what janus kept", out[0]); self.assertFalse((b / "old-1115").exists()); self.assertTrue((b / "live-1125").exists())
+            self.assertTrue(any("old-1115.wait" in c for c in cmds))
+            with self.assertRaises(janus.Err): janus.cancel_job(cfg, "here:999")
+
+
 if __name__ == "__main__": unittest.main()
