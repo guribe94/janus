@@ -320,13 +320,14 @@ def doctor(cfg, a):
     tgt = me.resolve() if me.exists() else None
     rel = tgt and ".local/share/janus/" in str(tgt)
     r(bool(rel), f"installed janus: {me} -> {tgt or 'missing'}", "run ./install from the janus repo (it copies a tested release; never a link to the working tree)")
-    sk = Path.home() / ".claude/skills/janus"
-    r(True if sk.exists() and ".local/share/janus/" in str(sk.resolve()) else None if sk.exists() else False,
-      f"skill {sk} -> {sk.resolve() if sk.exists() else 'missing'}", "run ./install")
-    try: hk = json.loads((Path.home() / ".claude/settings.json").read_text()).get("hooks", {})
-    except Exception: hk = {}
-    miss = [ev for ev in ("SessionStart", "PreToolUse", "Stop") if not any("janus hook " + ev in h.get("command", "") for e in hk.get(ev, []) for h in e.get("hooks", []))]
-    r(not miss, "Claude Code hooks " + ("installed" if not miss else "missing: " + ", ".join(miss)), "run ./install")
+    if cfg is not None:   # janus is on per project (janus on): its own skill link and hooks; the global ones are gone by design, and checking them failed every project that is on
+        sk = cfg.root / ".claude/skills/janus"
+        r(True if sk.exists() and ".local/share/janus/" in str(sk.resolve()) else None if sk.exists() else False,
+          f"skill {sk} -> {sk.resolve() if sk.exists() else 'missing'}", "janus on (in the project)")
+        try: hk = json.loads((cfg.root / ".claude/settings.local.json").read_text()).get("hooks", {})
+        except Exception: hk = {}
+        miss = [ev for ev in ("SessionStart", "PreToolUse", "Stop") if not any("janus hook " + ev in h.get("command", "") for e in hk.get(ev, []) for h in e.get("hooks", []))]
+        r(not miss, "Claude Code hooks " + ("installed" if not miss else "missing: " + ", ".join(miss)), "janus on (in the project)")
     r(watcher_loaded() or None, f"watcher {watcher_service()[1]} ({watcher_service()[0]}) loaded", "run ./install")
     if cfg is None:
         old = old_layout()
