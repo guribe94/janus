@@ -34,6 +34,7 @@ def probe_extra(h):
         w += f'\no=$(cat {shlex.quote(s)}/pid 2>/dev/null); [ -n "$o" ] && kill -0 "$o" 2>/dev/null && echo "sched=$o old lane {s}"'
     if not h.get("local"): w += "\n" + DIRECT_PROBE % {"rx": shlex.quote(BUILD_ERE)}
     # board:stale-sync: minutes the host's oldest board post has waited in its outbox (an older shipped board prints nothing)
+    if not h.get("local") and h.get("root"): w += f'\necho "janus_copy=$(cat {qp(h["root"])}/janus/VERSION 2>/dev/null)"'   # copy:<host>: the release install-host last copied
     if not h.get("local") and h.get("root"): w += f'\nb={qp(h["root"])}/bin/board.sh; [ -x "$b" ] && m=$("$b" outbox 2>/dev/null) && echo "outbox_min=$m"; true'
     w += "\n" + API_PROBE   # every host: Claude/Anthropic API processes janus did not start (spend safety)
     # legacy_probe (janus.toml, per host): shell that prints legacy_wait=<n> and legacy_run=<n> for a project's older job queue

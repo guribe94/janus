@@ -1,13 +1,13 @@
 """Findings about hosts: unreachable, margins, admission blocked or paused, lane stalls, idle slots and job ages, orphans, thrash
 acts, tidy and disk. Observations only: each clears when the condition does; nothing is stopped from here."""
-import functools, time
+import functools, re, time
 from janus.actions.jobs import LANES, job_of, job_progress, lane_age, lane_stall, lane_wait, orphan_jobs, slots
 from janus.project import label_owner, own_label, project_id, tmux_name, unit_tmux, untagged
 from janus.backlog import STRANDED, backlog_issues, ready_work, stranded_status
 from janus.board import board_script
 from janus.msgboard import STALE_MIN
 from janus.cap import build_room, capv, host_cap
-from janus.context import Err, fl, projects, ts, now
+from janus.context import Err, JANUS_SELF, fl, projects, ts, now
 from janus.platform import launchd_exports
 from janus.probe import host_liveness, margins, room
 from janus.units import orphan_tabs, verdict, ws_id
@@ -111,6 +111,8 @@ def other_projects(cfg):
         out.append((str(r.resolve()), o))
     return out
 
+RELEASE_RX = re.compile(r"\d{8}-\d{6}-[0-9a-f]{10}")   # an installed release's folder name (a checkout has no release to compare)
+
 def host_findings(cfg, hs, units):
     """host:, host:<h>:gone, duplicate:, margin:, idle:<host>, pressure:, scheduler:, orphan:job: and orphan:tmux: from each host's probe."""
     F = []; names = {u["name"] for u in units}; un = cfg.jget("hosts.json")
@@ -149,6 +151,9 @@ def host_findings(cfg, hs, units):
             if u.get("relaunched") in byname and st == "up":
                 F.append((f"duplicate:{u['name']}", f"{n} answers again: {u['name']} was relaunched as {u['relaunched']} while {n} was down; keep one: "
                           f"janus collect {u['name']}, then land or close it by its verdict, or janus close {u['relaunched']} --duplicate-of {u['name']} once {u['relaunched']} is stopped"))
+        # a release reached a remote host only through janus install-host: two hosts ran copies days older than the coordinator's
+        if not cfg.hosts[n].get("local") and RELEASE_RX.fullmatch(JANUS_SELF.parent.name) and p.get("janus_copy") != JANUS_SELF.parent.name:
+            F.append((f"copy:{n}", f"host {n} has janus copy {p.get('janus_copy') or 'of no recorded release'}, not this release ({JANUS_SELF.parent.name}): janus install-host {n}"))
         r, why = room(cfg, n, p, units)
         mg = margins(cfg.hosts[n], p, cfg=cfg)
         low = r < 1 and p.get("avail_mb") and fl(p.get("avail_mb")) / 1024 < cfg.hosts[n].get("reserve_gb", 2) * 0.6

@@ -221,8 +221,10 @@ def main():
         if formulas: run(["brew", "install", *formulas])
         answers = shutil.which("pueue") and subprocess.run(["pueue", "status"], capture_output=True).returncode == 0
         if not answers: run(["brew", "services", "start", "pueue"])
-    if root and not A.no_hosts:
-        for n, h in tomllib.loads((root / ".janus" / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, root)
-    elif not root: say("no .janus/janus.toml found: host tools skipped")
+    # the project here, else every project that is on: an install run from the janus repository reached no remote host
+    roots = [root] if root else [Path(p) for p in switch.on_projects() if (Path(p) / ".janus" / "janus.toml").is_file()]
+    if not roots: say("no .janus/janus.toml found and no project is on: host tools skipped")
+    for r in [] if A.no_hosts else roots:
+        for n, h in tomllib.loads((r / ".janus" / "janus.toml").read_text()).get("hosts", {}).items(): host_tools(n, h, r)
 
 main()

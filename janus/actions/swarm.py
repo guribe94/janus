@@ -185,7 +185,8 @@ def cmd_remember(cfg, a):
     say(f"remembered ({MEM_SECTIONS[kind]})" + (f", replacing the older entry on [{key}]" if old else "") + f": {text}")
     # a new entry on an old subject under a new key left the old one standing (nine entries on one model rule): show them
     words = {w for w in (key or "").split("-") if len(w) > 3 and not w.isdigit()}
-    rel = [f"{i:3} [{e[2]}] {e[3][:80]}" for i, e in enumerate(memory_read(cfg), 1) if e[2] and e[2] != key and words & set(e[2].split("-"))]
+    rel = sorted((-len(words & set(e[2].split("-"))), i, e) for i, e in enumerate(memory_read(cfg), 1) if e[2] and e[2] != key and words & set(e[2].split("-")))
+    rel = [f"{i:3} [{e[2]}] {e[3][:80]}" for _, i, e in rel[:5]]   # the closest keys first: one shared word matched unrelated subjects
     if rel: say("\n".join(["related entries still stand (janus forget <N> any that this one replaces):", *rel]))
     if not key: say("no --key: no later entry can replace this one (janus forget removes it)")
     if kind in ("instruction", "decision"): tell_running(cfg, f"{'replaced' if old else 'new'} {kind}{f' [{key}]' if key else ''}: {text}")

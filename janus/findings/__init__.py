@@ -22,6 +22,7 @@ FAMILIES = {
     "board": Family("a board card is blocked, has a question, is gone or silent; a host's posts wait unsynced over 3 min", urgent=True),
     "cap": Family("more agents than the owner's total or per-host cap"),
     "review": Family("a finished unit lacks the DONE reviews its rigor level requires before janus land ([rigor] level, RIGOR:)", urgent=True, recur=True),
+    "copy": Family("a remote host's janus copy is not this release's (janus install-host <host>; ./install does it for every project that is on)"),
     "duplicate": Family("a stranded unit's host answers again while its relaunch is open: keep one of the two", urgent=True),
     "disk": Family("a host is over its disk budget (tidy's last pass)"),
     "git": Family("the project's repository is dirty, unpushed or has no upstream"),

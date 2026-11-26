@@ -474,7 +474,11 @@ def cmd_install_host(cfg, a):
     steps = install_steps(cfg, n, h, f); rc = 0
     if not h.get("local"):
         root = h["root"]; dst = f"{h['ssh']}:{root.replace('$HOME/', '')}/janus/"
-        steps.append(("janus copy", ["rsync", "-a", "--delete", "--exclude", "__pycache__", "-e", " ".join(SSH), str(JANUS_SELF), str(JANUS_SELF.parent / "janus"), dst]))
+        steps.append(("janus copy", ["rsync", "-a", "--delete", "--exclude", "__pycache__", "-e", " ".join(SSH), str(JANUS_SELF), str(JANUS_SELF.parent / "janus"), str(JANUS_SELF.parent / "skill"), dst]))
+        # the release this copy is (copy:<host> compares it), and the skill: a janus skill link the host already has follows the copy
+        # (one host's links named a release eleven days old); no link is made: the skill is the orchestrator's, on per project
+        steps.append(("janus version and skill links", f"echo {shlex.quote(JANUS_SELF.parent.name)} > {qp(root)}/janus/VERSION; for l in $HOME/.claude/skills/janus $HOME/.codex/skills/janus $HOME/.agents/skills/janus; do "
+                      f"[ -L \"$l\" ] && ln -sfn {qp(root)}/janus/skill \"$l\" && echo \"$l\"; done; true"))
         b = h.get("bin", "$HOME/.local/bin")   # row 64: `janus` resolves in a job's shell there (job scripts put this folder on PATH)
         steps.append(("janus launcher", launcher_cmd(b, root)))
         e, d = heartbeat_env(cfg), heartbeat_files()

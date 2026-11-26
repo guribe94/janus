@@ -165,5 +165,33 @@ class MemoryUpkeep(unittest.TestCase):
         self.assertIn("no --key", self.remember("an unkeyed note"))
 
 
+class HostUpkeep(unittest.TestCase):
+    """Two hosts ran a janus copy days older than the coordinator's, and one host's disk filled with trees no tidy rule saw."""
+    def test_a_host_with_another_releases_copy_is_a_finding(self):
+        d, cfg = project(FAR); hs = {"far": {"ok": True, "res": [], "hist": [], "sched": [], "direct": [], "pueue": {"tasks": {}}, "cap_pause": "", "janus_copy": "20261115-122723-2e3bbe3df1"}}
+        F = lambda: dict(janus.host_findings(cfg, hs, []))
+        with mock.patch.object(janus, "ready_work", lambda cfg: []), mock.patch.object(janus, "other_projects", lambda cfg: []):
+            self.assertNotIn("copy:far", F())                                           # a checkout is no release: nothing to compare
+            with mock.patch.object(janus, "JANUS_SELF", Path("/r/20261126-000534-15642dba9f/janus.py")):
+                self.assertIn("janus install-host far", F()["copy:far"])
+                hs["far"]["janus_copy"] = "20261126-000534-15642dba9f"; self.assertNotIn("copy:far", F())
+        self.assertEqual(janus.finding("copy:far", "").family, "copy")
+
+    def test_tidy_lists_a_closed_units_job_tree_and_says_what_it_keeps(self):
+        import sys
+        d, cfg = project(FAR + 'worktrees = "/big/wt"\n'); T = sys.modules["janus.actions.tidy"]; ran = []; h = cfg.hosts["far"]
+        old, new = "2026-01-01T00:00:00Z", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        au = {"mine": {"name": "mine", "status": "closed", "host": "here", "_closed_at": old}, "fresh": {"name": "fresh", "status": "closed", "host": "here", "_closed_at": new},
+              "live": {"name": "live", "status": "in_progress", "host": "here"}, "theirs": {"name": "theirs", "status": "closed", "host": "far", "_closed_at": old}}
+        out = "tree mine\ntree fresh\ntree live\ntree base-clone\ncopy theirs 5\n"; kept = []
+        with mock.patch.object(T, "hrun", lambda h, c, **k: ran.append(c) or (0, out, "")), mock.patch.object(T, "uncollected", lambda cfg, u: "its copy has changes not collected"):
+            P = janus.tidy_host(cfg, "far", h, [{"name": "live"}], au, kept)
+            self.assertIn('wt=/big/wt;', ran[0])
+            self.assertEqual([(k, t) for k, t, *_ in P], [("job-tree", "far:tree/mine")])     # not a young close, an open unit, or a name no unit has
+            self.assertEqual(kept, [("far:base-clone", "no unit of this name: not judged"), ("far:theirs", "its copy has changes not collected")])
+            self.assertEqual(janus.tidy_do(cfg, "job-tree", "far:tree/mine")[0], 0); self.assertEqual(ran[-1], "rm -rf /big/wt/mine")
+            self.assertEqual(janus.tidy_do(cfg, "job-tree", "far:tree/..")[0], 1); self.assertEqual(janus.tidy_do(cfg, "job-tree", "far:tree/a/b")[0], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

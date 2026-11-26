@@ -130,6 +130,7 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 | `cap` | more agents than the owner's caps |
 | `disk` | a host is over its disk budget |
 | `review` | a finished unit lacks the DONE reviews its rigor level requires (`careful`: 1 for critical; `thorough`: 2 for critical, one by another vendor, 1 for normal); `janus land` refuses it until then (`--force-review`) |
+| `copy` | `copy:<host>`: the host's janus copy (`<root>/janus/VERSION`, written by `janus install-host`) is not this release's: `janus install-host <host>` |
 | `duplicate` | a stranded unit's host answers again while its relaunch is open: keep one (collect and land or close the original, or `close <relaunch> --duplicate-of <original>`) |
 | `git` | the project repository is dirty / unpushed |
 | `host` | a host is unreachable. Past `[capacity] down_after_min` (default 30) or marked `gone` it is stranded: its open units no longer cover their backlog items or hold cap slots, and `janus fill` relaunches each item on a host that answers (a new unit `<name>-rN`, `--resume-of` the original: its report copied here and its synced `backup.patch` applied); a brief pinned to it waits (`backlog:pinned:<unit>`). `host:<h>:gone` lists a gone host's units to close |
@@ -154,7 +155,7 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 | `stalled` | queued work with free slots |
 | `tab` | a tab of a closed unit is still open |
 | `thrash` | the watcher stopped and re-queued a job on a thrashing host |
-| `tidy` | what janus tidy can reclaim. Kind `brief`: brief files unchanged for `[tidy] keep_days` that nothing reads (a unit closed that long ago; a closed item's; one naming no item whose name never ran) are moved to `.janus/briefs-archive`, never deleted; an open unit's, an open item's unlaunched brief, `drafts/` and held files stay |
+| `tidy` | what janus tidy can reclaim (`janus tidy` prints `kept copy HOST:NAME: why` for each remote copy or tree it leaves). Kind `job-tree`: a tree `janus run` synced to a host for a unit closed over `[tidy] keep_days` (a mirror of the unit's tree, plus build output). Kind `brief`: brief files unchanged for `[tidy] keep_days` that nothing reads (a unit closed that long ago; a closed item's; one naming no item whose name never ran) are moved to `.janus/briefs-archive`, never deleted; an open unit's, an open item's unlaunched brief, `drafts/` and held files stay |
 | `unit` | a unit is blocked, finished, ended its turn without a verdict (`:ended-pending`), interrupted (`:interrupted`) or not started |
 | `unregistered` | a janus bug: an unregistered finding family |
 | `waiting` | a live agent waits for admission |
@@ -170,7 +171,7 @@ update the handoff over the context threshold. A worker's Stop hook blocks once 
 `--rollback` (back to the previous release), `--no-hosts`, `--hosts-only`, `--tests PATTERN` (also run only the matching test files against the copy).
 Both `--release-only` and a full `./install` switch `current` and refuse while a registered project is still on the old layout (migrate it first, with
 `python3 janus.py migrate` from the checkout or the staged release; see the README). A full `./install` also activates the watcher (launchd agent or systemd user timer, every 2 minutes, over the projects listed in
-`~/.config/janus/projects`) and runs `janus install-host` per remote host. Janus is on per project: `janus on` (in the project) writes its
+`~/.config/janus/projects`) and runs `janus install-host` per remote host of the project it is run in, else of every project that is on (the copy of janus, its release name, the skill; a janus skill link the host already has is pointed at that copy, none is made). Janus is on per project: `janus on` (in the project) writes its
 hooks into `<project>/.claude/settings.local.json`, links `<project>/.claude/skills/janus`, adds the project to `~/.config/janus/projects`, and
 while any project is on keeps the Codex hooks and skill global (`~/.codex/hooks.json`, `~/.agents/skills/janus`); `janus off` removes exactly
 those. Agents janus launches get the hooks for their own session (`claude --settings`). An install keeps every registered project on and removes
