@@ -148,7 +148,10 @@ def in_use():
         pq = subprocess.run(["pueue", "status", "--json"], capture_output=True, text=True, timeout=30) if shutil.which("pueue") else None
     except (OSError, subprocess.SubprocessError): return None
     if pq is not None and pq.returncode: return None   # a queue that does not answer: unknown, not "none"
-    text = ps + (pq.stdout if pq else "")
+    text = ps
+    if pq is not None:   # only a queued or running job: every finished task was counted, so five releases of two weeks ago were never pruned
+        try: text += "".join(json.dumps(t) for t in json.loads(pq.stdout).get("tasks", {}).values() if "Done" not in (t.get("status") if isinstance(t.get("status"), dict) else [t.get("status")]))
+        except ValueError: return None
     return set(re.findall(r"releases/([0-9]{8}-[0-9]{6}-[0-9a-f]{10})", text))
 
 def prune():
