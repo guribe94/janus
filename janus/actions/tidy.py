@@ -261,11 +261,14 @@ def old_briefs(cfg, units, au):
     """[(path, why)]: brief files (the folder's own *.md; never drafts/) nothing reads any more, unchanged for keep_days: a closed
     unit's brief (spent: fill never launches a name that ran), closed over keep_days ago; a brief of no unit whose ITEM: is a
     closed item, or that names none. Kept: an open unit's (by name, by its recorded brief, its relaunch's), one whose item is
-    still open and that never ran (fill may launch it), a held one. One project's folder held 5,657 files, read at every check
+    still open and that never ran (fill may launch it), one named after an open bead (work that is no backlog item: its brief
+    waits for a launch by hand, also after a unit of that name closed), a held one. One project's folder held 5,657 files, read at every check
     and fill, and no rule covered them."""
     bdir = cfg.p("briefs", "briefs"); days = tset(cfg, "keep_days"); cut = now() - days * 86400
     if not bdir.is_dir(): return []
     iss = backlog_issues(cfg); open_items = {norm_item(k.split(":", 1)[1]) for k, i in iss.items() if i.get("status") != "closed"}
+    ob = Beads(cfg).run("list", "--status", "open,in_progress", "-n", "0"); ob = ob.get("issues", ob) if isinstance(ob, dict) else ob
+    beads = {str(i.get(k)) for i in ob for k in ("id", "title") if i.get(k)}
     names = {u["name"] for u in units}; used = {str(Path(u["brief"]).resolve()) for u in units if u.get("brief")}
     holds = tidy_holds(cfg); out = []
     def closed_ts(rec):
@@ -276,7 +279,7 @@ def old_briefs(cfg, units, au):
             if not f.is_file() or f.stat().st_mtime >= cut: continue
         except OSError: continue
         n = f.stem
-        if n in names or any(re.fullmatch(re.escape(n) + r"-r\d+", x) for x in names) or str(f.resolve()) in used or held_by(cfg, str(f), holds): continue
+        if n in names or any(re.fullmatch(re.escape(n) + r"-r\d+", x) for x in names) or str(f.resolve()) in used or n in beads or held_by(cfg, str(f), holds): continue
         rec = au.get(n)
         if rec is not None:
             if rec.get("status") == "closed" and closed_ts(rec) < cut: out.append((f, "its unit is closed"))

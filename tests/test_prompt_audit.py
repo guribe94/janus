@@ -115,7 +115,7 @@ class OldBriefs(unittest.TestCase):
         def brief(n, text="do it\n", age=old):
             p = bd / n; p.parent.mkdir(exist_ok=True); p.write_text(text); os.utime(p, (age, age)); return p
         for n in ("closed-old.md", "recent-closed.md", "open-unit.md", "relaunched.md", "noitem.md", "drafts/d.md", "notes.txt"): brief(n)
-        brief("ready-item.md", "ITEM: X1\n"); brief("closed-item.md", "ITEM: X2\n"); brief("young.md", age=time.time()); brief("held.md")
+        brief("ready-item.md", "ITEM: X1\n"); brief("closed-item.md", "ITEM: X2\n"); brief("young.md", age=time.time()); brief("held.md"); brief("sweep-x.md", "ITEM: X2\n")
         au = {"closed-old": {"status": "closed", "_closed_at": "2026-01-01T00:00:00Z"},
               "recent-closed": {"status": "closed", "_closed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
               "open-unit": {"status": "in_progress"}, "relaunched": {"status": "closed", "_closed_at": "2026-01-01T00:00:00Z"}}
@@ -125,13 +125,14 @@ class OldBriefs(unittest.TestCase):
         class B:
             def __init__(s, c): pass
             def units(s): return units
+            def run(s, *a): return [{"id": "b-1", "title": "sweep-x"}]   # an open bead that is no backlog item: its brief waits for a launch by hand
         with mock.patch.object(janus, "backlog_issues", lambda c: iss), mock.patch.object(janus, "all_units", lambda c: au), mock.patch.object(janus, "Beads", B):
             self.assertEqual(sorted(f.name for f, _ in janus.old_briefs(cfg, units, au)), ["closed-item.md", "closed-old.md", "noitem.md"])
             P = janus.tidy_briefs(cfg, units, au)
             self.assertEqual([(k, t) for k, t, _, _ in P], [("brief", str(bd))]); self.assertIn("3 brief file(s)", P[0][2])
             self.assertEqual(janus.tidy_do(cfg, "brief", str(bd)), (0, "3 moved"))
         self.assertEqual(sorted(f.name for f in (d / ".janus/briefs-archive").iterdir()), ["closed-item.md", "closed-old.md", "noitem.md"])
-        self.assertEqual(sorted(f.name for f in bd.iterdir()), ["drafts", "held.md", "notes.txt", "open-unit.md", "ready-item.md", "recent-closed.md", "relaunched.md", "young.md"])
+        self.assertEqual(sorted(f.name for f in bd.iterdir()), ["drafts", "held.md", "notes.txt", "open-unit.md", "ready-item.md", "recent-closed.md", "relaunched.md", "sweep-x.md", "young.md"])
 
 
 if __name__ == "__main__":
