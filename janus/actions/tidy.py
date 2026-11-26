@@ -1,9 +1,10 @@
 """janus tidy: bookkeeping without hand operations (landed branches, old run files, stopped containers, closed units'
 remote copies, old test roots, cache entries over a host's disk budget)."""
-import json, os, re, shlex, tempfile
+import contextlib, datetime, json, os, re, shlex, tempfile
 from pathlib import Path
 from janus.actions.landing import follow_upstream
 from janus.actions.lifecycle import uncollected
+from janus.backlog import backlog_issues, norm_item
 from janus.beads import Beads
 from janus.board import board, board_rows
 from janus.cap import capv
@@ -252,6 +253,52 @@ def tidy_job_records(cfg):
         P += [("job-record", j, f"its task {r} is gone from {hn}'s pueue", 0) for j, r in recs.items() if r.split(":")[0] == hn and r.partition(":")[2] not in tasks]
     return P
 
+BRIEF_ITEM = re.compile(r"^ITEM:\s*(\S+)", re.M)
+
+def brief_archive(cfg): return cfg.state / "briefs-archive"
+
+def old_briefs(cfg, units, au):
+    """[(path, why)]: brief files (the folder's own *.md; never drafts/) nothing reads any more, unchanged for keep_days: a closed
+    unit's brief (spent: fill never launches a name that ran), closed over keep_days ago; a brief of no unit whose ITEM: is a
+    closed item, or that names none. Kept: an open unit's (by name, by its recorded brief, its relaunch's), one whose item is
+    still open and that never ran (fill may launch it), a held one. One project's folder held 5,657 files, read at every check
+    and fill, and no rule covered them."""
+    bdir = cfg.p("briefs", "briefs"); days = tset(cfg, "keep_days"); cut = now() - days * 86400
+    if not bdir.is_dir(): return []
+    iss = backlog_issues(cfg); open_items = {norm_item(k.split(":", 1)[1]) for k, i in iss.items() if i.get("status") != "closed"}
+    names = {u["name"] for u in units}; used = {str(Path(u["brief"]).resolve()) for u in units if u.get("brief")}
+    holds = tidy_holds(cfg); out = []
+    def closed_ts(rec):
+        try: return datetime.datetime.fromisoformat(str(rec.get("_closed_at")).replace("Z", "+00:00")).timestamp()
+        except ValueError: return 0   # no close time on the record: the file's own age decides
+    for f in sorted(bdir.glob("*.md")):
+        try:
+            if not f.is_file() or f.stat().st_mtime >= cut: continue
+        except OSError: continue
+        n = f.stem
+        if n in names or any(re.fullmatch(re.escape(n) + r"-r\d+", x) for x in names) or str(f.resolve()) in used or held_by(cfg, str(f), holds): continue
+        rec = au.get(n)
+        if rec is not None:
+            if rec.get("status") == "closed" and closed_ts(rec) < cut: out.append((f, "its unit is closed"))
+            continue
+        try:
+            with open(f, errors="replace") as fh: m = BRIEF_ITEM.search("".join(next(fh, "") for _ in range(12)))
+        except OSError: continue
+        if m and norm_item(m.group(1)) in open_items: continue
+        out.append((f, "its item is closed" if m else "it names no item and no unit ran under its name"))
+    return out
+
+def tidy_briefs(cfg, units, au):
+    """[("brief", <briefs folder>, why, 0)]: one row for all of old_briefs (thousands of rows said nothing). They are moved to
+    .janus/briefs-archive, never deleted: a brief is the record of what was asked."""
+    try: L = old_briefs(cfg, units, au)
+    except Err as e: say(f"note: the backlog could not be read ({e}): old briefs are not judged this time"); return []
+    if not L: return []
+    by = {}
+    for _, w in L: by[w] = by.get(w, 0) + 1
+    return [("brief", str(cfg.p("briefs", "briefs")), f"{len(L)} brief file(s) unchanged for {tset(cfg, 'keep_days')} days that nothing reads ("
+             + "; ".join(f"{n}: {w}" for w, n in by.items()) + f"): moved to {brief_archive(cfg)} (kept there, not deleted)", 0)]
+
 def tidy_repos(cfg):
     """The repositories the worktrees belong to (their git common dir) plus [tidy] repos, sorted."""
     repos = set(); wd = cfg.p("worktrees", "worktrees")
@@ -316,7 +363,8 @@ def tidy_all(cfg, units, hs=None):
         if err: say(f"note: {r}: {landing_branch(cfg, Path(r))} is {lag} behind its upstream and did not fast-forward: {err}")
         elif lag: say(f"{r}: {landing_branch(cfg, Path(r))} {'is' if cfg.run.dry or cfg.run.ro else 'was'} {lag} commit(s) behind its upstream" + ("" if cfg.run.dry or cfg.run.ro else ": fast-forwarded"))
     au = all_units(cfg); P = ([(k, t, w, 0) for k, t, w in tidy_plan(cfg, units)] + tidy_branches(cfg, units)
-                              + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units) + tidy_job_records(cfg))
+                              + tidy_roots(cfg) + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units) + tidy_job_records(cfg)
+                              + ([] if cfg.run.all_units_err else tidy_briefs(cfg, units, au)))
     for n, h in cfg.hosts.items():
         if hs is not None and not (hs.get(n) or {}).get("ok"): continue
         P += tidy_host(cfg, n, h, units, au)
@@ -326,7 +374,7 @@ def tidy_all(cfg, units, hs=None):
 # (clean and landed; closed and nothing uncollected; our own stopped container; older than keep_days; over the disk budget).
 # Only some once, and the rest waited for the orchestrator, whose hooks refuse hand removal: found waste filled the disk.
 TIDY_AUTO_KINDS = ("worktree", "branch", "remote-branch", "artifact", "remote-copy", "run-files", "container", "cache", "test-root", "out-bulk", "pane", "tab", "card", "tmux",
-                   "stale-wait", "job-record")
+                   "stale-wait", "job-record", "brief")
 TIDY_HOST_KINDS = ("remote-copy", "run-files", "container", "cache", "tmux", "stale-wait")
 
 LOW_DISK_MIN = 5   # a host under [capacity] min_disk_gb is tidied this often (a pass scans every host: tens of seconds)
@@ -363,6 +411,13 @@ def tidy_do(cfg, kind, t):
     if kind == "worktree":
         top = sh(["git", "-C", t, "rev-parse", "--path-format=absolute", "--git-common-dir"])[1].strip()
         rc, o, e = sh(["git", "-C", str(Path(top).parent) if top else t, "worktree", "remove", t]); return rc, e   # never --force: clean only
+    if kind == "brief":   # the list is made again now (one row stands for all of them): what is still unread moves to the archive
+        au = all_units(cfg)
+        if cfg.run.all_units_err: return 1, f"closed units could not be read ({cfg.run.all_units_err})"
+        dst = brief_archive(cfg); dst.mkdir(parents=True, exist_ok=True); n = 0
+        for f, _ in old_briefs(cfg, Beads(cfg).units(), au):
+            with contextlib.suppress(OSError): os.replace(f, dst / f.name); n += 1
+        return 0, f"{n} moved"
     if kind in ("pane", "tab"): return (0, "") if herdr(kind, "close", t) is not None else (1, f"herdr {kind} close failed")
     if kind == "card": rc, o, e = board(cfg, "close", t); return rc, e
     if kind in ("branch", "remote-branch"):
@@ -428,11 +483,12 @@ def cmd_tidy(cfg, a):
     except Err as e:   # beads unreadable (bd: timeout under load made tidy exit doing nothing): only the rules that need no unit run
         units = None
         say(f"note: beads could not be read ({e}): skipped the rules that need the open and closed units (worktrees, artifacts, closed units' output, "
-            "remote copies, tmux sessions, panes, cards); the rest runs")
+            "remote copies, tmux sessions, panes, cards, old briefs); the rest runs")
     au = all_units(cfg) if units is not None else {}
     if units is not None and cfg.run.all_units_err: say(f"note: closed units could not be read ({cfg.run.all_units_err}): their output and copies are not judged this time")
     P = tidy_branches(cfg, units or []) + tidy_roots(cfg) + tidy_job_records(cfg)
     if units is not None: P = [(k, t, w, 0) for k, t, w in tidy_plan(cfg, units, kept=kept)] + P + tidy_artifacts(cfg, units) + tidy_out_bulk(cfg, units)
+    if units is not None and not cfg.run.all_units_err: P += tidy_briefs(cfg, units, au)
     for n, h in cfg.hosts.items(): P += tidy_host(cfg, n, h, units, au)
     P = apply_holds(cfg, P)
     for d, why in kept: say(f"kept worktree {d}: {why}")

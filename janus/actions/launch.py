@@ -5,14 +5,14 @@ from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, foreign_excludes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
 from janus.backlog import backlog_issues, holding_units, item_eligible, norm_item, unit_items
 from janus.beads import Beads, UNIT_V
-from janus.board import board, board_dir, board_shipped
+from janus.board import board, board_dir, board_path, board_shipped
 from janus.branch import landing_branch
 from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost
 from janus import lane
 from janus.cap import FACTS, build_room, cap_call, cap_nums, capv, host_cap, record_history, tree_rss_mb
 from janus.context import EXCL, Err, LockLost, JANUS_SELF, SSH, X, atomic_write, clean_env, findkey, hrun, now, pq, qp, say, sh, ts
 from janus.ledger import ledger_done, model_ok, model_tool, read_secret, reserve_budget, run_cost
-from janus.memory import MEM_SECTIONS, mem_line, memory_read
+from janus.memory import agent_memory, agent_memory_path, memory_text
 from janus.platform import herdr, herdr_text
 from janus.project import project_id, tag, tmux_name
 from janus.rigor import DEFAULT, R, agent_text, check_level, level_of
@@ -80,7 +80,7 @@ def agent_prompt(cfg, unit, brief, hn, report=None, budget=None, level=None):
     rp = report or "REPORT.md (the path in the brief)"
     board_rule = f" {o.strip()}" if o.strip() else ""
     return (f"Read {brief} (absolute path) and carry out its instructions. Report in {rp}, updated at checkpoints (a result, a decision, a "
-            f"blocker): line 1 'VERDICT: PENDING' until done, then 'VERDICT: DONE' or 'VERDICT: BLOCKED' with the real exit codes.{board_rule}"
+            f"blocker): line 1 'VERDICT: PENDING' until done, then 'VERDICT: DONE', 'VERDICT: BLOCKED' or 'VERDICT: FAILED' with the real exit codes.{board_rule}"
             + (f" Rigor: {level} (the brief header says what to test and run)." if level else "")
             + (f" {budget_note(cfg, budget)}" if budget else ""))
 
@@ -190,7 +190,7 @@ def cmd_api_run(cfg, a):
     try: var, key = read_secret(pv)
     except Err as e: ledger_done(cfg, pv, run, name, 0, "no-key"); raise
     shim = cfg.f("bin"); put_script(cfg, {"local": True}, str(shim / "pueue"), clean_pueue_script({"local": True}))
-    env = clean_env({"JANUS_ROLE": "agent", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root), "JANUS_REPORT": a.report or str(od / "REPORT.md"), "BOARD_DIR": str(board_dir(cfg)), var: key})
+    env = clean_env({"JANUS_ROLE": "agent", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root), "JANUS_REPORT": a.report or str(od / "REPORT.md"), "BOARD_DIR": str(board_dir(cfg)), "JANUS_BOARD": board_path(cfg, {"local": True}), var: key})
     env["PATH"] = f"{shim}:{env['PATH']}"   # the agent's own `pueue add` never stores the key in pueue's state file
     prompt = Path(a.prompt_file).read_text() if a.prompt_file else agent_prompt(cfg, name, a.brief, hn, a.report or str(od / "REPORT.md"), budget=a.budget)
     argv = api_argv(pv, mc, a.budget, prompt, a.resume_session)
@@ -282,21 +282,17 @@ PARK_RULE = ("**Builds and tests (janus):** submit with `{submit}`; it prints th
              "`WAITING <job ids>` in your report ({report}) and end your turn: janus resumes this session with each result. Do not poll or sleep.\n\n")
 
 def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
-    """What every agent gets at start besides its brief: the project memory IN FULL (binding instructions first, never cut), then
+    """What every agent gets at start besides its brief: the project memory's instructions and pitfalls IN FULL (binding, never
+    cut) and where its decisions and facts are (memory.agent_memory), then
     pointers (never content) to the project's agent instructions, the reports index and the board's addressed messages."""
-    es = memory_read(cfg); L = []
-    if es:
-        L.append("## Project memory (binding: your brief wins only where it is more specific)")
-        for sec in MEM_SECTIONS.values():
-            sel = [mem_line(e) for e in es if e[0] == sec]
-            if sel: L += [f"{sec}:", *sel]
-        L.append("")
-    bdir = str(board_dir(cfg)) if local else f"{h['root']}/board"
+    es = agent_memory(cfg, h); L = []
+    if es: L += ["## Project memory (binding: your brief wins only where it is more specific)", *es, ""]
+    bdir = str(board_dir(cfg)) if local else f"{h['root']}/board"; B = board_path(cfg, h)   # the full path: board.sh is on no PATH
     docs = cfg.c.get("memory", {}).get("agent_docs", ["AGENTS.md"]); docs = [docs] if isinstance(docs, str) else docs
     L += ["## Shared knowledge (janus)",
           f"- Project instructions: read the root {' / '.join(docs)} of your tree ({rcwd}) and the one in each folder you touch, where present.",
           f"- Reports index: {bdir}/index.md (one line per unit: verdict, result, report path).",
-          "- Messages are addressed: `board.sh send <unit|orchestrator> <text>` reaches one recipient; `board.sh read <you>` shows what was sent to you. "
+          f"- Messages are addressed: `{B} send <unit|orchestrator> <text>` reaches one recipient; `{B} read {name}` shows what was sent to you. "
           "Memory changes arrive there as `[memory]` lines: apply them, no reply needed.",
           "- Another agent's transcript: `janus transcript <unit> --grep '<regex>'` (condensed, never whole)." if local else
           "- Another agent's transcript: ask with a board question; the orchestrator reads it for you.", ""]
@@ -304,7 +300,7 @@ def swarm_header(cfg, hn, h, name, rcwd, local, brief_text=None, pred=None):
 
 def report_block(report=None, level=DEFAULT):
     """The level's tests to write and to run (rigor.R), and the structured report janus reads before the prose."""
-    return (agent_text(level) + " Run builds and tests through the lane. "
+    return (agent_text(level) + " Builds and tests are submitted as this header says, never run directly. "
             f"Also write `report.json` beside {report or 'REPORT.md'} (verdict, files_changed, jobs with exit codes, left): janus reads it first.\n")
 
 def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_text=None, pred=None, repo=None, level=DEFAULT):
@@ -314,11 +310,16 @@ def brief_header(cfg, hn, h, name, rcwd, local, build=None, report=None, brief_t
     rep = report or "REPORT.md"
     head = (f"<!-- janus: unit {name} runs on {hn} -->\n"
             f"**Report:** `{rep}` is the only report janus reads. Line 1 `VERDICT: PENDING`; update it at checkpoints; "
-            f"end with `VERDICT: DONE` or `VERDICT: BLOCKED` and the real exit codes. Keep your plan in it as a checklist "
+            f"end with `VERDICT: DONE`, `VERDICT: BLOCKED` or `VERDICT: FAILED` and the real exit codes. Keep your plan in it as a checklist "
             f"(`- [ ] step`, ticked `- [x]` as each step is done): the monitor shows it as your progress.\n")
     if local:
         b = build or hn
-        return (head + PARK_RULE.format(
+        # a local agent was told nothing about git: it ended DONE with its work uncommitted, and janus land refuses such a tree
+        git = (f"**Git (janus):** `{rcwd}` is a git checkout: commit your work on its current branch before you report DONE. `janus land {name}` "
+               f"merges the landing branch, squashes and publishes (it refuses a tree with uncommitted changes); you do not push or merge to "
+               f"the landing branch yourself.\n" if (Path(str(rcwd)) / ".git").exists() else "")
+        return (head + git + "Do not run builds, tests or other heavy commands directly (add `--usb` to `janus run` for a command that uses "
+                "the host's USB devices: such jobs run one at a time).\n" + PARK_RULE.format(
             submit=f"janus run --detach --host {shlex.quote(b)} --wt {shlex.quote(str(rcwd))} -- '<command>'", report=rep)
             + report_block(report, level) + swarm_header(cfg, hn, h, name, rcwd, True, brief_text, pred))
     lane = qp(f"{h['root']}/run/{name}.lane")
@@ -571,7 +572,7 @@ def remote_env(cfg, h, name, level=None):
     """The environment of an agent janus starts on a remote host (launch, and a resume that starts its client again: JANUS_REPORT
     there too, or the Stop hook never checks the report of a restarted session)."""
     return {"JANUS_ROLE": "agent", "JANUS_REPORT": f"{h['root']}/out/{name}/REPORT.md", "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg),
-            "JANUS_ROOT": str(cfg.root), **({"JANUS_RIGOR": level} if level else {})}
+            "JANUS_ROOT": str(cfg.root), "JANUS_BOARD": board_path(cfg, h), **({"JANUS_RIGOR": level} if level else {})}
 
 def turn_command(cfg, h, mc, rcwd, env, session, msgf):
     """The pane command of one turn: the message is read from msgf by the shell that runs it, so the tmux command line stays short
@@ -783,7 +784,7 @@ def cmd_launch(cfg, a):
         atomic_write(rep, (rep.read_text() if seed else "VERDICT: PENDING\n").rstrip("\n") + f"\n\n{carried}\n")
         if mt: os.utime(rep, (mt, mt))   # the seed keeps the original's age (write_seed): its old lines still count for nothing
     start = report if report and report.exists() else outd / "REPORT.md" if (seed or carried) and not cfg.run.dry else None   # the report it starts from
-    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root), "JANUS_RIGOR": level,
+    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": str(report or outd / "REPORT.md"), "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root), "JANUS_RIGOR": level, "JANUS_BOARD": board_path(cfg, h),
            **({"BOARD_DIR": str(board_dir(cfg))} if local else {})}   # remote: <root>/bin/board.sh finds <root>/board itself
     snap = dict(u)
     try:
@@ -811,6 +812,7 @@ def cmd_launch(cfg, a):
                 if not cfg.paths.get("board"):
                     for n, t in board_shipped(cfg): put_script(cfg, h, f"{root}/bin/{n}", t)   # the shipped board there (outbox)
                 ship_context(cfg, h, name, bcopy)
+                if memory_text(cfg): put_script(cfg, h, agent_memory_path(cfg, h), memory_text(cfg) + "\n", "644")   # the header names it: decisions and facts, read on need
                 put_script(cfg, h, rbrief, brief_header(cfg, hn, h, name, rcwd, local, build, env["JANUS_REPORT"], brief_text=btext, pred=pred, repo=u.get("repo"), level=level) + btext, "644")
                 if start:   # a resumed unit starts from the report it continues; there it writes <root>/out/<unit>/REPORT.md, its own
                     put_script(cfg, h, f"{root}/out/{name}/REPORT.md", start.read_text(), "644")

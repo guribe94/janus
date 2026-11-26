@@ -10,6 +10,11 @@ def board_script(cfg):
     """The message board script: paths.board (a project's own), else the board.sh shipped next to janus.py (janus-swarm item 6)."""
     return cfg.p("board") if cfg.paths.get("board") else JANUS_SELF.parent / "board.sh"
 
+def board_path(cfg, h):
+    """The board script as an agent on host h calls it, in full: board.sh is on no PATH, so a bare `board.sh` in a brief header or
+    a Stop hook's text was a command not found (only the first prompt's rule named the path). The path msgboard's rule prints."""
+    return str(board_script(cfg)) if h.get("local") else f"{h['root']}/bin/board.sh"
+
 def board_shipped(cfg):
     """(name, text) of the shipped board sent into a remote unit's <root>/bin: the shell path every launcher names, and the
     Python module it execs next to it. A project's own paths.board script is shipped by itself (no shim)."""
@@ -108,9 +113,9 @@ def _board_alerts(cfg, log):
     if not new: return None
     pane = cfg.f("pane").read_text().strip() if cfg.f("pane").exists() else ""
     msg = (JANUS_MARK + "Board needs you now: " + " | ".join(t for _, t in new) + ". Read janus memory first; "
-           "answer with janus answer <id> <text> (a block: board.sh direct <agent> <text>); janus remember what every agent should know.")
+           "answer with janus answer <id> <text> (a block: janus send <agent> <text>); janus remember what every agent should know.")
     if not pane or herdr("agent", "prompt", pane, msg) is None: log(f"board alert not delivered (no orchestrator pane): {msg[:300]}"); return None
     log(f"board alert: {msg[:600]}"); cfg.jput("alerted.json", {**{k: v for k, v in seen.items() if now() - v < 7 * 86400}, **{k: now() for k, _ in new}})
     return msg
 
-__all__ = ["board_script", "board_shipped", "board_dir", "board", "board_rows", "board_questions", "board_findings", "cmd_answer", "cmd_send", "board_files", "board_alerts"]
+__all__ = ["board_script", "board_path", "board_shipped", "board_dir", "board", "board_rows", "board_questions", "board_findings", "cmd_answer", "cmd_send", "board_files", "board_alerts"]

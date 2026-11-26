@@ -4,6 +4,7 @@ from janus.backlog import backlog_cfg, backlog_issues, item_progress, norm_item
 from janus.units import all_units
 from janus.context import Err, sh
 from janus.ledger import route_unusable
+from janus.memory import long_texts
 from janus.platform import watcher_loaded, watcher_service
 
 def git_findings(cfg):
@@ -58,7 +59,7 @@ def backlog_findings(cfg, hs, units):
 ORCH_WAIT = 3   # watcher passes an unregistered orchestrator is tolerated
 
 def orchestrator_findings(cfg):
-    """orchestrator:kind: the registered orchestrator's kind differs from janus.toml [orchestrator] kind; orchestrator:unregistered:
+    """handoff:long and memory:long (memory.long_texts); orchestrator:kind: the registered orchestrator's kind differs from janus.toml [orchestrator] kind; orchestrator:unregistered:
     the watcher has not seen the orchestrator it started (or the recorded pane's agent) for ORCH_WAIT passes and starts none."""
     F = []
     w = cfg.jget("orch_wait.json")
@@ -68,6 +69,7 @@ def orchestrator_findings(cfg):
     for k, m, why in route_unusable(cfg):
         F.append((f"routing:{k}", f"[routing] {k} starts with {m}, which cannot launch ({why}), and no fallback is allowed: fill and launch without "
                   f"--model or MODEL: launch nothing for {k}; put an enabled model first in [routing] {k}, or set fallback = true"))
+    F += long_texts(cfg)   # handoff:long, memory:long: what every session start loads whole
     sk = cfg.f("session_kind").read_text().strip() if cfg.f("session_kind").exists() else ""
     if sk and sk != cfg.c.get("orchestrator", {}).get("kind", "claude"):
         F.append(("orchestrator:kind", f"the registered orchestrator is {sk}, but janus.toml [orchestrator] kind is {cfg.c.get('orchestrator', {}).get('kind')}: set it to {sk}"))

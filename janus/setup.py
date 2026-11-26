@@ -6,6 +6,7 @@ from janus.actions.jobs import facts_line, remote_wt
 from janus.actions.landing import SECRETS, cmd_commit_state, push_cmd
 from janus.actions.launch import new_tab, tmux_submit, wait_shell
 from janus.board import board_dir, board_script
+from janus.memory import long_texts
 from janus.context import (CLAIM_WINDOW, CONF, old_layout, Err, JANUS_MARK, JANUS_SELF, SSH, atomic_write, clean_env, herdr, hrun, now, pending_age, qp,
     record_session_proc, refuse_agent, say, session_alive, sh, slug, standby, wake_clear)
 from janus.beads import Beads
@@ -351,6 +352,7 @@ def doctor(cfg, a):
         for m in lst:
             if m not in cfg.models: r(False, f"routing {tier}: unknown model {m}", "fix [routing]")
     for tier, m, why in route_unusable(cfg): r(None, f"routing {tier}: its first model {m} cannot launch ({why}) and fallback is off", f"put an enabled model first in [routing] {tier}, or set fallback = true")
+    for k, tx in long_texts(cfg): r(None, tx.split(": ", 1)[0], tx.split(": ", 1)[1])
     if cfg.f("migration/PENDING.md").is_file(): r(None, "migration is not final: the bd database and its unit records still name the old root", f"review {cfg.f('migration/PENDING.md')}")
     for w in model_host_warnings(cfg): r(None, w, "drop [models.<m>] hosts to allow every host, or add the missing ones")
     for k, d in (("briefs", "briefs"), ("out", "out")):

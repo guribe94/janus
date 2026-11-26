@@ -7,12 +7,12 @@ from janus.actions.jobs import (agent_res, collect_job, job_of, job_state, patch
 from janus.actions.launch import (agent_scope, api_remote, close_tab, confirm_started, cwd_taken, per_turn, put_script, remote_env, start_tmux, start_turn, tmux_submit, tmux_target, tool_argv,
     turn_command, turn_running)
 from janus.beads import Beads
-from janus.board import board, board_dir, board_script
+from janus.board import board, board_dir, board_path, board_script
 from janus.branch import published_contains
 from janus.budgets import budget_note, finish_refusal, reload_usd, session_usage
 from janus.context import (DIFF_X, Err, JANUS_MARK, LockLost, JANUS_SELF, SSH, X, atomic_write, herdr, hrun, now, pq, ps_table, qp, say,
     sh, ts)
-from janus.memory import memory_text
+from janus.memory import agent_memory, agent_memory_path, memory_text
 from janus.ledger import keep_run_json, ledger_done, ledger_read, reserve_budget, route_ok, run_cost, settle_run
 from janus.project import project_id, tag, unit_tmux
 from janus.rigor import level_of
@@ -20,7 +20,7 @@ from janus.probe import host_liveness, probe, probe_all, pueue
 from janus.templates import FINGERPRINT, UNIT_PROCS
 from janus.transcripts import card_fields, read_transcript, session_of
 from janus.units import (ENDED, agent_live, all_units, busy_dead, busy_mark, no_remote_copy, get_unit, herdr_agents, force_close_refusal, own_tree, reopened, report_path, unit_runs, unit_spent, unit_state,
-    verdict, waiting_line_jobs)
+    unfinished_text, verdict, waiting_line_jobs)
 
 # Agents never pay to wait. An agent submits its builds and tests detached (`janus run --detach`, or its lane runner's
 # `--detach`), which prints each job id (<host>:<task>) at once, writes `WAITING <job ids>` in its report and ends its turn.
@@ -591,9 +591,11 @@ def resume_unit(cfg, u, msg, budget=None):
     """Continue the unit's own agent session with msg (see above). budget: a new budget for this run (`janus resume --budget`,
     same tree), instead of the unit's remaining budget (item 24: a capped unit with an unpushed commit can be continued). The
     caller saves u. Returns a line saying what was done."""
-    name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); mem = memory_text(cfg); text = JANUS_MARK + msg + (f"\n\nProject memory (binding; it may have changed since you started):\n{mem}" if mem else "")
+    name = u["name"]; h = cfg.hosts[u["host"]]; mc = cfg.models.get(u.get("model"), {}); via = u.get("via"); mem = "\n".join(agent_memory(cfg, h)); text = JANUS_MARK + msg + (f"\n\nProject memory (binding; it may have changed since you started):\n{mem}" if mem else "")
+    u.pop("nudged", None)   # tend_nudge sets it after its own resume: any other resume makes the next unfinished turn end new
     ok, why = route_ok(cfg, u.get("model"))   # the config's restrictions bind every resume as they bind a launch: a removed, unknown or disabled model fails closed; no other route is tried
     if not ok: raise Err(f"{name}: not resumed: model {u.get('model')} is not allowed now ({why})")
+    if not h.get("local") and not cfg.run.dry and memory_text(cfg): put_script(cfg, h, agent_memory_path(cfg, h), memory_text(cfg) + "\n", "644")   # the copy the message names, as it is now
     ag = herdr("agent", "list") if via == "herdr" and not cfg.run.dry else None   # None: herdr did not answer, so nothing is known gone
     if ag is not None and name not in {a.get("name") for a in ag.get("agents", [])}:   # stopped, or its pane closed: a prompt reaches nobody
         from janus.actions.backlog import relaunch_cmd
@@ -652,7 +654,7 @@ def resume_unit(cfg, u, msg, budget=None):
     text += "\n\n" + budget_note(cfg, budget, spent, round(spent + budget, 2) if explicit else u.get("budget"), reload)   # item 6
     local = h.get("local", False); old = u.get("task")
     report = str(report_path(cfg, u)) if local else f"{h['root']}/out/{name}/REPORT.md"
-    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": report, "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root)}
+    env = {"JANUS_ROLE": "agent", "JANUS_REPORT": report, "JANUS_UNIT": name, "JANUS_PROJECT": project_id(cfg), "JANUS_ROOT": str(cfg.root), "JANUS_BOARD": board_path(cfg, h)}
     if local:
         pf = od / f"resume-{k}.md"
         if not cfg.run.dry: atomic_write(pf, text)
@@ -939,8 +941,30 @@ def tend_parked(cfg, hs, units, log, fetched=None):
                     if cfg.run.dry: continue
                     u["handled_jobs"] = [*u.get("handled_jobs", []), *jobs]; u.pop("parked", None); save_soft(bd, u, log)
                 continue
+            tend_nudge(cfg, bd, u, log)
         except LockLost: raise
         except Err as e: log(f"{u['name']}: {e}")
+
+def tend_nudge(cfg, bd, u, log):
+    """One nudge for an agent whose client has no Stop hook (a per-turn unit: opencode): its turn ended with neither a verdict nor a
+    park, which a Claude or Codex agent's hook refuses once with this same text (units.unfinished_text). Once: the turn the nudge
+    starts is not nudged again when it ends the same way (unit:<name>:ended-pending then stands); any other resume (its jobs, a
+    message, an answer) clears the mark (resume_unit). Never in standby (the watcher's pass stops before this step)."""
+    end = u.get("_turn_end")
+    if not (u.get("turns") and end) or u.get("nudged") or u.get("busy") or verdict(cfg, u) or waiting_line_jobs(cfg, u): return
+    key, cause = f"nudge:{u['name']}", str(end)
+    if not cfg.run.dry:
+        cur = next((x for x in bd.units() if x["id"] == u["id"]), None)   # an earlier unit's resume let the lock go: its record as it is now
+        if cur is None or cur.get("busy") or cur.get("nudged"): return
+        if not once(cfg, key, cause): return
+    h = cfg.hosts[u["host"]]; report = str(report_path(cfg, u)) if h.get("local") else f"{h['root']}/out/{u['name']}/REPORT.md"
+    try: log(resume_outside_lock(cfg, bd, u, lambda: unfinished_text(report, board_path(cfg, h), u["name"]).removeprefix(JANUS_MARK)))
+    except LockLost: raise
+    except Err:
+        if not cfg.run.dry: unonce(cfg, key, cause)
+        raise
+    if cfg.run.dry: return
+    u["nudged"] = int(end); save_soft(bd, u, log); log(f"nudged {u['name']}: its turn ended without a verdict or a WAITING line (once)")
 
 def save_soft(bd, u, log):
     """Save the unit record best-effort: the once-only facts live in .janus/autopilot.json, so a busy bd only delays it."""

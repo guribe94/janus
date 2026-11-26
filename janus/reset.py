@@ -109,8 +109,8 @@ def stop_reset(cfg, d):
     asked = cfg.mtime("handoff_asked")
     if not d.get("stop_hook_active") and not (asked and handoff_path(cfg).exists() and handoff_path(cfg).stat().st_mtime > asked):
         cfg.touch("handoff_asked")
-        return (f"[janus] The context is {tok} tokens, over the reset threshold: bring {handoff_path(cfg)} up to date now (objective, decisions, "
-                f"blockers, next actions: curated, short; binding instructions belong in {memory_path(cfg)} via janus remember), then end the turn. "
+        return (f"[janus] The context is {tok} tokens, over the reset threshold: bring {handoff_path(cfg)} up to date now (rewrite it in place, do not append: the current objective, decisions, "
+                f"blockers and next actions only; older checkpoints go to {handoff_path(cfg).parent / 'HANDOFF-archive.md'}; binding instructions belong in {memory_path(cfg)} via janus remember), then end the turn. "
                 "janus then starts a new session and loads both.")
     cfg.touch("reset_asked"); log_line(cfg, f"context reset at Stop: {tok} tokens over {cfg.reset_tokens}")
     if not os.environ.get("JANUS_IN_TESTS"):

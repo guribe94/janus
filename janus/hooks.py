@@ -10,7 +10,7 @@ from janus.context import (CLAIM_WINDOW, Cfg, Err, atomic_write, find_root, hand
     session_alive, session_root, ts)
 from janus.memory import memory_text
 from janus.rigor import R, orchestrator_text
-from janus.units import force_close_refusal
+from janus.units import force_close_refusal, unfinished_text
 
 # PreToolUse shell rules (audit H2, M5). The command is parsed, not pattern-matched: heredoc bodies are data unless fed to a
 # shell or ssh; $( ), backticks and <( ) are judged as commands of their own; the rest is split on ; && || | & ( ) and newlines,
@@ -424,10 +424,7 @@ def agent_hook(ev, d):
     # One reminder at most: the runtime re-fires Stop with stop_hook_active once the hook has blocked, and then it passes. A stop
     # is never trapped (an agent that waits for a clarification must be able to end its turn).
     if d.get("stop_hook_active"): return
-    block(f"[janus] Not finished. Before you stop, {rp} must either (a) end with 'VERDICT: DONE', 'VERDICT: BLOCKED' or "
-          f"'VERDICT: FAILED' plus the real exit codes of what you ran, or (b) hold a line 'WAITING <job ids>' for jobs you "
-          f"submitted detached. Write the true one; never write DONE to get past this check. If you wait for an answer, post it "
-          f"with board.sh post <you> question <text> and end your turn again.")
+    block(unfinished_text(rp, os.environ.get("JANUS_BOARD"), os.environ.get("JANUS_UNIT")))
 
 def session_start_text(cfg):
     """What a session gets at start, after a reset and on `janus resume --here`: the project memory in full (it holds the binding

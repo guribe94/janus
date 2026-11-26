@@ -37,6 +37,14 @@ def unit_state(u, ps, agents):
         return {"Queued": "queued", "Running": "working"}.get(k, k.lower())
     return "unknown"
 
+def unfinished_text(rp, board=None, unit=None):
+    """What an agent whose turn ended with neither a verdict nor a park is told: by its Stop hook (Claude, Codex), and by the
+    watcher's one nudge for a client that has no hook (lifecycle.tend_nudge). One text; the board script by its full path."""
+    return (f"[janus] Not finished. Before you stop, {rp} must either (a) end with 'VERDICT: DONE', 'VERDICT: BLOCKED' or "
+            f"'VERDICT: FAILED' plus the real exit codes of what you ran, or (b) hold a line 'WAITING <job ids>' for jobs you "
+            f"submitted detached. Write the true one; never write DONE to get past this check. If you wait for an answer, post it "
+            f"with {board or 'board.sh'} post {unit or '<you>'} question <text> and end your turn again.")
+
 REPORT_SEED = "VERDICT: PENDING"   # what launch writes as a new unit's report; the agent's first write replaces it
 
 def reopened(text):
@@ -262,7 +270,7 @@ def all_units(cfg):
         for i in sorted(r, key=lambda i: i.get("created_at", "")):
             t = i.get("title", "")
             if not t.startswith("unit:"): continue
-            out[t[5:]] = {**unit_record(i), "id": i["id"], "name": t[5:], "status": i.get("status")}
+            out[t[5:]] = {**unit_record(i), "id": i["id"], "name": t[5:], "status": i.get("status"), "_closed_at": i.get("closed_at")}
         cfg.run.all_units = out
     return cfg.run.all_units
 
@@ -281,7 +289,7 @@ def unit_any(cfg, name):
     except Err: u = None
     return u or all_units(cfg).get(name)
 
-__all__ = ["unit_state", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "REPORT_SEED", "reopened", "report_untouched", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_live", "agent_ended", "unit_any"]
+__all__ = ["unit_state", "unfinished_text", "verdict", "verdict_line", "herdr_agents", "ws_id", "TAB_SEP", "orphan_tabs", "report_path", "report_json", "report_summary", "RESULT_RX", "main_checkout", "force_close_refusal", "REPORT_SEED", "reopened", "report_untouched", "get_unit", "own_tree", "ENDED", "WAIT_RX", "JOBREF", "report_text", "waiting_line_jobs", "unit_runs", "unit_spent", "api_out", "all_units", "agent_live", "agent_ended", "unit_any"]
 
 
 def no_remote_copy(u):

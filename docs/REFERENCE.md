@@ -37,10 +37,10 @@ has `$JANUS_ROOT`.
 
 ## Memory and handoff
 `MEMORY.md` holds the binding instructions and durable decisions, one keyed line each; a newer line with the same key replaces the older;
-nothing expires or is truncated. It is loaded whole before the handoff at every start, reset and resume and heads every worker brief.
+nothing expires or is truncated. It is loaded whole before the handoff at every orchestrator start, reset and resume. A worker's brief and each resume message carry its instructions and pitfalls in full and the path of the file for its decisions and facts (a remote host: the copy at `<root>/MEMORY.md`, written at launch and at each resume).
 A new or replaced instruction or decision is sent as one addressed `[memory]` message to each running unit (no reply is asked).
 `HANDOFF.md` is curated by the orchestrator: objective, decisions, blockers, next actions, and the latest short checkpoint. It is updated
-after a meaningful change of plan, and before a reset (the Stop hook asks once over `reset_tokens`).
+after a meaningful change of plan, and before a reset (the Stop hook asks once over `reset_tokens`). It is rewritten in place, never appended to.
 
 ## Routing (one place: `janus.toml`)
 `[providers.X] enabled`, `auth = "api_key"|"subscription"`; `[models.M] tool`, `provider`, `hosts`; `[routing] allow_tools = [...]`,
@@ -133,6 +133,7 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 | `duplicate` | a stranded unit's host answers again while its relaunch is open: keep one (collect and land or close the original, or `close <relaunch> --duplicate-of <original>`) |
 | `git` | the project repository is dirty / unpushed |
 | `host` | a host is unreachable. Past `[capacity] down_after_min` (default 30) or marked `gone` it is stranded: its open units no longer cover their backlog items or hold cap slots, and `janus fill` relaunches each item on a host that answers (a new unit `<name>-rN`, `--resume-of` the original: its report copied here and its synced `backup.patch` applied); a brief pinned to it waits (`backlog:pinned:<unit>`). `host:<h>:gone` lists a gone host's units to close |
+| `handoff`, `memory` | `handoff:long` / `memory:long`: HANDOFF.md or MEMORY.md is over its size (`[project] handoff_max_kb`, default 16; `memory_max_kb`, default 48). Both are loaded whole at every session start; nothing is cut: rewrite the handoff in place (older checkpoints to `.janus/HANDOFF-archive.md`), `janus forget` superseded memory entries |
 | `idle` | room while work waits |
 | `idle-with-backlog` | ready briefed units fit now: janus fill; `:nobrief`: ready items without a usable brief, by id. Dispatch work: wakes an idle orchestrator again every 10 min while it holds |
 | `ledger` | a provider ledger is malformed or unreconciled |
@@ -153,15 +154,15 @@ ends and `check` names the unit interrupted. A resume refuses a removed, unknown
 | `stalled` | queued work with free slots |
 | `tab` | a tab of a closed unit is still open |
 | `thrash` | the watcher stopped and re-queued a job on a thrashing host |
-| `tidy` | what janus tidy can reclaim |
-| `unit` | a unit is blocked or finished |
+| `tidy` | what janus tidy can reclaim. Kind `brief`: brief files unchanged for `[tidy] keep_days` that nothing reads (a unit closed that long ago; a closed item's; one naming no item whose name never ran) are moved to `.janus/briefs-archive`, never deleted; an open unit's, an open item's unlaunched brief, `drafts/` and held files stay |
+| `unit` | a unit is blocked, finished, ended its turn without a verdict (`:ended-pending`), interrupted (`:interrupted`) or not started |
 | `unregistered` | a janus bug: an unregistered finding family |
 | `waiting` | a live agent waits for admission |
 | `watcher` | the watcher is not running or a step keeps failing |
 
 ## Hooks
 `SessionStart` loads MEMORY.md and HANDOFF.md; `PreToolUse` refuses the orchestrator's hand operations; `Stop` never blocks except one reminder to
-update the handoff over the context threshold. A worker's Stop hook blocks once if its report has no VERDICT and no WAITING line.
+update the handoff over the context threshold. A worker's Stop hook blocks once if its report has no VERDICT and no WAITING line. A client without hooks (opencode, one process per turn) gets the same text from the watcher instead: one resume when its turn ended with neither, once (the turn that nudge starts is not nudged again; `unit:<name>:ended-pending` then stands). Hook and nudge name the board script by its full path (`JANUS_BOARD`).
 
 ## Install
 `./check [test_file.py ...]` is a smoke check (and only the named tests). `./install` options: `--dry-run` (print every change), `--project DIR`,
