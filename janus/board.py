@@ -12,8 +12,12 @@ def board_script(cfg):
 
 def board_path(cfg, h):
     """The board script as an agent on host h calls it, in full: board.sh is on no PATH, so a bare `board.sh` in a brief header or
-    a Stop hook's text was a command not found (only the first prompt's rule named the path). The path msgboard's rule prints."""
-    return str(board_script(cfg)) if h.get("local") else f"{h['root']}/bin/board.sh"
+    a Stop hook's text was a command not found (only the first prompt's rule named the path). Here it is the `current` link of an
+    installed janus, not the release folder: an agent outlives its release (install keeps five, and a running agent's process
+    names none, so its folder is pruned), and the link is what install moves."""
+    if not h.get("local"): return f"{h['root']}/bin/board.sh"
+    p = board_script(cfg); cur = p.parent.parent.parent / "current" / p.name   # <share>/releases/<release>/board.sh
+    return str(cur if p.parent.parent.name == "releases" and cur.is_file() else p)
 
 def board_shipped(cfg):
     """(name, text) of the shipped board sent into a remote unit's <root>/bin: the shell path every launcher names, and the

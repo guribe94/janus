@@ -5,7 +5,7 @@ from pathlib import Path
 from janus.actions.jobs import agent_res, ensure_lanes, foreign_excludes, host_meets, in_container, job_script, parse_needs, runs_dir, task_rc, task_status, write_cap
 from janus.backlog import backlog_issues, holding_units, item_eligible, norm_item, unit_items
 from janus.beads import Beads, UNIT_V
-from janus.board import board, board_dir, board_path, board_shipped
+from janus.board import board, board_dir, board_path, board_script, board_shipped
 from janus.branch import landing_branch
 from janus.budgets import budget_for, budget_note, finish_refusal, transcript_cost
 from janus import lane
@@ -78,7 +78,7 @@ def agent_prompt(cfg, unit, brief, hn, report=None, budget=None, level=None):
     checkpoint rule (budget_note, budget-follow item 6)."""
     rc, o, e = board(cfg, "rule", unit, *([] if cfg.hosts[hn].get("local") else [hn]))
     rp = report or "REPORT.md (the path in the brief)"
-    board_rule = f" {o.strip()}" if o.strip() else ""
+    board_rule = f" {o.strip()}".replace(str(board_script(cfg)), board_path(cfg, cfg.hosts[hn])) if o.strip() else ""   # the path that outlives the release
     return (f"Read {brief} (absolute path) and carry out its instructions. Report in {rp}, updated at checkpoints (a result, a decision, a "
             f"blocker): line 1 'VERDICT: PENDING' until done, then 'VERDICT: DONE', 'VERDICT: BLOCKED' or 'VERDICT: FAILED' with the real exit codes.{board_rule}"
             + (f" Rigor: {level} (the brief header says what to test and run)." if level else "")

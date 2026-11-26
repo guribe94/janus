@@ -177,6 +177,14 @@ class HostUpkeep(unittest.TestCase):
                 hs["far"]["janus_copy"] = "20261126-000534-15642dba9f"; self.assertNotIn("copy:far", F())
         self.assertEqual(janus.finding("copy:far", "").family, "copy")
 
+    def test_a_local_agent_is_given_the_board_path_that_outlives_its_release(self):
+        """Catches: the path named the release folder, which install prunes after five newer ones while the agent still runs."""
+        d, cfg = project(); rel = d / "share/releases/20261126-000534-15642dba9f"; rel.mkdir(parents=True); (rel / "board.sh").write_text("#!/bin/sh\n")
+        with mock.patch.object(janus, "JANUS_SELF", rel / "janus.py"):
+            self.assertEqual(janus.board_path(cfg, cfg.hosts["here"]), str(rel / "board.sh"))       # no current link: the release itself
+            (d / "share/current").symlink_to(rel)
+            self.assertEqual(janus.board_path(cfg, cfg.hosts["here"]), str(d / "share/current/board.sh"))
+
     def test_tidy_lists_a_closed_units_job_tree_and_says_what_it_keeps(self):
         import sys
         d, cfg = project(FAR + 'worktrees = "/big/wt"\n'); T = sys.modules["janus.actions.tidy"]; ran = []; h = cfg.hosts["far"]
