@@ -1107,7 +1107,7 @@ class DoctorProjectListed(unittest.TestCase):
 class Memory(unittest.TestCase):
     """MEMORY.md: keyed replacement, instructions never truncated, delivered to running units without a forced reply, loaded in full."""
     def test_keyed_instruction_replaces_and_loads_in_full(self):
-        d, cfg = project(); A = lambda text, **k: type("A", (), {"text": text, "source": None, "key": k.get("key"), "instruction": True, "decision": False, "fact": False, "pitfall": False})()
+        d, cfg = project(); A = lambda text, **k: type("A", (), {"text": text, "source": None, "key": k.get("key"), "until": None, "instruction": True, "decision": False, "fact": False, "pitfall": False})()
         told = []
         with mock.patch.object(janus, "Beads", lambda cfg: type("B", (), {"units": lambda s: [{"name": "u1", "id": "1"}]})()), \
              mock.patch.object(janus, "board", lambda cfg, *a, **k: told.append(a) or (0, "", "")):

@@ -1,7 +1,8 @@
 """The project memory (.janus/MEMORY.md): the active user instructions and the durable decisions, facts and pitfalls.
 
 One file, one dated line per entry, `- <date> [key] <text> (source: <where>)`. An entry with a key replaces the older entry of the
-same key; nothing expires and nothing is truncated: a binding instruction stays until someone replaces or forgets it. The file is
+same key; nothing is truncated: a binding instruction stays until someone replaces or forgets it, or until the end it was given
+(`janus remember --until`: text ending `(until <date>[ <time>])`; past it the entry is loaded nowhere). The file is
 loaded in full before the handoff at every start, reset and resume; a worker's brief carries its instructions and pitfalls
 (agent_memory). Tool, model, provider and
 auth route restrictions are NOT written here: they live once in janus.toml ([providers] enabled, [routing]) where janus
@@ -34,9 +35,17 @@ def memory_write(cfg, entries):
         L += ["", f"## {sec}"] + [mem_line(e) for e in entries if e[0] == sec]
     atomic_write(memory_path(cfg), "\n".join(L) + "\n")
 
+UNTIL_RX = re.compile(r" \(until (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)\)$")
+
+def expired(e):
+    """An entry given an end (`janus remember --until`) that has passed; a date alone ends with its day. A time-boxed instruction
+    ('both subscriptions until 15:20') stayed binding for weeks: nothing ended it."""
+    m = UNTIL_RX.search(e[3]); return bool(m) and (m.group(1) if " " in m.group(1) else m.group(1) + " 23:59") < ts()
+
 def memory_text(cfg):
-    """MEMORY.md in full, or "" when it holds no entry."""
-    return memory_path(cfg).read_text().strip() if memory_read(cfg) else ""
+    """MEMORY.md without its expired entries, or "" when it holds no entry."""
+    es = memory_read(cfg); gone = {mem_line(e) for e in es if expired(e)}
+    return "\n".join(l for l in memory_path(cfg).read_text().strip().splitlines() if l not in gone) if es else ""
 
 AGENT_SECTIONS = ("Instructions", "Pitfalls")   # what binds an agent's work; decisions and facts are read on need
 
@@ -46,7 +55,7 @@ def agent_memory(cfg, h):
     """The memory an agent on host h is given, as lines: the instructions and pitfalls in full (binding, never cut), then where the
     decisions and facts are (the file here, the copy janus ships to a remote host's root). An agent got all of it at launch and
     again at every resume: 94 KB in one project, most of a small model's context and of a free route's request budget."""
-    es = memory_read(cfg); L = []
+    es = [e for e in memory_read(cfg) if not expired(e)]; L = []
     for sec in AGENT_SECTIONS:
         sel = [mem_line(e) for e in es if e[0] == sec]
         if sel: L += [f"{sec}:", *sel]
@@ -58,7 +67,7 @@ TEXT_MAX_KB = {"handoff": 16, "memory": 48}   # [project] handoff_max_kb / memor
 
 def long_texts(cfg):
     """[(key, text)]: handoff:long and memory:long, for a HANDOFF.md or MEMORY.md over its size ([project] handoff_max_kb, default
-    16; memory_max_kb, default 48). Both are loaded whole at every session start, and nothing measured them: one project's handoff
+    16; memory_max_kb, default 48), and memory:expired. Both are loaded whole at every session start, and nothing measured them: one project's handoff
     grew to 197 KB (appended at each checkpoint, void workarounds still read as current) and its memory to 94 KB, most of a
     session's context before its first command. Nothing is cut here: the orchestrator curates."""
     F = []; pr = cfg.c.get("project", {})
@@ -71,6 +80,8 @@ def long_texts(cfg):
                   + (f"rewrite it in place to the current objective, decisions, blockers and next actions; move older checkpoints to {p.parent / 'HANDOFF-archive.md'}"
                      if k == "handoff" else
                      f"it holds {len(memory_read(cfg))} entries: janus memory lists them; janus forget each one a newer entry supersedes or that no longer binds")))
+    n = sum(map(expired, memory_read(cfg)))
+    if n: F.append(("memory:expired", f"{n} MEMORY.md entr{'y is' if n == 1 else 'ies are'} past the end given with --until and loaded nowhere: janus memory marks each EXPIRED; janus forget them"))
     return F
 
 def memory_history(cfg, e, why):

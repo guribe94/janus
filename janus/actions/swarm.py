@@ -9,7 +9,7 @@ from janus.budgets import OUTCOMES, run_outcomes
 from janus.context import Err, Locked, NUM, atomic_write, memory_path, refuse_agent, say, slug, ts
 from janus.findings.units import unreconciled
 from janus.ledger import RECONCILED, implausible, ledger_done, ledger_path, ledger_read, committed, left_cost, recost, recost_plan, reconciled_plan, spend
-from janus.memory import MEM_SECTIONS, mem_line, memory_history, memory_read, memory_write
+from janus.memory import MEM_SECTIONS, expired, mem_line, memory_history, memory_read, memory_write
 from janus.probe import probe_all
 from janus.transcripts import read_transcript
 from janus.units import ENDED, herdr_agents, report_summary, unit_any, unit_state
@@ -170,6 +170,10 @@ def cmd_remember(cfg, a):
     text = re.sub(r"\s+", " ", a.text).strip()
     if not text: raise Err("nothing to remember")
     if kind == "fact" and not a.source: raise Err("a fact needs --source <path|sha|job> (where it can be checked)")
+    if a.until:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?", a.until): raise Err("--until takes YYYY-MM-DD or 'YYYY-MM-DD HH:MM'")
+        text += f" (until {a.until})"
+        if expired((None, None, None, text, None)): raise Err(f"--until {a.until} is already past")
     es = memory_read(cfg)
     if any(e[3] == text for e in es): raise Err("already remembered (exact duplicate)")
     key = slug(a.key) if a.key else None
@@ -179,6 +183,11 @@ def cmd_remember(cfg, a):
     for e in old: memory_history(cfg, e, "replaced")
     memory_write(cfg, [e for e in es if e not in old] + [new])
     say(f"remembered ({MEM_SECTIONS[kind]})" + (f", replacing the older entry on [{key}]" if old else "") + f": {text}")
+    # a new entry on an old subject under a new key left the old one standing (nine entries on one model rule): show them
+    words = {w for w in (key or "").split("-") if len(w) > 3 and not w.isdigit()}
+    rel = [f"{i:3} [{e[2]}] {e[3][:80]}" for i, e in enumerate(memory_read(cfg), 1) if e[2] and e[2] != key and words & set(e[2].split("-"))]
+    if rel: say("\n".join(["related entries still stand (janus forget <N> any that this one replaces):", *rel]))
+    if not key: say("no --key: no later entry can replace this one (janus forget removes it)")
     if kind in ("instruction", "decision"): tell_running(cfg, f"{'replaced' if old else 'new'} {kind}{f' [{key}]' if key else ''}: {text}")
 
 def tell_running(cfg, text):
@@ -201,4 +210,4 @@ def cmd_forget(cfg, a):
     say(f"forgotten (moved to {cfg.f('memory-history.md').name}): {hit[0][3]}")
 
 def cmd_memory(cfg, a):
-    return 0, [f"{i:3} {e[0][:-1].lower():11} {mem_line(e)[2:]}" for i, e in enumerate(memory_read(cfg), 1)] or [f"(no entries in {memory_path(cfg)})"]
+    return 0, [f"{i:3} {e[0][:-1].lower():11} {'EXPIRED ' if expired(e) else ''}{mem_line(e)[2:]}" for i, e in enumerate(memory_read(cfg), 1)] or [f"(no entries in {memory_path(cfg)})"]

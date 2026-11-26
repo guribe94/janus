@@ -99,7 +99,8 @@ def main():
         A("--abort", action="store_true", help="undo a close that was interrupted before its cleanup began: the unit is open again (resume, collect, land or close it)"), dry=True)
     add("commit-state", cmd_commit_state, A("-m", "--message", default="janus: state"), dry=True)
     m = add("remember", cmd_remember, A("text"), A("--source", help="where it can be checked: a path, a commit sha or a job (a fact needs one)"),
-            A("--key", help="its subject: a newer entry on the same subject replaces the older one"), dry=True)
+            A("--key", help="its subject: a newer entry on the same subject replaces the older one"),
+            A("--until", metavar="WHEN", help="its end, YYYY-MM-DD or 'YYYY-MM-DD HH:MM': past it the entry is loaded nowhere"), dry=True)
     g = m.add_mutually_exclusive_group(required=True)
     for k in MEM_SECTIONS: g.add_argument(f"--{k}", action="store_true")
     add("forget", cmd_forget, A("text", help="the entry's number (janus memory), its subject, or its text"), dry=True)

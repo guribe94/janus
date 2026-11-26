@@ -135,5 +135,35 @@ class OldBriefs(unittest.TestCase):
         self.assertEqual(sorted(f.name for f in bd.iterdir()), ["drafts", "held.md", "notes.txt", "open-unit.md", "ready-item.md", "recent-closed.md", "relaunched.md", "sweep-x.md", "young.md"])
 
 
+class MemoryUpkeep(unittest.TestCase):
+    """One project's memory reached 238 entries: nothing ended a time-boxed instruction, and a new entry on an old subject got a new key."""
+    def remember(self, text, **k):
+        a = type("A", (), {"text": text, "source": None, "key": k.get("key"), "until": k.get("until"), "instruction": True, "decision": False, "fact": False, "pitfall": False})()
+        out = io.StringIO()
+        with mock.patch.object(janus, "Beads", lambda cfg: type("B", (), {"units": lambda s: []})()), contextlib.redirect_stdout(out): janus.cmd_remember(self.cfg, a)
+        return out.getvalue()
+
+    def setUp(self): self.d, self.cfg = project()
+
+    def test_an_entry_past_its_end_is_loaded_nowhere_and_is_a_finding(self):
+        cfg = self.cfg
+        with self.assertRaises(janus.Err): self.remember("both subscriptions", key="sprint", until="2026-01-01 15:20")   # already past
+        with self.assertRaises(janus.Err): self.remember("both subscriptions", key="sprint", until="tomorrow")
+        self.remember("both subscriptions", key="sprint", until="2999-01-01"); self.remember("land first", key="land")
+        self.assertIn("both subscriptions (until 2999-01-01)", janus.session_start_text(cfg)); self.assertEqual(janus.long_texts(cfg), [])
+        janus.memory_write(cfg, [(s, d, k, t.replace("2999", "2020"), src) for s, d, k, t, src in janus.memory_read(cfg)])   # its end has passed
+        self.assertNotIn("both subscriptions", janus.session_start_text(cfg)); self.assertIn("land first", janus.session_start_text(cfg))
+        self.assertNotIn("both subscriptions", "\n".join(janus.agent_memory(cfg, cfg.hosts["here"])))
+        self.assertEqual([k for k, _ in janus.long_texts(cfg)], ["memory:expired"]); self.assertEqual(janus.finding("memory:expired", "").family, "memory")
+        self.assertIn("EXPIRED", janus.cmd_memory(cfg, None)[1][0])
+
+    def test_remember_shows_the_standing_entries_on_the_same_subject(self):
+        self.assertEqual(self.remember("fable for critical reviews", key="fable-priority"), "remembered (Instructions): fable for critical reviews\n")
+        out = self.remember("fable for critical units too", key="fable-critical-20261116")
+        self.assertIn("related entries still stand", out); self.assertIn("  1 [fable-priority] fable for critical reviews", out)
+        self.assertNotIn("related", self.remember("use rg", key="search-2026"))        # a shared number or short word is no subject
+        self.assertIn("no --key", self.remember("an unkeyed note"))
+
+
 if __name__ == "__main__":
     unittest.main()

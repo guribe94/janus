@@ -32,7 +32,7 @@ FAMILIES = {
     "ledger": Family("a provider ledger is malformed, implausible or holds unreconciled runs", urgent=True),
     "machine": Family("a job or tmux session on a shared host with no project id: listed, never acted on"),
     "margin": Family("a host is over its disk or memory-pressure margins", urgent=True),
-    "memory": Family("MEMORY.md is over its size ([project] memory_max_kb): it is loaded whole at every session start"),
+    "memory": Family("MEMORY.md is over its size ([project] memory_max_kb; it is loaded whole at every session start) or holds entries past their end"),
     "old-rule": Family("jobs still wait under the old cap rule", urgent=True),
     "orchestrator": Family("the registered orchestrator's kind differs from janus.toml, or one the watcher started never registered"),
     "orphan": Family("a job, tmux session or agent pane with no open unit", urgent=True),
