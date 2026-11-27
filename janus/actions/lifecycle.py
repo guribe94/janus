@@ -350,8 +350,10 @@ def cmd_collect(cfg, a):
     for l in (perr or "").splitlines():
         if l.strip(): say(l.strip())   # a path no patch can carry (fifo, socket, device) is named, never dropped in silence
     if not cfg.run.dry and not save_transcript(cfg, u): say(f"note: no transcript of {n} saved (none found on {u['host']})")   # out/<unit>/transcript.md
-    st = task_status(h, u["task"]) if u.get("via") == "pueue" and u.get("task") is not None and not cfg.run.dry else None
-    if not (st and task_rc(st) is None): X(cfg, h, f"rm -f {qp(f'{root}/run/{n}.key')}")   # the key fifo, once no task can still read it (row 52)
+    queued = u.get("via") == "pueue" and u.get("task") is not None
+    st = task_status(h, u["task"]) if queued and not cfg.run.dry else None
+    if not queued or st == {} or task_rc(st) is not None:   # an unreadable queue may still have a reader on the FIFO
+        X(cfg, h, f"rm -f {qp(f'{root}/run/{n}.key')}")
     kv = fingerprint(cfg, u) if not cfg.run.dry else None   # the last remote read; the lock is taken only now, for the state below
     with cfg.command_writer():
         bd, u = get_unit(cfg, a.unit)   # the record as it is now: a unit another command changed or closed meanwhile is not overwritten

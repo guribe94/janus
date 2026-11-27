@@ -168,6 +168,14 @@ class Carry(Base):
         self.assertIn("NOT applied", msg); self.assertIn("backup.patch", msg); self.assertEqual(git(r, "status", "--porcelain"), "")
         (r / "b.txt").write_text("mine\n")
         self.assertIn("NOT applied", janus.carry_patch(self.cfg, "old", r, fresh=False)); self.assertEqual((r / "b.txt").read_text(), "mine\n")   # not ours: untouched
+        backup = self.d / ".janus/out/old/backup.patch"; collected = backup.with_name("changes.patch")
+        collected.write_text("different")
+        before = git(r, "status", "--porcelain")
+        msg = janus.carry_patch(self.cfg, "old", r, fresh=True)
+        self.assertIn(str(backup), msg); self.assertIn(str(collected), msg); self.assertIn("neither was applied", msg)
+        backup.unlink()
+        self.assertIn(str(collected), janus.carry_patch(self.cfg, "old", r, fresh=True))
+        self.assertEqual(git(r, "status", "--porcelain"), before); self.assertEqual(collected.read_text(), "different")
         self.assertIn("no synced changes", janus.carry_patch(self.cfg, "none", r, fresh=True))
 
     def test_launch_records_the_pair_and_seeds_report_and_tree(self):

@@ -18,7 +18,7 @@ class WhatAnAgentIsTold(unittest.TestCase):
     def test_a_local_agent_is_told_to_commit_and_how_to_reach_the_board(self):
         """Catches: a local agent ending DONE with uncommitted work (janus land refuses such a tree; only the remote header had a git
         paragraph), `board.sh` named bare (on no PATH), 'the lane' named to an agent that has none, FAILED missing from the verdicts."""
-        d, cfg = project(FAR); (d / ".git").mkdir(); B = str(janus.JANUS_SELF.parent / "board.sh")
+        d, cfg = project(FAR); (d / ".git").mkdir(); B = janus.board_path(cfg, cfg.hosts["here"])
         h = janus.brief_header(cfg, "here", cfg.hosts["here"], "u1", str(d), True, report="/x/REPORT.md")
         self.assertIn("commit your work on its current branch", h); self.assertIn("refuses a tree with uncommitted changes", h)
         self.assertIn(f"`{B} send <unit|orchestrator> <text>`", h); self.assertIn(f"`{B} read u1`", h); self.assertNotIn("`board.sh ", h)

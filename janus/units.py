@@ -30,6 +30,7 @@ def unit_state(u, ps, agents):
             u["_turn_end"] = p["tmux_dead"][t] or "dead"; return "idle"
         return "working" if u.get("turns") or t in p.get("tmux_busy", []) else "idle"   # a per-turn client works while its process lives
     if via == "pueue":
+        if (p.get("pueue") or {}).get("tasks") is None: return "unknown"
         t = ((p.get("pueue") or {}).get("tasks") or {}).get(str(u.get("task")))
         if not t: return "gone"
         s = t.get("status"); k = s if isinstance(s, str) else next(iter(s), "")

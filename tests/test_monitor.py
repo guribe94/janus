@@ -408,6 +408,16 @@ class ReadOnly(Base):
 
 
 class Recovery(Base):
+    def test_failed_probe_and_standby_are_visible_on_a_narrow_screen(self):
+        self.w.units = [unit("remote", host="far", task=7)]
+        self.w.probes["far"] = probe_text(tasks={"7": task(7, {"Running": {}})})
+        self.cfg.f("standby.json").write_text('{"reason":"waiting for cameras"}')
+        self.collect(); self.w.fail.add("far"); self.collect()
+        m = self.model(); m.project = "long-project-name" * 4
+        self.assertTrue(m.rows["Active"][0].state.startswith("unknown"))
+        screen = ["".join(t for t, _ in line)[:50] for line in M.render(m, M.UI(), 18, 50, time.time(), "")]
+        self.assertIn("STANDBY", screen[0]); self.assertTrue(any("remote" in l and "unknown" in l for l in screen))
+        self.assertIn("waiting for cameras", m.rows["Overview"][0].cells)
     def test_stale_data_is_kept_with_its_age_and_error_then_recovers(self):
         """Catches: a failed source blanking the screen or showing zeros, a stale row looking fresh, a recovered source still flagged."""
         self.w.units = [unit("a")]; self.w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})}, avail=6144); self.w.board("2026-11-13 10:00 ann status: hello\n")
@@ -697,6 +707,7 @@ class BeadsReads(Base):
         self.w.units = [unit("run", task=1)]; self.w.probes["here"] = probe_text(tasks={"1": task(1, {"Running": {}})})
         with mock.patch.object(M, "BEADS_EVERY", 30.0):
             self.collect(); n, s = bd(), far(); self.assertGreater(n, 0)
+            self.assertEqual(sum(c[0] == "bd" and "closed" in c and "unit" in c for c in self.w.calls), 1)
             self.collect(); self.assertEqual(bd(), n); self.assertGreater(far(), s)    # within BEADS_EVERY: no bd call, the hosts again
             self.assertEqual(self.states(), {"run": "working"})                         # the units read before are still shown
         self.col.request(); self.col.wake.clear(); self.collect(); self.assertGreater(bd(), n)

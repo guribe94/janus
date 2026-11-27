@@ -107,13 +107,21 @@ class Reduction(unittest.TestCase):
             except janus.Err as e: again.append(str(e))
             return {}                                                  # herdr's answer: the prompt was taken
         with mock.patch.object(janus, "Beads", B), mock.patch.object(janus, "herdr", slow_host_io), mock.patch.object(janus, "job_result", lambda *a: (0, "/x.log")):
+            for snapshot in ({"tasks": {"5": {"status": "Running"}}}, None, None):
+                restarted = janus.Cfg(d)
+                with restarted.writer():
+                    janus.tend_parked(restarted, {"here": {"ok": True, "pueue": snapshot}},
+                                      [dict(rec, state="idle", _park=["here:5"])], again.append, {})
+                self.assertEqual(prompts, [])
+                self.assertEqual(rec["parked"]["jobs"], ["here:5"])
             with cfg.writer(): janus.tend_parked(cfg, hs, [dict(rec, state="idle", _park=["here:5"])], again.append, {})
         self.assertEqual(len(prompts), 1, again); self.assertEqual(free, [True])      # lock free during the host I/O; one resume only
         self.assertTrue(any("busy since" in x for x in again) and any("no second resume" in x for x in again), again)
         self.assertNotIn("busy", rec); self.assertEqual(rec.get("handled_jobs"), ["here:5"]); self.assertNotIn("parked", rec)   # state written back under the lock, mark cleared
         import subprocess, sys   # another process holds the pass lock (the lock is re-entrant inside one process)
         other = subprocess.Popen([sys.executable, "-c", "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f,2); print('held',flush=True); time.sleep(30)", str(cfg.f("watch.lock"))], stdout=subprocess.PIPE, text=True)
-        self.addCleanup(other.kill); self.assertEqual(other.stdout.readline().strip(), "held")
+        self.addCleanup(other.stdout.close); self.addCleanup(other.wait, 5); self.addCleanup(other.kill)
+        self.assertEqual(other.stdout.readline().strip(), "held")
         with mock.patch.object(janus, "watch_step", lambda *a, **k: None), mock.patch.object(janus, "sync_ticker", lambda *a: threading.Event()), \
              mock.patch.object(janus, "read_remote", lambda c: ran.append(1)):
             janus.cmd_watch(cfg, type("A", (), {"alert": False, "reset": False})())       # the pass lock is held: this pass is skipped, not run

@@ -255,10 +255,15 @@ class Jobs(unittest.TestCase):
         d, cfg = project(); b = cfg.f("runs") / "busy"; b.mkdir(parents=True); j = cfg.f("runs") / "jobs"; j.mkdir()
         for jid, ref in (("old-1115", "here:689"), ("live-1125", "here:7")):
             (b / jid).write_text(f"{ref}\t/w/t\n"); (j / f"{jid}.json").write_text("{}")
-        with mock.patch.object(janus, "hrun", lambda h, s, **k: (0, json.dumps({"tasks": {"7": {}}}), "")):
+        with mock.patch.object(janus, "hrun", lambda h, s, **k: (0, json.dumps({"tasks": {"7": {"status": "Queued"}}}), "")):
             self.assertEqual([t for k, t, _, _ in janus.tidy_job_records(cfg)], ["old-1115"])
+        for answer in ("{}", '{"tasks":null}', "invalid"):
+            with mock.patch.object(janus, "hrun", return_value=(0, answer, "")):
+                self.assertEqual(janus.tidy_job_records(cfg), [])
+                with self.assertRaisesRegex(janus.Err, "unavailable"): janus.cancel_job(cfg, "here:689")
+                self.assertTrue((b / "old-1115").exists())
         cmds = []
-        with mock.patch.object(janus, "task_status", lambda h, t: None), mock.patch.object(janus, "hrun", lambda h, s, **k: cmds.append(s) or (0, "", "")):
+        with mock.patch.object(janus, "task_status", lambda h, t: {}), mock.patch.object(janus, "hrun", lambda h, s, **k: cmds.append(s) or (0, "", "")):
             out = janus.cancel_job(cfg, "here:689")
             self.assertIn("removed what janus kept", out[0]); self.assertFalse((b / "old-1115").exists()); self.assertTrue((b / "live-1125").exists())
             self.assertTrue(any("old-1115.wait" in c for c in cmds))

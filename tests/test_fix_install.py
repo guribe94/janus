@@ -740,6 +740,7 @@ class Item30BriefPath(unittest.TestCase):
     def test_a_key_list_is_not_read_as_a_path(self):
         """Catches (item 30): the brief's path reader took the `/` between two KEY= items (`FMT=/CLIPPY=`) for the absolute
         path `/CLIPPY`, so a remote launch was refused for a path the brief never named."""
+        self.assertEqual(janus.brief_paths("Read /tmp/old-unit/report.md:21 before launch"), ["/tmp/old-unit/report.md"])
         self.assertEqual(janus.brief_paths("prints FMT=/CLIPPY= (a KEY= list in prose)"), [])
         self.assertEqual(janus.brief_paths("A=/x=/y= and B=/z"), ["/z"])   # `/x` `/y` are KEY= separators; `/z` is a value
 

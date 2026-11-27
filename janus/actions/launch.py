@@ -414,6 +414,13 @@ def carry_patch(cfg, old, cwd, fresh):
     seeded report gets: applied, or why not and where the patch is (the launch goes on either way). fresh: cwd was made by this
     launch, so a failed 3-way merge is undone with a hard reset and clean of that tree only; otherwise only a clean apply is tried."""
     p = cfg.p("out", "out") / old / "backup.patch"
+    collected = p.with_name("changes.patch")
+    if collected.is_file() and collected.stat().st_size:
+        import filecmp
+        if not p.is_file() or not p.stat().st_size:
+            return f"RELAUNCH: collected changes in {collected} were NOT applied; verify their ownership and published state."
+        if not filecmp.cmp(p, collected, shallow=False):
+            return f"RELAUNCH: {p} and {collected} differ; neither was applied. Reconcile both before continuing."
     if not p.is_file() or not p.stat().st_size: return f"RELAUNCH: no synced changes of {old} to carry (no {p.name}); start from this report."
     g = lambda *x: sh(["git", "-C", str(cwd), *x], timeout=300)
     if g("rev-parse", "--git-dir")[0]: return f"RELAUNCH: {old}'s changes were NOT applied ({cwd} is no git tree); they are in {p}."
@@ -909,7 +916,7 @@ def cmd_launch(cfg, a):
 # Item 30: a `/`-word must not be read as a path when it is only the separator of a KEY= list in prose (`FMT=/CLIPPY=`
 # was read as the absolute path `/CLIPPY`, and a remote launch was refused for a path the brief never named): the trailing
 # lookahead rejects a candidate whose next character is still a path character (a maximal word) or `=` (a KEY= boundary).
-PATH_RX = re.compile(r"(?<![\w.:/~$>)\]}*-])(/[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*)(?![A-Za-z0-9._@+/-=])")
+PATH_RX = re.compile(r"(?<![\w.:/~$>)\]}*-])(/[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*)(?![A-Za-z0-9._@+/=-])")
 
 def brief_paths(text):
     """Every absolute path the brief names (trailing dots stripped), in order, once."""

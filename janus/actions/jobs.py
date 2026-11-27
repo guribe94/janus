@@ -13,7 +13,7 @@ from janus.cap import cap_call, cap_lib, cap_nums, capv, class_rows, host_cap
 from janus.context import Err, LockLost, JANUS_SELF, SSH, atomic_write, fl, hrun, now, pq, qp, say, sh, ts
 from janus.platform import ARCH, CACHE_ENV, MAXRSS_PY, cache_env_sh
 from janus.project import own_label, tag, untagged
-from janus.probe import MARK_KINDS, MARKS, host_facts, host_liveness, probe, probe_all, pueue
+from janus.probe import MARK_KINDS, MARKS, host_facts, host_liveness, probe, probe_all, pueue, queue_snapshot
 from janus.templates import ADMIT
 from janus.units import agent_ended, unit_state
 
@@ -29,7 +29,7 @@ def job_state(hs, ref):
     """(state, exit code) of job <host>:<task> from the probes: queued | admission (running, waiting in janus's admission) |
     running | done | gone (no such task any more) | unknown (host unreachable) | paused, stashed, locked."""
     hn, _, tid = ref.partition(":"); p = hs.get(hn) or {}
-    if not p.get("ok"): return "unknown", None
+    if not p.get("ok") or (p.get("pueue") or {}).get("tasks") is None: return "unknown", None
     t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid)
     if not t: return "gone", None
     rc = task_rc(t)
@@ -265,10 +265,11 @@ def sync_wt(cfg, hn, h, src, name):
         if (Path(src) / x).exists() and hrun(h, f"test -e {qp(dst + '/' + x)}")[0]: raise Err(f"{x} did not arrive on {hn}")
 
 def task_status(h, tid):
+    """The task, {} for confirmed absence, or None when the queue could not be read."""
     rc, o, e = hrun(h, f"{pueue(h)} status --json", timeout=30)
     if rc: return None
-    try: return (json.loads(o).get("tasks") or {}).get(str(tid))
-    except Exception: return None
+    listing = queue_snapshot(o)
+    return listing["tasks"].get(str(tid), {}) if listing is not None else None
 
 def task_rc(t):
     s = (t or {}).get("status"); k = s if isinstance(s, str) else next(iter(s or {}), "")
@@ -293,7 +294,7 @@ def finish_job(cfg, hn, h, tid, jid, quiet=False):
     the host's admission is really holding (the same rule as the check, hosts.py). Finding 2 (fix-install6): the answer is this
     job's OWN admission-wait file, not the host's `cap_admit` (the answer for ONE MORE job): a task that started and runs normally
     is never probed or reported (the old condition reported it whenever a heavy job made admission say no)."""
-    miss = 0; last = 0
+    miss = 0; last = 0; unavailable = False
     while True:
         try:
             # Bounded where the wait runs: `exec` makes the local pueue the process subprocess kills on timeout (a plain sh -c left
@@ -302,9 +303,17 @@ def finish_job(cfg, hn, h, tid, jid, quiet=False):
             if h.get("local"): rc = subprocess.run(["sh", "-c", f"exec {pueue(h)} wait -q {int(tid)}"], timeout=WAIT_STEP).returncode
             else: rc = subprocess.run([*LSSH, h["ssh"], f"{pueue(h, f'timeout {WAIT_STEP} ')} wait -q {int(tid)}"], stdin=subprocess.DEVNULL, timeout=WAIT_STEP + 30).returncode
         except subprocess.TimeoutExpired: rc = 124
-        if rc == 124:   # the wait ran out (local, or the host's timeout): the step's report below
-            t = task_status(h, tid)
-            if task_rc(t) is not None: break
+        t = task_status(h, tid)
+        if t is None:
+            if not unavailable: print(f"janus: {hn} queue unavailable; still waiting for task {tid}", file=sys.stderr)
+            unavailable = True; miss = 0
+            time.sleep(30); continue
+        if unavailable:
+            print(f"janus: {hn} queue readable again; checking task {tid}", file=sys.stderr)
+            unavailable = False
+        if task_rc(t) is not None: break
+        miss = 0 if t else miss + 1
+        if rc == 124 and t:
             if now() - last >= WAIT_STEP:
                 last = now()
                 if admission_wait(cfg, h, jid):   # only a task this job's own admission is holding, never one merely queued/running
@@ -315,14 +324,11 @@ def finish_job(cfg, hn, h, tid, jid, quiet=False):
                     why = paused or (adm if adm and adm != "yes" else "admission says room for one more, so it may start soon")
                     print(f"janus: {hn} task {tid} is held by admission after {WAIT_STEP}s ({why}): see janus queue {hn}", file=sys.stderr)
             continue
-        t = task_status(h, tid)
-        if task_rc(t) is not None: break
-        miss = miss + 1 if t is None and rc != 255 else 0
         if miss >= 5:   # the task is gone (removed or cleaned): its rc file, else give up (M16)
             r2, o2, _ = hrun(h, f"cat {qp(f'{runs_dir(cfg, h)}/{jid}.rc')} 2>/dev/null")
             if o2.strip().lstrip("-").isdigit(): return int(o2.strip())
             print(f"janus: {hn} task {tid} is gone and left no exit code", file=sys.stderr); return 255
-        print(f"janus: {hn} task {tid} not done yet (wait exit {rc}); retrying", file=sys.stderr); time.sleep(30 if rc == 255 or t is None else 5)
+        print(f"janus: {hn} task {tid} not done yet (wait exit {rc}); retrying", file=sys.stderr); time.sleep(30 if rc == 255 or not t else 5)
     rd = runs_dir(cfg, h)
     if not quiet:
         if h.get("local"): subprocess.run(["cat", f"{rd}/{jid}.log"])
@@ -546,12 +552,14 @@ def busy_reasons(cfg, wt, hs=None, ps=None):
     for f, ref, src in recs:
         hn, _, tid = ref.partition(":"); p = hs.get(hn) or {}
         t = ((p.get("pueue") or {}).get("tasks") or {}).get(tid)
-        if p.get("ok") and (t is None or task_rc(t) is not None):
+        observed = p.get("ok") and (p.get("pueue") or {}).get("tasks") is not None
+        if observed and (t is None or task_rc(t) is not None):
             if not cfg.run.dry: f.unlink(missing_ok=True)   # ended or removed: the record goes
             continue
         if src.resolve() == wt or wt in src.resolve().parents:
-            st = t["status"] if p.get("ok") else None; st = st if isinstance(st, str) else next(iter(st or {}), "")
-            why.append(f"job {ref} ({f.name}) " + (f"is {st.lower()}" if p.get("ok") else f"on unreachable {hn}: assumed running"))
+            state, _ = job_state(hs, ref)
+            unknown = "queue unavailable" if p.get("ok") else "host unreachable"
+            why.append(f"job {ref} ({f.name}) " + (f"is {state}" if observed else f"on {hn}: {unknown}, assumed running"))
     for u in mine:
         why += [f"unit {u['name']}'s job {j}" for j in unit_jobs(cfg, hs, u["name"])]
     pats = cfg.c.get("busy", {}).get("patterns", BUSY_PATTERNS)
@@ -640,7 +648,8 @@ def cancel_job(cfg, ref, force=False):
     hn, _, tid = ref.partition(":")
     if hn not in cfg.hosts or not tid.isdigit(): raise Err("expected <host>:<task id>")
     h = cfg.hosts[hn]; t = task_status(h, tid)
-    if t is None: return cancel_leftovers(cfg, ref, h)   # the task is gone: what janus kept for it still read as a job (busy, waiting)
+    if t is None: raise Err(f"{hn}: queue unavailable; retaining {ref} and its records")
+    if not t: return cancel_leftovers(cfg, ref, h)   # the task is gone: what janus kept for it still read as a job (busy, waiting)
     if own_label(cfg, t) is None:   # cross-project safety: never another project's job, nor one with no project id (machine state)
         raise Err(f"refused: {hn}:{tid} ({t.get('label')}) is " + ("machine state (no project id)" if untagged(t) else "another project's job")
                   + f": janus acts only on its own; if it must go, pueue kill {tid} on {hn} by hand")
@@ -887,7 +896,8 @@ def collect_job(cfg, ref):
     hn, _, tid = ref.partition(":")
     if hn not in cfg.hosts or not tid.isdigit(): raise Err("expected <host>:<task id>")
     h = cfg.hosts[hn]; t = task_status(h, tid)
-    if t is None: raise Err(f"no task {tid} on {hn} (unreachable, or cleaned)")
+    if t is None: raise Err(f"{hn}: queue unavailable; cannot collect task {tid}")
+    if not t: raise Err(f"no task {tid} on {hn}")
     jid = job_of(t); rc = task_rc(t)
     if rc is None: say(f"{hn}:{tid} is {next(iter(t['status'])) if isinstance(t['status'], dict) else t['status']}, not finished"); return 3
     local = cfg.f("runs"); local.mkdir(exist_ok=True)

@@ -11,7 +11,7 @@ from janus.board import board, board_rows
 from janus.cap import capv
 from janus.context import FIXTURE_MARK, Err, LockLost, fl, herdr, hrun, now, qp, refuse_agent, say, sh, ts
 from janus.branch import contained, landed, landing_branch
-from janus.probe import pueue
+from janus.probe import pueue, queue_snapshot
 from janus.project import label_owner, own_card, tmux_name, unit_tmux
 from janus.actions.launch import tmux_target
 from janus.transcripts import card_fields
@@ -256,8 +256,9 @@ def tidy_job_records(cfg):
         if h is None: continue
         rc, o, e = hrun(h, f"{pueue(h)} status --json", timeout=30)
         if rc: continue
-        try: tasks = (json.loads(o) or {}).get("tasks") or {}
-        except ValueError: continue
+        listing = queue_snapshot(o)
+        if listing is None: continue
+        tasks = listing["tasks"]
         P += [("job-record", j, f"its task {r} is gone from {hn}'s pueue", 0) for j, r in recs.items() if r.split(":")[0] == hn and r.partition(":")[2] not in tasks]
     return P
 

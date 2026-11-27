@@ -185,12 +185,10 @@ def relaunch_brief(cfg, u, ever, taken=()):
 def relaunch_text(cfg, u, brief, live):
     """The brief of a relaunch of the stranded unit u: its own brief, then why it was relaunched and what it starts from."""
     st, since = live.get(u.get("host"), ("?", None))
-    patch = cfg.p("out", "out") / u["name"] / "backup.patch"
     return (Path(brief).read_text().rstrip("\n") + f"\n\n## Relaunch of {u['name']} (janus fill)\n\n{u['name']} ran on {u.get('host')}, which is {st}"
             + (f" (no answer since {ts(since)})" if since else "") + f". Your report starts from its last copy here (out/{u['name']}/REPORT.md)"
-            + (f", and its changes as last synced ({ts(u['saved_at']) if u.get('saved_at') else 'time unknown'}) were applied to your tree from out/{u['name']}/backup.patch"
-               " when they applied cleanly (your report says if they did not)" if patch.is_file() and patch.stat().st_size else "; no patch of its changes was synced, so start from the report")
-            + f". Work done on {u.get('host')} after that sync is not here: redo it. Do not touch {u['name']}'s copy on its host.\n")
+            + ". Read its RELAUNCH note for the actual patch outcome before continuing. Leave the original host copy intact.\n")
+
 
 def fill_plan(cfg, hs, units, limit=None, launch=False, cands=None, missing=None, held=None, pinned=None):
     """(plan [(name, item, model, agent host, build host, budget, why)], stops [why the rest does not launch now]): candidates

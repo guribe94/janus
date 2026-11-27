@@ -50,6 +50,27 @@ def pueue(h, wrap=""):
 
 LIST_KEYS = ("res", "cls", "sched", "direct", "waitjob", "apiproc", "apiinfo", "live", "report")   # apiproc/apiinfo: API processes janus did not start, and whose they are   # probe lines that repeat: kept as lists (waitjob: jobs waiting for admission)
 
+def queue_snapshot(raw):
+    """A successful, usable pueue listing, including an empty one. None means observation failed."""
+    try: data = json.loads(raw)
+    except ValueError: return None
+    if not isinstance(data, dict) or not isinstance(data.get("tasks"), dict): return None
+    for task in data["tasks"].values():
+        status = task.get("status") if isinstance(task, dict) else None
+        if not isinstance(status, (dict, str)) or not status: return None
+        if isinstance(status, dict):
+            if len(status) != 1: return None
+            state, fields = next(iter(status.items()))
+            if state == "Done" and isinstance(fields, str):   # older daemons returned the result directly
+                fields = status[state] = {"result": fields}
+            if not isinstance(fields, dict): return None
+            if state == "Done":
+                result = fields.get("result")
+                if not isinstance(result, (str, dict)) or not result: return None
+                if isinstance(result, dict) and "Failed" in result and not isinstance(result["Failed"], int): return None
+        elif status == "Done": return None   # terminal status without the result is incomplete
+    return data
+
 def probe(name, h, ro=True, cfg=None):
     """One ssh (or local sh) per host: memory, load, PSI, disk, waiting jobs, the capacity library's report (reservations, pause,
     history), other schedulers, direct builds, pueue status and tmux sessions. ro: the overload tracker is only read."""
@@ -70,8 +91,7 @@ def probe(name, h, ro=True, cfg=None):
         if k in LIST_KEYS: p[k].append(v)
         else: p[k] = v
     p["reports"] = dict(x.split(" ", 1) for x in p.pop("report") if " " in x)   # unit -> its remote report's mtime
-    try: p["pueue"] = json.loads(pj) if pj.strip() else None
-    except Exception: p["pueue"] = None
+    p["pueue"] = queue_snapshot(pj)
     return p
 
 def discover(name, h):

@@ -18,7 +18,8 @@ from janus.context import CLAIM_WINDOW, Err, JANUS_MARK, LockLost, writer_lock, 
 from janus.setup import heartbeat_beat
 
 def cmd_watch(cfg, a):
-    log = lambda m: cfg.f("watch.log").open("a").write(f"{ts()} {m}\n")
+    def log(message):
+        with cfg.f("watch.log").open("a") as f: f.write(f"{ts()} {message}\n")
     if getattr(a, "alert", False): board_alerts(cfg, log); return   # board.sh .notify: a new question or block, at once
     if getattr(a, "reset", False): return 0 if reset_now(cfg) else 1   # the Stop hook's safe-boundary context reset (janus/reset.py)
     watch_step(cfg, log, "sync", board_sync, cfg)   # first, before the writer lock: the hosts' posts are merged (their questions alert at once through .notify) before the check

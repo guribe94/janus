@@ -114,7 +114,9 @@ def collect_units(cfg):
     return [u for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "open,in_progress", "-n", "0")) if u]
 
 def collect_closed(cfg):
-    us = [u for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u]
+    return [u for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u]
+
+def latest_closed(us):
     best = {}
     for u in sorted(us, key=lambda u: epoch(u.get("closed_at")) or 0, reverse=True): best.setdefault(u["name"], u)   # a name relaunched: its latest closing
     return list(best.values())   # every closed unit, newest first: the flow counts them all; the Ended rows take the first FINISHED_KEEP
@@ -139,13 +141,12 @@ def collect_reports(cfg, units):
         except Exception as e: out[u["name"]] = {"err": err_text(e)}
     return out
 
-def collect_checklist(cfg, units, backlog):
+def collect_checklist(cfg, units, backlog, closed):
     """The checklist's totals as janus report and status give them (backlog.checklist_totals) and the ready items without a usable
     brief, by id (the selection fill uses, over what bd --readonly answered and the brief files). Reads only."""
     from janus.actions.backlog import brief_dir, brief_index, usable_brief
     iss = {i["external_ref"]: i for i in (backlog or {}).get("items", []) if str(i.get("external_ref") or "").startswith("backlog:")}   # bd --readonly's answer
     tot = checklist_totals(cfg, units, iss)
-    closed = [u for u in map(unit_of, bd_json(cfg, "list", "--label", "unit", "--status", "closed", "-n", "0")) if u]
     prog = item_progress(cfg, units + closed, iss)   # each item's units, open and closed: the Backlog's UNITS, STATE and LAST
     items_of = {}
     for k, v in prog.items():
@@ -309,11 +310,19 @@ class Collector:
             beads = self.clock() >= self.beads_due
             if beads: self.beads_due = self.clock() + BEADS_EVERY
             units = self.step("units", collect_units, cfg) if beads else last("units")
-            closed = self.step("closed", collect_closed, cfg) if beads else last("closed")
+            closed = last("closed")
+            if beads:
+                try: history = collect_closed(cfg)
+                except Exception as e:
+                    st.fail("closed", err_text(e), self.clock()); closed = None
+                else:
+                    closed = latest_closed(history); st.ok("closed", closed, self.clock())
             if units is not None: self.step("reports-open", collect_reports, cfg, units)
             if closed is not None: self.step("reports-closed", collect_reports, cfg, closed[:FINISHED_KEEP])
             backlog = self.step("backlog", collect_backlog, cfg) if beads else last("backlog")
-            if units is not None and beads: self.step("checklist", collect_checklist, cfg, units, backlog)
+            if units is not None and beads:
+                if closed is None: st.fail("checklist", "closed units unavailable", self.clock())
+                else: self.step("checklist", collect_checklist, cfg, units, backlog, history)
             self.step("board", collect_board, cfg)
             self.step("facts", collect_facts, cfg)
             self.step("liveness", collect_liveness, cfg)
@@ -421,7 +430,7 @@ def job_words(ps, ref, now):
     if st == "running":
         return f"running{took}" + (f", usually {fmt_dur(usual)}" if usual else ""), bool(el and usual and el > CAP_DEFAULTS["overrun_x"] * usual)
     pause = (p.get("cap_pause") or "").strip()
-    return ({"unknown": "its host is not answering", "done": f"finished (exit {rc}): janus resumes the unit", "gone": "no longer in the queue",
+    return ({"unknown": "queue status unavailable", "done": f"finished (exit {rc}): janus resumes the unit", "gone": "no longer in the queue",
              "queued": f"queued{took}", "admission": "held by admission " + (f"({pause})" if pause else "(the host's build capacity is full)")}.get(st, st), False)
 
 def state_words(state, note):
@@ -643,8 +652,9 @@ def derive(view, now, interval):
     ck = S("checklist").data or {}
     if ck.get("total"): m.done = (ck["done"], ck["total"])
     general = [f"{n}: {S(n).err}" for n in ("config", "collection") if S(n).err]
-    ps = {n: S(f"host:{n}").data for n in hosts if S(f"host:{n}").data}
+    ps = {n: S(f"host:{n}").data for n in hosts if st(f"host:{n}") == "ok"}
     units, closed, ag = S("units").data, S("closed").data, S("herdr").data
+    if st("herdr") != "ok": ag = None
     accepted = ck.get("accepted_at")
     tools = (cfg.data or {}).get("tools", {}); cards = (S("board").data or {}).get("cards", {})
     lv = (S("liveness").data or {}).get("live", {}); after = (S("liveness").data or {}).get("after", {})
@@ -653,6 +663,8 @@ def derive(view, now, interval):
     for u in units or []:
         rep = (S("reports-open").data or {}).get(u["name"], NOT_READ)
         tab, state, note, slow = classify(u, ps, ag, rep, lv, (ck.get("strand") or {}).get(u["name"]), now)
+        source = "herdr" if u.get("via") == "herdr" else f"host:{u.get('host')}"
+        if stale(source): note += f" (last observation {fmt_dur(now - S(source).ok_at)} ago)"
         t0 = epoch(u.get("started")); wait = after.get(u.get("host"), 1800)
         if state == "starting" and t0 is not None and now - t0 > wait:   # a launch takes minutes, never this long: it was interrupted
             state, note = "starting STALLED", f"its launch began {fmt_dur(now - t0)} ago and never finished (interrupted?): janus check says why; close or relaunch it"
@@ -716,6 +728,9 @@ def overview_rows(m, rows, hand, now, view):
     cp = (f"~{h['pct']}% - {h['line']}" if h.get("pct") is not None else "no percentage checkpoint in HANDOFF.md" if hand.data is not None else "unknown: HANDOFF.md not read")
     if h.get("at"): cp += f"  (handoff updated {fmt_dur(now - h['at'])} ago)"
     R.append(Row("o:checkpoint", ("Checkpoint", cp), "ok" if h.get("pct") is not None else "dim", [cp]))
+    if m.standby:
+        reason = clean(m.standby.get("reason")) or "owner paused orchestration"
+        R.insert(0, Row("o:standby", ("Standby", reason), "warn", [reason]))
     by = {}
     for r in rows["Active"]: k = state_word(r.state); by[k] = by.get(k, 0) + 1
     known = m.counts.get("Active") is not None
@@ -770,6 +785,8 @@ def machine_row(n, s, now, limit, agents, facts=None, _now=None, live=None):
     state, style, note = {"none": ("checking", "dim", "first probe running"), "failed": ("UNREACHABLE", "bad", short_err(s.err) + down),
                           "stale": ("UNREACHABLE" if s.err else "STALE", "bad" if s.err else "warn", f"{short_err(s.err)}; {age}{down}" if s.err else f"no answer for a while; {age}"),
                           "ok": ("PAUSED", "warn", "admission paused: " + pause) if pause else ("ok", "ok", "")}[k]
+    if k == "ok" and p.get("pueue") is None:
+        state, style, note = "QUEUE UNKNOWN", "warn", "host answered; queue status unavailable"
     adm = clean(p.get("cap_admit"), 40) if s.data is not None else ""
     adm = "?" if not adm else "admits" if adm == "yes" else "blocked: " + adm
     tools = tools_text(n, facts, now) if facts is not None else "?"
@@ -779,6 +796,9 @@ def machine_row(n, s, now, limit, agents, facts=None, _now=None, live=None):
 
 def layout(cols, width):
     """[(column index, width)] that fit width: the least important columns go first; the flex column takes what is left."""
+    if cols in (WORK_COLS, ENDED_COLS) and width < 64:
+        name_width = max(8, width // 3)
+        return [(0, name_width), (2, width - name_width - 1)]
     use = list(range(len(cols)))
     def total(): return sum(8 if cols[i][3] else cols[i][1] for i in use) + len(use) - 1   # the flex column counts at a minimum: it never costs the others their place
     while total() > width and len(use) > 1:
@@ -920,8 +940,9 @@ def render(model, ui, h, w, now, status):
     if ui.help: return [[(l[:w], "bold" if i == 0 else "")] for i, l in enumerate(wrap(HELP, w))][:h]
     L = []
     tab = TABS[ui.tab]
-    top = [("janus monitor", "bold"), (f" {model.project}  ", ""), ("READ-ONLY", "info")]
+    top = [("janus monitor", "bold")]
     if model.standby: top.append(("  STANDBY", "warn"))
+    top.extend([(f" {model.project}  ", ""), ("READ-ONLY", "info")])
     if model.rigor: top.append((f"  rigor {model.rigor}", "warn" if model.rigor.startswith("?") else "dim"))
     if model.done:
         d, n = model.done; top.append((f"  done {d}/{n} {bar(d / n)} {100 * d // n}%", "ok"))

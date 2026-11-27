@@ -362,7 +362,9 @@ class LaunchQuoting(unittest.TestCase):
         self.assertIn("launched u", out.getvalue())
         tid = saved["u"]["task"]
         subprocess.run(["pueue", "-c", str(self.pd / "p.yml"), "wait", "-q", str(tid)], timeout=60)
-        self.assertEqual(janus.task_rc(janus.task_status(cfg.hosts["here"], tid)), 0)
+        hs["here"]["pueue"] = json.loads(subprocess.check_output(
+            ["pueue", "-c", str(self.pd / "p.yml"), "status", "--json"], text=True, timeout=20))
+        self.assertEqual(janus.task_rc(hs["here"]["pueue"]["tasks"][str(tid)]), 0)
         self.assertIn(f"agent saw {rep.resolve()}\nVERDICT: DONE", rep.read_text())   # the --report path arrived intact
         self.assertTrue(rep.read_text().startswith("VERDICT: PENDING"))              # the resumed report restarted as PENDING
         out = io.StringIO()
@@ -618,6 +620,16 @@ class AdmitBound(unittest.TestCase):
         finally: subprocess.run = real_run; janus.task_status, janus.probe, janus.hrun = real
         self.assertEqual(rc, 0)
         self.assertIn("held by admission", out.getvalue()); self.assertIn("disk", out.getvalue())
+
+    def test_queue_outage_does_not_exhaust_missing_task_retries(self):
+        _, cfg = project(); h = cfg.hosts["here"]
+        broken = [(1, "", "offline"), (0, "{}", ""), (0, "bad json", ""),
+                  (0, '{"tasks":{"7":{"status":{"Done":null}}}}', "")] * 2
+        done = (0, json.dumps({"tasks": {"7": {"status": {"Done": {"result": {"Failed": 23}}}}}}), "")
+        for replies in (broken + [done, (1, "", "")], [(0, '{"tasks":{}}', "")] * 5 + [(0, "23", "")]):
+            with mock.patch.object(janus, "hrun", side_effect=replies), mock.patch("time.sleep"), \
+                 mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1)), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(janus.finish_job(cfg, "here", h, 7, "job7", quiet=True), 23)
 
     def test_a_timed_out_wait_leaves_no_pueue_behind_local_or_remote(self):
         """Catches (a build host held 26 orphan `pueue wait -q` per task): the subprocess timeout killed only the local sh / ssh, so the
